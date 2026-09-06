@@ -88,15 +88,14 @@
 
 <script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/ui.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
 const STATUS_LABEL={active:'正常',exhausted:'額度用完',cooling:'冷卻中',invalid:'憑證異常',disabled:'已停用'};
 const STATUS_COLOR={active:'#22c55e',exhausted:'#a855f7',cooling:'#f59e0b',invalid:'#ef4444',disabled:'#94a3b8'};
 
 (async()=>{
-  await renderAdminHeader();
-  const key=await adminKey.get();
-  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  if(!await requireAdmin())return;
   await loadDashboard();
   setInterval(()=>{if(!document.hidden)loadDashboard(true);},10000);
 })();
@@ -119,21 +118,21 @@ function renderDashboard(data,status,settings){
   const input=Number(stats.tokens_in)||0,output=Number(stats.tokens_out)||0,cache=Number(stats.tokens_cache)||0;
   const tokens=input+output+cache;
   const quota=quotaSummary(accounts);
-  setText('m-accounts',fmt(stats.total));setText('m-active',fmt(stats.active));
-  setText('m-pool',fmt(Object.values(status.quota_pool||{}).reduce((n,v)=>n+(Number(v)||0),0)));
-  setText('m-providers',`${(data.providers||[]).length} 個提供商`);
-  setText('m-calls',fmt(calls));setText('m-failed',fmt(failed));
-  setText('m-success',calls?`${Math.max(0,(calls-failed)/calls*100).toFixed(1)}%`:'--');
-  setText('m-tokens',fmtCompact(tokens));setText('m-token-split',`輸入 ${fmtCompact(input)} · 輸出 ${fmtCompact(output)}`);
-  setText('m-quota',fmtCompact(quota.remaining));setText('m-quota-models',`${quota.items} 個額度項目`);
+  set('m-accounts',fmt(stats.total));set('m-active',fmt(stats.active));
+  set('m-pool',fmt(Object.values(status.quota_pool||{}).reduce((n,v)=>n+(Number(v)||0),0)));
+  set('m-providers',`${(data.providers||[]).length} 個提供商`);
+  set('m-calls',fmt(calls));set('m-failed',fmt(failed));
+  set('m-success',calls?`${Math.max(0,(calls-failed)/calls*100).toFixed(1)}%`:'--');
+  set('m-tokens',fmtCompact(tokens));set('m-token-split',`輸入 ${fmtCompact(input)} · 輸出 ${fmtCompact(output)}`);
+  set('m-quota',fmtCompact(quota.remaining));set('m-quota-models',`${quota.items} 個額度項目`);
   renderProviders(accounts,data.providers||[]);
   renderHealth(stats);
   renderTokens(input,output,cache);
   renderActivity(accounts);
-  setText('gateway-endpoint',location.origin+'/v1/messages');
-  setText('gateway-auth',status.gateway_key_set?'已啟用':'未啟用');
-  setText('gateway-interval',settings.quota_refresh_interval?`${settings.quota_refresh_interval} 秒`:'手動');
-  setText('dashboard-updated',new Date().toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+  set('gateway-endpoint',location.origin+'/v1/messages');
+  set('gateway-auth',status.gateway_key_set?'已啟用':'未啟用');
+  set('gateway-interval',settings.quota_refresh_interval?`${settings.quota_refresh_interval} 秒`:'手動');
+  set('dashboard-updated',new Date().toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
 }
 
 function renderProviders(accounts,providers){
@@ -151,7 +150,7 @@ function renderProviders(accounts,providers){
     </div>`;
   }).join('');
   document.getElementById('provider-table').innerHTML=rows||'<div class="dashboard-empty">尚無提供商資料</div>';
-  setText('provider-count',`${providers.length} 個提供商`);
+  set('provider-count',`${providers.length} 個提供商`);
 }
 
 function renderHealth(stats){
@@ -161,7 +160,7 @@ function renderHealth(stats){
   const stops=[];
   keys.forEach((key,i)=>{const start=cursor;cursor+=total?values[i]/total*100:0;if(values[i])stops.push(`${STATUS_COLOR[key]} ${start}% ${cursor}%`);});
   document.getElementById('health-donut').style.background=stops.length?`conic-gradient(${stops.join(',')})`:'#eef2f6';
-  setText('health-total',fmt(total));
+  set('health-total',fmt(total));
   document.getElementById('health-legend').innerHTML=keys.filter((_,i)=>values[i]).map((key,i)=>{
     const value=Number(stats[key])||0;
     return `<div><span class="legend-dot" style="background:${STATUS_COLOR[key]}"></span><span>${STATUS_LABEL[key]}</span><strong>${value}</strong></div>`;
@@ -171,7 +170,7 @@ function renderHealth(stats){
 function renderTokens(input,output,cache){
   const parts=[['輸入',input,'#3b82f6'],['輸出',output,'#10b981'],['快取',cache,'#8b5cf6']];
   const total=parts.reduce((n,p)=>n+p[1],0);
-  setText('token-total',fmtCompact(total));
+  set('token-total',fmtCompact(total));
   document.getElementById('token-composition').innerHTML=parts.map(([label,value,color])=>{
     const pct=total?value/total*100:0;
     return `<div class="token-part"><div><span><i style="background:${color}"></i>${label}</span><strong>${fmtCompact(value)}</strong></div><div class="token-track"><span style="width:${pct}%;background:${color}"></span></div><small>${pct.toFixed(1)}%</small></div>`;
@@ -199,10 +198,7 @@ function quotaSummary(accounts){
 }
 function accountTokens(a){const t=a.total_tokens||{};return(Number(t.input)||0)+(Number(t.output)||0)+(Number(t.cache_creation)||0)+(Number(t.cache_read)||0);}
 function relativeTime(ts){if(!ts)return'尚未使用';const sec=Math.max(0,Date.now()/1000-ts);if(sec<60)return'剛剛';if(sec<3600)return`${Math.floor(sec/60)} 分鐘前`;if(sec<86400)return`${Math.floor(sec/3600)} 小時前`;return`${Math.floor(sec/86400)} 天前`;}
-function fmt(value){return Number(value||0).toLocaleString('zh-TW');}
-function fmtCompact(value){const n=Number(value)||0;if(n>=1e9)return(n/1e9).toFixed(1)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return fmt(n);}
-function setText(id,value){document.getElementById(id).textContent=value;}
-function esc(value){const el=document.createElement('span');el.textContent=String(value??'');return el.innerHTML;}
+/* set／fmt／fmtCompact／esc 等共用工具見 /static/js/ui.js */
 </script>
 </body>
 </html>

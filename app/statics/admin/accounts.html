@@ -56,8 +56,7 @@
   <div class="table-card">
     <table>
       <thead><tr>
-        <th>Token</th><th class="table-center" style="width:88px">提供商</th>
-        <th class="table-center" style="width:72px">类型</th>
+        <th>賬號</th>
         <th class="table-center" style="width:80px">狀態</th>
         <th style="width:150px">出口線路</th>
         <th style="min-width:220px">額度</th>
@@ -77,20 +76,16 @@
   <div class="modal">
     <div class="modal-title">新增帳號</div>
     <div class="filter-bar" style="margin-bottom:16px">
-      <button class="filter-chip active" id="tab-paste" onclick="switchAddTab('paste')">貼上憑證</button>
-      <button class="filter-chip" id="tab-login" onclick="switchAddTab('login')">授權登入</button>
+      <button class="filter-chip" id="tab-paste" onclick="switchAddTab('paste')">貼上憑證</button>
+      <button class="filter-chip active" id="tab-login" onclick="switchAddTab('login')">授權登入</button>
     </div>
 
     <!-- 貼上憑證 -->
-    <div id="add-pane-paste">
+    <div id="add-pane-paste" style="display:none">
       <div class="dialog-body">
         <div>
           <div class="dialog-help">每行一個 Coding Plan JWT 或 API Key，已存在的會自動跳過</div>
           <textarea class="input" id="add-tokens" rows="7" placeholder="貼上 JWT / API Key，每行一個..."></textarea>
-        </div>
-        <div class="dialog-field">
-          <span class="dialog-label">提供商</span>
-          <select class="input" id="add-provider"><option value="zai">Z.AI (Coding Plan)</option></select>
         </div>
         <div class="dialog-field">
           <span class="dialog-label">出口線路</span>
@@ -104,7 +99,7 @@
     </div>
 
     <!-- 授權登入 -->
-    <div id="add-pane-login" style="display:none">
+    <div id="add-pane-login">
       <div class="dialog-body">
         <div class="dialog-help">Z.AI 只允許 ZCode 官方回呼地址，需要在登入完成後複製一次瀏覽器地址，不需要提供帳號密碼。</div>
         <div id="login-idle">
@@ -147,33 +142,22 @@
   </div>
 </div>
 
-<!-- Confirm modal -->
-<div class="modal-overlay" id="modal-confirm">
-  <div class="modal" style="max-width:400px">
-    <div class="modal-title" id="confirm-title">確認</div>
-    <div id="confirm-body" class="dialog-help"></div>
-    <div class="dialog-actions">
-      <button onclick="closeModal('modal-confirm')" class="dialog-btn">取消</button>
-      <button onclick="_cb&&_cb()" class="dialog-btn dialog-btn-danger">確認</button>
-    </div>
-  </div>
-</div>
+<!-- Confirm modal 由 /static/js/ui.js 的 openConfirm() 依需求自動注入 -->
 
 <input type="file" id="import-file" accept=".json" style="display:none" onchange="onImportFile(event)">
 
 <script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/ui.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
-let allAccounts=[],proxyProfiles=[],availableModels=[],curFilter='all',_cb=null,_editId='',_timer=null;
+let allAccounts=[],proxyProfiles=[],availableModels=[],curFilter='all',_editId='',_timer=null;
 const refreshing=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'異常',disabled:'停用'};
 
 (async()=>{
-  await renderAdminHeader();
-  const key=await adminKey.get();
-  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  if(!await requireAdmin())return;
   await load();
   startPolling();
 })();
@@ -206,17 +190,17 @@ function renderStats(s){
     totalRem+=Number(w.remaining)||0;
     totalQuota+=Number(w.total)||0;
   });});
-  set('s-quota',fmt(totalRem));
+  set('s-quota',fmtCompact(totalRem));
   const quotaPct=totalQuota>0?Math.max(0,Math.min(100,totalRem/totalQuota*100)):0;
   const quotaProgress=document.getElementById('s-quota-progress');
   const quotaFill=document.getElementById('s-quota-progress-fill');
   quotaFill.style.width=quotaPct+'%';
   quotaFill.style.background=quotaPct<=15?'#ef4444':quotaPct<=40?'#f59e0b':'#22c55e';
   quotaProgress.setAttribute('aria-valuenow',quotaPct.toFixed(1));
-  quotaProgress.title=totalQuota?`剩餘 ${fmtTokens(totalRem)} / ${fmtTokens(totalQuota)}（${quotaPct.toFixed(1)}%）`:'尚無額度資料';
-  set('s-quota-meta',totalQuota?`${fmtTokens(totalRem)} / ${fmtTokens(totalQuota)} · ${quotaPct.toFixed(1)}%`:'尚無額度資料');
+  quotaProgress.title=totalQuota?`剩餘 ${fmtCompact(totalRem)} / ${fmtCompact(totalQuota)}（${quotaPct.toFixed(1)}%）`:'尚無額度資料';
+  set('s-quota-meta',totalQuota?`${fmtCompact(totalRem)} / ${fmtCompact(totalQuota)} · ${quotaPct.toFixed(1)}%`:'尚無額度資料');
   const tIn=Number(s.tokens_in)||0,tOut=Number(s.tokens_out)||0,tCache=Number(s.tokens_cache)||0;
-  set('s-tokens',fmtTokens(tIn+tOut));
+  set('s-tokens',fmtCompact(tIn+tOut));
   document.getElementById('s-tokens-cell').title=`輸入 ${tIn.toLocaleString()} · 輸出 ${tOut.toLocaleString()} · 快取 ${tCache.toLocaleString()}`;
 }
 
@@ -234,7 +218,7 @@ function renderTable(){
   const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
   document.getElementById('tbl-count').textContent=items.length;
   const tb=document.getElementById('tbody');
-  if(!items.length){tb.innerHTML='<tr><td colspan="11" class="empty-state">尚無帳號，請點擊右上角「新增」</td></tr>';return;}
+  if(!items.length){tb.innerHTML='<tr><td colspan="9" class="empty-state">尚無帳號，請點擊右上角「新增」</td></tr>';return;}
   tb.innerHTML=items.map(rowHtml).join('');
 }
 
@@ -243,14 +227,10 @@ function rowHtml(a){
   const isDisabled=a.status==='disabled';
   const loading=refreshing.has(a.id);
   const identity=a.email||a.name||'未命名帳號';
-  const nameHint=a.email&&a.name&&a.name!==a.email?`<small>${esc(a.name)}</small>`:'';
-  const trialBadge=a.plan_is_trial||isTrialPlan(a.plan)?'<span class="badge badge-trial">體驗套餐</span>':'';
   const disabledCount=(a.disabled_models||[]).length;
   const disabledBadge=disabledCount?`<span class="badge badge-model-disabled" title="${escAttr((a.disabled_models||[]).join('、'))}">停用 ${disabledCount} 模型</span>`:'';
   return `<tr>
-    <td><span class="tok">${esc(a.token_masked)}</span><div class="account-identity"><strong>${esc(identity)}</strong>${nameHint}${trialBadge}${disabledBadge}</div></td>
-    <td class="table-center">${a.provider}</td>
-    <td class="table-center"><span class="badge badge-${a.mode}">${isJwt?'JWT':'Key'}</span></td>
+    <td><div class="account-identity"><strong>${esc(identity)}</strong>${disabledBadge}</div></td>
     <td class="table-center"><span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span></td>
     <td>${proxyCell(a)}</td>
     <td>${quotaCell(a)}</td>
@@ -274,43 +254,32 @@ function quotaCell(a){
   const q=a.quota||{};
   const keys=Object.keys(q);
   if(!keys.length)return a.mode==='jwt'?'<span class="quota-empty">未取得</span>':'<span class="quota-empty">—</span>';
-  const planBadge=a.plan_is_trial||isTrialPlan(a.plan)?'<span class="badge badge-trial quota-plan-badge">體驗套餐</span>':'';
-  return planBadge+'<div class="quota-rows">'+keys.map(k=>{
+  // 多套餐帳號每列自帶 plan_name；單套餐帳號後端留空，整體回退到帳號層的方案名
+  const hasPlanNames=keys.some(k=>(q[k]||{}).plan_name);
+  return '<div class="quota-rows">'+keys.map(k=>{
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
     const color=rem<=0?'#c9c9cf':(pct<15?'#b0632a':'#4c9168');
     const period=w.period==='daily'?'每日':'當期';
-    const reset=w.period_end?` · 重置 ${fmtReset(w.period_end)}`:'';
+    const reset=w.period_end?` · 重置 ${fmtDate(w.period_end)}`:'';
     const model=esc((w&&w.model)||k);
-    const trialTag=w.plan_is_trial?'<em class="quota-row-trial">體驗</em>':'';
-    const planTag=w.plan_name?`<span class="quota-row-plan">${esc(w.plan_name)}</span>`:'';
+    const planName=w.plan_name||(hasPlanNames?'':(a.plan_name||''));
+    const planTag=planName?`<span class="quota-row-plan">${esc(planName)}</span>`:'';
     return `<div class="quota-row" title="${esc(`${k} · ${period}配額${reset}`)}">
-      <span class="quota-row-name"><span class="quota-row-title">${model}${trialTag}</span>${planTag}</span>
+      <span class="quota-row-name"><span class="quota-row-title">${model}</span>${planTag}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
-      <span class="quota-row-val">${period} ${fmtTokens(rem)} / ${fmtTokens(tot)}</span>
+      <span class="quota-row-val">${period} ${fmtCompact(rem)} / ${fmtCompact(tot)}</span>
     </div>`;
   }).join('')+'</div>';
 }
-function isTrialPlan(plan){
-  if(!plan||typeof plan!=='object')return false;
-  const markers=/trial|free|experience|體驗|体验|試用|试用/i;
-  return Object.entries(plan).some(([key,value])=>{
-    const normalized=key.replace(/[_-]/g,'').toLowerCase();
-    if(['istrial','trial','isfree','free','isexperience','trialplan'].includes(normalized)&&value===true)return true;
-    if(typeof value==='object'&&value)return isTrialPlan(value);
-    return markers.test(String(value||''));
-  });
-}
-function fmtReset(ts){return new Date(Number(ts)*1000).toLocaleString('zh-TW',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
-
 function tokensCell(a){
   const t=a.total_tokens||{};
   const i=Number(t.input)||0,o=Number(t.output)||0,c=(Number(t.cache_creation)||0)+(Number(t.cache_read)||0);
   if(!i&&!o&&!c)return '<span class="quota-empty">—</span>';
   return `<div class="token-rows" title="輸入 ${i.toLocaleString()} · 輸出 ${o.toLocaleString()} · 快取 ${c.toLocaleString()}">
-    <div><span>入</span><b>${fmtTokens(i)}</b></div>
-    <div><span>出</span><b>${fmtTokens(o)}</b></div>
-    ${c?`<div><span>緩</span><b>${fmtTokens(c)}</b></div>`:''}
+    <div><span>入</span><b>${fmtCompact(i)}</b></div>
+    <div><span>出</span><b>${fmtCompact(o)}</b></div>
+    ${c?`<div><span>緩</span><b>${fmtCompact(c)}</b></div>`:''}
   </div>`;
 }
 
@@ -329,26 +298,21 @@ function fillProxySelect(id,selectedId='',legacy=false){
   el.value=legacy&&!selectedId?'__legacy__':(selectedId||'');
 }
 
-function proxyScheme(url){
-  return String(url||'').split(':')[0].toLowerCase().startsWith('socks')?'SOCKS5':'HTTP';
-}
-
 /* ── Actions ── */
 function openAdd(){
   document.getElementById('add-tokens').value='';
   fillProxySelect('add-proxy-id');
-  switchAddTab('paste');
+  switchAddTab('login');
   resetLoginPane();
   openModal('modal-add');
 }
 async function doAdd(){
   const tokens=document.getElementById('add-tokens').value;
-  const provider=document.getElementById('add-provider').value;
   const proxy_id=document.getElementById('add-proxy-id').value||null;
   const list=tokens.split('\n').map(s=>s.trim()).filter(Boolean);
   if(!list.length)return showToast('請輸入至少一個 Token','error');
   try{
-    const d=await api('POST','/accounts',{provider,tokens:list,proxy_id});
+    const d=await api('POST','/accounts',{tokens:list,proxy_id});
     closeModal('modal-add');
     showToast(`新增 ${d.count} 個帳號`,'success');
     load();
@@ -380,8 +344,7 @@ async function startLogin(){
     document.getElementById('login-url').value=_loginUrl;
     document.getElementById('login-idle').style.display='none';
     document.getElementById('login-active').style.display='';
-    setLoginStatus('等待完成授權並貼上回呼地址…',false);
-    try{window.open(_loginUrl,'_blank','noopener');}catch{}
+    setLoginStatus('已產生授權連結，複製到瀏覽器開啟並完成 Z.AI 登入…',false);
   }catch(e){
     showToast('發起登入失敗：'+e.message,'error');
     btn.disabled=false;
@@ -448,7 +411,8 @@ async function doEdit(){
 
 function doDelete(id){
   const a=allAccounts.find(x=>x.id===id);
-  openConfirm('刪除帳號',`確認刪除 <code>${esc(a?a.token_masked:id)}</code>？此操作無法復原。`,async()=>{
+  const label=a?(a.email||a.name||id):id;
+  openConfirm('刪除帳號',`確認刪除 <code>${esc(label)}</code>？此操作無法復原。`,async()=>{
     try{await api('DELETE','/accounts',[id]);showToast('已刪除','success');load();}
     catch(e){showToast('刪除失敗：'+e.message,'error');}
   });
@@ -474,7 +438,8 @@ async function refreshAll(){
 
 async function resetStats(id){
   const a=allAccounts.find(x=>x.id===id);
-  openConfirm('重置 Token 統計',`確認清零賬號 <code>${esc(a?a.token_masked:id)}</code> 的累計 Token 用量？此操作不可撤銷。`,async()=>{
+  const label=a?(a.email||a.name||id):id;
+  openConfirm('重置 Token 統計',`確認清零賬號 <code>${esc(label)}</code> 的累計 Token 用量？此操作不可撤銷。`,async()=>{
     try{await api('POST','/accounts/'+id+'/reset-stats');showToast('已重置統計','success');load();}
     catch(e){showToast('重置失敗: '+e.message,'error');}
   });
@@ -500,17 +465,8 @@ async function onImportFile(ev){
 }
 
 /* ── Helpers ── */
-function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
-function fmt(n){n=Number(n)||0;return n>=10000?(n/1000).toFixed(1)+'k':n;}
-function fmtTokens(n){n=Number(n)||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(2)+'M';if(n>=1e3)return (n/1e3).toFixed(1)+'k';return String(n);}
-function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+/* esc、escAttr、set、fmt、fmtCompact、fmtDate、彈窗與確認框等共用工具見 /static/js/ui.js */
 function normalizeModel(model){return String(model||'').trim().toLowerCase().replace(/[_ ]/g,'-').replace(/-+/g,'-');}
-function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
-function openModal(id){document.getElementById(id).classList.add('open');}
-function closeModal(id){document.getElementById(id).classList.remove('open');}
-function openConfirm(title,body,cb){_cb=async()=>{closeModal('modal-confirm');await cb();};document.getElementById('confirm-title').textContent=title;document.getElementById('confirm-body').innerHTML=body;openModal('modal-confirm');}
-document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el)el.classList.remove('open');}));
 </script>
 </body>
 </html>

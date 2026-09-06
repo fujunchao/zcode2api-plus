@@ -2,8 +2,6 @@
 async function renderAdminHeader(){
   const mount=document.getElementById('admin-header');
   if(!mount)return;
-  let version='';
-  try{const r=await fetch('/meta');if(r.ok)version='v'+(await r.json()).version;}catch{}
   const active=mount.dataset.active||location.pathname;
   const nav=[
     {href:'/admin/dashboard',label:'儀表板',group:'總覽',icon:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>'},
@@ -42,11 +40,6 @@ async function renderAdminHeader(){
         <button class="sidebar-toggle" onclick="toggleAdminSidebar()" title="開啟導覽" aria-label="開啟導覽"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
         <div class="breadcrumb"><span>控制台</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg><strong>${pageName}</strong></div>
       </div>
-      <div class="topbar-right">
-        <span class="topbar-status"><span class="runtime-dot"></span>系統正常</span>
-        ${version?`<span class="topbar-version">${version}</span>`:''}
-        <button class="topbar-avatar" title="管理員" aria-label="管理員">Z</button>
-      </div>
     </header>`;
 }
 
@@ -55,4 +48,12 @@ function toggleAdminSidebar(){
 }
 function closeAdminSidebar(){
   document.body.classList.remove('sidebar-open');
+}
+
+/* 後台頁共用進場流程：渲染導覽並驗證密鑰，未通過導回登入頁；回傳是否可進入 */
+async function requireAdmin(){
+  await renderAdminHeader();
+  const key=await adminKey.get();
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false)){location.href='/admin/login';return false;}
+  return true;
 }

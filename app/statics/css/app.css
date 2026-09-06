@@ -102,7 +102,6 @@ th{background:#fff;font-size:11px;font-weight:500;color:#9b9b9b;padding:11px 16p
 td{font-size:13px;padding:13px 16px;vertical-align:middle;color:#3f3f3f}
 tr:hover td{background:#fdfdfd}
 .table-center{text-align:center}
-.tok{font-family:ui-monospace,monospace;font-size:12px;color:#333}
 .empty-state{padding:48px 16px;color:#8a8a8a;font-size:13px;text-align:center}
 
 /* Badges */
@@ -112,15 +111,11 @@ tr:hover td{background:#fdfdfd}
 .badge-exhausted{color:#8d6bbd;background:#f7f3fb}
 .badge-invalid,.badge-expired{color:#b66a63;background:#fbf3f2}
 .badge-disabled{color:#6f675d;background:#f1ece4}
-.badge-jwt{color:#4c76b2;background:#f1f6fc}
-.badge-apiKey{color:#6d6d6d;background:#f7f7f7}
-.badge-trial{color:#b45309;background:#fff7ed;border:1px solid #fed7aa}
 .badge-model-disabled{color:#b42318;background:#fef3f2;border:1px solid #fecdca}
 
 /* 帳號辨識資訊 */
-.account-identity{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:3px;max-width:260px}
+.account-identity{display:flex;align-items:center;gap:6px;flex-wrap:wrap;max-width:260px}
 .account-identity strong{font-size:11px;color:#344054;font-weight:600;overflow-wrap:anywhere}
-.account-identity small{font-size:10px;color:#98a2b3;overflow-wrap:anywhere}
 
 /* Quota pills */
 .quota-cell{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
@@ -132,13 +127,11 @@ tr:hover td{background:#fdfdfd}
 .q-bar-fill{height:100%;background:#4c9168;border-radius:999px}
 
 /* Quota expanded rows (展开为进度条) */
-.quota-plan-badge{margin-bottom:6px}
 .quota-rows{display:flex;flex-direction:column;gap:7px;min-width:300px;max-width:380px}
 .quota-row{display:grid;grid-template-columns:minmax(120px,max-content) minmax(60px,1fr) auto;align-items:center;gap:10px}
 .quota-row-name{font-size:11px;font-weight:600;color:#6a6a6a;white-space:nowrap;display:flex;flex-direction:column;line-height:1.35}
 .quota-row-title{display:inline-flex;align-items:center;gap:4px}
 .quota-row-plan{font-size:9px;font-weight:500;color:#98a2b3;max-width:170px;overflow:hidden;text-overflow:ellipsis}
-.quota-row-trial{font-style:normal;font-size:9px;font-weight:600;color:#b0632a;border:1px solid currentColor;border-radius:4px;padding:0 3px;line-height:1.5}
 .quota-row-track{height:6px;border-radius:999px;background:#eef0ee;overflow:hidden}
 /* span 預設為 inline，width 不生效會讓進度條永遠空白，必須 block 化 */
 .quota-row-fill{display:block;height:100%;border-radius:999px;transition:width .3s}
@@ -272,14 +265,12 @@ body{background:var(--bg);color:var(--fg);overflow-x:hidden}
 .sidebar-logout:hover{background:#f2f4f7;color:#344054}
 .sidebar-logout svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .admin-topbar{position:fixed;z-index:100;top:0;left:248px;right:0;height:70px;padding:0 32px;background:rgba(255,255,255,.92);border-bottom:1px solid var(--border);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:space-between}
-.topbar-left,.topbar-right,.breadcrumb{display:flex;align-items:center}
-.topbar-left{gap:16px}.topbar-right{gap:14px}.breadcrumb{gap:8px;font-size:12px;color:var(--fg-subtle)}
+.topbar-left,.breadcrumb{display:flex;align-items:center}
+.topbar-left{gap:16px}.breadcrumb{gap:8px;font-size:12px;color:var(--fg-subtle)}
 .breadcrumb svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .breadcrumb strong{color:var(--fg);font-weight:600}
 .sidebar-toggle{display:none;width:34px;height:34px;border:1px solid var(--border);border-radius:7px;align-items:center;justify-content:center;color:var(--fg-muted);background:#fff}
 .sidebar-toggle svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
-.topbar-status{display:inline-flex;align-items:center;gap:8px;color:var(--fg-muted);font-size:12px}.topbar-version{color:var(--fg-subtle);font-size:11px;font-variant-numeric:tabular-nums}
-.topbar-avatar{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#e0e7ff;color:#3730a3;font-size:12px;font-weight:700}
 .admin-main{max-width:none;margin:0;padding:104px 32px 40px 280px}
 .page-hd{max-width:1440px;margin:0 auto 28px;align-items:flex-end}.page-title{font-size:24px;letter-spacing:-.025em;color:#101828}.page-sub{font-size:13px;color:var(--fg-muted);margin-top:7px}
 .page-actions{gap:8px}.page-action-btn{height:36px;padding:0 12px;border:1px solid var(--border);border-radius:7px;background:#fff;color:#344054;font-size:12px;box-shadow:0 1px 2px rgba(16,24,40,.03)}
@@ -328,7 +319,7 @@ body{background:var(--bg);color:var(--fg);overflow-x:hidden}
   .analytics-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.analytics-grid,.analytics-grid-wide{grid-template-columns:1fr}.monitor-health-grid{grid-template-columns:1fr}.monitor-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.service-list{grid-template-columns:1fr}.monitor-grid,.monitor-grid-bottom{grid-template-columns:1fr}.proxy-layout{grid-template-columns:1fr}
 }
 @media (max-width:600px){
-  .admin-topbar{height:62px;padding:0 14px}.topbar-status,.topbar-version{display:none}.topbar-right{gap:0}.breadcrumb{font-size:11px}.admin-main{padding:84px 14px 24px}.page-hd{align-items:flex-start;margin-bottom:22px}.page-title{font-size:21px}.page-sub{font-size:12px;max-width:100%}.page-actions{width:100%;overflow:auto;padding-bottom:2px}.page-action-btn{flex:0 0 auto}.live-dot{margin-right:auto}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.stat-cell{min-height:94px;padding:14px}.stat-label{white-space:normal}.stat-num{font-size:22px}.section-head{margin-top:22px}.table-card{margin-left:0;margin-right:0}.settings-card{padding:18px}.dialog-field{align-items:flex-start;flex-direction:column;gap:6px}.dialog-label{width:auto}.modal{width:min(460px,calc(100vw - 28px));padding:20px}.login-card{padding:26px 22px}
+  .admin-topbar{height:62px;padding:0 14px}.breadcrumb{font-size:11px}.admin-main{padding:84px 14px 24px}.page-hd{align-items:flex-start;margin-bottom:22px}.page-title{font-size:21px}.page-sub{font-size:12px;max-width:100%}.page-actions{width:100%;overflow:auto;padding-bottom:2px}.page-action-btn{flex:0 0 auto}.live-dot{margin-right:auto}.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.stat-cell{min-height:94px;padding:14px}.stat-label{white-space:normal}.stat-num{font-size:22px}.section-head{margin-top:22px}.table-card{margin-left:0;margin-right:0}.settings-card{padding:18px}.dialog-field{align-items:flex-start;flex-direction:column;gap:6px}.dialog-label{width:auto}.modal{width:min(460px,calc(100vw - 28px));padding:20px}.login-card{padding:26px 22px}
   .dashboard-metrics{grid-template-columns:1fr;gap:10px}.metric-card{min-height:94px;padding:15px}.dashboard-panel{padding:17px}.provider-row{grid-template-columns:minmax(150px,1fr) repeat(2,70px)}.provider-row>div:nth-child(4),.provider-row>div:nth-child(5){display:none}.health-layout{gap:22px}.health-donut{width:126px;height:126px}.health-donut::after{inset:22px}.gateway-details{gap:14px}.gateway-endpoint{min-width:0}.gateway-meta{grid-template-columns:1fr 1fr}.gateway-meta span:last-child{grid-column:1/-1}
   .analytics-metrics{grid-template-columns:1fr;gap:10px}.analytics-grid{gap:10px}.usage-donut-wrap{flex-direction:column;gap:16px}.usage-donut-legend{width:100%;grid-template-columns:repeat(2,1fr)}.usage-chart-row{grid-template-columns:74px minmax(0,1fr) 40px}.monitor-hero{padding:17px}.monitor-hero-head{align-items:flex-start}.monitor-stat-grid{grid-template-columns:1fr 1fr;gap:9px}.monitor-kpi{min-height:86px;padding:12px}.monitor-kpi strong{font-size:20px}.resource-row{grid-template-columns:80px minmax(0,1fr)}.resource-row small{grid-column:2;text-align:left;margin-top:-7px}.quality-list{gap:8px}.runtime-details{gap:10px}.proxy-profile-row{align-items:flex-start;flex-wrap:wrap;padding:12px 0}.proxy-profile-copy{min-width:calc(100% - 50px)}.proxy-profile-scheme{margin-left:43px}.proxy-profile-status{margin-left:auto}.proxy-profile-actions{margin-left:auto}.proxy-select{width:100%}
 }

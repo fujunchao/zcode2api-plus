@@ -53,12 +53,11 @@
 
 <script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/ui.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
 (async()=>{
-  await renderAdminHeader();
-  const key=await adminKey.get();
-  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  if(!await requireAdmin())return;
   document.getElementById('endpoint').textContent=location.origin+'/v1/messages';
   load();
 })();
