@@ -15,8 +15,10 @@ zcode_oauth_result.json
 docker-compose.yml
 nginx.conf
 
-# ── 依赖与缓存（镜像内重新安装）──
+# ── 依赖与缓存（镜像内重新安装/构建）──
 captcha_node/node_modules
+frontend/node_modules
+frontend/dist
 temp
 **/__pycache__
 *.pyc

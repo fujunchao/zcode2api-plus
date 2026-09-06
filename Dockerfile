@@ -1,6 +1,16 @@
 # zcode2api-plus — Python(FastAPI) + Node(jsdom 无痕验证求解器) + cloakbrowser(真实浏览器运行时)
 # 运行期同时需要 Python 与 Node：网关用 Python，验证码求解以 Node 子进程方式运行；
 # cloakbrowser 提供真实 Chromium（与生产 Python 3.11 对齐；zcode-proxy 需 >=3.13 故不安装）。
+# 管理後台 SPA（frontend/）在 multi-stage 的 node:20-alpine 阶段建置，僅複製產物進最終映像。
+
+# ── 階段一：建置管理後台 SPA ─────────────────────────────────────────────────
+FROM node:20-alpine AS frontend
+WORKDIR /fe
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -75,6 +85,9 @@ RUN cd captcha_node && npm ci --omit=dev
 
 # ── 应用源码 ────────────────────────────────────────────────────────────────
 COPY . .
+
+# ── 管理後台 SPA 建置產物（pages 路由以 FileResponse 服務 frontend/dist）────
+COPY --from=frontend /fe/dist ./frontend/dist
 
 # 账号 / 设置持久化目录（建议挂载到宿主机卷）
 VOLUME ["/data"]

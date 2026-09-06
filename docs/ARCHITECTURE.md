@@ -290,7 +290,8 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 │   ├── auth_admin.py      # 鉴权依赖
 │   ├── logs.py            # 彩色日志
 │   ├── routes/            # gateway / admin_api / pages
-│   └── statics/           # css / js / admin/*.html
+├── frontend/              # 管理後台 SPA（Vite + React + TS + Tailwind v4 + shadcn/ui）
+│   └── dist/              # 建置產物；pages 路由將 /admin/* 回落 index.html
 ├── captcha_node/          # Captcha Solver（Node + jsdom，solver.js）
 ├── main.py                # CLI 入口
 ├── data/                  # 运行时生成：accounts.db

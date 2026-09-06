@@ -202,7 +202,11 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 │   ├── usage.py           # Token 调度统计（UsageCollector：解析上游 usage）
 │   ├── logs.py            # 彩色终端日志
 │   ├── routes/            # gateway / admin_api / pages
-│   └── statics/           # app.css, auth.js, toast.js, header.js, admin/*.html
+│   └── statics/           # （已移除，後台改為 frontend/ SPA）
+├── frontend/              # 管理後台 SPA（Vite + React + TypeScript + Tailwind v4 + shadcn/ui）
+│   ├── src/pages/         # login / dashboard / accounts / usage / monitor / proxies / settings / captcha
+│   ├── src/lib/           # admin-key（舊 auth.js 加密格式相容）/ api / format / types
+│   └── dist/              # 建置產物（npm run build，git 忽略）
 ├── captcha_node/          # 无浏览器无痕验证求解器（Node + jsdom，solver.js）
 ├── main.py                # 命令行入口（serve / login / accounts / quota ...）
 ├── data/                  # 运行时生成：accounts.db (SQLite)
@@ -220,6 +224,21 @@ python main.py export [file] / import <file>       # 导出 / 导入账号
 - Python 3.13 · FastAPI · Uvicorn · httpx
 - SQLite（账号 / 设置持久化，WAL 模式）
 - Node.js + jsdom（无浏览器求解阿里云无痕验证 → verifyParam）
+
+## 管理後台（前端）
+
+管理後台為 React SPA（`frontend/`，Vite + TypeScript + Tailwind CSS v4 + shadcn/ui，僅淺色模式）：
+
+```bash
+cd frontend
+npm ci
+npm run dev      # 開發模式：Vite 代理 /admin/api 與 /meta 到本機 127.0.0.1:3000
+npm run build    # 產出 frontend/dist/（後端服務此目錄，源碼運行前需先建置）
+```
+
+- 後端將 `/admin/*` 全部回落到 `frontend/dist/index.html`（SPA 內部路由重新整理不 404），`/assets/*` 為 Vite 靜態資源。
+- 登入密鑰沿用舊版的加密儲存格式（localStorage `zcode2api_admin_key`），升級後既有瀏覽器 session 無需重新登入。
+- Docker 映像與 `deploy/install.sh` 皆會自動執行前端建置。
 
 ## 文档
 

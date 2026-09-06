@@ -82,6 +82,10 @@ echo "==> 建立 venv 並安裝 Python 依賴"
 echo "==> 安裝驗證碼求解器（Node）依賴"
 ( cd "${APP_DIR}/captcha_node" && npm ci --omit=dev >/dev/null )
 
+# ── 3.5 管理後台 SPA（frontend/）建置 ───────────────────────────────────────
+echo "==> 建置管理後台 SPA（npm ci + npm run build）"
+( cd "${APP_DIR}/frontend" && npm ci >/dev/null && npm run build >/dev/null )
+
 # ── 4. 可選：真實 Chromium 驗證碼池（--with-browser）────────────────────────
 CAPTCHA_BROWSER_VALUE=false
 if [[ "${WITH_BROWSER}" -eq 1 ]]; then

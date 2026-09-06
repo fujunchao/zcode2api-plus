@@ -1,5 +1,8 @@
 node_modules/
 js-code/node_modules/
+# 管理後台 SPA（frontend/ 的依賴與建置產物）
+frontend/node_modules/
+frontend/dist/
 # Python
 __pycache__/
 *.py[cod]

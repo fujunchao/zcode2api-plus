@@ -60,16 +60,20 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="zcode2api-plus", version=settings.APP_VERSION, lifespan=lifespan)
 
-    app.mount("/static", StaticFiles(directory=str(settings.STATIC_DIR)), name="static")
+    # SPA 靜態資源（Vite 預設輸出 /assets/*）；未建置前端時略過，頁面路由會回 404 提示
+    if (settings.FRONTEND_DIST / "assets").exists():
+        app.mount("/assets", StaticFiles(directory=str(settings.FRONTEND_DIST / "assets")), name="assets")
 
-    app.include_router(pages.router)
+    # 順序重要：admin_api（/admin/api）必須先於 pages 的 /admin catch-all 註冊
     app.include_router(admin_api.router)
     app.include_router(gateway.router)
-    
+
     # 条件挂载 async 路由
     if settings.ASYNC_ENABLED:
         app.include_router(async_pool.router)
-    
+
+    app.include_router(pages.router)
+
     return app
 
 

@@ -35,7 +35,8 @@ def _int(env_name: str, default: int) -> int:
 DATA_DIR = _resolve_path("ZCODE_DATA_DIR", "data")
 # 账号与设置持久化到本地 SQLite（与 grok2api 的 local 后端一致）
 DB_PATH = DATA_DIR / "accounts.db"
-STATIC_DIR = Path(__file__).resolve().parent / "statics"
+# 管理後台 SPA 的建置產物（由 frontend/ 目錄 npm run build 產生）
+FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 
 # ── 服务 ─────────────────────────────────────────────────────────────────────
 PORT = _int("ZCODE_PORT", 3000)
