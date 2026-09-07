@@ -8,7 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# dist 不再忽略：根包 webui.go 以 go:embed all:frontend/dist 引用，構建產物必須入庫
 dist-ssr
 *.local
 

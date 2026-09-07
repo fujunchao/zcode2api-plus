@@ -1,14 +1,13 @@
 node_modules/
 js-code/node_modules/
-# 管理後台 SPA（frontend/ 的依賴與建置產物）
+# 管理後台 SPA（frontend/ 的依賴；dist 由 go:embed 引用，必須入庫）
 frontend/node_modules/
-frontend/dist/
 # Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-# 运行时数据（账号 SQLite 等）
+# 运行时数据（账号 SQLite 等），绝不可入库
 data/
 data_test/
 
