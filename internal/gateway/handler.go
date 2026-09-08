@@ -1,4 +1,5 @@
-// HTTP 层：/v1/messages 与 /v1/models。
+// HTTP 层：/v1/messages 与 /v1/models。同时导出供 OpenAI 兼容层复用的
+// JSON 写出、鉴权错误、请求头汇合工具（M4）。
 // 对应 Python 版 routes/gateway.py 的路由与流式透传部分。
 package gateway
 
@@ -26,13 +27,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if e := h.Auth.VerifyGatewayKey(r); e != nil {
-		writeAuthError(w, e)
+		WriteAuthError(w, e)
 		return
 	}
 
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
+		WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{"message": "请求体不是合法 JSON", "type": "invalid_request"},
 		})
 		return
@@ -42,8 +43,8 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 	NormalizeBody(body, false)
 
 	if !ModelAllowed(body["model"]) {
-		modelName := anyToString(body["model"])
-		writeJSON(w, http.StatusBadRequest, map[string]any{
+		modelName := AnyToString(body["model"])
+		WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{
 				"message": fmt.Sprintf("模型 %s 不在可用清單內，僅支持 %s", modelName, strings.Join(AvailableModels, ", ")),
 				"type":    "model_not_allowed",
@@ -52,20 +53,22 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := h.Engine.RunMessages(r.Context(), body, incomingHeaders(r), func(d Delivery) error {
+	result := h.Engine.RunMessages(r.Context(), body, IncomingHeaders(r), func(d Delivery) error {
 		return passthroughDeliver(w, d)
 	})
 	if result.Delivered {
 		return
 	}
-	writeJSON(w, result.Status, result.Body)
+	WriteJSON(w, result.Status, result.Body)
 }
 
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	if e := h.Auth.VerifyGatewayKey(r); e != nil {
-		writeAuthError(w, e)
+		WriteAuthError(w, e)
 		return
 	}
+	// 双兼容超集（M4）：每项同时带 Anthropic 侧 id/display_name/type 与
+	// OpenAI 侧 object/created/owned_by，顶层 object:list
 	data := make([]map[string]any, 0, len(AvailableModels))
 	for _, id := range AvailableModels {
 		data = append(data, map[string]any{
@@ -73,9 +76,12 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			"type":         "model",
 			"display_name": id,
 			"created_at":   "2025-01-01T00:00:00Z",
+			"object":       "model",
+			"created":      float64(1735689600), // 2025-01-01T00:00:00Z
+			"owned_by":     "zcode2api",
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 // passthroughDeliver 字节级透传上游响应；SSE 每 chunk flush。
@@ -105,8 +111,8 @@ func passthroughDeliver(w http.ResponseWriter, d Delivery) error {
 	}
 }
 
-// incomingHeaders 汇合客户端请求头（多值逗号连接，对齐 Python request.headers）。
-func incomingHeaders(r *http.Request) map[string]string {
+// IncomingHeaders 汇合客户端请求头（多值逗号连接，对齐 Python request.headers）。
+func IncomingHeaders(r *http.Request) map[string]string {
 	out := map[string]string{}
 	for k, vs := range r.Header {
 		out[k] = strings.Join(vs, ", ")
@@ -114,7 +120,7 @@ func incomingHeaders(r *http.Request) map[string]string {
 	return out
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
+func WriteJSON(w http.ResponseWriter, status int, body any) {
 	// 与 Python JSONResponse 对齐：紧凑序列化、不转义 HTML、无尾部换行
 	data, err := marshalJSON(body)
 	if err != nil {
@@ -126,13 +132,13 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_, _ = w.Write(data)
 }
 
-// writeAuthError 鉴权错误返回 FastAPI 的 {"detail": ...} 形态（与 Python 版一致）。
-func writeAuthError(w http.ResponseWriter, e *auth.AuthError) {
-	writeJSON(w, e.Status, map[string]any{"detail": e.Message})
+// WriteAuthError 鉴权错误返回 FastAPI 的 {"detail": ...} 形态（与 Python 版一致）。
+func WriteAuthError(w http.ResponseWriter, e *auth.AuthError) {
+	WriteJSON(w, e.Status, map[string]any{"detail": e.Message})
 }
 
-// anyToString 对应 Python str(v or "")：nil → 空串。
-func anyToString(v any) string {
+// AnyToString 对应 Python str(v or "")：nil → 空串。
+func AnyToString(v any) string {
 	if v == nil {
 		return ""
 	}

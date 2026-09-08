@@ -17,6 +17,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
+	"zcode2api/internal/openai"
 	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
 	"zcode2api/internal/web"
@@ -43,6 +44,9 @@ func main() {
 	gw := gateway.Handler{Engine: engine, Auth: authSvc}
 	gw.Register(mux)
 	adminapi.New(st, authSvc, cm, qs).Register(mux)
+
+	// OpenAI 兼容层：/v1/chat/completions 复用同一引擎（M4）
+	openai.New(engine, authSvc).Register(mux)
 
 	// Async 空闲池：与 Python 版一致按设置条件挂载
 	if config.AsyncEnabled {

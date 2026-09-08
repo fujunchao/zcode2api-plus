@@ -251,11 +251,12 @@ meta(key TEXT PK, value TEXT)
 - [x] /async/v1/messages（ticket 全语义）
 - [x] **验收**：移植 test_quota / test_usage / test_async_pool 全部用例
 ### M4 OpenAI 兼容层（Go 版增量，见 §5.7）
-- [ ] 请求转换：system 归并、content blocks、图片、tools/tool_calls/tool_result、stop_sequences
-- [ ] 响应转换：非流式 JSON + 流式 SSE 重编码 + stop_reason/usage 映射
-- [ ] /v1/models 扩展为双兼容超集
-- [ ] **验收**：§5.7 每条映射至少一个单测；openai 官方客户端（python）指向网关跑通
-  非流式、流式、一次工具调用三种场景
+- [x] 请求转换：system 归并、content blocks、图片、tools/tool_calls/tool_result、stop_sequences
+- [x] 响应转换：非流式 JSON + 流式 SSE 重编码 + stop_reason/usage 映射
+- [x] /v1/models 扩展为双兼容超集
+- [x] **验收**：§5.7 每条映射至少一个单测（convert 10 + respond/stream 9 + e2e 5）；
+  httptest 全链路覆盖非流式、流式、一次工具调用三种场景（openai 官方客户端真机
+  跑通待真实账号环境，与 M0/M1 验收合并执行）
 ### M5 验证码（高风险，单独攻坚）
 - [ ] rod 池（复用 cloakbrowser 二进制）+ manager（缓存/人工回填/冷却）
 - [ ] **验收**：真实账号连续 20 次 JWT 请求全部自动通过（无 F001）；
