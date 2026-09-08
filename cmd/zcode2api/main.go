@@ -12,9 +12,12 @@ import (
 
 	"zcode2api/internal/adminapi"
 	"zcode2api/internal/auth"
+	"zcode2api/internal/asyncpool"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
+	"zcode2api/internal/model"
+	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
 	"zcode2api/internal/web"
 )
@@ -31,13 +34,28 @@ func main() {
 	authSvc := auth.New(st)
 	cm := captcha.NewManager()
 
+	// 额度查询：网关成功/耗尽路径触发刷新，后台管理端点与周期监控共用
+	qs := quota.NewService(st)
+
 	// 网关 + 后台管理 API（各自端点内建鉴权）
-	gw := gateway.Handler{Engine: gateway.NewEngine(st, cm, nil), Auth: authSvc}
+	engine := gateway.NewEngine(st, cm, nil)
+	engine.OnQuotaRefresh = func(acc *model.Account) { _ = qs.FetchQuota(acc) }
+	gw := gateway.Handler{Engine: engine, Auth: authSvc}
 	gw.Register(mux)
-	adminapi.New(st, authSvc, cm).Register(mux)
+	adminapi.New(st, authSvc, cm, qs).Register(mux)
+
+	// Async 空闲池：与 Python 版一致按设置条件挂载
+	if config.AsyncEnabled {
+		asyncpool.NewPool(st, authSvc, cm).Register(mux)
+	}
 
 	// SPA 托管（/ → /admin、/assets 静态、/admin/{path...} 回落 index.html、/meta）
 	web.NewSPA(distSub()).Register(mux)
+
+	// 后台额度监控：随服务启动、退出时等待循环收尾（对齐 lifespan）
+	mon := qs.NewMonitor()
+	mon.Start()
+	defer mon.Stop()
 
 	printBanner(st)
 

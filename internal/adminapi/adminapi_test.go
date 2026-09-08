@@ -9,24 +9,58 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
 )
 
-// setup 打开隔离存储并注册完整后台路由；返回 mux 与存储（预置数据用）。
-func setup(t *testing.T) (*http.ServeMux, *store.Store) {
+// fakeBilling 计费端点假客户端：add/refresh 端点触发的额度刷新不打真实网络。
+type fakeBilling struct {
+	mu     sync.Mutex
+	status int
+	body   string
+	calls  int
+}
+
+func (f *fakeBilling) Do(req *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return &http.Response{
+		StatusCode: f.status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(f.body)),
+	}, nil
+}
+
+func (f *fakeBilling) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeBilling) setStatus(status int, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status, f.body = status, body
+}
+
+// setup 打开隔离存储并注册完整后台路由；返回 mux、存储与假计费客户端。
+func setup(t *testing.T) (*http.ServeMux, *store.Store, *fakeBilling) {
 	t.Helper()
-	oldDB, oldAdmin, oldGW := config.DBPath, config.AdminKeyEnv, config.GatewayKeyEnv
+	oldDB, oldAdmin, oldGW, oldData := config.DBPath, config.AdminKeyEnv, config.GatewayKeyEnv, config.DataDir
 	config.DBPath = filepath.Join(t.TempDir(), "accounts.db")
 	config.AdminKeyEnv = ""
 	config.GatewayKeyEnv = ""
+	config.DataDir = t.TempDir() // DeviceMid 持久化路径隔离
 	t.Cleanup(func() {
-		config.DBPath, config.AdminKeyEnv, config.GatewayKeyEnv = oldDB, oldAdmin, oldGW
+		config.DBPath, config.AdminKeyEnv, config.GatewayKeyEnv, config.DataDir = oldDB, oldAdmin, oldGW, oldData
 	})
 	st, err := store.New()
 	if err != nil {
@@ -34,8 +68,12 @@ func setup(t *testing.T) (*http.ServeMux, *store.Store) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	mux := http.NewServeMux()
-	New(st, auth.New(st), captcha.NewManager()).Register(mux)
-	return mux, st
+	qs := quota.NewService(st)
+	// 默认应答：合法 JSON 但无套餐（错误路径不改账号状态，测试断言不受干扰）
+	billing := &fakeBilling{status: http.StatusOK, body: `{"code":0,"data":{"plans":[],"balances":[]}}`}
+	qs.Client = billing
+	New(st, auth.New(st), captcha.NewManager(), qs).Register(mux)
+	return mux, st, billing
 }
 
 // do 发起带鉴权的 JSON 请求并解码响应体（空响应体返回 nil map）。
@@ -79,7 +117,7 @@ func num(t *testing.T, v any) float64 {
 }
 
 func TestAdminUnauthorized(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/verify", nil)
 	rec := httptest.NewRecorder()
@@ -103,7 +141,7 @@ func TestAdminUnauthorized(t *testing.T) {
 }
 
 func TestAddAndListAccounts(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 
 	// 字符串 tokens 按行拆分 + 去重保序；默认名循环递增
 	code, body := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{
@@ -141,7 +179,7 @@ func TestAddAndListAccounts(t *testing.T) {
 }
 
 func TestAddAccountsValidation(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 
 	cases := []struct {
 		body map[string]any
@@ -160,7 +198,7 @@ func TestAddAccountsValidation(t *testing.T) {
 }
 
 func TestEditAccountLifecycle(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 	_, added := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{
 		"tokens": "tok-plain",
 	})
@@ -219,7 +257,7 @@ func TestEditAccountLifecycle(t *testing.T) {
 }
 
 func TestEditAccountValidation(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 	_, added := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{"tokens": "tok-x"})
 	accountID := str(t, added["ids"].([]any)[0])
 
@@ -263,7 +301,7 @@ func longStr(n int) string {
 }
 
 func TestProxiesCRUDAndAssign(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 
 	code, body := do(t, mux, st, http.MethodPost, "/admin/api/proxies", map[string]any{
 		"name": "线路A", "url": "http://127.0.0.1:8080",
@@ -342,29 +380,74 @@ func TestProxiesCRUDAndAssign(t *testing.T) {
 	}
 }
 
-func TestRefreshStubs(t *testing.T) {
-	mux, st := setup(t)
+func TestRefreshEndpoints(t *testing.T) {
+	mux, st, billing := setup(t)
 
-	// M3 接入点：批量刷新与 jwt 单账号刷新均为 503
-	code, body := do(t, mux, st, http.MethodPost, "/admin/api/accounts/refresh", map[string]any{})
-	if code != http.StatusServiceUnavailable || str(t, body["detail"]) != "功能將在後續里程碑啟用" {
-		t.Fatalf("批量刷新应 503: %d %v", code, body)
-	}
-
-	_, added := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{
+	// 添加含 jwt 的账号：入库后立即触发一次额度刷新（仅 jwt，对齐 add_accounts 尾段）
+	code, body := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{
 		"tokens": "jwt.a.b\nplain-key",
 	})
-	ids := added["ids"].([]any)
+	if code != http.StatusOK || num(t, body["count"]) != 2 {
+		t.Fatalf("添加应成功: %d %v", code, body)
+	}
+	if got := billing.callCount(); got != 1 {
+		t.Fatalf("仅 jwt 账号应触发一次额度刷新: %d", got)
+	}
+	ids := body["ids"].([]any)
+
+	// 非 jwt 账号刷新：200 + ok=false 提示
 	code, body = do(t, mux, st, http.MethodPost, "/admin/api/accounts/"+str(t, ids[1])+"/refresh", nil)
 	if code != http.StatusOK || body["ok"] != false ||
 		str(t, body["message"]) != "仅 Coding Plan (JWT) 账号支持额度查询" {
 		t.Fatalf("非 jwt 刷新应 200/false: %d %v", code, body)
 	}
+
+	// jwt 账号刷新：返回计费原始载荷与最新账号视图
+	billing.setStatus(http.StatusOK, `{"code":0,"data":{
+		"plans":[{"plan_id":"start-plan","entitlements":[
+			{"entitlement_id":"ent-flash","show_name":"GLM-5.3-Flash","period":"daily"}]}],
+		"balances":[{"entitlement_id":"ent-flash","show_name":"GLM-5.3-Flash",
+			"total_units":100,"used_units":50,"remaining_units":50,"available_units":50}]}}`)
 	code, body = do(t, mux, st, http.MethodPost, "/admin/api/accounts/"+str(t, ids[0])+"/refresh", nil)
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("jwt 刷新应 503: %d %v", code, body)
+	if code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("jwt 刷新应成功: %d %v", code, body)
+	}
+	result, _ := body["result"].(map[string]any)
+	if _, ok := result["balance"]; !ok {
+		t.Fatalf("result 应含 balance: %v", body)
+	}
+	view, _ := body["account"].(map[string]any)
+	quotaMap, _ := view["quota"].(map[string]any)
+	if len(quotaMap) == 0 {
+		t.Fatalf("账号视图应含额度快照: %v", view)
 	}
 
+	// 批量刷新 all=true：仅 jwt 计入
+	code, body = do(t, mux, st, http.MethodPost, "/admin/api/accounts/refresh", map[string]any{"all": true})
+	if code != http.StatusOK {
+		t.Fatalf("批量刷新应 200: %d %v", code, body)
+	}
+	summary := body["summary"].(map[string]any)
+	if num(t, summary["ok"]) != 1 || num(t, summary["fail"]) != 0 || num(t, body["count"]) != 1 {
+		t.Fatalf("批量刷新汇总不符: %v", body)
+	}
+
+	// 空请求体（FastAPI Body(default=None) 语义）：无目标、零汇总
+	code, body = do(t, mux, st, http.MethodPost, "/admin/api/accounts/refresh", nil)
+	if code != http.StatusOK || num(t, body["count"]) != 0 {
+		t.Fatalf("空批量刷新应 200/0: %d %v", code, body)
+	}
+
+	// 非法 JSON 请求体 400
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/accounts/refresh", strings.NewReader("{bad"))
+	req.Header.Set("Authorization", "Bearer "+st.AdminKey())
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if res := rec.Result(); res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("非法 JSON 应 400: %d", res.StatusCode)
+	}
+
+	// 登录初始化仍是 M6 stub
 	code, _ = do(t, mux, st, http.MethodPost, "/admin/api/login/start", map[string]any{})
 	if code != http.StatusServiceUnavailable {
 		t.Fatalf("登录初始化应 503: %d", code)
@@ -372,7 +455,7 @@ func TestRefreshStubs(t *testing.T) {
 }
 
 func TestSettingsFlow(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 
 	code, body := do(t, mux, st, http.MethodGet, "/admin/api/settings", nil)
 	if code != http.StatusOK || str(t, body["admin_key"]) != st.AdminKey() {
@@ -420,7 +503,7 @@ func TestSettingsFlow(t *testing.T) {
 }
 
 func TestMonitorAndUsage(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 	_, added := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{
 		"tokens": "tok-a\njwt.b.c",
 	})
@@ -475,7 +558,7 @@ func TestMonitorAndUsage(t *testing.T) {
 }
 
 func TestExportImportRoundTrip(t *testing.T) {
-	mux, st := setup(t)
+	mux, st, _ := setup(t)
 	_, added := do(t, mux, st, http.MethodPost, "/admin/api/accounts", map[string]any{
 		"tokens": "tok-a\njwt.b.c",
 	})

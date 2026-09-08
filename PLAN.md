@@ -247,9 +247,9 @@ meta(key TEXT PK, value TEXT)
 - [ ] auth（Bearer + 限速）、admin_api 全部端点、embed dist + catch-all
 - [ ] **验收**：浏览器完整走一遍后台 UI（登录/账号/代理/设置/验证码页）；限速单测
 ### M3 额度监控 + async
-- [ ] fetch_quota（解析 + 多订阅合并 + 15s 缓存 + inflight 去重 + 清理）+ 后台 monitor
-- [ ] /async/v1/messages（ticket 全语义）
-- [ ] **验收**：移植 test_quota / test_usage / test_async_pool 全部用例
+- [x] fetch_quota（解析 + 多订阅合并 + 15s 缓存 + inflight 去重 + 清理）+ 后台 monitor
+- [x] /async/v1/messages（ticket 全语义）
+- [x] **验收**：移植 test_quota / test_usage / test_async_pool 全部用例
 ### M4 OpenAI 兼容层（Go 版增量，见 §5.7）
 - [ ] 请求转换：system 归并、content blocks、图片、tools/tool_calls/tool_result、stop_sequences
 - [ ] 响应转换：非流式 JSON + 流式 SSE 重编码 + stop_reason/usage 映射

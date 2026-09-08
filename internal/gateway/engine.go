@@ -463,7 +463,8 @@ func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg st
 	_ = e.Store.UpdateAccount(acc)
 }
 
-// success 记录成功调用的账号状态。
+// success 记录成功调用的账号状态；并异步触发一次额度刷新
+//（对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
 	acc.UseCount++
 	ts := float64(e.now().UnixNano()) / 1e9
@@ -472,6 +473,7 @@ func (e *Engine) success(acc *model.Account) {
 		acc.Status = model.StatusActive
 	}
 	_ = e.Store.UpdateAccount(acc)
+	e.fireRefresh(acc)
 }
 
 func (e *Engine) bumpFail(acc *model.Account) {

@@ -1,10 +1,12 @@
 // 账号池、验证码、设置、导入导出端点。
-// 对应 Python 版 admin_api.py 的对应段落；M3/M6 功能留 stub 接入点。
+// 对应 Python 版 admin_api.py 的对应段落；M6 OAuth 登录留 stub 接入点。
 package adminapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -125,7 +127,20 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		added = append(added, acc.ID)
 	}
-	// M3 接入点：Python 版此处对新增的 jwt 账号立即刷新额度（refresh_accounts）。
+	// 对新增的 jwt 账号立即刷新一次额度（仅 zai；对齐 add_accounts 尾段）
+	addedSet := map[string]bool{}
+	for _, id := range added {
+		addedSet[id] = true
+	}
+	fresh := []*model.Account{}
+	for _, a := range h.Store.ListAccounts(provider) {
+		if addedSet[a.ID] && a.Mode == "jwt" {
+			fresh = append(fresh, a)
+		}
+	}
+	if len(fresh) > 0 {
+		h.Quota.RefreshAccounts(fresh)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(added), "ids": added})
 }
 
@@ -311,9 +326,39 @@ func (h *Handler) handleSetEnabled(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
-	// M3 接入点：Python 版在此按 payload.all / ids 筛选 jwt 账号后
-	// 调 refresh_accounts 并返回 {"summary", "count"}。
-	writeAPIError(w, errStub())
+	// 对齐 refresh：payload.all → 全部 zai jwt 账号；否则按 ids 过滤（仅 jwt）。
+	// 请求体可空（FastAPI Body(default=None) 语义）。
+	payload := map[string]any{}
+	if raw, err := io.ReadAll(r.Body); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			writeAPIError(w, errBadRequest("请求体不是合法 JSON"))
+			return
+		}
+	}
+	var targets []*model.Account
+	if truthy(payload["all"]) {
+		for _, a := range h.Store.ListAccounts(model.ProviderZai) {
+			if a.Mode == "jwt" {
+				targets = append(targets, a)
+			}
+		}
+	} else {
+		ids := map[string]bool{}
+		if raw, ok := payload["ids"].([]any); ok {
+			for _, v := range raw {
+				if s, ok := v.(string); ok {
+					ids[s] = true
+				}
+			}
+		}
+		for _, a := range h.Store.ListAccounts("") {
+			if ids[a.ID] && a.Mode == "jwt" {
+				targets = append(targets, a)
+			}
+		}
+	}
+	summary := h.Quota.RefreshAccounts(targets)
+	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "count": len(targets)})
 }
 
 func (h *Handler) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -329,8 +374,17 @@ func (h *Handler) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// M3 接入点：Python 版此处调 fetch_quota 并返回 {"ok", "result", "account"}。
-	writeAPIError(w, errStub())
+	res := h.Quota.FetchQuota(acc)
+	updated := h.Store.FindAny(r.PathValue("account_id"))
+	if updated == nil {
+		updated = acc
+	}
+	_, hasErr := res["error"]
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      !hasErr,
+		"result":  res,
+		"account": updated.PublicView(time.Now()),
+	})
 }
 
 func (h *Handler) handleResetStats(w http.ResponseWriter, r *http.Request) {

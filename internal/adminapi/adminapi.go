@@ -14,6 +14,7 @@ import (
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/model"
+	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
 )
 
@@ -22,12 +23,13 @@ type Handler struct {
 	Store     *store.Store
 	Auth      *auth.Service
 	Captcha   *captcha.Manager
+	Quota     *quota.Service
 	StartedAt time.Time
 }
 
 // New 创建后台管理处理器（StartedAt 对齐 Python 版模块导入时刻 _STARTED_AT）。
-func New(st *store.Store, au *auth.Service, cm *captcha.Manager) *Handler {
-	return &Handler{Store: st, Auth: au, Captcha: cm, StartedAt: time.Now()}
+func New(st *store.Store, au *auth.Service, cm *captcha.Manager, qs *quota.Service) *Handler {
+	return &Handler{Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now()}
 }
 
 // Register 在 mux 上注册全部 /admin/api/* 路由；每个端点先过后台密钥鉴权。
@@ -80,7 +82,7 @@ func errBadRequest(msg string) *apiError { return &apiError{http.StatusBadReques
 
 func errNotFound(msg string) *apiError { return &apiError{http.StatusNotFound, msg} }
 
-// errStub 对应尚未迁移的里程碑功能（M3 额度查询 / M6 OAuth 登录）的接入点。
+// errStub 对应尚未迁移的里程碑功能（M6 OAuth 登录）的接入点。
 func errStub() *apiError {
 	return &apiError{http.StatusServiceUnavailable, "功能將在後續里程碑啟用"}
 }
