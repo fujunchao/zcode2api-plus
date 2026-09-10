@@ -289,8 +289,9 @@ meta(key TEXT PK, value TEXT)
   CLI 子命令（serve/login/add-account/accounts/remove-account/quota/status/set-admin-key/export/import）、
   Dockerfile（多阶段：node 前端 → go 二进制 → bookworm-slim + Debian chromium）+ compose + README
 - [ ] **验收**：`docker compose up -d --build` 一键起；`-race` 下全测试通过；两版本交替使用同一 db 无异常
-### M7 `/v1/responses` 端点（已规划，见 §5.8）
-- [ ] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）
+### M7 `/v1/responses` 端点（代码完成，待真机验收）
+- [x] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）—
+  `internal/openai/{responses,responses_stream}.go`（8 组单测 + 2 组 e2e）
 - [ ] **验收**：Codex CLI 指向网关完成一次完整会话（无状态模式）
 ### M8 套餐自动领取（Go 版增量，见 §5.9）
 - [ ] claim 核心链（preview 解析 / claim 业务码 / 3007 换码重试）+ 激活事件上报

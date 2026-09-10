@@ -23,10 +23,11 @@ func New(engine *gateway.Engine, au *auth.Service) *Handler {
 	return &Handler{Engine: engine, Auth: au}
 }
 
-// Register 在 mux 上注册 /v1/chat/completions（/v1/models 由 gateway.Handler
-// 提供双兼容超集）。
+// Register 在 mux 上注册 /v1/chat/completions 与 /v1/responses（/v1/models 由
+// gateway.Handler 提供双兼容超集）。
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/chat/completions", h.handleChatCompletions)
+	mux.HandleFunc("POST /v1/responses", h.handleResponses)
 }
 
 func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
