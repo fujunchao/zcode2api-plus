@@ -19,6 +19,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
@@ -66,6 +67,20 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 
 // SetNow 注入时钟（测试用）。
 func (e *Engine) SetNow(fn func() time.Time) { e.now = fn }
+
+// clientFor 返回账号出站客户端：配置了代理（proxy_url，含代理线路指派）时
+// 走代理 Transport，否则用引擎默认客户端。代理构造失败回退直连并记日志。
+func (e *Engine) clientFor(acc *model.Account) *http.Client {
+	if acc == nil || acc.ProxyURL == nil || *acc.ProxyURL == "" {
+		return e.Client
+	}
+	t, err := proxy.TransportFor(*acc.ProxyURL)
+	if err != nil {
+		web.Warn("gateway", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
+		return e.Client
+	}
+	return &http.Client{Transport: t}
+}
 
 // defaultUpstreamClient 对齐 Python 版超时语义：连接 30s、响应头最长 120s、
 // 响应体流式读取不设超时（长连接 SSE）。
@@ -187,7 +202,7 @@ func (e *Engine) tryAccount(
 			httpReq.Header.Set(k, v)
 		}
 
-		resp, err := e.Client.Do(httpReq)
+		resp, err := e.clientFor(acc).Do(httpReq)
 		if err != nil {
 			e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))

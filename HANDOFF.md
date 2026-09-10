@@ -2,7 +2,8 @@
 
 > 給新會話（Claude 或人類協作者）的快速上手指南。計劃與進度台账在 `PLAN.md`（唯一權威），
 > 本文檔只做「狀態快照 + 工作流 + 紅線 + 踩坑記錄」，避免重複維護。
-> 最後更新：2026-09-11（M5 代码完成：rod 池 + 失败注入单测全绿；新增 M8 套餐自动领取规划）。
+> 最後更新：2026-09-11（M6 代码完成：OAuth 登录链 + 账号级代理 + CLI + Dockerfile/compose/README；
+> M5/M6 真机验收与 -race 待做）。
 
 ---
 
@@ -51,10 +52,11 @@
 - 對照 Python 版 `app/captcha_pool.py`（或同名模塊，先在主倉庫定位）。
 - 對策見 PLAN.md §8 風險表：參數逐項對齊 → stealth → 人工回填兜底。
 
-### M6 OAuth + 代理出口 + CLI + 交付
-- OAuth 登錄鏈（對照主倉庫 `app/routes/oauth.py`）、賬號級出站代理（http/socks，`internal/proxy` 包已建空殼）、
-  CLI 子命令（serve/login/add-account/…）、Dockerfile 多階段（node 構建前端 → go 構建 → bookworm-slim + Chromium）。
-- 驗收：`docker compose up -d --build` 一鍵起；`-race` 全測試通過；兩版本交替用同一 db 無異常。
+### M6 OAuth + 代理出口 + CLI + 交付（代码完成，下一项做真机验收）
+- 已落地：`internal/oauth`（完整 Python oauth.py 移植）、`internal/adminapi/login.go`（login/start+complete）、
+  `internal/proxy`（http/socks4/4a/5/5h 拨号器 + Transport 缓存；engine/quota 已接线 clientFor）、
+  `cmd/zcode2api/cli.go`（全部子命令）、`Dockerfile`（多阶段，Debian chromium）+ `docker-compose.yml` + `README.md`。
+- 验收：`docker compose up -d --build` 一键起；`-race` 全测试通过；两版本交替用同一 db 无异常。
 
 ### M7 `/v1/responses`（見 PLAN.md §5.8）
 - 復用 M4 的 `internal/openai` 轉換基建；`previous_response_id` v1 明確 400。

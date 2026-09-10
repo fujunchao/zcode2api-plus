@@ -24,6 +24,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		os.Exit(runCLI(os.Args[1], os.Args[2:], serve))
+	}
+	serve()
+}
+
+// serve 启动网关 + 后台管理 + SPA（对应 Python 版 main.py serve）。
+func serve() {
 	st, err := store.New()
 	if err != nil {
 		web.Err("main", "存储初始化失败: "+err.Error())

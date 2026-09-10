@@ -25,6 +25,9 @@ const (
 const (
 	Bold    = "\033[1m"
 	Magenta = "\033[35m"
+	Red     = ansiRed
+	Green   = ansiGreen
+	Blue    = "\033[34m"
 	Cyan    = ansiCyan
 	Yellow  = ansiYellow
 	Dim     = ansiDim

@@ -447,10 +447,17 @@ func TestRefreshEndpoints(t *testing.T) {
 		t.Fatalf("非法 JSON 应 400: %d", res.StatusCode)
 	}
 
-	// 登录初始化仍是 M6 stub
-	code, _ = do(t, mux, st, http.MethodPost, "/admin/api/login/start", map[string]any{})
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("登录初始化应 503: %d", code)
+	// 登录初始化：M6 已实装（本地构造授权链接，无网络依赖）应 200
+	code, body = do(t, mux, st, http.MethodPost, "/admin/api/login/start", map[string]any{})
+	if code != http.StatusOK || str(t, body["flow_id"]) == "" || str(t, body["authorize_url"]) == "" {
+		t.Fatalf("登录初始化应 200 且含 flow_id/authorize_url: %d %v", code, body)
+	}
+
+	// 登录完成：未知 flow_id 应 404
+	code, _ = do(t, mux, st, http.MethodPost, "/admin/api/login/complete/no-such-flow",
+		map[string]any{"callback_url": "https://example.com/x"})
+	if code != http.StatusNotFound {
+		t.Fatalf("未知登录会话应 404: %d", code)
 	}
 }
 

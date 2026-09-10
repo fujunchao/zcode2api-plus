@@ -1,0 +1,7 @@
+# 構建上下文瘦身：運行時數據與本地產物絕不進鏡像
+data/
+data_test/
+temp/
+node_modules/
+*.md
+.git/

@@ -283,8 +283,11 @@ meta(key TEXT PK, value TEXT)
 - [x] rod 池（复用 cloakbrowser 二进制）+ manager（缓存/人工回填/冷却）— `internal/captcha/{pool,browser_solver,solve}.go`
 - [ ] **验收**：真实账号连续 20 次 JWT 请求全部自动通过（无 F001）；
   失败注入测试（超时/崩溃替换/迟到 token 不误投）**已由单测覆盖**（pool_test.go 12 组）
-### M6 OAuth + 代理 + CLI + 交付
-- [ ] OAuth 登录链、账号代理出口（含 socks）、CLI 子命令、Dockerfile（多阶段）+ compose、README 增补
+### M6 OAuth + 代理 + CLI + 交付（代码完成，待真机验收）
+- [x] OAuth 登录链（internal/oauth + adminapi login 端点 + CLI login）、账号代理出口
+  （internal/proxy：http/https CONNECT + 手写 socks4/4a/5/5h，Transport 缓存；引擎与 quota 已接线）、
+  CLI 子命令（serve/login/add-account/accounts/remove-account/quota/status/set-admin-key/export/import）、
+  Dockerfile（多阶段：node 前端 → go 二进制 → bookworm-slim + Debian chromium）+ compose + README
 - [ ] **验收**：`docker compose up -d --build` 一键起；`-race` 下全测试通过；两版本交替使用同一 db 无异常
 ### M7 `/v1/responses` 端点（已规划，见 §5.8）
 - [ ] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）

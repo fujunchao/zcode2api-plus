@@ -18,6 +18,7 @@ import (
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 )
 
@@ -187,7 +188,7 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 			req.Header.Set(k, v)
 		}
 		var resp *http.Response
-		resp, err = s.client().Do(req)
+		resp, err = s.clientFor(acc).Do(req)
 		if err == nil {
 			return s.handleBillingResponse(acc, resp)
 		}
@@ -198,9 +199,16 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 	return map[string]any{"error": msg}
 }
 
-func (s *Service) client() HTTPClient {
+// clientFor 返回账号出站客户端；配置了代理时走代理传输（20s 超时，短请求）。
+// 代理无效时回退直连并落 last_error 日志。
+func (s *Service) clientFor(acc *model.Account) HTTPClient {
 	if s.Client != nil {
 		return s.Client
+	}
+	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
+		if client, err := proxy.ClientFor(*acc.ProxyURL, 20*time.Second); err == nil {
+			return client
+		}
 	}
 	return &http.Client{Timeout: 20 * time.Second}
 }

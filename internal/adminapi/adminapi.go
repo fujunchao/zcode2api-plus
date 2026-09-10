@@ -82,11 +82,6 @@ func errBadRequest(msg string) *apiError { return &apiError{http.StatusBadReques
 
 func errNotFound(msg string) *apiError { return &apiError{http.StatusNotFound, msg} }
 
-// errStub 对应尚未迁移的里程碑功能（M6 OAuth 登录）的接入点。
-func errStub() *apiError {
-	return &apiError{http.StatusServiceUnavailable, "功能將在後續里程碑啟用"}
-}
-
 // writeJSON 与 Python JSONResponse 对齐：紧凑序列化、不转义 HTML、无尾部换行。
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	data, err := marshalJSON(body)

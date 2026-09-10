@@ -430,18 +430,6 @@ func (h *Handler) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (h *Handler) handleLoginStart(w http.ResponseWriter, r *http.Request) {
-	// M6 接入点：Python 版在此创建 ZaiAuthFlow 并返回 {flow_id, authorize_url}，
-	// 初始化失败返回 502「登录初始化失败: {err}」。
-	writeAPIError(w, errStub())
-}
-
-func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
-	// M6 接入点：Python 版在此解析回调地址、兑换凭证并入池；会话缺失 404、
-	// 回调解析失败 400、state 不匹配 400「回调地址与当前登录会话不匹配」。
-	writeAPIError(w, errStub())
-}
-
 func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"admin_key":              h.Store.AdminKey(),
