@@ -34,6 +34,11 @@ func main() {
 	mux := http.NewServeMux()
 	authSvc := auth.New(st)
 	cm := captcha.NewManager()
+	// 浏览器池求解器（M5）：启用时注入 rod 求解，失败冷却后回退人工回填
+	if config.CaptchaBrowserEnabled {
+		cm.SetSolver(captcha.NewBrowserSolver())
+	}
+	defer func() { _ = cm.Close() }()
 
 	// 额度查询：网关成功/耗尽路径触发刷新，后台管理端点与周期监控共用
 	qs := quota.NewService(st)

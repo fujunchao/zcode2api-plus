@@ -37,6 +37,8 @@
 - [ ] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
 - [ ] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
 - [ ] Dockerfile（多阶段：node 构建前端 → go 构建二进制 → 运行镜像仅含 Chromium 运行库）
+- [ ] **套餐自动领取（Go 版增量，2026-09-10 后新增，Python 主仓已上线）**：billing/preview + billing/claim、
+  激活事件上报、业务码翻译、3007 换码重试、入池自动领取（对照 Python 主仓 `app/claim.py` + `app/telemetry.py`，见 §5.9）
 
 **明确不移植：**
 
@@ -226,6 +228,26 @@ meta(key TEXT PK, value TEXT)
   带 `previous_response_id` 的请求 v1 返回明确 400；内存 LRU 回放列为后续可选增强，不阻塞。
 - 排期：M4 的 completions 验收通过后启动，避免两个转换层并行开发。
 
+### 5.9 套餐自动领取（Go 版增量，2026-09-10 新增）
+
+- 定位：Python 主仓 2026-09-10 上线的活动套餐自动领取（`app/claim.py` + `app/telemetry.py`），
+  Go 版对齐移植，排期 M8（M6 交付后）。
+- 链路：`GET {BILLING_BASE}/billing/preview?app_version=&platform=` → 解析
+  `data.plans[]`（plan_id/name/priority + model_usage token grants）→
+  `POST {BILLING_BASE}/billing/claim` body `{"plan_id"}`，需验证码头
+  `X-Aliyun-Captcha-Verify-Param`（+ 可选 `X-Aliyun-Captcha-Verify-Region`）。
+- 业务码映射：1001 套餐不存在 / 1002 活动结束 / 1003 已领取过 / 1004 不符合条件 /
+  1005 今日名额用完 / 3001 参数错误 / 3007 验证码失败（换码重试一次）/ 401 未登录。
+- 激活上报：preview 前对 `https://zcode.z.ai/api/v1/event/report` 发 `app_launch` +
+  `app_daily_active` 两事件（16 字段体，无 Authorization；疑似活动投放资格信号；
+  失败仅记日志不阻断）。device_mid 沿用本机持久化标识。
+- 触发点：入池后（批量添加 / OAuth 完成 / CLI login）后台自动全量领取 +
+  Admin API `GET /claim/preview`、`POST /claim`（account_ids 可选，冷却账号跳过）+
+  前端账单页按钮（工具栏全量 + JWT 账号行内单账号）。
+- 复用项：鉴权头与 quota 同源（`X-ZCode-App-Version`/`X-Platform`/`X-Device-Mid`）；
+  请求走账号代理（与 Python 版 make_async_client 语义一致）；
+  验证码经 M5 的 captcha manager 求解/人工回填。
+
 ## 6. 里程碑
 
 ### M0 骨架 + 数据层
@@ -258,15 +280,19 @@ meta(key TEXT PK, value TEXT)
   httptest 全链路覆盖非流式、流式、一次工具调用三种场景（openai 官方客户端真机
   跑通待真实账号环境，与 M0/M1 验收合并执行）
 ### M5 验证码（高风险，单独攻坚）
-- [ ] rod 池（复用 cloakbrowser 二进制）+ manager（缓存/人工回填/冷却）
+- [x] rod 池（复用 cloakbrowser 二进制）+ manager（缓存/人工回填/冷却）— `internal/captcha/{pool,browser_solver,solve}.go`
 - [ ] **验收**：真实账号连续 20 次 JWT 请求全部自动通过（无 F001）；
-  失败注入测试（超时/崩溃替换/迟到 token 不误投）
+  失败注入测试（超时/崩溃替换/迟到 token 不误投）**已由单测覆盖**（pool_test.go 12 组）
 ### M6 OAuth + 代理 + CLI + 交付
 - [ ] OAuth 登录链、账号代理出口（含 socks）、CLI 子命令、Dockerfile（多阶段）+ compose、README 增补
 - [ ] **验收**：`docker compose up -d --build` 一键起；`-race` 下全测试通过；两版本交替使用同一 db 无异常
 ### M7 `/v1/responses` 端点（已规划，见 §5.8）
 - [ ] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）
 - [ ] **验收**：Codex CLI 指向网关完成一次完整会话（无状态模式）
+### M8 套餐自动领取（Go 版增量，见 §5.9）
+- [ ] claim 核心链（preview 解析 / claim 业务码 / 3007 换码重试）+ 激活事件上报
+- [ ] Admin API `/claim/preview` + `/claim` + 入池自动领取触发点（批量添加 / OAuth / CLI login）
+- [ ] **验收**：单测覆盖业务码映射与重试语义（对照 Python 主仓 tests/test_claim.py）；真机领取一次成功（待真实账号环境）
 
 ## 7. 测试策略
 

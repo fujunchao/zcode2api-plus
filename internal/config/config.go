@@ -93,6 +93,9 @@ var (
 	CaptchaBrowserQueueTimeout    = max(1, envInt("ZCODE_CAPTCHA_BROWSER_QUEUE_TIMEOUT", 60))
 	CaptchaBrowserShutdownTimeout = max(1, envInt("ZCODE_CAPTCHA_BROWSER_SHUTDOWN_TIMEOUT", 10))
 	CaptchaBrowserFailureCooldown = max(1, envInt("ZCODE_CAPTCHA_BROWSER_FAILURE_COOLDOWN", 60))
+	// 显式指定浏览器可执行文件；缺省时按 cloakbrowser 缓存目录自动发现
+	//（CLOAKBROWSER_BINARY_PATH / CLOAKBROWSER_CACHE_DIR，见 internal/captcha/solve.go）。
+	CaptchaBrowserBin = env("ZCODE_CAPTCHA_BROWSER_BIN", "")
 )
 
 // ── Async 空闲池 ────────────────────────────────────────────────────────────

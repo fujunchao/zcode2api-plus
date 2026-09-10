@@ -2,7 +2,7 @@
 
 > 給新會話（Claude 或人類協作者）的快速上手指南。計劃與進度台账在 `PLAN.md`（唯一權威），
 > 本文檔只做「狀態快照 + 工作流 + 紅線 + 踩坑記錄」，避免重複維護。
-> 最後更新：2026-09-08（M4 完成，提交 b97acc2）。
+> 最後更新：2026-09-11（M5 代码完成：rod 池 + 失败注入单测全绿；新增 M8 套餐自动领取规划）。
 
 ---
 
@@ -12,8 +12,8 @@
 |------|------|
 | 模塊 | `zcode2api`（Go 1.22+，標準庫優先，僅 sqlite/rod/godotenv 為外部依賴） |
 | 遠端 | origin = github.com/gakiyukr/zcode2api-go（分支 master）；upstream = github.com/gakiyukr/zcode2api-plus（**只讀參照，絕不推送**） |
-| 里程碑 | M0-M4 全部完成並勾選：M0 骨架+數據層、M1 網關核心、M2 Admin API+SPA、M3 額度+async、M4 OpenAI 兼容層 |
-| 提交鏈 | d01c740（M0-M2）→ ff97604（M3）→ b97acc2（M4），全部 GPG 簽名 |
+| 里程碑 | M0-M4 全部完成並勾選：M0 骨架+數據層、M1 網關核心、M2 Admin API+SPA、M3 額度+async、M4 OpenAI 兼容層；**M5 代碼完成**（rod 池 + 12 組失敗注入單測，真機驗收待做） |
+| 提交鏈 | d01c740（M0-M2）→ ff97604（M3）→ b97acc2（M4）→ M5 提交（見 git log），全部 GPG 簽名 |
 | 測試 | `go build ./... && go vet ./... && go test ./...` 全綠（9 個含測試的包）；`-race` 本機不可用（無 gcc），M6 驗收時補 |
 | 行為契約 | 主倉庫 Python 版（`C:\Projects\zcode2api`，`app/`）為權威對照；唯 M4 為 Go 版增量，契約是 `PLAN.md` §5.7 |
 
