@@ -288,6 +288,11 @@ func (p *Pool) stoppedResetLocked() {
 // Solve 取一个验证码 token（内存，不落盘）。并发上限 = size；
 // 错误为上列哨兵的包装，语义对齐 Python get_token 抛出的 CaptchaBrowserError 子类。
 func (p *Pool) Solve(ctx context.Context) (string, error) {
+	if ctx == nil {
+		// claim 等调用方允许传 nil（GetVerifyParam(nil)）；select 对 nil 接口
+		// 取 Done() 会空指针，统一兜底。
+		ctx = context.Background()
+	}
 	p.mu.Lock()
 	g := p.cur
 	started := p.started

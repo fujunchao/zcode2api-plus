@@ -60,6 +60,9 @@ func (s *BrowserSolver) SetNow(fn func() time.Time) { s.now = fn }
 //   - 池已启动但本次求解失败 → 带原因的错误（交给网关有限重试；
 //     池自身负责替换超时或退出的 worker）。
 func (s *BrowserSolver) Solve(ctx context.Context, cfg Config) (string, error) {
+	if ctx == nil {
+		ctx = context.Background() // GetVerifyParam(nil) 允许 nil ctx
+	}
 	key := strings.Join([]string{
 		strings.TrimSpace(cfg.SceneID),
 		strings.TrimSpace(cfg.Region),

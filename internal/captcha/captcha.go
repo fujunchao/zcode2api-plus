@@ -158,6 +158,9 @@ func fetchConfigHTTP(ctx context.Context) (Config, error) {
 // 语义对齐 Python 版：缓存命中直接返回；配置禁用返回 (nil, nil)（无需验证码）；
 // 浏览器求解的令牌可能是一次性的，不写缓存；人工回填令牌按 TTL 复用。
 func (m *Manager) GetVerifyParam(ctx context.Context) (*Token, error) {
+	if ctx == nil {
+		ctx = context.Background() // 允许 nil ctx（claim 等后台调用）
+	}
 	m.mu.Lock()
 	if m.cached != nil && m.now().Sub(m.cachedAt) < m.cachedTTL {
 		t := *m.cached
