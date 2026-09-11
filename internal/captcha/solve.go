@@ -181,19 +181,25 @@ const solveInitJS = `() => {
     getInstance(instance) {
       const start = instance && (instance.startTracelessVerification || instance.show);
       if (typeof start !== 'function') { window.__zcodeError = 'SDK instance unavailable'; return; }
-      try { start.call(instance); } catch (e) { window.__zcodeError = String(e && e.message || e); }
+      try { start.call(instance); } catch (e) { window.__zcodeError = describe(e); }
     },
     success(param) { window.__zcodeOutcome = param; },
-    fail(e) { window.__zcodeError = 'SDK fail: ' + String(e && e.message || e); },
-    onError(e) { window.__zcodeError = 'SDK error: ' + String(e && e.message || e); }
+    fail(e) { window.__zcodeError = 'SDK fail: ' + describe(e); },
+    onError(e) { window.__zcodeError = 'SDK error: ' + describe(e); }
   });
+  function describe(e) {
+    if (e && e.message) return String(e.message);
+    try { return JSON.stringify(e); } catch (_) { return String(e); }
+  }
 }`
 
 // solvePollJS 轮询求解结果（对齐 _solve_once 的 state 读取）。
 const solvePollJS = `() => ({ outcome: window.__zcodeOutcome, error: window.__zcodeError })`
 
 // sdkReadyJS SDK 就绪探测表达式（对齐 wait_for_function 的条件）。
-const sdkReadyJS = `typeof window.initAliyunCaptcha === 'function'`
+// 必须包成箭头函数：rod.Eval 对裸表达式会在求值结果上调用 .apply，
+// 布尔结果直接抛 TypeError（曾致 SDK 已就绪仍误报加载超时）。
+const sdkReadyJS = `() => (typeof window.initAliyunCaptcha === 'function')`
 
 // sdkLoadTimeout SDK 加载超时（对齐 Python worker 的 --sdk-load-timeout 默认 20s）。
 const sdkLoadTimeout = 20 * time.Second
