@@ -696,42 +696,61 @@ export function AccountsPage() {
       {showArchived && (
         <Card>
           <CardContent className="px-0">
-            <div className="flex items-center gap-2 px-4 py-3 text-sm font-medium">
-              <Archive className="size-4" /> 已歸檔帳號
-              <Badge variant="secondary">{archivedAccounts.length}</Badge>
-              <span className="text-xs font-normal text-muted-foreground">不參與調度、領取與額度刷新</span>
-            </div>
-            {!archivedAccounts.length ? (
-              <p className="px-4 pb-6 py-4 text-center text-sm text-muted-foreground">尚無歸檔帳號</p>
-            ) : (
-              <div className="flex flex-col divide-y">
-                {archivedAccounts.map((a) => (
-                  <div key={a.id} className="flex items-center gap-3 px-4 py-2.5">
-                    <EmailCell account={a} onCopy={() => void copyEmail(a)} />
-                    <span className="shrink-0 text-[11px] text-muted-foreground">
-                      歸檔於 {fmtDate(a.archived_at)}
-                    </span>
-                    <span className="shrink-0 text-[11px] text-muted-foreground">
-                      累計 {a.use_count || 0} 次 · {fmtCompact(Number(a.total_tokens?.input || 0) + Number(a.total_tokens?.output || 0))} tokens
-                    </span>
-                    <span className="ml-auto flex shrink-0 gap-0.5">
-                      <Button variant="ghost" size="icon-sm" title="恢復到帳號池" onClick={() => void doRestore(a)}>
-                        <ArchiveRestore />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        className="text-destructive hover:text-destructive"
-                        title="刪除"
-                        onClick={() => doDelete(a)}
-                      >
-                        <Trash2 />
-                      </Button>
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="text-center">賬號</TableHead>
+                  <TableHead className="w-20 text-center">狀態</TableHead>
+                  <TableHead className="w-40 text-center">歸檔時間</TableHead>
+                  <TableHead className="w-24 text-center">累計呼叫</TableHead>
+                  <TableHead className="w-24 text-center">Tokens</TableHead>
+                  <TableHead className="w-24 text-center">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {!archivedAccounts.length ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
+                      尚無歸檔帳號。歸檔＝停止調用，帳號記錄保留在此。
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  archivedAccounts.map((a) => (
+                    <TableRow key={a.id} className="text-muted-foreground">
+                      <TableCell>
+                        <div className="flex items-center justify-center gap-1">
+                          <EmailCell account={a} onCopy={() => void copyEmail(a)} />
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-center">
+                        <Badge className={STATUS_BADGE[a.status]}>{STATUS_LABEL[a.status] || a.status}</Badge>
+                      </TableCell>
+                      <TableCell className="text-center text-xs">{fmtDate(a.archived_at)}</TableCell>
+                      <TableCell className="text-center tabular-nums text-xs">{a.use_count || 0}</TableCell>
+                      <TableCell className="text-center text-xs">
+                        {fmtCompact(Number(a.total_tokens?.input || 0) + Number(a.total_tokens?.output || 0))}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex justify-center gap-0.5">
+                          <Button variant="ghost" size="icon-sm" title="恢復到帳號池" onClick={() => void doRestore(a)}>
+                            <ArchiveRestore />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="text-destructive hover:text-destructive"
+                            title="刪除"
+                            onClick={() => doDelete(a)}
+                          >
+                            <Trash2 />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
           </CardContent>
         </Card>
       )}
