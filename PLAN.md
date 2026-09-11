@@ -36,7 +36,7 @@
 - [ ] 验证码：真实 Chromium 池（rod）+ 人工回填兜底
 - [ ] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
 - [ ] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
-- [ ] Dockerfile（多阶段：node 构建前端 → go 构建二进制 → 运行镜像仅含 Chromium 运行库）
+- [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建 linux/darwin/windows × amd64/arm64 并上传 Releases）— `.github/workflows/release.yml`
 - [ ] **套餐自动领取（Go 版增量，2026-09-10 后新增，Python 主仓已上线）**：billing/preview + billing/claim、
   激活事件上报、业务码翻译、3007 换码重试、入池自动领取（对照 Python 主仓 `app/claim.py` + `app/telemetry.py`，见 §5.9）
 
@@ -287,8 +287,8 @@ meta(key TEXT PK, value TEXT)
 - [x] OAuth 登录链（internal/oauth + adminapi login 端点 + CLI login）、账号代理出口
   （internal/proxy：http/https CONNECT + 手写 socks4/4a/5/5h，Transport 缓存；引擎与 quota 已接线）、
   CLI 子命令（serve/login/add-account/accounts/remove-account/quota/status/set-admin-key/export/import）、
-  Dockerfile（多阶段：node 前端 → go 二进制 → bookworm-slim + Debian chromium）+ compose + README
-- [ ] **验收**：`docker compose up -d --build` 一键起；`-race` 下全测试通过；两版本交替使用同一 db 无异常
+  Release CI（原 Dockerfile/compose 方案 2026-09-11 放弃，见范围一节）
+- [ ] **验收**：Release CI 产物可运行；`-race` 下全测试通过；两版本交替使用同一 db 无异常
 ### M7 `/v1/responses` 端点（代码完成，待真机验收）
 - [x] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）—
   `internal/openai/{responses,responses_stream}.go`（8 组单测 + 2 组 e2e）
@@ -324,6 +324,7 @@ meta(key TEXT PK, value TEXT)
 ## 9. 交付形态
 
 - `go build ./cmd/zcode2api` → 单二进制（前端已 embed），仅 Chromium 运行库为外部依赖。
-- Docker 镜像：`node:20-alpine` 构建前端 → `golang` 镜像构建二进制 → 运行层 `python:3.11-slim` 换成
-  `debian:bookworm-slim` + Chromium 运行库 + cloakbrowser 预下载（构建期一行 Python）→ 无 Python/Node 运行时。
+- Release CI：推 `v*` tag → GitHub Actions 交叉编译 linux/darwin/windows × amd64/arm64
+  （CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）→ 上传 GitHub Releases。
+  （2026-09-11 定案放弃 Docker 镜像方案：裸二进制 + systemd 更简单，Chromium 由部署机自备。）
 - Python 版保留在仓库中直至 Go 版 M6 验收通过，届时再决定去留（不在本计划范围内）。

@@ -55,8 +55,8 @@
 ### M6 OAuth + 代理出口 + CLI + 交付（代码完成，下一项做真机验收）
 - 已落地：`internal/oauth`（完整 Python oauth.py 移植）、`internal/adminapi/login.go`（login/start+complete）、
   `internal/proxy`（http/socks4/4a/5/5h 拨号器 + Transport 缓存；engine/quota 已接线 clientFor）、
-  `cmd/zcode2api/cli.go`（全部子命令）、`Dockerfile`（多阶段，Debian chromium）+ `docker-compose.yml` + `README.md`。
-- 验收：`docker compose up -d --build` 一键起；`-race` 全测试通过；两版本交替用同一 db 无异常。
+  `cmd/zcode2api/cli.go`（全部子命令）、Release CI（原 Dockerfile/compose 2026-09-11 放弃）。
+- 验收：Release CI 产物可运行（推 tag 触发）；`-race` 全测试通过；两版本交替用同一 db 无异常。
 
 ### M7 `/v1/responses`（見 PLAN.md §5.8）
 - 復用 M4 的 `internal/openai` 轉換基建；`previous_response_id` v1 明確 400。
@@ -64,7 +64,7 @@
 
 ### 欠賬驗收（需真實賬號環境，合併一次做）
 - M5：真實賬號連續 20 次 JWT 請求全自動通過（無 F001）。
-- M6：`docker compose up -d --build` 一鍵起；`-race` 全測試（本機無 gcc）；兩版本交替用同一 db。
+- M6：Release CI 产物可运行；`-race` 全測試；兩版本交替用同一 db。
 - M7：Codex CLI 指向網關無狀態模式完整會話。
 - M8：真機領取一次成功（billing/preview + claim + 激活上報全鏈路）。- M0：真實 `data/accounts.db` 互通實測（Go 寫回後 Python 版可讀）。
 - M1：真實賬號非流式 + 流式各打通一次。

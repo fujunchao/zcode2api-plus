@@ -10,12 +10,15 @@ OpenAI 兼容 `/v1/chat/completions`、`/async/v1/messages`、`/v1/responses`）
 ## 快速開始
 
 ```bash
+# 下載現成產物（GitHub Releases，推 v* tag 自動構建）
+# linux / darwin / windows，amd64 + arm64
+
 # 源碼構建
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
 
-# Docker 一鍵起（含 Chromium 驗證碼求解）
-docker compose up -d --build
+# 驗證碼自動求解需系統有 Chromium（僅此外部依賴）
+ZCODE_CAPTCHA_BROWSER=true ZCODE_CAPTCHA_BROWSER_BIN=/usr/bin/chromium ./zcode2api serve
 ```
 
 首次啟動橫幅會輸出後台密碼與網關 API Key（也可用 CLI 設定）。
