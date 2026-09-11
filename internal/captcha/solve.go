@@ -1,8 +1,8 @@
 // rod 驱动真实 Chromium 的求解 worker：对应 Python 版 app/captcha_browser.py 的
 // worker 入口（_build_captcha_html / _solve_once / worker_main）。
 //
-// 浏览器二进制复用 cloakbrowser 下载的同一份 Chromium（构建期
-// `python -m cloakbrowser install` 预下载到 CLOAKBROWSER_CACHE_DIR），启动参数
+// 浏览器二进制复用 cloakbrowser 的同一份补丁 Chromium（发现链落空时由
+// browserdl.go 自动下载，无需 Python 预下载），启动参数
 // 逐项对齐 cloakbrowser.launch(headless=True) 经 playwright 落到进程的最终有效集：
 // playwright 默认开关（剔除 --enable-automation / --enable-unsafe-swiftshader）
 // + cloakbrowser stealth 参数（随机指纹种子）+ _BROWSER_ARGS 五项。差异项在
@@ -427,7 +427,8 @@ func DiscoverBrowserBinary() (string, error) {
 
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
-		return "", fmt.Errorf("浏览器缓存目录不可读（先执行 python -m cloakbrowser install 预下载）: %s", cacheDir)
+		// 缓存目录不可读（首次部署）：走自动下载，无需 Python 预下载。
+		return discoverViaDownload()
 	}
 	type candidate struct {
 		version []int
@@ -450,7 +451,7 @@ func DiscoverBrowserBinary() (string, error) {
 		}
 	}
 	if len(candidates) == 0 {
-		return "", fmt.Errorf("缓存目录中未发现可用的 Chromium 二进制: %s", cacheDir)
+		return discoverViaDownload()
 	}
 	// 版本降序，取最高
 	sort.Slice(candidates, func(i, j int) bool {
@@ -463,6 +464,20 @@ func DiscoverBrowserBinary() (string, error) {
 		return len(a) > len(b)
 	})
 	return candidates[0].path, nil
+}
+
+// discoverViaDownload 发现链落空后的兜底：自动下载补丁 Chromium 再重扫缓存目录。
+// 下载失败返回原始错误（人工回填兜底不受影响）。
+func discoverViaDownload() (string, error) {
+	version, err := EnsureBrowserBinary(context.Background())
+	if err != nil {
+		return "", fmt.Errorf("自动下载补丁 Chromium 失败（可手动执行 python -m cloakbrowser install 或设 ZCODE_CAPTCHA_BROWSER_BIN）: %w", err)
+	}
+	bin := filepath.Join(cloakBinaryDir(version), executableName())
+	if info, statErr := os.Stat(bin); statErr != nil || info.IsDir() {
+		return "", fmt.Errorf("补丁 Chromium 安装异常: %s", bin)
+	}
+	return bin, nil
 }
 
 // parseVersion 解析点分版本号为整数段（如 146.0.7680.177.5）。

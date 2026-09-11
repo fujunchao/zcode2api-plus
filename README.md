@@ -30,8 +30,9 @@ OAuth 登錄、賬號級出站代理、活動套餐自動領取，單二進制�
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
 
-# 驗證碼自動求解需系統有 Chromium（唯一外部依賴）
-ZCODE_CAPTCHA_BROWSER=true ZCODE_CAPTCHA_BROWSER_BIN=/usr/bin/chromium ./zcode2api serve
+# 驗證碼自動求解：首次啟動自動下載補丁 Chromium（約 200MB，無需 Python）；
+# 也可用 ZCODE_CAPTCHA_BROWSER_BIN 指定已有的瀏覽器二進制
+ZCODE_CAPTCHA_BROWSER=true ./zcode2api serve
 ```
 
 首次啟動橫幅輸出後台密碼與網關 API Key（也可 CLI 設定）。
@@ -60,14 +61,15 @@ WorkingDirectory=/opt/zcode2api
 Environment=ZCODE_PORT=3010
 Environment=ZCODE_DATA_DIR=/opt/zcode2api/data
 Environment=ZCODE_CAPTCHA_BROWSER=true
-Environment=ZCODE_CAPTCHA_BROWSER_BIN=/usr/bin/chromium
 ExecStart=/opt/zcode2api/zcode2api serve
 Restart=on-failure
 ```
 
-> ⚠️ 實測注意：部分發行版新 Chromium 的 headless 指紋會被 Aliyun 驗證碼風控拒絕
-> （SDK 載入後 `AliyunCaptcha` 為 undefined）。若遇到，改用 CloakBrowser 下載的
-> Chromium 二進制（`ZCODE_CAPTCHA_BROWSER_BIN` 指向其 chrome 可執行文件）即可。
+> 💡 驗證碼瀏覽器：啟動時自動從 cloakbrowser.dev 下載補丁 Chromium（SHA256SUMS +
+> Ed25519 簽名校驗，GitHub Releases 兜底），緩存於 `~/.cloakbrowser/`，零 Python 依賴。
+> 下載源可用 `CLOAKBROWSER_DOWNLOAD_URL` 覆蓋；`ZCODE_CAPTCHA_BROWSER_BIN` 可指向
+> 任意已有瀏覽器。實測部分發行版自帶 Chromium（如 Debian 150）會被風控拒絕——
+> 自動下載的補丁二進制即為此問題的內建解法。
 
 ## 配置（環境變量）
 
