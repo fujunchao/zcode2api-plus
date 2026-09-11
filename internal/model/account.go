@@ -77,6 +77,7 @@ type Account struct {
 	ProxyURL              *string  `json:"proxy_url"`
 	ProxyID               *string  `json:"proxy_id"`
 	CreatedAt             float64  `json:"created_at"`
+	ArchivedAt            *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -150,7 +151,11 @@ func (a *Account) Secret() string {
 }
 
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。
+// 已归档账号一律不可选（归档即停止调用）。
 func (a *Account) IsSelectable(now time.Time) bool {
+	if a.ArchivedAt != nil {
+		return false
+	}
 	if !a.Enabled || a.Status == StatusDisabled || a.Status == StatusInvalid {
 		return false
 	}
@@ -372,6 +377,7 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		"proxy_url":       a.ProxyURL,
 		"proxy_id":        a.ProxyID,
 		"created_at":      a.CreatedAt,
+		"archived_at":     a.ArchivedAt,
 	}
 }
 

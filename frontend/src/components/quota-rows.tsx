@@ -42,6 +42,25 @@ export function PlanRows({ account }: { account: Account }) {
   )
 }
 
+/* 全部套餐均已過期時回傳最晚的到期時間字串；無套餐或仍有生效方案則回傳 null */
+export function allPlansExpired(account: Account): string | null {
+  const plans = (account.plans || []).filter(
+    (p) => p && (p.name || p.plan_id) && (p.ends_at || p.effective_at),
+  )
+  if (!plans.length) return null
+  const now = Date.now() / 1000
+  let latest = 0
+  for (const p of plans) {
+    const end = Number(p.ends_at) || 0
+    const eff = Number(p.effective_at) || 0
+    const pending = eff > now
+    const expired = end > 0 && end <= now
+    if (pending || !expired) return null
+    latest = Math.max(latest, end)
+  }
+  return latest ? fmtDate(latest) : null
+}
+
 export function QuotaRows({ account }: { account: Account }) {
   const quota = account.quota || {}
   const keys = Object.keys(quota)

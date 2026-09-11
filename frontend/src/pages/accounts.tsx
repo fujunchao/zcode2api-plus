@@ -1,5 +1,8 @@
 /* 帳號池頁：統計卡、篩選、帳號明細表與新增／編輯對話框（輪詢 5 秒） */
 import {
+  Archive,
+  ArchiveRestore,
+  Copy,
   Download,
   Gift,
   Loader2,
@@ -16,7 +19,7 @@ import { useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
-import { QuotaRows, PlanRows } from '@/components/quota-rows'
+import { PlanRows, QuotaRows, allPlansExpired } from '@/components/quota-rows'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -65,10 +68,14 @@ export function AccountsPage() {
   })
 
   const allAccounts = data?.accounts ?? []
+  /* 已归档账号独立展示：不计入统计、不参与筛选，只在归档区列出 */
+  const archivedAccounts = allAccounts.filter((a) => a.archived_at != null)
+  const liveAccounts = allAccounts.filter((a) => a.archived_at == null)
   const proxies = data?.proxies ?? []
   const availableModels = data?.models ?? []
 
   const [filter, setFilter] = useState<FilterKey>('all')
+  const [showArchived, setShowArchived] = useState(false)
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set())
 
   /* 新增對話框 */
@@ -103,7 +110,7 @@ export function AccountsPage() {
   /* ── 統計計算（語義照搬舊版 renderStats） ── */
   let totalRem = 0
   let totalQuota = 0
-  allAccounts.forEach((a) => {
+  liveAccounts.forEach((a) => {
     Object.values(a.quota || {}).forEach((w) => {
       totalRem += Number(w.remaining) || 0
       totalQuota += Number(w.total) || 0
@@ -113,12 +120,12 @@ export function AccountsPage() {
   const quotaColor = quotaPct <= 15 ? '#ef4444' : quotaPct <= 40 ? '#f59e0b' : '#22c55e'
   const stats = data?.stats
 
-  /* ── 篩選 ── */
-  const counts: Record<string, number> = { all: allAccounts.length, exhausted: 0, disabled: 0 }
-  allAccounts.forEach((a) => {
+  /* ── 篩選（歸檔帳號不參與） ── */
+  const counts: Record<string, number> = { all: liveAccounts.length, exhausted: 0, disabled: 0 }
+  liveAccounts.forEach((a) => {
     counts[a.status] = (counts[a.status] || 0) + 1
   })
-  const filtered = filter === 'all' ? allAccounts : allAccounts.filter((a) => a.status === filter)
+  const filtered = filter === 'all' ? liveAccounts : liveAccounts.filter((a) => a.status === filter)
 
   /* ── 新增 ── */
   function openAdd() {
@@ -283,6 +290,50 @@ export function AccountsPage() {
     }
   }
 
+  /* ── 歸檔 ┐─ 歸檔＝停止調用，帳號移入歸檔區僅保留記錄 */
+  function doArchive(a: Account) {
+    const label = a.email || a.name || a.id
+    confirm({
+      title: '歸檔帳號',
+      description: (
+        <>
+          歸檔 <code className="rounded bg-muted px-1 py-0.5">{label}</code>
+          ？歸檔後停止調用該帳號，可在「歸檔」區恢復。
+        </>
+      ),
+      onConfirm: async () => {
+        try {
+          await api('POST', '/accounts/' + a.id + '/archived', { archived: true })
+          toast.success('已歸檔')
+          invalidate()
+        } catch (e) {
+          toast.error('歸檔失敗：' + errMsg(e))
+        }
+      },
+    })
+  }
+
+  async function doRestore(a: Account) {
+    try {
+      await api('POST', '/accounts/' + a.id + '/archived', { archived: false })
+      toast.success('已恢復到帳號池')
+      invalidate()
+    } catch (e) {
+      toast.error('恢復失敗：' + errMsg(e))
+    }
+  }
+
+  /* ── 郵箱複製 ── */
+  async function copyEmail(a: Account) {
+    const text = a.email || a.name || a.id
+    try {
+      await navigator.clipboard.writeText(text)
+      toast.success('已複製 ' + text)
+    } catch {
+      toast.error('複製失敗')
+    }
+  }
+
   async function refreshOne(a: Account) {
     if (refreshing.has(a.id)) return
     setRefreshing((s) => new Set(s).add(a.id))
@@ -438,6 +489,16 @@ export function AccountsPage() {
           <Button variant="outline" size="sm" onClick={claimAll}>
             <Gift /> 領取套餐
           </Button>
+          <Button
+            variant={showArchived ? 'default' : 'outline'}
+            size="sm"
+            onClick={() => setShowArchived((v) => !v)}
+          >
+            <Archive /> 歸檔
+            {archivedAccounts.length > 0 && (
+              <span className="tabular-nums opacity-70">{archivedAccounts.length}</span>
+            )}
+          </Button>
           <Button size="sm" onClick={openAdd}>
             <Plus /> 新增
           </Button>
@@ -517,15 +578,15 @@ export function AccountsPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>賬號</TableHead>
+                <TableHead className="text-center">賬號</TableHead>
                 <TableHead className="w-20 text-center">狀態</TableHead>
-                <TableHead className="w-36">出口線路</TableHead>
-                <TableHead className="min-w-56">額度</TableHead>
+                <TableHead className="w-28 text-center">出口線路</TableHead>
+                <TableHead className="min-w-56 text-center">額度</TableHead>
                 <TableHead className="w-16 text-center">呼叫</TableHead>
                 <TableHead className="w-16 text-center">失敗</TableHead>
                 <TableHead className="w-24 text-center">Tokens</TableHead>
-                <TableHead className="w-28">最近使用</TableHead>
-                <TableHead className="w-40 text-right">操作</TableHead>
+                <TableHead className="w-28 text-center">最近使用</TableHead>
+                <TableHead className="w-44 text-center">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -539,10 +600,10 @@ export function AccountsPage() {
                 filtered.map((a) => (
                   <TableRow key={a.id}>
                     <TableCell>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium">{a.email || a.name || '未命名帳號'}</span>
+                      <div className="flex items-center gap-1">
+                        <EmailCell account={a} onCopy={() => void copyEmail(a)} />
                         {(a.disabled_models || []).length > 0 && (
-                          <Badge variant="outline" className="text-[11px] font-normal" title={(a.disabled_models || []).join('、')}>
+                          <Badge variant="outline" className="shrink-0 text-[11px] font-normal" title={(a.disabled_models || []).join('、')}>
                             停用 {a.disabled_models.length} 模型
                           </Badge>
                         )}
@@ -565,8 +626,17 @@ export function AccountsPage() {
                       )}
                     </TableCell>
                     <TableCell className="min-w-56">
-                      <QuotaRows account={a} />
-                      <PlanRows account={a} />
+                      {allPlansExpired(a) ? (
+                        <span className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
+                          <span className="size-1.5 rounded-full" style={{ background: '#c9c9cf' }} />
+                          已到期 {allPlansExpired(a)}
+                        </span>
+                      ) : (
+                        <>
+                          <QuotaRows account={a} />
+                          <PlanRows account={a} />
+                        </>
+                      )}
                     </TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.use_count || 0}</TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.fail_count || 0}</TableCell>
@@ -597,6 +667,9 @@ export function AccountsPage() {
                         >
                           {a.status === 'disabled' ? <RotateCcw /> : <XCircle />}
                         </Button>
+                        <Button variant="ghost" size="icon-sm" title="歸檔（停止調用）" onClick={() => doArchive(a)}>
+                          <Archive />
+                        </Button>
                         <Button variant="ghost" size="icon-sm" title="編輯" onClick={() => openEdit(a)}>
                           <Pencil />
                         </Button>
@@ -618,6 +691,50 @@ export function AccountsPage() {
           </Table>
         </CardContent>
       </Card>
+
+      {/* 歸檔區：已停止調用的帳號，僅保留記錄，可恢復或刪除 */}
+      {showArchived && (
+        <Card>
+          <CardContent className="px-0">
+            <div className="flex items-center gap-2 px-4 py-3 text-sm font-medium">
+              <Archive className="size-4" /> 已歸檔帳號
+              <Badge variant="secondary">{archivedAccounts.length}</Badge>
+              <span className="text-xs font-normal text-muted-foreground">不參與調度、領取與額度刷新</span>
+            </div>
+            {!archivedAccounts.length ? (
+              <p className="px-4 pb-6 py-4 text-center text-sm text-muted-foreground">尚無歸檔帳號</p>
+            ) : (
+              <div className="flex flex-col divide-y">
+                {archivedAccounts.map((a) => (
+                  <div key={a.id} className="flex items-center gap-3 px-4 py-2.5">
+                    <EmailCell account={a} onCopy={() => void copyEmail(a)} />
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      歸檔於 {fmtDate(a.archived_at)}
+                    </span>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      累計 {a.use_count || 0} 次 · {fmtCompact(Number(a.total_tokens?.input || 0) + Number(a.total_tokens?.output || 0))} tokens
+                    </span>
+                    <span className="ml-auto flex shrink-0 gap-0.5">
+                      <Button variant="ghost" size="icon-sm" title="恢復到帳號池" onClick={() => void doRestore(a)}>
+                        <ArchiveRestore />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="text-destructive hover:text-destructive"
+                        title="刪除"
+                        onClick={() => doDelete(a)}
+                      >
+                        <Trash2 />
+                      </Button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* 新增帳號對話框：授權登入為預設分頁 */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
@@ -759,9 +876,28 @@ export function AccountsPage() {
   )
 }
 
-/* 統計小卡 */
-function StatCell({ label, value, color, icon }: { label: string; value: string; color?: string; icon?: React.ReactNode }) {
+/* 賬號欄：截断显示邮箱，悬停出现复制按钮（复制完整邮箱），为右侧操作按钮腾空间 */
+function EmailCell({ account, onCopy }: { account: Account; onCopy: () => void }) {
+  const label = account.email || account.name || '未命名帳號'
   return (
+    <span className="group/email flex min-w-0 items-center gap-1">
+      <span className="max-w-44 truncate font-medium" title={label}>
+        {label}
+      </span>
+      <button
+        type="button"
+        onClick={onCopy}
+        title="複製"
+        className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus:opacity-100 group-hover/email:opacity-100"
+      >
+        <Copy className="size-3" />
+      </button>
+    </span>
+  )
+}
+
+/* 統計小卡 */
+function StatCell({ label, value, color, icon }: { label: string; value: string; color?: string; icon?: React.ReactNode }) {  return (
     <Card>
       <CardContent className="flex flex-col gap-1">
         <div className="flex items-center justify-between text-xs text-muted-foreground">

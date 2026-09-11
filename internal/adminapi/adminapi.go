@@ -49,6 +49,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/api/accounts", guard(h.handleDeleteAccounts))
 	mux.HandleFunc("PUT /admin/api/accounts/{account_id}", guard(h.handleEditAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/enabled", guard(h.handleSetEnabled))
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/archived", guard(h.handleSetArchived))
 	mux.HandleFunc("POST /admin/api/accounts/refresh", guard(h.handleRefreshAll))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/refresh", guard(h.handleRefreshAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/reset-stats", guard(h.handleResetStats))
@@ -175,11 +176,15 @@ func strOf(v any) string {
 func (h *Handler) accountSnapshot() ([]map[string]any, map[string]any) {
 	now := time.Now()
 	views := []map[string]any{}
-	var active, exhausted, cooling, invalid, disabled int
+	var active, exhausted, cooling, invalid, disabled, archivedCount int
 	var calls, fail, tokensIn, tokensOut, tokensCache int
 	for _, a := range h.Store.ListAccounts("") {
 		view := a.PublicView(now)
 		views = append(views, view)
+		if a.ArchivedAt != nil {
+			archivedCount++ // 已归档账号不计入统计（前端在归档区单独展示）
+			continue
+		}
 		switch view["status"] {
 		case model.StatusActive:
 			active++
@@ -199,7 +204,7 @@ func (h *Handler) accountSnapshot() ([]map[string]any, map[string]any) {
 		tokensCache += a.TotalCacheCreationTokens + a.TotalCacheReadTokens
 	}
 	return views, map[string]any{
-		"total":        len(views),
+		"total":        len(views) - archivedCount,
 		"active":       active,
 		"exhausted":    exhausted,
 		"cooling":      cooling,

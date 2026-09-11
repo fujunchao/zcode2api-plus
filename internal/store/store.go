@@ -636,6 +636,27 @@ func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error
 	return true, nil
 }
 
+// SetArchived 归档/恢复账号：归档后不参与调度（IsSelectable 返回 false），
+// 状态保持原样以便恢复后回到停用前的语义；归档时间取当前时刻。
+func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := s.findLocked(provider, idOrName)
+	if acc == nil {
+		return false, nil
+	}
+	if archived {
+		now := float64(time.Now().UnixNano()) / 1e9
+		acc.ArchivedAt = &now
+	} else {
+		acc.ArchivedAt = nil
+	}
+	if err := s.persistAccountLocked(acc); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ── 轮询选择 ────────────────────────────────────────────────────────────────
 
 // Select 按模型额度与 round-robin 选择账号。

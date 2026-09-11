@@ -27,6 +27,10 @@ func (h *Handler) jwtAccounts(ids []string) []*model.Account {
 		if len(wanted) > 0 && !wanted[acc.ID] {
 			continue
 		}
+		// 已归档账号不参与批量领取（显式指定单个账号时仍允许，便于排查）
+		if acc.ArchivedAt != nil && len(wanted) == 0 {
+			continue
+		}
 		if acc.Mode == "jwt" && acc.JWTToken != nil && *acc.JWTToken != "" {
 			out = append(out, acc)
 		}

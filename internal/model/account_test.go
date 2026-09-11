@@ -48,13 +48,15 @@ const pythonAccountJSON = `{
 }`
 
 // pythonAccountKeys Python dataclass asdict 输出的全部键（序列化契约）。
+// archived_at 是 Go 版新增（归档功能）：Python 侧已退休，旧版 JSON 读取时缺失即 nil，
+// Python json.loads 对多出的键会原样保留在 dict 中，不影响旧数据互读。
 var pythonAccountKeys = []string{
 	"id", "name", "provider", "mode", "email", "jwt_token", "api_key",
 	"enabled", "status", "quota", "exhausted_models", "disabled_models",
 	"plan", "plans", "usage", "use_count", "fail_count",
 	"total_input_tokens", "total_output_tokens", "total_cache_creation_tokens",
 	"total_cache_read_tokens", "last_used_at", "last_checked_at", "cooling_until",
-	"last_error", "proxy_url", "proxy_id", "created_at",
+	"last_error", "proxy_url", "proxy_id", "created_at", "archived_at",
 }
 
 func TestJSONContractWithPython(t *testing.T) {

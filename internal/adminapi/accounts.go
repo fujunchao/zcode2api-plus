@@ -329,6 +329,31 @@ func (h *Handler) handleSetEnabled(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (h *Handler) handleSetArchived(w http.ResponseWriter, r *http.Request) {
+	acc := h.Store.FindAny(r.PathValue("account_id"))
+	if acc == nil {
+		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	payload, apiErr := decodeBody(r)
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		return
+	}
+	archived := true
+	if v, ok := payload["archived"]; ok {
+		archived = truthy(v)
+	}
+	if ok, err := h.Store.SetArchived(acc.Provider, acc.ID, archived); err != nil {
+		writeError500(w, err)
+		return
+	} else if !ok {
+		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 	// 对齐 refresh：payload.all → 全部 zai jwt 账号；否则按 ids 过滤（仅 jwt）。
 	// 请求体可空（FastAPI Body(default=None) 语义）。

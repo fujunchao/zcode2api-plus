@@ -49,6 +49,7 @@ export interface Account {
   proxy_url: string | null
   proxy_id: string | null
   created_at: number
+  archived_at: number | null
 }
 
 export interface Stats {
