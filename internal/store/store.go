@@ -672,6 +672,19 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	if len(pool) == 0 {
 		return nil
 	}
+	// 持有未耗尽一次性优惠（period 含 one_time 且 remaining>0）的账号优先：
+	// 优惠额度不用会过期，每日体验额度次日刷新；优惠组耗尽后自然回落全池轮询。
+	var promo, regular []*model.Account
+	for _, a := range pool {
+		if hasPromoQuota(a) {
+			promo = append(promo, a)
+		} else {
+			regular = append(regular, a)
+		}
+	}
+	if len(promo) > 0 {
+		pool = promo
+	}
 	key := provider + ":" + orStar(modelName)
 	idx := s.rotation[key] % len(pool)
 	acc := pool[idx]
@@ -684,6 +697,31 @@ func orStar(modelName string) string {
 		return "*"
 	}
 	return modelName
+}
+
+// hasPromoQuota 账号额度快照中是否存在未耗尽的一次性优惠额度。
+// 快照缺 remaining 视为未知（不参与优先判定），仅明确 remaining>0 才算优惠在握。
+func hasPromoQuota(a *model.Account) bool {
+	for _, q := range a.Quota {
+		period, _ := q["period"].(string)
+		if !strings.Contains(period, "one_time") {
+			continue
+		}
+		if v, ok := asNumber(q["remaining"]); ok && v > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func asNumber(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	}
+	return 0, false
 }
 
 // ── 导入 / 导出 ─────────────────────────────────────────────────────────────

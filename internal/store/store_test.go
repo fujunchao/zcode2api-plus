@@ -221,6 +221,45 @@ func TestSelectRotationAndModelFilter(t *testing.T) {
 	}
 }
 
+func TestSelectPromoAccountsFirst(t *testing.T) {
+	s := newTestStore(t)
+	promo1, _ := s.AddAccount(model.ProviderZai, "promo1", "h1.p.s3")
+	promo2, _ := s.AddAccount(model.ProviderZai, "promo2", "h2.p.s3")
+	plain, _ := s.AddAccount(model.ProviderZai, "plain", "h3.p.s3")
+	// promo1/2 持有未耗尽的一次性优惠；plain 只有每日额度。
+	for _, a := range []*model.Account{promo1, promo2} {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"remaining": float64(500), "period": "one_time", "model": "GLM-5.3"},
+		}
+	}
+	plain.Quota = map[string]map[string]any{
+		"GLM-5.3": {"remaining": float64(10), "period": "daily", "model": "GLM-5.3"},
+	}
+
+	// 优惠组内轮询，绝不落到 plain。
+	seen := map[string]bool{}
+	for range 6 {
+		acc := s.Select("zai", nil, "GLM-5.3")
+		if acc == nil {
+			t.Fatal("应选到账号")
+		}
+		if acc.ID == plain.ID {
+			t.Fatal("优惠组未耗尽时不应选中普通账号")
+		}
+		seen[acc.ID] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("优惠组内应两个账号轮询: %v", seen)
+	}
+
+	// 优惠全部耗尽 → 回落普通账号。
+	promo1.Quota["GLM-5.3"]["remaining"] = float64(0)
+	promo2.Quota["GLM-5.3"]["remaining"] = float64(0)
+	if acc := s.Select("zai", nil, "GLM-5.3"); acc == nil || acc.ID != plain.ID {
+		t.Fatalf("优惠耗尽后应选中普通账号: %v", acc)
+	}
+}
+
 func TestExportImportRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	s1 := openAt(t, filepath.Join(dir, "a.db"))
