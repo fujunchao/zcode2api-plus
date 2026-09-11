@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
@@ -257,6 +258,36 @@ func TestSelectPromoAccountsFirst(t *testing.T) {
 	promo2.Quota["GLM-5.3"]["remaining"] = float64(0)
 	if acc := s.Select("zai", nil, "GLM-5.3"); acc == nil || acc.ID != plain.ID {
 		t.Fatalf("优惠耗尽后应选中普通账号: %v", acc)
+	}
+}
+
+func TestArchiveForcesDisabled(t *testing.T) {
+	s := newTestStore(t)
+	acc, _ := s.AddAccount(model.ProviderZai, "arc", "h.p.s3")
+	if ok, err := s.SetArchived(model.ProviderZai, acc.ID, true); !ok || err != nil {
+		t.Fatalf("归档失败: %v %v", ok, err)
+	}
+	got := s.Find(model.ProviderZai, acc.ID)
+	if got.ArchivedAt == nil || got.Status != model.StatusDisabled || got.Enabled {
+		t.Fatalf("归档应强制停用: archived=%v status=%s enabled=%v", got.ArchivedAt, got.Status, got.Enabled)
+	}
+	if got.IsSelectable(time.Now()) {
+		t.Fatal("归档账号不可被调度")
+	}
+
+	// 恢复后仍是停用状态，需手动启用
+	if ok, err := s.SetArchived(model.ProviderZai, acc.ID, false); !ok || err != nil {
+		t.Fatalf("恢复失败: %v %v", ok, err)
+	}
+	got = s.Find(model.ProviderZai, acc.ID)
+	if got.ArchivedAt != nil || got.Status != model.StatusDisabled || got.Enabled {
+		t.Fatalf("恢复后应保持停用: archived=%v status=%s enabled=%v", got.ArchivedAt, got.Status, got.Enabled)
+	}
+	if ok, err := s.SetEnabled(model.ProviderZai, acc.ID, true); !ok || err != nil {
+		t.Fatalf("启用失败: %v %v", ok, err)
+	}
+	if got = s.Find(model.ProviderZai, acc.ID); got.Status != model.StatusActive {
+		t.Fatalf("手动启用后应恢复 active: %s", got.Status)
 	}
 }
 

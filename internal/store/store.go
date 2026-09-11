@@ -636,8 +636,8 @@ func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error
 	return true, nil
 }
 
-// SetArchived 归档/恢复账号：归档后不参与调度（IsSelectable 返回 false），
-// 状态保持原样以便恢复后回到停用前的语义；归档时间取当前时刻。
+// SetArchived 归档/恢复账号：归档即强制停用（无论原状态），调度、领取、刷新全部跳过；
+// 恢复后保持停用状态，需手动启用才会重新参与调度。归档时间取当前时刻。
 func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -648,6 +648,8 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 	if archived {
 		now := float64(time.Now().UnixNano()) / 1e9
 		acc.ArchivedAt = &now
+		acc.Enabled = false
+		acc.Status = model.StatusDisabled
 	} else {
 		acc.ArchivedAt = nil
 	}

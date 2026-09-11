@@ -700,7 +700,6 @@ export function AccountsPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead className="text-center">賬號</TableHead>
-                  <TableHead className="w-20 text-center">狀態</TableHead>
                   <TableHead className="w-40 text-center">歸檔時間</TableHead>
                   <TableHead className="w-24 text-center">累計呼叫</TableHead>
                   <TableHead className="w-24 text-center">Tokens</TableHead>
@@ -710,8 +709,8 @@ export function AccountsPage() {
               <TableBody>
                 {!archivedAccounts.length ? (
                   <TableRow>
-                    <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
-                      尚無歸檔帳號。歸檔＝停止調用，帳號記錄保留在此。
+                    <TableCell colSpan={5} className="py-8 text-center text-sm text-muted-foreground">
+                      尚無歸檔帳號。歸檔＝停止調用並強制停用，帳號記錄保留在此。
                     </TableCell>
                   </TableRow>
                 ) : (
@@ -721,9 +720,6 @@ export function AccountsPage() {
                         <div className="flex items-center justify-center gap-1">
                           <EmailCell account={a} onCopy={() => void copyEmail(a)} />
                         </div>
-                      </TableCell>
-                      <TableCell className="text-center">
-                        <Badge className={STATUS_BADGE[a.status]}>{STATUS_LABEL[a.status] || a.status}</Badge>
                       </TableCell>
                       <TableCell className="text-center text-xs">{fmtDate(a.archived_at)}</TableCell>
                       <TableCell className="text-center tabular-nums text-xs">{a.use_count || 0}</TableCell>
