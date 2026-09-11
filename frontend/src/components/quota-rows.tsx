@@ -6,6 +6,42 @@ const COLOR_EMPTY = '#c9c9cf'
 const COLOR_LOW = '#b0632a'
 const COLOR_OK = '#4c9168'
 
+/* 套餐到期列：每個訂閱方案一行，顯示名稱＋待生效/到期時間（資料源 account.plans） */
+export function PlanRows({ account }: { account: Account }) {
+  const plans = (account.plans || []).filter(
+    (p) => p && (p.name || p.plan_id) && (p.ends_at || p.effective_at),
+  )
+  if (!plans.length) return null
+  const now = Date.now() / 1000
+  return (
+    <div className="mt-1.5 flex min-w-0 flex-col gap-0.5 border-t border-dashed pt-1.5">
+      {plans.map((p, i) => {
+        const eff = Number(p.effective_at) || 0
+        const end = Number(p.ends_at) || 0
+        const pending = eff > now
+        const expired = end > 0 && end <= now
+        const name = String(p.name || p.plan_id || `方案 ${i + 1}`)
+        const time = pending
+          ? `待生效 ${fmtDate(eff)}`
+          : expired
+            ? `已過期 ${fmtDate(end)}`
+            : `到期 ${fmtDate(end)}`
+        return (
+          <div key={String(p.plan_id || i)} className="flex items-center gap-1.5 text-[11px] leading-tight">
+            <span
+              className="size-1.5 shrink-0 rounded-full"
+              style={{ background: expired ? COLOR_EMPTY : pending ? '#4c76b2' : COLOR_OK }}
+              title={pending ? '尚未生效' : expired ? '已過期' : '生效中'}
+            />
+            <span className="truncate font-medium">{name}</span>
+            <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">{time}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export function QuotaRows({ account }: { account: Account }) {
   const quota = account.quota || {}
   const keys = Object.keys(quota)

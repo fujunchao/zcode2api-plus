@@ -16,7 +16,7 @@ import { useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
-import { QuotaRows } from '@/components/quota-rows'
+import { QuotaRows, PlanRows } from '@/components/quota-rows'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -566,6 +566,7 @@ export function AccountsPage() {
                     </TableCell>
                     <TableCell className="min-w-56">
                       <QuotaRows account={a} />
+                      <PlanRows account={a} />
                     </TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.use_count || 0}</TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.fail_count || 0}</TableCell>
