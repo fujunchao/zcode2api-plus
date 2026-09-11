@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/captcha"
+	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/oauth"
@@ -160,7 +162,23 @@ func cmdLogin(args []string) {
 			_ = st.UpdateAccount(acc)
 		}
 		fmt.Println(web.Green + fmt.Sprintf("\n✔ 已保存 Coding Plan JWT 账号: %s (%s)", acc.Name, acc.ID) + web.Reset)
-		// M8 接入点：入池后自动领取套餐（对齐 Python cmd_login 的 auto_claim_all_plans）
+		// 入池即激活上报 + 自动领取全部可领活动套餐（失败仅提示，不中断；
+		// 对齐 Python cmd_login 的 auto_claim_all_plans）
+		cm := captcha.NewManager()
+		if config.CaptchaBrowserEnabled {
+			cm.SetSolver(captcha.NewBrowserSolver())
+		}
+		outcomes := claim.NewService(cm).AutoClaimAllPlans(acc)
+		for _, o := range outcomes {
+			if ok, _ := o["ok"].(bool); ok {
+				planName, _ := o["plan_name"].(string)
+				fmt.Println(web.Green + "✔ 自动领取成功: " + planName + web.Reset)
+			} else {
+				msg, _ := o["message"].(string)
+				fmt.Println(web.Yellow + "⚠️ 自动领取失败: " + msg + web.Reset)
+			}
+		}
+		_ = cm.Close()
 	}
 	if result.AccessToken != "" {
 		if key, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil {

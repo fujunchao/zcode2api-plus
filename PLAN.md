@@ -293,10 +293,12 @@ meta(key TEXT PK, value TEXT)
 - [x] 请求/响应/流式转换 + 状态化划界（`previous_response_id` v1 先 400）—
   `internal/openai/{responses,responses_stream}.go`（8 组单测 + 2 组 e2e）
 - [ ] **验收**：Codex CLI 指向网关完成一次完整会话（无状态模式）
-### M8 套餐自动领取（Go 版增量，见 §5.9）
-- [ ] claim 核心链（preview 解析 / claim 业务码 / 3007 换码重试）+ 激活事件上报
-- [ ] Admin API `/claim/preview` + `/claim` + 入池自动领取触发点（批量添加 / OAuth / CLI login）
-- [ ] **验收**：单测覆盖业务码映射与重试语义（对照 Python 主仓 tests/test_claim.py）；真机领取一次成功（待真实账号环境）
+### M8 套餐自动领取（代码完成，待真机验收）
+- [x] claim 核心链（preview 解析 / claim 业务码 / 3007 换码重试）+ 激活事件上报 —
+  `internal/claim/`（8 组单测对照 Python tests/test_claim.py）
+- [x] Admin API `/claim/preview` + `/claim` + 入池自动领取触发点（批量添加 / OAuth / CLI login）
+  + 前端按钮（工具栏全量 + JWT 账号行内单账号）
+- [ ] **验收**：单测覆盖业务码映射与重试语义（已完成）；真机领取一次成功（待真实账号环境）
 
 ## 7. 测试策略
 

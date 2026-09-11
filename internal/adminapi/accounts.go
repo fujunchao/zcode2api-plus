@@ -140,6 +140,10 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(fresh) > 0 {
 		h.Quota.RefreshAccounts(fresh)
+		// 入池即自动领取（后台 fire-and-forget；对齐 Python add_accounts 尾段）
+		for _, acc := range fresh {
+			h.scheduleAutoClaim(acc)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"count": len(added), "ids": added})
 }

@@ -1,6 +1,7 @@
 /* 帳號池頁：統計卡、篩選、帳號明細表與新增／編輯對話框（輪詢 5 秒） */
 import {
   Download,
+  Gift,
   Loader2,
   Pencil,
   Plus,
@@ -311,6 +312,57 @@ export function AccountsPage() {
     }
   }
 
+  /* ── 套餐領取 ── */
+  const [claiming, setClaiming] = useState<Set<string>>(new Set())
+
+  function claimOutcomeToast(name: string, d: { outcomes: { ok: boolean; message?: string }[]; summary: { ok: number; fail: number } }) {
+    for (const o of d.outcomes.filter((x) => !x.ok)) {
+      toast.warning(`${name} 領取失敗：${o.message ?? '未知原因'}`)
+    }
+    toast.success(`${name} 套餐領取完成：成功 ${d.summary.ok}，失敗 ${d.summary.fail}`)
+    invalidate()
+  }
+
+  async function claimOne(a: Account) {
+    if (claiming.has(a.id)) return
+    setClaiming((s) => new Set(s).add(a.id))
+    toast.info(`${a.email || a.name || a.id} 正在領取套餐…`)
+    try {
+      const d = await api<{ outcomes: { ok: boolean; message?: string }[]; summary: { ok: number; fail: number } }>(
+        'POST', '/claim', { account_ids: [a.id] },
+      )
+      claimOutcomeToast(a.email || a.name || a.id, d)
+    } catch (e) {
+      toast.error('領取失敗：' + errMsg(e))
+    } finally {
+      setClaiming((s) => {
+        const next = new Set(s)
+        next.delete(a.id)
+        return next
+      })
+    }
+  }
+
+  async function claimAll() {
+    confirm({
+      title: '領取活動套餐',
+      description: '將對池內全部 JWT 帳號依優先級領取當前可領的限時活動套餐（需求解驗證碼，可能耗時數十秒）。確認執行？',
+      onConfirm: async () => {
+        toast.info('正在領取套餐…')
+        try {
+          const d = await api<{ outcomes: { account_name?: string; ok: boolean; message?: string }[]; summary: { ok: number; fail: number } }>('POST', '/claim', {})
+          for (const o of d.outcomes.filter((x) => !x.ok)) {
+            toast.warning(`${o.account_name ?? ''} 領取失敗：${o.message ?? '未知原因'}`)
+          }
+          toast.success(`套餐領取完成：成功 ${d.summary.ok}，失敗 ${d.summary.fail}`)
+          invalidate()
+        } catch (e) {
+          toast.error('領取失敗：' + errMsg(e))
+        }
+      },
+    })
+  }
+
   function resetStats(a: Account) {
     const label = a.email || a.name || a.id
     confirm({
@@ -382,6 +434,9 @@ export function AccountsPage() {
           </Button>
           <Button variant="outline" size="sm" onClick={() => void refreshAll()}>
             <RefreshCw /> 重新整理額度
+          </Button>
+          <Button variant="outline" size="sm" onClick={claimAll}>
+            <Gift /> 領取套餐
           </Button>
           <Button size="sm" onClick={openAdd}>
             <Plus /> 新增
@@ -523,6 +578,11 @@ export function AccountsPage() {
                         {a.mode === 'jwt' && (
                           <Button variant="ghost" size="icon-sm" title="重新整理額度" onClick={() => void refreshOne(a)}>
                             {refreshing.has(a.id) ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                          </Button>
+                        )}
+                        {a.mode === 'jwt' && (
+                          <Button variant="ghost" size="icon-sm" title="領取活動套餐" onClick={() => void claimOne(a)}>
+                            {claiming.has(a.id) ? <Loader2 className="animate-spin" /> : <Gift />}
                           </Button>
                         )}
                         <Button variant="ghost" size="icon-sm" title="重置 Token 統計" onClick={() => resetStats(a)}>

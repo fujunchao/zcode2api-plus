@@ -65,6 +65,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/captcha/config", guard(h.handleCaptchaConfig))
 	mux.HandleFunc("POST /admin/api/captcha/submit", guard(h.handleCaptchaSubmit))
 	mux.HandleFunc("POST /admin/api/login/start", guard(h.handleLoginStart))
+	mux.HandleFunc("GET /admin/api/claim/preview", guard(h.handleClaimPreview))
+	mux.HandleFunc("POST /admin/api/claim", guard(h.handleClaim))
 	mux.HandleFunc("POST /admin/api/login/complete/{flow_id}", guard(h.handleLoginComplete))
 	mux.HandleFunc("GET /admin/api/settings", guard(h.handleGetSettings))
 	mux.HandleFunc("PUT /admin/api/settings", guard(h.handleUpdateSettings))

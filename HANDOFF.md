@@ -2,8 +2,8 @@
 
 > 給新會話（Claude 或人類協作者）的快速上手指南。計劃與進度台账在 `PLAN.md`（唯一權威），
 > 本文檔只做「狀態快照 + 工作流 + 紅線 + 踩坑記錄」，避免重複維護。
-> 最後更新：2026-09-11（M6 代码完成：OAuth 登录链 + 账号级代理 + CLI + Dockerfile/compose/README；
-> M5/M6 真机验收与 -race 待做）。
+> 最後更新：2026-09-11（M6/M7/M8 代码全部完成：OAuth+代理+CLI+Docker、/v1/responses、
+> 套餐自动领取；M5 真机验收与 -race 待做；全部真机验收合并执行）。
 
 ---
 
@@ -62,8 +62,11 @@
 - 復用 M4 的 `internal/openai` 轉換基建；`previous_response_id` v1 明確 400。
 - 驗收：Codex CLI 指向網關無狀態模式完整會話。
 
-### 欠賬驗收（需真實賬號環境，與 M5/M6 驗收合併做）
-- M0：真實 `data/accounts.db` 互通實測（Go 寫回後 Python 版可讀）。
+### 欠賬驗收（需真實賬號環境，合併一次做）
+- M5：真實賬號連續 20 次 JWT 請求全自動通過（無 F001）。
+- M6：`docker compose up -d --build` 一鍵起；`-race` 全測試（本機無 gcc）；兩版本交替用同一 db。
+- M7：Codex CLI 指向網關無狀態模式完整會話。
+- M8：真機領取一次成功（billing/preview + claim + 激活上報全鏈路）。- M0：真實 `data/accounts.db` 互通實測（Go 寫回後 Python 版可讀）。
 - M1：真實賬號非流式 + 流式各打通一次。
 - M4：openai 官方 Python 客戶端指向網關跑通三場景。
 

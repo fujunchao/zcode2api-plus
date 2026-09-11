@@ -130,6 +130,8 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account
 	}
 	if account.Mode == "jwt" {
 		h.Quota.RefreshAccounts([]*model.Account{account})
+		// 授权完成即激活 + 自动领取（入池即吃满活动；对齐 Python _save_oauth_account）
+		h.scheduleAutoClaim(account)
 	}
 	return account, nil
 }
