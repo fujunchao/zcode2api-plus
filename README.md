@@ -1,41 +1,73 @@
-# zcode2api-go
+# zcode2api
 
-ZCode2api-plus 的 Go 重寫版：把 Z.AI ZCode Coding Plan 網關（Anthropic 協議 `/v1/messages`、
-OpenAI 兼容 `/v1/chat/completions`、`/async/v1/messages`、`/v1/responses`）以單二進制交付，
-內建 Admin SPA、驗證碼瀏覽器池（rod + Chromium）、額度查詢、OAuth 登錄與賬號級出站代理。
+Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主線**）。
 
-> 行為契約以 Python 主倉庫（zcode2api-plus）為權威對照；逐項對齊的里程碑與進度見 `PLAN.md`，
-> 交接注意事項見 `HANDOFF.md`。
+把 Z.AI Coding Plan 賬號池包裝成標準 API：多賬號輪詢、驗證碼全自動求解、額度監控、
+OAuth 登錄、賬號級出站代理、活動套餐自動領取，單二進制交付（前端已內嵌，無外部運行時）。
+
+> 📦 歷史沿革：本項目原為 Python 實現，現已由 Go 重寫版取代成為主線。
+> Python 舊版保留在 [`python-legacy`](../../tree/python-legacy) 分支（僅歸檔維護，不再更新）。
+
+## 端點一覽
+
+| 端點 | 協議 | 說明 |
+|------|------|------|
+| `POST /v1/messages` | Anthropic Messages | 流式/非流式，字節級透傳 |
+| `POST /v1/chat/completions` | OpenAI Chat | 本地轉換為 Anthropic Messages，含工具調用 |
+| `POST /v1/responses` | OpenAI Responses | 服務 Codex CLI（無狀態模式；`previous_response_id` 返回 400） |
+| `POST /async/v1/messages` | Anthropic 異步 | ticket + keepalive + 流中斷語義 |
+| `GET /v1/models` | 雙兼容超集 | Anthropic 與 OpenAI 形態字段並存 |
+| `/admin/*` | — | 內嵌 React 管理後台 |
+
+對外三種請求格式，內部統一走 Anthropic Messages 上游管道：選號循環、驗證碼求解、
+錯誤分類（401/402/429 碼族/3010/F001）、賬號狀態機與用量統計只維護一份。
 
 ## 快速開始
 
 ```bash
-# 下載現成產物（GitHub Releases，推 v* tag 自動構建）
-# linux / darwin / windows，amd64 + arm64
-
-# 源碼構建
+# 下載現成產物（Releases 頁：linux / darwin / windows × amd64 / arm64）
+# 或源碼構建：
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
 
-# 驗證碼自動求解需系統有 Chromium（僅此外部依賴）
+# 驗證碼自動求解需系統有 Chromium（唯一外部依賴）
 ZCODE_CAPTCHA_BROWSER=true ZCODE_CAPTCHA_BROWSER_BIN=/usr/bin/chromium ./zcode2api serve
 ```
 
-首次啟動橫幅會輸出後台密碼與網關 API Key（也可用 CLI 設定）。
+首次啟動橫幅輸出後台密碼與網關 API Key（也可 CLI 設定）。
+瀏覽器求解不可用時自動回退人工回填（後台 `/admin/captcha`），功能不中斷。
 
 ## CLI
 
 ```
 zcode2api serve [--port 3000]        啟動網關 + 後台 UI
-zcode2api login zai [--no-browser]   OAuth 登錄 Z.AI 並入池
+zcode2api login zai [--no-browser]   OAuth 登錄 Z.AI 並入池（自動領取活動套餐）
 zcode2api add-account zai <name> <jwt|key>
 zcode2api accounts [zai]             查看賬號列表
 zcode2api remove-account <provider> <id|name>
 zcode2api quota                      查看各賬號實時額度
 zcode2api status                     配置概覽
 zcode2api set-admin-key <key>        設置後台密碼
-zcode2api export [file] / import <file>
+zcode2api export [file] / import <file>   賬號導出/導入（與 python-legacy 互通）
 ```
+
+## 部署（裸二進制 + systemd，推薦）
+
+```ini
+# /etc/systemd/system/zcode2api.service
+[Service]
+WorkingDirectory=/opt/zcode2api
+Environment=ZCODE_PORT=3010
+Environment=ZCODE_DATA_DIR=/opt/zcode2api/data
+Environment=ZCODE_CAPTCHA_BROWSER=true
+Environment=ZCODE_CAPTCHA_BROWSER_BIN=/usr/bin/chromium
+ExecStart=/opt/zcode2api/zcode2api serve
+Restart=on-failure
+```
+
+> ⚠️ 實測注意：部分發行版新 Chromium 的 headless 指紋會被 Aliyun 驗證碼風控拒絕
+> （SDK 載入後 `AliyunCaptcha` 為 undefined）。若遇到，改用 CloakBrowser 下載的
+> Chromium 二進制（`ZCODE_CAPTCHA_BROWSER_BIN` 指向其 chrome 可執行文件）即可。
 
 ## 配置（環境變量）
 
@@ -51,10 +83,22 @@ zcode2api export [file] / import <file>
 
 ## 賬號級出站代理
 
-賬號（或代理線路指派）配置 `proxy_url` 後，該賬號的網關請求與額度查詢均走對應代理；
-支持 `http://`、`https://`（CONNECT）與 `socks4://`、`socks5://`、`socks5h://`（socks5h
+賬號配置 `proxy_url` 後，該賬號的網關請求、額度查詢與套餐領取均走對應代理；
+支持 `http(s)://`（CONNECT）與 `socks4://`、`socks5://`、`socks5h://`（socks5h
 由代理解析域名）。代理無效時回退直連並記錄 `last_error`。
 
-## 包結構
+## 套餐自動領取
 
-見 `HANDOFF.md` §7 速查表。
+JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件上報 →
+`billing/preview` 按優先級逐個 `billing/claim`（驗證碼 3007 自動換碼重試一次）。
+後台賬號頁另有「領取套餐」按鈕（工具欄全量 + JWT 賬號行內單賬號）。
+
+## 發佈與開發
+
+- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物並上傳 Releases。
+- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`。
+- 行為契約與里程碑台账見 `PLAN.md`；交接注意事項見 `HANDOFF.md`。
+
+## License
+
+供個人學習與自部署使用；上游服務條款由使用者自行遵守。
