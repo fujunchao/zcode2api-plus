@@ -126,11 +126,17 @@ func fetchBytes(ctx context.Context, client *http.Client, url string) ([]byte, e
 }
 
 // verifySHA256SUMS 校验 SHA256SUMS 的 Ed25519 签名并返回摘要表。
-// 签名无效视作篡改信号：直接失败，绝不降级使用未校验的哈希表。
-func verifySHA256SUMS(sums, sig []byte) (map[string]string, error) {
+// 实测 .sig 文件为 base64 编码的签名（88 字节文本 = 64 字节原始签名），
+// 兼容直接存原始字节的形态；签名无效视作篡改信号：直接失败，绝不降级
+// 使用未校验的哈希表。
+func verifySHA256SUMS(sums, sigFile []byte) (map[string]string, error) {
 	pub, err := base64.StdEncoding.DecodeString(*cloakSigningPubkey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("内置校验公钥非法")
+	}
+	sig, b64Err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(sigFile)))
+	if b64Err != nil || len(sig) != ed25519.SignatureSize {
+		sig = sigFile // 回退：按原始字节签名处理
 	}
 	if !ed25519.Verify(ed25519.PublicKey(pub), sums, sig) {
 		return nil, fmt.Errorf("SHA256SUMS 签名校验失败（下载源被篡改或密钥已轮换）")

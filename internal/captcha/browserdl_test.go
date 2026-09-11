@@ -64,7 +64,8 @@ func newFakeSource(t *testing.T, files map[string]string) *fakeCloakSource {
 
 	sumLines := hex.EncodeToString(func() []byte { s := sha256.Sum256(archive); return s[:] }()) + "  " + fakeArchiveName + "\n"
 	sums := []byte(sumLines)
-	sig := ed25519.Sign(priv, sums)
+	// 真实 .sig 形态：base64 编码的签名文本。
+	sig := []byte(base64.StdEncoding.EncodeToString(ed25519.Sign(priv, sums)) + "\n")
 
 	s := &fakeCloakSource{sums: sums, sig: sig, archive: archive, archiveN: fakeArchiveName}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
