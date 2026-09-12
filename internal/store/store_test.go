@@ -261,6 +261,22 @@ func TestSelectPromoAccountsFirst(t *testing.T) {
 	}
 }
 
+func TestUpdateDeletedAccountRejected(t *testing.T) {
+	s := newTestStore(t)
+	acc, _ := s.AddAccount(model.ProviderZai, "ghost", "h.p.s3")
+	if ok, _ := s.RemoveAccount(model.ProviderZai, acc.ID); !ok {
+		t.Fatal("删除失败")
+	}
+	// 模拟后台流长期持有旧对象、删除后回写：必须被拒绝而非复活
+	acc.UseCount = 999
+	if err := s.UpdateAccount(acc); err == nil {
+		t.Fatal("已删除账号的回写应报错")
+	}
+	if s.Find(model.ProviderZai, acc.ID) != nil {
+		t.Fatal("已删除账号不得复活")
+	}
+}
+
 func TestArchiveForcesDisabled(t *testing.T) {
 	s := newTestStore(t)
 	acc, _ := s.AddAccount(model.ProviderZai, "arc", "h.p.s3")

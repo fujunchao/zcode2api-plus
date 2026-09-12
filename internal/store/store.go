@@ -613,6 +613,11 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 func (s *Store) UpdateAccount(acc *model.Account) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 防御已删除账号复活：后台流/额度刷新可能长期持有旧对象，
+	// 若删除后完成回写，INSERT OR REPLACE 会把账号重新插回 SQLite。
+	if s.findLocked(acc.Provider, acc.ID) == nil {
+		return fmt.Errorf("账号已不存在，拒绝回写: %s", acc.ID)
+	}
 	return s.persistAccountLocked(acc)
 }
 
