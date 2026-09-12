@@ -22,7 +22,8 @@ func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 
 	var successRate any
 	if calls > 0 {
-		successRate = roundN(float64(calls-fail)/float64(calls)*100, 2)
+		// fail 与 calls 计数口径独立，失败数理论上可超过调用数，夹取防负值
+		successRate = roundN(max(0, float64(calls-fail)/float64(calls)*100), 2)
 	}
 	averageQPS := 0.0
 	if uptime > 0 {
