@@ -58,9 +58,8 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 	if stream, ok := body["stream"]; ok {
 		out["stream"] = stream
 	}
-	if opts, ok := body["stream_options"].(map[string]any); ok {
-		out["include_usage"], _ = opts["include_usage"].(bool)
-	}
+	// stream_options.include_usage 是 OpenAI 侧参数，Messages API 没有对应字段，
+	// 故不写入上游请求体；handler 直接从原始 body 读取（见 handler.go）。
 
 	// 思维链：客户端显式 thinking 优先，其次按 reasoning_effort / reasoning.effort 档位开启
 	if thinking := resolveThinking(body, numberOr(out["max_tokens"], 8192)); thinking != nil {
@@ -288,7 +287,7 @@ func contentBlocks(content any) ([]any, error) {
 
 // imageURLToBlock 把 OpenAI image_url part 转换为 Anthropic image block。
 // data URL → base64 source（media_type 从 URL 解析）；http[s] URL → url source
-//（上游支持度未知，失败按上游错误原样透传）。
+// （上游支持度未知，失败按上游错误原样透传）。
 func imageURLToBlock(part map[string]any) (map[string]any, error) {
 	inner, ok := part["image_url"].(map[string]any)
 	if !ok {
@@ -359,9 +358,9 @@ func toolCallToUse(call map[string]any) (map[string]any, error) {
 		}
 	}
 	return map[string]any{
-		"type": "tool_use",
-		"id":   call["id"],
-		"name": name,
+		"type":  "tool_use",
+		"id":    call["id"],
+		"name":  name,
 		"input": input,
 	}, nil
 }

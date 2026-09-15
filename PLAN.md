@@ -312,7 +312,40 @@ meta(key TEXT PK, value TEXT)
   `internal/claim/`（8 组单测对照 Python tests/test_claim.py）
 - [x] Admin API `/claim/preview` + `/claim` + 入池自动领取触发点（批量添加 / OAuth / CLI login）
   + 前端按钮（工具栏全量 + JWT 账号行内单账号）
-- [ ] **验收**：单测覆盖业务码映射与重试语义（已完成）；真机领取一次成功（待真实账号环境）
+- [x] **验收**：单测覆盖业务码映射与 3007 换码重试语义（claim_test.go 8 组）
+- [ ] **验收**：真机领取一次成功（billing/preview + claim + 激活上报全链路）
+
+### M9 已知缺陷修复（2026-09-15 完成，仅剩 1 项待评估）
+以下为代码审查确认的行为问题，**已全部修复**（每项附回归测试）：
+
+- [x] `asyncpool` 错误分类与 engine 分歧 → 抽出 `gateway.MarkAccount` / `MarkModelExhausted` /
+  `IsQuotaExhaustedCode` 共用，asyncpool 现按同一顺序分类 401/402/3010/429 码族/503；
+  新增 `TestQuotaExhaustedCodeMarksModelNotCooling`、`TestUnauthorizedMarksInvalid`、
+  `TestConcurrencyLimitKeepsAccountState`
+- [x] `BrowserSolver.Solve` 持锁跨 `pool.Solve` → 锁只保护池的选取与重建，求解在锁外执行；
+  配置变更时以 `retired` 标记延迟关闭旧池，避免中止在途求解；
+  新增 `TestBrowserSolverConcurrentSolvesDoNotSerialize`（验证 n 路并发）、
+  `TestBrowserSolverConfigChangeDoesNotAbortInFlight`
+- [x] async ticket 逾时不投递终止事件 → 补发 `ticket_timeout` 错误事件；
+  新增 `TestTicketTimeoutEmitsErrorEvent`
+- [x] `include_usage` 外泄到上游 → 不再写入上游请求体，handler 改从原始 OpenAI 请求读取；
+  测试改为 `TestStreamOptionsIncludeUsageNotForwarded`
+- [x] `responses_stream` 的 `item_id` 不一致 → 统一取 function_call item 的 id；
+  `TestResponsesStreamEvents` 增加 id 一致性断言
+- [x] socks5 IPv6 回退 → 本地解析优先 IPv4，仅有 IPv6 时以 ATYP=0x04 发送；
+  新增 `TestSocks5LocalResolveFallsBackToIPv6`
+- [x] `browserdl.extractTarGz` 无 symlink 分支 → 支持 `TypeSymlink`（限制链接目标在解包目录内）
+  与 `TypeLink`，未知类型记日志而非静默丢弃；新增 `TestExtractTarGzPreservesSymlink`、
+  `TestExtractTarGzRejectsEscapingSymlink`
+- [x] `quota` 代理回退无日志 → 补 `web.Warn`
+- [x] `go.mod` 将 `go-rod/rod` 标为 indirect → `go mod tidy` 修正，并补齐 go.sum 缺失条目
+- [x] `gofmt` 未覆盖 → 全部 62 个 Go 档已格式化
+
+**待评估（未修改）**：
+- [ ] 后台限速以 `RemoteAddr` 为键、不信任 `X-Forwarded-For`（`auth.go:129-135`）。
+  这是**刻意的安全取舍**（信任 `X-Forwarded-For` 会让攻击者伪造头绕过限速），
+  本次仅吸收上游核心修复，不引入其部署脚本；后台限制内网访问的部署说明另行维护。
+  若确需反代支持，应改为显式配置可信代理列表，而非无条件信任该头。
 
 ## 7. 测试策略
 
