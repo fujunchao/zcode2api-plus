@@ -71,9 +71,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # 只出两个标签：完整版本 + latest。
+          # 不加 `{{major}}.{{minor}}` 滚动标签：本项目 tag 带 `-go` 后缀（如 v2.0.2-go），
+          # semver 会把 `-go` 解析成 prerelease，该模式会因此生成一个误导性的 `2.2`。
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
       - name: Build and push
