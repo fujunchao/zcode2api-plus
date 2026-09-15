@@ -206,8 +206,8 @@ meta(key TEXT PK, value TEXT)
 | `tools` / `tool_choice` | 仅支持 function 工具，`parameters` → `input_schema`；`auto/none` 保留语义、`required` → `any`、named → `{type:"tool",name}`；强制的函数必须已声明，重复名称/不支持的类型/`strict:true` 明确 400 |
 | `parallel_tool_calls` | 转换为 `tool_choice.disable_parallel_tool_use` 的反值；未指定 choice 时补 auto，none 时不附并行开关 |
 | `n` | 仅支持 1，>1 返回 400 |
-| `reasoning_effort`（顶层） | `none` 显式关闭；`minimal/low/medium/high` → 预算 1024/2048/4096/8192，**上限取 `max_tokens` 一半**；输出上限不足 2048 或档位不支持时明确 400，不静默关闭、不擅自增加上限 |
-| `thinking`（客户端自带） | 显式预算校验后优先于 effort；disabled 始终优先。Pi ZAI/DeepSeek 的 enabled 开关无预算时，按 effort 补齐，缺省 medium，不上行 `clear_thinking` |
+| `reasoning_effort`（顶层） | GLM-5.3 系列原生 low/high/max；Coding Plan 别名 none/minimal/low→low、medium/high→high、xhigh/max→max，转为 Anthropic output_config.effort；不虚构预算、不改变输出上限 |
+| `thinking`（客户端自带） | 模型强制思考，disabled 返回 400；Pi 无预算 enabled 开关沿用上游默认思考，不再补猜测预算。显式 budget_tokens 校验后独立保留，不覆盖 effort；不透传 clear_thinking |
 | `presence_penalty` / `frequency_penalty` / `logprobs` / `user` 等 | 静默忽略（README 声明） |
 
 **响应转换（Anthropic → OpenAI）：**
@@ -236,8 +236,8 @@ meta(key TEXT PK, value TEXT)
 - 定位：服务 Codex CLI 等 Responses 生态客户端；复用 §5.7 的引擎与转换基建，增量约 300-500 行。
 - v1 范围：`instructions` → system；`input`（字符串 / 类型化 item 数组：message、function_call、
   function_call_output）→ messages；扁平 `tools` → Anthropic tools；`max_output_tokens` → `max_tokens`；
-  `reasoning.effort` → 上游 `output_config.effort`，**并同时**按 §5.7 档位表翻译为 `thinking` 块
-  （只有按 effort 启用思考时保留辅助 output_config；显式 thinking 或关闭思考时不追加另一套开关）；输出端 text → `output_text`、
+  `reasoning.effort` 按 §5.7 模型原生档位归一化后转为上游 `output_config.effort`，
+  不再伪造 thinking 预算；未指定参数时保留上游强制思考与默认 max。输出端 text → `output_text`、
   tool_use → `function_call`、thinking → `reasoning` item（`summary[].summary_text` 承载思考内容，
   流中按上游内容块首次声明顺序分配连续 `output_index`，不插入虚构空 message）；流式重编码为 `response.*` 事件序列
   （`response.output_text.delta`、`response.reasoning_summary_text.delta`、`response.output_item.added` 等）。
@@ -355,11 +355,18 @@ meta(key TEXT PK, value TEXT)
 
 ### M10 工具、思考与真实客户端兼容（2026-09-15）
 - [x] 合入上游 7675309 核心修复，保留本仓库 Docker/GHCR/数据卷及思考功能。
-- [x] 工具控制参数共用转换与校验；Pi 开关式 thinking、none 及预算校验。
+- [x] 工具控制参数共用转换与校验；初版思考预算映射在 M11 按模型原生能力纠正。
 - [x] Responses 完整项目生命周期、交错工具流与异常终止；Chat 初始工具 input 与断流错误。
 - [x] HTTP 回归覆盖工具结果闭环、思考档位、错误参数、流式项目关联。
 - [x] 官方 OpenAI Python SDK 2.30.0 与 Pi 0.85.1 适配器通过本地 mock 上游闭环，测试见 client_sdk_test.go。
 - [ ] 真实 Z.AI 账号与实际 Pi 会话在线验收（离线 SDK 回归不代替上游能力验证）。
+
+### M11 GLM-5.3 原生 max 热修复（v2.0.4-go）
+- [x] 用 HTTP 回归复现 Flash + max 被本地白名单错误拒绝。
+- [x] 对照 Z.AI 官方模型及深度思考文档，按 low/high/max 和 Coding Plan 别名实现转换。
+- [x] 移除自定义固定预算与 minimum max_tokens=2048 限制，保留显式预算与输出上限校验。
+- [x] Pi 示例启用两种模型的原生 max，并隐藏不支持的关闭思考选项。
+- [x] Python/Pi SDK 回归覆盖两种模型、high/max 与两种请求格式，断言真正上行的 effort。
 
 ## 7. 测试策略
 
@@ -382,7 +389,7 @@ meta(key TEXT PK, value TEXT)
 | Go 无 jsdom 兜底 | 接受——jsdom 本已被风控判死；人工回填为最终兜底 |
 | rod 版本 API 变动 | go.mod 锁定 minor 版本 |
 | 开启 thinking 后多轮会话历史缺 thinking 块 | Anthropic 语义下续聊需回灌上一轮 thinking（含签名）；OpenAI 形态客户端只回传正文与 `reasoning_content`，缺签名无法合规回灌。当前策略：历史不回灌、按上游实际行为验收；若上游强制要求，则改为仅在客户端显式传 Anthropic `thinking` 时开启，或增加开关 |
-| thinking 的 `budget_tokens` 与 `max_tokens` 冲突 | 档位预算上限取 max_tokens 一半；容纳不下最低预算时明确 400，避免用户误以为思考已开启；显式预算必须至少 1024 且小于输出上限 |
+| 把兼容层预算映射误当成模型能力 | 以模型官方文档为依据；GLM-5.3 仅原生 low/high/max 且强制思考，effort 与输出上限独立。显式 Anthropic 预算仍单独校验，但不能据此限制模型 effort |
 
 ## 9. 交付形态
 

@@ -27,9 +27,9 @@ const context = {
     },
   }],
 };
-async function run() {
+async function run(effort) {
   const response = stream(model, context, {
-    apiKey: "sk-test", maxTokens: 16384, reasoningEffort: "high", toolChoice: "auto",
+    apiKey: "sk-test", maxTokens: 16384, reasoningEffort: effort, toolChoice: "auto",
   });
   const events = [];
   for await (const event of response) {
@@ -38,26 +38,31 @@ async function run() {
   }
   return { message: await response.result(), events };
 }
-for (const format of ["openai", "zai"]) {
-  model.compat.thinkingFormat = format;
-  context.messages = context.messages.slice(0, 1);
-  const first = await run();
-  assert.equal(first.message.stopReason, "toolUse");
-  assert.ok(first.events.includes("thinking_delta"));
-  assert.ok(first.events.includes("toolcall_delta"));
-  assert.equal(first.message.content.find(x => x.type === "thinking").thinking, "先查询两个城市。");
-  const calls = first.message.content.filter(x => x.type === "toolCall");
-  assert.deepEqual(calls.map(x => x.arguments.city), ["杭州", "上海"]);
-  assert.deepEqual(calls.map(x => x.id), ["call_a", "call_b"]);
-  context.messages.push(first.message);
-  for (const call of calls) {
-    context.messages.push({
-      role: "toolResult", toolCallId: call.id, toolName: call.name,
-      content: [{ type: "text", text: "晴 20 度" }], isError: false, timestamp: Date.now(),
-    });
+for (const modelId of ["GLM-5.3", "glm-5.3-flash"]) {
+  for (const effort of ["high", "max"]) {
+    for (const format of ["openai", "zai"]) {
+      model.id = modelId;
+      model.compat.thinkingFormat = format;
+      context.messages = context.messages.slice(0, 1);
+      const first = await run(effort);
+      assert.equal(first.message.stopReason, "toolUse");
+      assert.ok(first.events.includes("thinking_delta"));
+      assert.ok(first.events.includes("toolcall_delta"));
+      assert.equal(first.message.content.find(x => x.type === "thinking").thinking, "先查询两个城市。");
+      const calls = first.message.content.filter(x => x.type === "toolCall");
+      assert.deepEqual(calls.map(x => x.arguments.city), ["杭州", "上海"]);
+      assert.deepEqual(calls.map(x => x.id), ["call_a", "call_b"]);
+      context.messages.push(first.message);
+      for (const call of calls) {
+        context.messages.push({
+          role: "toolResult", toolCallId: call.id, toolName: call.name,
+          content: [{ type: "text", text: "晴 20 度" }], isError: false, timestamp: Date.now(),
+        });
+      }
+      const second = await run(effort);
+      assert.equal(second.message.stopReason, "stop");
+      assert.equal(second.message.content.find(x => x.type === "text").text, "回答");
+    }
   }
-  const second = await run();
-  assert.equal(second.message.stopReason, "stop");
-  assert.equal(second.message.content.find(x => x.type === "text").text, "回答");
 }
-console.log("Pi Chat Completions 适配器：OpenAI / ZAI 两种思考格式、交错双工具参数、工具结果回传、最终回答均通过");
+console.log("Pi Chat Completions 适配器：GLM-5.3 / Flash，high / max，OpenAI / ZAI 格式与工具闭环均通过");

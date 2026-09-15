@@ -64,14 +64,23 @@ func TestClientSDKCompatibility(t *testing.T) {
 			if len(calls) < 2 {
 				t.Fatalf("至少应有工具请求和工具结果回传两轮: %d", len(calls))
 			}
+			seenEfforts := map[string]bool{}
 			for _, call := range calls {
 				if _, leaked := call.Body["include_usage"]; leaked {
 					t.Fatal("客户端的 include_usage 不能泄漏到上游")
 				}
-				thinking, _ := call.Body["thinking"].(map[string]any)
-				if thinking["budget_tokens"] != float64(8192) {
-					t.Fatalf("客户端 high 档位未实际到达上游: %v", call.Body["thinking"])
+				config, _ := call.Body["output_config"].(map[string]any)
+				effort, _ := config["effort"].(string)
+				if effort != "high" && effort != "max" {
+					t.Fatalf("客户端原生 effort 未实际到达上游: %v", config)
 				}
+				seenEfforts[effort] = true
+				if _, invented := call.Body["thinking"]; invented {
+					t.Fatal("SDK 没有请求预算时不应伪造 thinking.budget_tokens")
+				}
+			}
+			if !seenEfforts["high"] || !seenEfforts["max"] {
+				t.Fatalf("必须验证 high 和 max 两档实际到达上游: %v", seenEfforts)
 			}
 		})
 	}

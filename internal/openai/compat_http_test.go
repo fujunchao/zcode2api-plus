@@ -131,65 +131,74 @@ func TestToolControlsReachUpstream(t *testing.T) {
 }
 
 func TestThinkingControlsOverHTTP(t *testing.T) {
-	for _, api := range []string{"chat", "responses"} {
-		for _, tc := range []struct {
-			name     string
-			effort   any
-			limit    float64
-			explicit any
-			want     string
-		}{
-			{"minimal", "minimal", 16384, nil, `{"type":"enabled","budget_tokens":1024}`},
-			{"low", "low", 16384, nil, `{"type":"enabled","budget_tokens":2048}`},
-			{"medium", "medium", 16384, nil, `{"type":"enabled","budget_tokens":4096}`},
-			{"high", "high", 16384, nil, `{"type":"enabled","budget_tokens":8192}`},
-			{"clamped", "high", 8192, nil, `{"type":"enabled","budget_tokens":4096}`},
-			{"none", "none", 8192, nil, `{"type":"disabled"}`},
-			{"explicit_disabled", "high", 8192, map[string]any{"type": "disabled"}, `{"type":"disabled"}`},
-			{"explicit_budget", "low", 8192, map[string]any{"type": "enabled", "budget_tokens": float64(3000)}, `{"type":"enabled","budget_tokens":3000}`},
-			{"unknown", "extreme", 8192, nil, ""},
-			{"unsupported_xhigh", "xhigh", 8192, nil, ""},
-			{"wrong_type", true, 8192, nil, ""},
-			{"too_small", "high", 1024, nil, ""},
-			{"invalid_explicit", "low", 8192, map[string]any{"type": "sometimes"}, ""},
-			{"invalid_budget", "low", 8192, map[string]any{"type": "enabled", "budget_tokens": float64(8192)}, ""},
-		} {
-			t.Run(api+"/"+tc.name, func(t *testing.T) {
-				f := newFixture(t)
-				f.setResponder(replyText)
-				body := compatRequest(api)
-				if api == "chat" {
-					body["reasoning_effort"], body["max_tokens"] = tc.effort, tc.limit
-				} else {
-					body["reasoning"] = map[string]any{"effort": tc.effort}
-					body["max_output_tokens"] = tc.limit
-				}
-				if tc.explicit != nil {
-					body["thinking"] = tc.explicit
-				}
-				status, raw := postCompat(t, f, api, body)
-				if tc.want == "" {
-					if status != http.StatusBadRequest || !strings.Contains(raw, "invalid_request_error") {
-						t.Fatalf("无效思考参数应明确返回 400: %d %s", status, raw)
+	for _, modelName := range []string{"GLM-5.3", "glm-5.3-flash"} {
+		for _, api := range []string{"chat", "responses"} {
+			for _, tc := range []struct {
+				name     string
+				effort   any
+				limit    float64
+				explicit any
+				want     string
+			}{
+				{"minimal_alias", "minimal", 8192, nil, "low"},
+				{"low", "low", 8192, nil, "low"},
+				{"medium_alias", "medium", 8192, nil, "high"},
+				{"high", "high", 8192, nil, "high"},
+				{"max", "max", 8192, nil, "max"},
+				{"xhigh_alias", "xhigh", 8192, nil, "max"},
+				{"none_alias", "none", 8192, nil, "low"},
+				{"small_output_limit", "max", 1024, nil, "max"},
+				{"explicit_disabled", "high", 8192, map[string]any{"type": "disabled"}, ""},
+				{"explicit_budget", "max", 8192, map[string]any{"type": "enabled", "budget_tokens": float64(3000)}, "max"},
+				{"pi_switch", "max", 8192, map[string]any{"type": "enabled", "clear_thinking": false}, "max"},
+				{"unknown", "extreme", 8192, nil, ""},
+				{"wrong_type", true, 8192, nil, ""},
+				{"invalid_limit", "max", 0, nil, ""},
+				{"invalid_explicit", "low", 8192, map[string]any{"type": "sometimes"}, ""},
+				{"invalid_budget", "low", 8192, map[string]any{"type": "enabled", "budget_tokens": float64(8192)}, ""},
+			} {
+				t.Run(modelName+"/"+api+"/"+tc.name, func(t *testing.T) {
+					f := newFixture(t)
+					f.setResponder(replyText)
+					body := compatRequest(api)
+					body["model"] = modelName
+					if api == "chat" {
+						body["reasoning_effort"], body["max_tokens"] = tc.effort, tc.limit
+					} else {
+						body["reasoning"] = map[string]any{"effort": tc.effort}
+						body["max_output_tokens"] = tc.limit
 					}
-					return
-				}
-				if status != http.StatusOK {
-					t.Fatalf("思考请求失败: %d %s", status, raw)
-				}
-				up := f.lastUpstream().Body
-				if !reflect.DeepEqual(up["thinking"], mustJSON(t, tc.want)) {
-					t.Fatalf("思考参数转换不符: got=%v want=%s", up["thinking"], tc.want)
-				}
-				if up["max_tokens"] != tc.limit {
-					t.Fatal("不得擅自提高调用方的输出上限")
-				}
-				if tc.explicit != nil || tc.effort == "none" {
-					if _, conflicting := up["output_config"]; conflicting {
-						t.Fatal("显式 thinking 优先或关闭思考时，不得追加另一套 effort 开关")
+					if tc.explicit != nil {
+						body["thinking"] = tc.explicit
 					}
-				}
-			})
+					status, raw := postCompat(t, f, api, body)
+					if tc.want == "" {
+						if status != http.StatusBadRequest || !strings.Contains(raw, "invalid_request_error") {
+							t.Fatalf("无效思考参数应明确返回 400: %d %s", status, raw)
+						}
+						return
+					}
+					if status != http.StatusOK {
+						t.Fatalf("思考请求失败: %d %s", status, raw)
+					}
+					up := f.lastUpstream().Body
+					config, _ := up["output_config"].(map[string]any)
+					if config["effort"] != tc.want {
+						t.Fatalf("原生 effort 转换不符: got=%v want=%s", config, tc.want)
+					}
+					if up["max_tokens"] != tc.limit {
+						t.Fatal("不得擅自提高调用方的输出上限")
+					}
+					explicit, _ := tc.explicit.(map[string]any)
+					if explicit["budget_tokens"] != nil {
+						if !reflect.DeepEqual(up["thinking"], explicit) {
+							t.Fatalf("显式预算必须独立于 effort 保留: %v", up["thinking"])
+						}
+					} else if _, invented := up["thinking"]; invented {
+						t.Fatalf("不能用虚构的固定 thinking 预算代替原生 effort: %v", up["thinking"])
+					}
+				})
+			}
 		}
 	}
 }
@@ -274,10 +283,9 @@ func TestFunctionCallsRoundTripOverHTTP(t *testing.T) {
 func TestPiZaiThinkingSwitchOverHTTP(t *testing.T) {
 	for _, tc := range []struct {
 		name, effort string
-		budget       float64
 	}{
-		{"with_effort", "high", 8192},
-		{"switch_only", "", 4096},
+		{"with_effort", "high"},
+		{"switch_only", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
@@ -292,13 +300,38 @@ func TestPiZaiThinkingSwitchOverHTTP(t *testing.T) {
 			if status != http.StatusOK {
 				t.Fatalf("Pi ZAI 开关式请求应转换后接收: %d %s", status, raw)
 			}
-			thinking := f.lastUpstream().Body["thinking"].(map[string]any)
-			if thinking["type"] != "enabled" || thinking["budget_tokens"] != tc.budget {
-				t.Fatalf("开关式 thinking 没有补齐正确预算: %v", thinking)
+			up := f.lastUpstream().Body
+			if _, invented := up["thinking"]; invented {
+				t.Fatal("强制思考模型的 enabled 开关不应被换成猜测的 token 预算")
 			}
-			if _, leaked := thinking["clear_thinking"]; leaked {
-				t.Fatal("ZAI 专属开关不得泄漏进 Anthropic thinking 对象")
+			config, _ := up["output_config"].(map[string]any)
+			if tc.effort != "" && config["effort"] != tc.effort {
+				t.Fatalf("Pi 的原生 effort 未转发: %v", config)
+			}
+			if tc.effort == "" && config != nil {
+				t.Fatal("只开思考开关时应保留上游默认 max，不另造档位")
 			}
 		})
+	}
+}
+
+// GLM-5.3-Flash 官方推荐 max；不得在网关内将该合法档位提前拒绝。
+func TestGLM53FlashMaxEffortReachesUpstream(t *testing.T) {
+	f := newFixture(t)
+	f.setResponder(replyText)
+	body := map[string]any{
+		"model": "glm-5.3-flash", "reasoning_effort": "max", "max_tokens": 8192,
+		"messages": []any{map[string]any{"role": "user", "content": "你好"}},
+	}
+	status, raw := postCompat(t, f, "chat", body)
+	if status != http.StatusOK {
+		t.Fatalf("max 不应被本地校验拒绝: %d %s", status, raw)
+	}
+	if f.lastUpstream().Body["model"] != "glm-5.3-flash" {
+		t.Fatal("不得通过切换模型规避 max 支持")
+	}
+	config, _ := f.lastUpstream().Body["output_config"].(map[string]any)
+	if config["effort"] != "max" {
+		t.Fatalf("必须传递 max 意图，不能只换成更大的 token 预算: %v", config)
 	}
 }

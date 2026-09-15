@@ -80,9 +80,18 @@ final = client.responses.create(
 )
 assert final.status == "completed" and final.output_text == "回答"
 assert final.parallel_tool_calls is False
+# 验证实际 Python SDK 能在 Flash 模型上发送 max，而不是被网关白名单提前拒绝。
+max_chat = client.chat.completions.create(
+    model="glm-5.3-flash", messages=[user], tools=[chat_tool], reasoning_effort="max", max_tokens=8192,
+)
+assert len(max_chat.choices[0].message.tool_calls) == 2
+max_response = client.responses.create(
+    model="glm-5.3-flash", input=[user], tools=[response_tool], reasoning={"effort": "max"}, max_output_tokens=8192,
+)
+assert max_response.status == "completed"
 try:
     client.chat.completions.create(
-        model="GLM-5.3", messages=[user], reasoning_effort="xhigh",
+        model="GLM-5.3", messages=[user], reasoning_effort="extreme",
     )
 except openai.BadRequestError as error:
     assert error.status_code == 400

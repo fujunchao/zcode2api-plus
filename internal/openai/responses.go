@@ -46,19 +46,8 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 		out["system"] = []any{map[string]any{"type": "text", "text": inst}}
 	}
 
-	thinking, err := resolveThinking(body, numberOr(out["max_tokens"], 0))
-	if err != nil {
+	if err := applyGLM53Reasoning(body, out); err != nil {
 		return nil, err
-	}
-	if thinking != nil {
-		out["thinking"] = thinking
-		// 保留既有 effort 提示，但不覆盖显式 thinking，也不在关闭思考时追加启用提示。
-		if thinking["type"] == "enabled" && body["thinking"] == nil && body["reasoning_effort"] == nil {
-			if reasoning, ok := body["reasoning"].(map[string]any); ok {
-				effort := strings.ToLower(strings.TrimSpace(stringOf(reasoning["effort"])))
-				out["output_config"] = map[string]any{"effort": effort}
-			}
-		}
 	}
 
 	if err := applyTools(body, out, true); err != nil {

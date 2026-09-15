@@ -12,7 +12,7 @@
 本服务不提供服务器端 bash、文件访问或内建搜索工具运行器。
 
 只看到 role、content 不一定是丢字段：普通回复和首个流分片就可能只有这两项。
-必须读取完整流，并实际向模型声明工具或开启思考；模型没有生成的字段不会凭空补上。
+必须读取完整流，并实际向模型声明工具；思考输出由模型生成，网关不会凭空补出字段。
 发送给 Anthropic 的消息外层通常仍只有 role/content，工具和结果位于 content 数组内。
 
 ## 工具控制
@@ -27,47 +27,60 @@
 - 多个函数调用及多个工具结果按同角色合并，不丢失 call_id 或 tool_use_id。
 - Responses 是无状态模式；每轮携带完整历史，previous_response_id 仍不支持。
 
-## 思考程度
+## 思考程度（v2.0.4 修正）
 
-| 请求档位 | 目标预算 |
-| --- | ---: |
-| none | 显式关闭 |
-| minimal | 1024 |
-| low | 2048 |
-| medium | 4096 |
-| high | 8192 |
+GLM-5.3 和 GLM-5.3-Flash 的原生档位是 low、high、max，默认且推荐 max。
+两者均强制思考，不能关闭。v2.0.3 把自定义 token 预算映射误当成模型能力白名单，
+错误拒绝了 max；该限制已移除。
 
-Chat 使用 reasoning_effort；Responses 使用 reasoning.effort。默认不主动启用思考。
-档位预算最多为 max_tokens / max_output_tokens 的一半：默认输出上限 8192 时，
-medium 和 high 实际同为 4096。需要 high 的完整预算时，输出上限至少设为 16384。
+按官方 Coding Plan 的兼容规则归一化：
 
-显式 thinking={type:"enabled",budget_tokens:N} 优先；预算须为整数、至少 1024 且小于输出上限。
-thinking={type:"disabled"} 优先关闭。
-Pi 的 ZAI/DeepSeek 格式只发 enabled 开关时，网关按 effort 补预算；没有 effort 时按 medium。
-ZAI 专用 clear_thinking 不会被写进 Anthropic thinking。
+| 客户端档位 | 原生 effort | 说明 |
+| --- | --- | --- |
+| none / minimal / low | low | 轻度推理，none 在这里不表示关闭 |
+| medium / high | high | 增强推理 |
+| xhigh / max | max | 深度推理 |
 
-不支持的档位（包括 xhigh、max）、错误类型、输出上限无法容纳最低思考预算时明确返回 400，
-不再静默关闭思考，也不会擅自增加 token 上限。none 与 enabled 开关同时出现会报参数冲突。
+Chat 使用 reasoning_effort，Responses 使用 reasoning.effort。
+内部统一调用 Anthropic 兼容端点，因此转换成 output_config.effort，
+不把 OpenAI 顶层参数直接塞给不同协议，也不再用虚构的 budget_tokens 代替原生 effort。
+未指定档位时保留上游默认值。
+
+max 与 max_tokens / max_output_tokens 是两个独立控制：前者是推理程度，
+后者是本次输出总上限。网关保持调用方的输出上限，不要求它必须达到 16384，
+也不再把一半固定划作思考预算。小上限可能导致正常的 length / incomplete 截断，
+应根据任务需要调整。
+
+显式 Anthropic thinking.budget_tokens 仍校验并保留（整数、至少 1024 且小于总上限），
+但不会替代或覆盖同时请求的原生 effort。
+Pi ZAI 的无预算 enabled 开关等同于模型的强制思考默认行为，不会被换成猜测的预算；
+clear_thinking 不是 Anthropic thinking 参数，不上行。
+thinking.type=disabled 明确返回 400，建议用 low 降低开销；真正未知的档位仍报错。
+
 历史中的 reasoning_content / reasoning item 不会转换成缺签名的 Anthropic thinking；
-原生思考签名不向 OpenAI 客户端输出，真实上游多轮行为仍需在线验收。
+原生思考签名不向 OpenAI 客户端输出，真实上游多轮保留式思考行为仍需在线验收。
+
+能力依据：
+[GLM-5.3-Flash 推荐参数](https://docs.z.ai/guides/vlm/glm-5.3-flash)、
+[GLM-5.3 原生档位](https://docs.z.ai/guides/llm/glm-5.3)、
+[Coding Plan 兼容映射](https://docs.z.ai/guides/capabilities/thinking)、
+[Anthropic effort 参数](https://platform.claude.com/docs/en/build-with-claude/effort)。
 
 ## Pi 配置
 
 将 examples/pi-models.json 中 zcode2api 提供商条目合入 Pi 的 models.json，
 不要覆盖其它提供商；按实际部署修改 baseUrl，并设置环境变量 ZCODE_GATEWAY_KEY。
-该示例使用独立提供商名，避免更改既有代理、Z.AI 直连等配置。
+示例同时包含 GLM-5.3 和 glm-5.3-flash，使用独立提供商名，不修改其它代理配置。
 
 关键设置：
 
-- reasoning=true：Pi 才会按思考档位发送参数。
-- thinkingFormat=openai、supportsReasoningEffort=true：发送标准 reasoning_effort。
+- reasoning=true：让 Pi 显示思考档位并发送参数；不代表底层模型可以关闭思考。
+- thinkingFormat=openai、supportsReasoningEffort=true：发送标准 reasoning_effort；ZAI 格式也兼容。
 - supportsStrictMode=false：不请求上游尚未保证的严格工具采样。
-- maxTokens=16384：让 high 与 medium 的有效预算有区别。
-- thinkingLevelMap 逐档同名映射；xhigh/max 设 null，从 Pi 界面隐藏不支持的档位。
-- 不要把 low/medium/high 全映射为 high，否则界面切换并不会改变请求中的档位。
+- maxTokens=16384 仅是示例输出上限，可根据任务调整，不是 max 档位的启用门槛。
+- thinkingLevelMap 暴露原生 low/high/max；off/minimal/medium/xhigh 设 null，避免界面暗示不存在的独立档位。
+- 其它客户端仍可使用上表 Coding Plan 别名；例如 xhigh 会转为 max，medium 会转为 high。
 
-现有 ZAI 格式也可使用，但建议给本网关建立独立 OpenAI 格式配置。
-示例只声明 GLM-5.3；需要 Flash 时可按同样设置增加 glm-5.3-flash 条目。
 模型白名单仍只有这两个，glm-5.2 等不会被路由。
 
 ## 流事件与错误
@@ -108,7 +121,7 @@ Windows PowerShell 示例：
     go test -count=1 -timeout=180s ./internal/openai -run '^TestClientSDKCompatibility$' -v
 
 本地已验证 OpenAI Python SDK 2.30.0、Pi 0.85.1 的真实协议适配器。
-Pi 分别以 OpenAI 和 ZAI 思考格式完成：思考/文本增量 → 两个交错工具调用 → 结果回传 → 最终回答。
+Pi 在两种模型、high/max 两档、OpenAI/ZAI 两种格式下验证：思考/文本增量 → 两个交错工具调用 → 结果回传 → 最终回答。
 CI 增加相同 SDK 回归并开启竞态检测。Windows 无符号链接权限时只跳过对应环境能力用例，
 Linux CI 继续执行该用例。离线回归证明网关与客户端协议兼容，不等于真实 Z.AI 模型在线验收完成。
 

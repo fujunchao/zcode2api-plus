@@ -292,28 +292,23 @@ func TestOpenAIDirectivesSilentlyIgnored(t *testing.T) {
 	}
 }
 
-// ── 思维链（§5.7 增量）────────────────────────────────────────────────────────
-
-func TestNoThinkingByDefault(t *testing.T) {
-	// 未表达推理意图时不得主动开启思考：否则会改变既有用户的响应形态与 token 消耗
+// GLM-5.3 的原生 effort 与输出上限是不同概念；以官方能力定义为契约。
+func TestNoSyntheticThinkingByDefault(t *testing.T) {
 	out := convertInput(t, map[string]any{"model": "glm-5.3-flash", "messages": []any{}})
-	if _, ok := out["thinking"]; ok {
-		t.Fatalf("默认不应写入 thinking: %v", out["thinking"])
+	if out["thinking"] != nil || out["output_config"] != nil {
+		t.Fatalf("未指定配置时应沿用上游强制思考及默认 max: %v", out)
 	}
 }
 
-func TestReasoningEffortEnablesThinking(t *testing.T) {
-	// max_tokens 足够大时，档位预算全额生效
-	out := convertInput(t, map[string]any{
-		"model": "glm-5.3-flash", "messages": []any{},
-		"reasoning_effort": "high", "max_tokens": float64(16384),
-	})
-	thinking, ok := out["thinking"].(map[string]any)
-	if !ok {
-		t.Fatalf("reasoning_effort 应开启 thinking: %v", out)
-	}
-	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(8192) {
-		t.Fatalf("high 档 thinking 块不符: %v", thinking)
+func TestNativeEffortNotConvertedToBudget(t *testing.T) {
+	for _, effort := range []string{"low", "high", "max"} {
+		out := convertInput(t, map[string]any{
+			"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": effort,
+		})
+		config, _ := out["output_config"].(map[string]any)
+		if config["effort"] != effort || out["thinking"] != nil {
+			t.Fatalf("应传递原生 effort 而非猜测预算: %v", out)
+		}
 	}
 }
 
@@ -322,64 +317,44 @@ func TestReasoningEffortUnknownValueRejected(t *testing.T) {
 		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "extreme",
 	})
 	if err == nil {
-		t.Fatal("未知档位应明确报错，不得静默关闭思考")
+		t.Fatal("真正未知的档位仍应报错")
 	}
 }
 
-func TestThinkingBudgetLeavesRoomForAnswer(t *testing.T) {
-	// max_tokens 是「思考 + 正文」的总上限，预算最多占一半，否则正文会被立刻截断
-	out := convertInput(t, map[string]any{
-		"model": "glm-5.3-flash", "messages": []any{},
-		"reasoning_effort": "high", "max_tokens": float64(3000),
-	})
-	thinking, _ := out["thinking"].(map[string]any)
-	if thinking["budget_tokens"] != float64(1500) {
-		t.Fatalf("预算应收缩到 max_tokens 的一半: %v", thinking)
+func TestEffortIndependentOfOutputLimit(t *testing.T) {
+	for _, limit := range []float64{128, 1024, 3000, 8192, 16384} {
+		out := convertInput(t, map[string]any{
+			"model": "glm-5.3-flash", "messages": []any{},
+			"reasoning_effort": "max", "max_tokens": limit,
+		})
+		config, _ := out["output_config"].(map[string]any)
+		if config["effort"] != "max" || out["max_tokens"] != limit || out["thinking"] != nil {
+			t.Fatalf("输出上限不能改变原生 max，网关也不能增加上限: %v", out)
+		}
 	}
 }
 
-func TestThinkingRejectedWhenNoRoom(t *testing.T) {
-	// 不静默关闭显式请求的思考，也不擅自放大 max_tokens。
-	_, err := ConvertRequest(map[string]any{
-		"model": "glm-5.3-flash", "messages": []any{},
-		"reasoning_effort": "high", "max_tokens": float64(1024),
-	})
-	if err == nil {
-		t.Fatal("预算不足应明确报错")
-	}
-}
-
-func TestDefaultMaxTokensStillEnablesThinking(t *testing.T) {
-	// 缺省 max_tokens=8192：high 档被压到 4096，仍应启用（正文同得 4096）
-	out := convertInput(t, map[string]any{
-		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "high",
-	})
-	thinking, _ := out["thinking"].(map[string]any)
-	if thinking == nil || thinking["budget_tokens"] != float64(4096) {
-		t.Fatalf("缺省 max_tokens 下 high 应为 4096: %v", out["thinking"])
-	}
-}
-
-func TestExplicitThinkingTakesPrecedence(t *testing.T) {
-	// 客户端自带 Anthropic 形态 thinking 时原样透传，不被 reasoning_effort 覆盖
+func TestExplicitBudgetDoesNotReplaceEffort(t *testing.T) {
 	explicit := map[string]any{"type": "enabled", "budget_tokens": float64(3000)}
 	out := convertInput(t, map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{},
-		"thinking": explicit, "reasoning_effort": "low",
+		"thinking": explicit, "reasoning_effort": "max",
 	})
-	if got, _ := out["thinking"].(map[string]any); !reflect.DeepEqual(got, explicit) {
-		t.Fatalf("显式 thinking 应优先: %v", got)
+	if !reflect.DeepEqual(out["thinking"], explicit) {
+		t.Fatalf("显式预算应独立保留: %v", out["thinking"])
+	}
+	config, _ := out["output_config"].(map[string]any)
+	if config["effort"] != "max" {
+		t.Fatal("不能因传入显式预算而丢弃 max 档位")
 	}
 }
 
-func TestExplicitThinkingDisabledRespected(t *testing.T) {
-	// 显式关闭思考时不得因 reasoning_effort 又被打开
-	out := convertInput(t, map[string]any{
+func TestGLM53CannotDisableThinking(t *testing.T) {
+	_, err := ConvertRequest(map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{},
 		"thinking": map[string]any{"type": "disabled"}, "reasoning_effort": "high",
 	})
-	got, _ := out["thinking"].(map[string]any)
-	if got == nil || got["type"] != "disabled" {
-		t.Fatalf("显式 disabled 应透传: %v", got)
+	if err == nil {
+		t.Fatal("GLM-5.3-Flash 不支持关闭思考，应明确提示使用 low")
 	}
 }

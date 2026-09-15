@@ -5,7 +5,6 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"strings"
 )
 
@@ -62,13 +61,8 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 	// stream_options.include_usage 是 OpenAI 侧参数，Messages API 没有对应字段，
 	// 故不写入上游请求体；handler 直接从原始 body 读取（见 handler.go）。
 
-	// 思维链：客户端显式 thinking 优先，其次按 reasoning_effort / reasoning.effort 档位开启
-	thinking, err := resolveThinking(body, numberOr(out["max_tokens"], 0))
-	if err != nil {
+	if err := applyGLM53Reasoning(body, out); err != nil {
 		return nil, err
-	}
-	if thinking != nil {
-		out["thinking"] = thinking
 	}
 
 	if err := applyTools(body, out, false); err != nil {
@@ -331,127 +325,4 @@ func toolCallToUse(call map[string]any) (map[string]any, error) {
 		"name":  name,
 		"input": input,
 	}, nil
-}
-
-// ── 思维链（extended thinking）───────────────────────────────────────────────
-// OpenAI 系客户端用 reasoning_effort 表达「想多久」，Anthropic 侧则是一个独立的
-// thinking 块（type/budget_tokens）。两个 OpenAI 兼容层共用本组工具做翻译；
-// /v1/messages 原生路径不需要它们——那条路是字节级透传，客户端自带 thinking 原样上行。
-
-// minThinkingBudget Anthropic 侧 budget_tokens 的下限；低于此值上游拒绝启用思考。
-const minThinkingBudget = 1024
-
-// thinkingBudgets 推理档位 → budget_tokens。取 OpenAI（low/medium/high/minimal）
-// 与 Responses（minimal/low/medium/high）两侧档位的并集。
-var thinkingBudgets = map[string]float64{
-	"minimal": 1024,
-	"low":     2048,
-	"medium":  4096,
-	"high":    8192,
-}
-
-// thinkingFromEffort 把推理档位翻译成 Anthropic 的 thinking 块。
-//
-// 预算上限取 max_tokens 的一半，而不是贴着 max_tokens 给满：max_tokens 是「思考 + 正文」
-// 的总上限，若把预算给到 max_tokens-1（如 high=8192 配默认 max_tokens=8192），正文只剩
-// 个位数额度，模型思考完会被立刻截断——比不思考更糟。留一半给正文。
-// 放不下最低预算时明确报错，不静默关闭思考，也不擅自放大输出上限。
-func thinkingFromEffort(effort any, maxTokens float64) (map[string]any, error) {
-	s, _ := effort.(string)
-	s = strings.ToLower(strings.TrimSpace(s))
-	if s == "none" {
-		return map[string]any{"type": "disabled"}, nil
-	}
-	budget, ok := thinkingBudgets[s]
-	if !ok {
-		return nil, &convertError{"reasoning_effort / reasoning.effort 仅支持 none、minimal、low、medium、high"}
-	}
-	if ceiling := math.Floor(maxTokens / 2); budget > ceiling {
-		budget = ceiling
-	}
-	if budget < minThinkingBudget {
-		return nil, &convertError{"开启思考时 max_tokens / max_output_tokens 至少为 2048，才能保留最低思考预算与正文空间"}
-	}
-	return map[string]any{"type": "enabled", "budget_tokens": budget}, nil
-}
-
-// resolveThinking 决定最终写入上游请求体的 thinking 块，优先级：
-//  1. 客户端显式传了 Anthropic 形态的 thinking（type 为 enabled / disabled）→
-//     校验预算后原样透传；只有 enabled 开关时按 effort 或 medium 补齐预算；
-//  2. 否则按 reasoning_effort（chat/completions）或 reasoning.effort（Responses）开启；
-//  3. 两者皆无 → 返回 nil，不写该字段。默认不主动开启思考，避免改变既有用户的
-//     响应形态与 token 消耗，也让旧行为与旧测试保持成立。
-func resolveThinking(body map[string]any, maxTokens float64) (map[string]any, error) {
-	if maxTokens <= 0 || math.IsInf(maxTokens, 0) || math.IsNaN(maxTokens) || math.Trunc(maxTokens) != maxTokens {
-		return nil, &convertError{"max_tokens / max_completion_tokens / max_output_tokens 必须是正整数"}
-	}
-	if raw := body["thinking"]; raw != nil {
-		explicit, ok := raw.(map[string]any)
-		if !ok {
-			return nil, &convertError{"thinking 必须是对象"}
-		}
-		switch explicit["type"] {
-		case "disabled":
-			return explicit, nil
-		case "enabled":
-			if explicit["budget_tokens"] == nil {
-				// Pi 的 ZAI/DeepSeek 适配器只发送启用开关；补齐 Anthropic 所需预算。
-				// 有 effort 时按档位，只有开关时用 medium；不透传 clear_thinking 等异协议字段。
-				effort, err := requestedReasoningEffort(body)
-				if err != nil {
-					return nil, err
-				}
-				if effort == nil {
-					effort = "medium"
-				}
-				thinking, err := thinkingFromEffort(effort, maxTokens)
-				if err == nil && thinking["type"] == "disabled" {
-					return nil, &convertError{"thinking.type=enabled 与 reasoning_effort=none 相互矛盾"}
-				}
-				return thinking, err
-			}
-			budget := numberOr(explicit["budget_tokens"], 0)
-			if math.Trunc(budget) != budget || budget < minThinkingBudget || budget >= maxTokens || math.IsNaN(budget) {
-				return nil, &convertError{"thinking.budget_tokens 必须是至少 1024 且小于 max_tokens / max_output_tokens 的整数"}
-			}
-			return explicit, nil
-		default:
-			return nil, &convertError{"thinking.type 仅支持 enabled 或 disabled"}
-		}
-	}
-	effort, err := requestedReasoningEffort(body)
-	if err != nil {
-		return nil, err
-	}
-	if effort != nil {
-		return thinkingFromEffort(effort, maxTokens)
-	}
-	return nil, nil
-}
-
-func requestedReasoningEffort(body map[string]any) (any, error) {
-	if effort := body["reasoning_effort"]; effort != nil {
-		return effort, nil
-	}
-	if raw := body["reasoning"]; raw != nil {
-		reasoning, ok := raw.(map[string]any)
-		if !ok {
-			return nil, &convertError{"reasoning 必须是对象"}
-		}
-		return reasoning["effort"], nil
-	}
-	return nil, nil
-}
-
-// numberOr 宽松取数值（JSON 数字解码为 float64）；不可用时回退默认值。
-func numberOr(v any, fallback float64) float64 {
-	switch n := v.(type) {
-	case float64:
-		return n
-	case int:
-		return float64(n)
-	case int64:
-		return float64(n)
-	}
-	return fallback
 }

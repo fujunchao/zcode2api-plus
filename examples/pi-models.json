@@ -22,13 +22,32 @@
           ],
           "maxTokens": 16384,
           "thinkingLevelMap": {
-            "off": "none",
-            "minimal": "minimal",
+            "off": null,
+            "minimal": null,
             "low": "low",
-            "medium": "medium",
+            "medium": null,
             "high": "high",
             "xhigh": null,
-            "max": null
+            "max": "max"
+          }
+        },
+        {
+          "id": "glm-5.3-flash",
+          "name": "ZCode GLM-5.3-Flash",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "maxTokens": 16384,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
           }
         }
       ]
