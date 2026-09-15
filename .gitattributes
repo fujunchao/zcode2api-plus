@@ -2,3 +2,8 @@
 deploy/*.sh text eol=lf
 deploy/zcode2api.service text eol=lf
 deploy/zcode2api.env.example text eol=lf
+
+# 容器化文件保持 LF：Dockerfile 的 `\` 續行在 CRLF 下可能被解析錯
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+.dockerignore text eol=lf

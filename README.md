@@ -26,7 +26,11 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 ## 快速開始
 
 ```bash
-# 下載現成產物（Releases 頁：linux / darwin / windows × amd64 / arm64）
+# 容器（最快）：鏡像見 GHCR，或就地從源碼構建
+docker compose up -d
+docker compose logs zcode2api | grep -E '初始后台密码|网关 API Key'
+
+# 或裸二進制：下載現成產物（Releases 頁：linux / darwin / windows × amd64 / arm64）
 # 或源碼構建：
 go build -o zcode2api ./cmd/zcode2api
 ./zcode2api serve            # http://127.0.0.1:3000
@@ -53,7 +57,31 @@ zcode2api set-admin-key <key>        設置後台密碼
 zcode2api export [file] / import <file>   賬號導出/導入（與 python-legacy 互通）
 ```
 
-## 部署（裸二進制 + systemd，推薦）
+## 部署
+
+### 方式一：Docker（推薦）
+
+```bash
+docker compose up -d            # 同目錄的 docker-compose.yml，預設從源碼構建
+docker compose logs zcode2api | grep -E '初始后台密码|网关 API Key'
+```
+
+CI 推 `v*` tag 時會構建 `linux/amd64` + `linux/arm64` 多架構鏡像並發到
+`ghcr.io/fujunchao/zcode2api-plus`（用上現成鏡像可把 compose 裡的 `build:` 註釋掉，
+改指該 image）。**首次發布後記得把 GHCR package 的可見性改成 Public**，否則他人 pull 需先登入。
+
+數據持久化在命名卷 `zcode-data`，內含 `accounts.db`、`device_mid.txt` 與補丁 Chromium 緩存；
+**首次求解驗證碼時**自動下載約 200MB 補丁 Chromium（僅一次，走卷持久化）。
+
+兩個容易踩的坑：
+
+- 應用**不讀 `.env` 文件**（只認進程環境變量）。同目錄的 `.env` 之所以生效，是因為 compose
+  讀它來做 `${VAR}` 插值——所以變量必須在 `docker-compose.yml` 的 `environment:` 裡顯式引用，
+  寫進 `.env` 卻沒被引用的不會進容器；把 `.env` 放進 `/data` 更是完全無效。
+- 想沿用宿主機既有的 `./data` 目錄時，bind mount 前先 `sudo chown -R 10001:10001 ./data`
+  （鏡像以 uid 10001 非 root 運行），或改用命名卷。
+
+### 方式二：裸二進制 + systemd
 
 ```ini
 # /etc/systemd/system/zcode2api.service
@@ -67,7 +95,8 @@ Restart=on-failure
 ```
 
 > 💡 驗證碼瀏覽器：啟動時自動從 cloakbrowser.dev 下載補丁 Chromium（SHA256SUMS +
-> Ed25519 簽名校驗，GitHub Releases 兜底），緩存於 `~/.cloakbrowser/`，零 Python 依賴。
+> Ed25519 簽名校驗，GitHub Releases 兜底），緩存於 `~/.cloakbrowser/`（容器內為
+> `/data/cloakbrowser`），零 Python 依賴。
 > 下載源可用 `CLOAKBROWSER_DOWNLOAD_URL` 覆蓋；`ZCODE_CAPTCHA_BROWSER_BIN` 可指向
 > 任意已有瀏覽器。實測部分發行版自帶 Chromium（如 Debian 150）會被風控拒絕——
 > 自動下載的補丁二進制即為此問題的內建解法。

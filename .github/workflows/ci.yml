@@ -8,7 +8,8 @@
 #   3. 本仓库是公开仓库，Actions 分钟数不计费。
 #
 # 全量测试均为 httptest 本地环回或显式 t.Skip（真机用例需 ZCODE_REAL_BROWSER_TEST=1），
-# 故本工作流不联网、不需要浏览器，可直接跑。
+# 故 test / cross-build 两个 job 不触网、不需要浏览器。docker job 需要联网
+# （拉基础镜像、apt 装 Chromium 运行库、go mod download）。
 name: ci
 
 on:
@@ -69,3 +70,22 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/zcode2api
+
+  # 镜像构建守门员：本地不一定装了 Docker（本仓库开发者机器就没有），
+  # 所以 Dockerfile 的正确性只能靠这里保证。只构建不推送，推送上 GHCR 在 release.yml。
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 单平台构建即可验证 Dockerfile；多架构留给 release.yml
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

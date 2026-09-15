@@ -42,3 +42,47 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: zcode2api-*
+
+  # 多架構容器鏡像 → ghcr.io/<repo>。linux/amd64 與 linux/arm64 都有 cloakbrowser
+  # 的預構建補丁 Chromium，故兩個架構都能自動求解驗證碼。
+  # 構建階段用 $BUILDPLATFORM（原生速度）交叉編譯，故 QEMU 只需支撐運行階段的 apt。
+  #
+  # ⚠️ 首次推送後，GHCR 套件預設是 private：要在
+  #    GitHub → 該 package 的 Settings → Change visibility 改成 Public，
+  #    否則別人 pull 需要先 docker login。
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

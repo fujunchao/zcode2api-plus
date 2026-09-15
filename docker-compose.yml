@@ -1,0 +1,63 @@
+# Docker Compose 部署。
+#
+# 用法：
+#   1) 在同目录建 .env（可选，但推薦）寫上兩個密鑰：
+#        ZCODE_ADMIN_KEY=你的後台密碼
+#        ZCODE_GATEWAY_KEY=sk-你的網關金鑰
+#      不寫也行——首次啟動會隨機生成並打到日誌裡。
+#   2) docker compose up -d
+#   3) docker compose logs zcode2api | grep -E '初始后台密码|网关 API Key'
+#
+# ⚠️ 兩個容易踩的坑：
+#   a) 應用本身**不讀 .env 文件**（只認進程環境變量，見 internal/config）。
+#      同目錄的 .env 之所以生效，是因為 compose 讀它來做 ${VAR} 插值 —— 因此下面每個
+#      變量都必須在 environment: 裡顯式引用；寫進 .env 卻沒被引用的不會進容器。
+#   b) 別把 .env 放進數據卷（/data）裡，應用不會讀它。
+
+services:
+  zcode2api:
+    # 預設從源碼構建，開箱即用、不依賴鏡像是否已發布。
+    # CI 推 v* tag 後會把 linux/amd64 + linux/arm64 多架構鏡像發到 GHCR，
+    # 屆時可註釋掉 build: 並改用鏡像（更省事，也省下本地 Go 構建）：
+    #   image: ghcr.io/fujunchao/zcode2api-plus:latest
+    build: .
+    image: zcode2api-plus:latest
+    container_name: zcode2api
+    restart: unless-stopped
+    # 容器內會拉起 Chromium 子進程，用 init 收屍，避免殭屍進程堆積
+    init: true
+    ports:
+      - "${ZCODE_PORT:-3000}:${ZCODE_PORT:-3000}"
+    environment:
+      ZCODE_PORT: ${ZCODE_PORT:-3000}
+      ZCODE_HOST: 0.0.0.0
+      ZCODE_DATA_DIR: /data
+      # 密鑰初始值：留空 → 首次啟動隨機生成並打到日誌；寫入數據庫後以庫為準
+      ZCODE_ADMIN_KEY: ${ZCODE_ADMIN_KEY:-}
+      ZCODE_GATEWAY_KEY: ${ZCODE_GATEWAY_KEY:-}
+      # 驗證碼瀏覽器池：JWT 賬號自動過驗證碼必需。首次用到時自動下載約 200MB
+      # 補丁 Chromium 到 /data/cloakbrowser（只需一次，走卷持久化）。
+      # 只用 API Key 賬號、或打算後台人工回填，可設 "false" 免掉這 200MB。
+      ZCODE_CAPTCHA_BROWSER: ${ZCODE_CAPTCHA_BROWSER:-true}
+      # 後台自動刷新額度的間隔（秒），0 關閉
+      ZCODE_QUOTA_REFRESH_INTERVAL: ${ZCODE_QUOTA_REFRESH_INTERVAL:-60}
+      # 限流冷卻時長（秒）
+      ZCODE_COOLING_SECONDS: ${ZCODE_COOLING_SECONDS:-300}
+    volumes:
+      # 必須持久化：accounts.db + device_mid.txt + 補丁 Chromium 都在這裡。
+      # device_mid 每次重建都變會被上游當成新設備（風控）。
+      - zcode-data:/data
+      # 想沿用宿主機既有的 ./data 目錄，改用下面這行，並先對齊屬主
+      #（鏡像以 uid 10001 非 root 運行）：sudo chown -R 10001:10001 ./data
+      # - ./data:/data
+    # 若改用 bind mount 又不想 chown，可取消註釋改以 root 運行
+    #（--no-sandbox 已內置於 rod 啟動參數，不會撞沙箱）
+    # user: "0:0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  zcode-data:

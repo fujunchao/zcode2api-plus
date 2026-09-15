@@ -37,6 +37,10 @@
 - [ ] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
 - [ ] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
 - [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建 linux/darwin/windows × amd64/arm64 并上传 Releases）— `.github/workflows/release.yml`
+- [x] **容器化交付（2026-09-15 决策翻转：Docker 重新纳入）**：多阶段 `Dockerfile`
+  （golang:1.25-bookworm 构建 → debian:bookworm-slim 运行，非 root uid 10001）+ `docker-compose.yml`
+  + `.dockerignore`；CI 每次 push 构建镜像当守门员，推 `v*` tag 时构建 linux/amd64 + linux/arm64
+  多架构镜像并发布到 GHCR。翻转依据见 §9。
 - [ ] **套餐自动领取（Go 版增量，2026-09-10 后新增，Python 主仓已上线）**：billing/preview + billing/claim、
   激活事件上报、业务码翻译、3007 换码重试、入池自动领取（对照 Python 主仓 `app/claim.py` + `app/telemetry.py`，见 §5.9）
 
@@ -338,5 +342,14 @@ meta(key TEXT PK, value TEXT)
 - `go build ./cmd/zcode2api` → 单二进制（前端已 embed），仅 Chromium 运行库为外部依赖。
 - Release CI：推 `v*` tag → GitHub Actions 交叉编译 linux/darwin/windows × amd64/arm64
   （CGO_ENABLED=0，`-trimpath -ldflags="-s -w"`）→ 上传 GitHub Releases。
-  （2026-09-11 定案放弃 Docker 镜像方案：裸二进制 + systemd 更简单，Chromium 由部署机自备。）
+  （2026-09-11 曾定案放弃 Docker 镜像方案：裸二进制 + systemd 更简单，Chromium 由部署机自备。
+  **2026-09-15 翻回**：① 补丁 Chromium 的自动下载已是纯 Go 实现（`internal/captcha/browserdl.go`，
+  net/http + archive/tar，无 curl/tar 等外部工具依赖），容器化不再需要把 Python 构建期依赖带进来；
+  ② rod 启动参数已内置 `--no-sandbox`（`captcha/solve.go`），容器内无需额外旗标；
+  ③ cloakbrowser 对 linux-x64 与 linux-arm64 都有预构建二进制，多架构镜像可行。
+  保留 systemd 作为无 Docker 环境的替代方案。）
+- 容器镜像（`Dockerfile` + `docker-compose.yml`）：debian:bookworm-slim 运行阶段，
+  非 root uid 10001；`/data` 卷承载 `accounts.db`、`device_mid.txt` 与
+  `CLOAKBROWSER_CACHE_DIR=/data/cloakbrowser`（device_mid 必须稳定，否则被上游当新设备）。
+  **不可用 Alpine**：补丁 Chromium 是 glibc 构建，musl 下跑不起来（表现是 JWT 账号恒 503）。
 - Python 版保留在仓库中直至 Go 版 M6 验收通过，届时再决定去留（不在本计划范围内）。

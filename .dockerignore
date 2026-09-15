@@ -1,0 +1,13 @@
+# 構建上下文瘦身。
+# ⚠️ 不要排除 frontend/dist —— go:embed 依賴它，缺了構建會失敗（Dockerfile 內有守衛）。
+.git
+.github
+.vscode
+.idea
+data/
+temp/
+.workbuddy/
+node_modules/
+frontend/node_modules/
+*.log
+*.pprof
