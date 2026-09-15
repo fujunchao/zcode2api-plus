@@ -68,7 +68,8 @@ docker compose logs zcode2api | grep -E '初始后台密码|网关 API Key'
 
 CI 推 `v*` tag 時會構建 `linux/amd64` + `linux/arm64` 多架構鏡像並發到
 `ghcr.io/fujunchao/zcode2api-plus`（用上現成鏡像可把 compose 裡的 `build:` 註釋掉，
-改指該 image）。**首次發布後記得把 GHCR package 的可見性改成 Public**，否則他人 pull 需先登入。
+改指該 image；公開倉庫的 package 默認繼承 Public 可見性，匿名即可 pull——
+若你把倉庫改成私有，需到 package 的 Settings 自行調整）。
 
 數據持久化在命名卷 `zcode-data`，內含 `accounts.db`、`device_mid.txt` 與補丁 Chromium 緩存；
 **首次求解驗證碼時**自動下載約 200MB 補丁 Chromium（僅一次，走卷持久化）。

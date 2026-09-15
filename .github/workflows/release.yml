@@ -47,9 +47,7 @@ jobs:
   # 的預構建補丁 Chromium，故兩個架構都能自動求解驗證碼。
   # 構建階段用 $BUILDPLATFORM（原生速度）交叉編譯，故 QEMU 只需支撐運行階段的 apt。
   #
-  # ⚠️ 首次推送後，GHCR 套件預設是 private：要在
-  #    GitHub → 該 package 的 Settings → Change visibility 改成 Public，
-  #    否則別人 pull 需要先 docker login。
+  # 實測（v2.0.2-go）：公開倉庫的 package 默認即可匿名 pull，無需手動改可見性。
   image:
     runs-on: ubuntu-latest
     permissions:
