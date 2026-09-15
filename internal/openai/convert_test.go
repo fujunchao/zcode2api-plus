@@ -295,8 +295,10 @@ func TestNoThinkingByDefault(t *testing.T) {
 }
 
 func TestReasoningEffortEnablesThinking(t *testing.T) {
+	// max_tokens 足够大时，档位预算全额生效
 	out := convertInput(t, map[string]any{
-		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "high",
+		"model": "glm-5.3-flash", "messages": []any{},
+		"reasoning_effort": "high", "max_tokens": float64(16384),
 	})
 	thinking, ok := out["thinking"].(map[string]any)
 	if !ok {
@@ -316,26 +318,38 @@ func TestReasoningEffortUnknownValueIgnored(t *testing.T) {
 	}
 }
 
-func TestThinkingBudgetClampedToMaxTokens(t *testing.T) {
-	// 上游要求 budget_tokens 严格小于 max_tokens
+func TestThinkingBudgetLeavesRoomForAnswer(t *testing.T) {
+	// max_tokens 是「思考 + 正文」的总上限，预算最多占一半，否则正文会被立刻截断
 	out := convertInput(t, map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{},
-		"reasoning_effort": "high", "max_tokens": float64(2000),
+		"reasoning_effort": "high", "max_tokens": float64(3000),
 	})
 	thinking, _ := out["thinking"].(map[string]any)
-	if thinking["budget_tokens"] != float64(1999) {
-		t.Fatalf("budget 应收缩到 max_tokens-1: %v", thinking)
+	if thinking["budget_tokens"] != float64(1500) {
+		t.Fatalf("预算应收缩到 max_tokens 的一半: %v", thinking)
 	}
 }
 
 func TestThinkingOmittedWhenNoRoom(t *testing.T) {
-	// 预算连最小思考都装不下：宁可不启用，也不擅自放大 max_tokens
+	// 预算连最小思考都装不下（8192 的一半 4096 尚可，调小到 1024 则一半仅 512）：宁可不启用，
+	// 也不擅自放大 max_tokens
 	out := convertInput(t, map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{},
 		"reasoning_effort": "high", "max_tokens": float64(1024),
 	})
 	if _, ok := out["thinking"]; ok {
 		t.Fatalf("无空间时不应开启思考: %v", out["thinking"])
+	}
+}
+
+func TestDefaultMaxTokensStillEnablesThinking(t *testing.T) {
+	// 缺省 max_tokens=8192：high 档被压到 4096，仍应启用（正文同得 4096）
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "high",
+	})
+	thinking, _ := out["thinking"].(map[string]any)
+	if thinking == nil || thinking["budget_tokens"] != float64(4096) {
+		t.Fatalf("缺省 max_tokens 下 high 应为 4096: %v", out["thinking"])
 	}
 }
 

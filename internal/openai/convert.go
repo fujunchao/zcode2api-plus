@@ -384,8 +384,12 @@ var thinkingBudgets = map[string]float64{
 }
 
 // thinkingFromEffort 把推理档位翻译成 Anthropic 的 thinking 块。
-// 上游要求 budget_tokens 严格小于 max_tokens，否则整条请求被拒——空间不足时
-// 宁可不启用思考，也不擅自放大 max_tokens（那会改变调用方的成本预期）。
+//
+// 预算上限取 max_tokens 的一半，而不是贴着 max_tokens 给满：max_tokens 是「思考 + 正文」
+// 的总上限，若把预算给到 max_tokens-1（如 high=8192 配默认 max_tokens=8192），正文只剩
+// 个位数额度，模型思考完会被立刻截断——比不思考更糟。留一半给正文。
+// 连最小预算（minThinkingBudget）都放不下时返回 nil，不启用思考：宁可不思考，
+// 也不擅自放大 max_tokens（那会改变调用方的成本预期）。
 // 档位无法识别（含非字符串、空值）时返回 nil。
 func thinkingFromEffort(effort any, maxTokens float64) map[string]any {
 	s, _ := effort.(string)
@@ -393,11 +397,11 @@ func thinkingFromEffort(effort any, maxTokens float64) map[string]any {
 	if !ok {
 		return nil
 	}
-	if maxTokens <= minThinkingBudget {
-		return nil
+	if ceiling := float64(int(maxTokens / 2)); budget > ceiling {
+		budget = ceiling
 	}
-	if budget > maxTokens-1 {
-		budget = maxTokens - 1
+	if budget < minThinkingBudget {
+		return nil
 	}
 	return map[string]any{"type": "enabled", "budget_tokens": budget}
 }

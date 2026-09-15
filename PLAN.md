@@ -201,7 +201,7 @@ meta(key TEXT PK, value TEXT)
 | `stream` | true → OpenAI chunk 流；false → JSON |
 | `tools` / `tool_choice` | tools → Anthropic tools（`parameters` → `input_schema`）；choice `auto/none` 透传语义、named → `{type:"tool",name}` |
 | `n` | 仅支持 1，>1 返回 400 |
-| `reasoning_effort`（顶层） | 映射为 Anthropic `thinking` 块：`minimal/low/medium/high` → `budget_tokens` 1024/2048/4096/8192；`budget_tokens` 收缩到 `max_tokens-1`（上游要求严格小于），装不下则不启用——**不擅自放大 `max_tokens`** |
+| `reasoning_effort`（顶层） | 映射为 Anthropic `thinking` 块：`minimal/low/medium/high` → `budget_tokens` 1024/2048/4096/8192；预算**上限取 `max_tokens` 的一半**（`max_tokens` 是思考+正文总上限，给满会让正文被截断），低于 1024 则不启用——**不擅自放大 `max_tokens`** |
 | `thinking`（Anthropic 形态，客户端自带） | 原样透传并优先于 `reasoning_effort`，含 `type:"disabled"` 显式关闭 |
 | `presence_penalty` / `frequency_penalty` / `logprobs` / `user` 等 | 静默忽略（README 声明） |
 
@@ -331,7 +331,7 @@ meta(key TEXT PK, value TEXT)
 | Go 无 jsdom 兜底 | 接受——jsdom 本已被风控判死；人工回填为最终兜底 |
 | rod 版本 API 变动 | go.mod 锁定 minor 版本 |
 | 开启 thinking 后多轮会话历史缺 thinking 块 | Anthropic 语义下续聊需回灌上一轮 thinking（含签名）；OpenAI 形态客户端只回传正文与 `reasoning_content`，缺签名无法合规回灌。当前策略：历史不回灌、按上游实际行为验收；若上游强制要求，则改为仅在客户端显式传 Anthropic `thinking` 时开启，或增加开关 |
-| thinking 的 `budget_tokens` 与 `max_tokens` 冲突 | 收缩到 `max_tokens-1`；装不下（≤1024）时不启用思考，宁可不思考也不擅自放大 `max_tokens` |
+| thinking 的 `budget_tokens` 与 `max_tokens` 冲突 | 预算上限取 `max_tokens` 一半，给正文留同等空间（贴近 `max_tokens` 会让正文被立刻截断，比不思考更糟）；低于 1024 时不启用思考，宁可不思考也不擅自放大 `max_tokens` |
 
 ## 9. 交付形态
 

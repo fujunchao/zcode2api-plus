@@ -62,9 +62,10 @@ func TestResponsesConvertItems(t *testing.T) {
 	if oc["effort"] != "high" {
 		t.Fatalf("reasoning.effort 未映射: %v", got["output_config"])
 	}
-	// 同一档位还应翻译成上游的 thinking 块（output_config.effort 是否被识别未验证）
+	// 同一档位还应翻译成上游的 thinking 块（output_config.effort 是否被识别未验证）；
+	// 未给 max_output_tokens，缺省 max_tokens=8192 → 预算占一半 4096
 	thinking, _ := got["thinking"].(map[string]any)
-	if thinking == nil || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(8192) {
+	if thinking == nil || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(4096) {
 		t.Fatalf("reasoning.effort 应同时开启 thinking: %v", got["thinking"])
 	}
 	msgs, _ := got["messages"].([]any)
