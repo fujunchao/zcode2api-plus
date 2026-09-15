@@ -102,6 +102,13 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
+// setResponder 与上游处理器使用同一把锁，外部 SDK 进程发起请求时也有明确的同步关系。
+func (f *fixture) setResponder(respond func(int) (int, string, string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.respond = respond
+}
+
 // postChat 发起 OpenAI 请求并返回状态码与响应体。
 func (f *fixture) postChat(t *testing.T, key, payload string) (int, string) {
 	t.Helper()
@@ -130,12 +137,12 @@ func TestChatCompletionsNonStream(t *testing.T) {
 	// 非流式：OpenAI 请求 → Anthropic 上游 → OpenAI 响应；上游收包应为
 	// Anthropic 形态（system 归并、max_tokens 映射）
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) {
+	f.setResponder(func(int) (int, string, string) {
 		return http.StatusOK, "application/json",
 			`{"id":"msg_a","type":"message","role":"assistant","model":"GLM-5.3",
 			  "stop_reason":"end_turn","usage":{"input_tokens":6,"output_tokens":3},
 			  "content":[{"type":"text","text":"回答"}]}`
-	}
+	})
 
 	code, body := f.postChat(t, "sk-test", `{
 		"model":"glm-5.3-flash","max_tokens":100,"stream":false,
@@ -178,7 +185,7 @@ func TestChatCompletionsNonStream(t *testing.T) {
 func TestChatCompletionsStream(t *testing.T) {
 	// 流式：SSE 重编码为 OpenAI chunk 流
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) {
+	f.setResponder(func(int) (int, string, string) {
 		return http.StatusOK, "text/event-stream",
 			"event: message_start\n" +
 				`data: {"type":"message_start","message":{"id":"msg_s","model":"GLM-5.3","usage":{"input_tokens":4}}}` + "\n\n" +
@@ -188,7 +195,7 @@ func TestChatCompletionsStream(t *testing.T) {
 				`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}` + "\n\n" +
 				"event: message_stop\n" +
 				`data: {"type":"message_stop"}` + "\n\n"
-	}
+	})
 
 	req, _ := http.NewRequest(http.MethodPost, f.srv.URL+"/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.3-flash","stream":true,
@@ -228,13 +235,13 @@ func TestChatCompletionsStream(t *testing.T) {
 func TestChatCompletionsToolCall(t *testing.T) {
 	// 工具调用：tools/tool_choice 转换 + tool_use → tool_calls
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) {
+	f.setResponder(func(int) (int, string, string) {
 		return http.StatusOK, "application/json",
 			`{"id":"msg_t","type":"message","role":"assistant","model":"GLM-5.3",
 			  "stop_reason":"tool_use","usage":{"input_tokens":9,"output_tokens":5},
 			  "content":[{"type":"tool_use","id":"call_77","name":"get_weather",
 			              "input":{"city":"北京"}}]}`
-	}
+	})
 
 	code, body := f.postChat(t, "sk-test", `{
 		"model":"glm-5.3-flash","max_tokens":512,

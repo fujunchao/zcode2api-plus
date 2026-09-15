@@ -21,7 +21,7 @@ func TestClientSDKCompatibility(t *testing.T) {
 			}
 			f := newFixture(t)
 			mixed := mixedToolStream(t)
-			f.respond = func(call int) (int, string, string) {
+			f.setResponder(func(call int) (int, string, string) {
 				up := f.lastUpstream().Body
 				hasResult := false
 				messages, _ := up["messages"].([]any)
@@ -44,7 +44,7 @@ func TestClientSDKCompatibility(t *testing.T) {
 					return http.StatusOK, "text/event-stream", mixed
 				}
 				return http.StatusOK, "application/json", `{"id":"sdk_json","model":"GLM-5.3","stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":6},"content":[{"type":"thinking","thinking":"先查询两个城市。"},{"type":"text","text":"正在查询天气。"},{"type":"tool_use","id":"call_a","name":"get_weather","input":{"city":"杭州"}},{"type":"tool_use","id":"call_b","name":"get_weather","input":{"city":"上海"}}]}`
-			}
+			})
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			program, script := "python", "testdata/python_sdk_compat.py"

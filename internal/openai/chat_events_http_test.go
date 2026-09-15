@@ -11,14 +11,14 @@ func TestChatStreamPreservesInitialToolInput(t *testing.T) {
 	for _, input := range []string{`{"city":"杭州"}`, `{}`} {
 		t.Run(input, func(t *testing.T) {
 			f := newFixture(t)
-			f.respond = func(int) (int, string, string) {
+			f.setResponder(func(int) (int, string, string) {
 				return http.StatusOK, "text/event-stream",
 					"event: message_start\ndata: {\"message\":{\"id\":\"initial_tool\",\"model\":\"GLM-5.3\"}}\n\n" +
 						"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_initial\",\"name\":\"get_weather\",\"input\":" + input + "}}\n\n" +
 						"event: content_block_stop\ndata: {\"index\":0}\n\n" +
 						"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
 						"event: message_stop\ndata: {}\n\n"
-			}
+			})
 			body := compatRequest("chat")
 			body["stream"] = true
 			status, raw := postCompat(t, f, "chat", body)
@@ -62,7 +62,7 @@ func TestChatStreamReportsUpstreamFailure(t *testing.T) {
 		"event: content_block_delta\ndata: {\"index\":99,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
 	} {
 		f := newFixture(t)
-		f.respond = func(int) (int, string, string) { return http.StatusOK, "text/event-stream", truncated + tail }
+		f.setResponder(func(int) (int, string, string) { return http.StatusOK, "text/event-stream", truncated + tail })
 		body := compatRequest("chat")
 		body["stream"] = true
 		status, raw := postCompat(t, f, "chat", body)
@@ -74,13 +74,13 @@ func TestChatStreamReportsUpstreamFailure(t *testing.T) {
 
 func TestChatInitialToolArgumentsPrecedeFinish(t *testing.T) {
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) {
+	f.setResponder(func(int) (int, string, string) {
 		return http.StatusOK, "text/event-stream",
 			"event: message_start\ndata: {\"message\":{\"id\":\"initial\",\"model\":\"GLM-5.3\"}}\n\n" +
 				"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_a\",\"name\":\"get_weather\",\"input\":{\"city\":\"杭州\"}}}\n\n" +
 				"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
 				"event: message_stop\ndata: {}\n\n"
-	}
+	})
 	body := compatRequest("chat")
 	body["stream"] = true
 	status, raw := postCompat(t, f, "chat", body)

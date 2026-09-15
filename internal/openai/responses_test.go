@@ -234,12 +234,12 @@ func TestResponsesStreamEvents(t *testing.T) {
 
 func TestResponsesE2ENonStream(t *testing.T) {
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) {
+	f.setResponder(func(int) (int, string, string) {
 		return http.StatusOK, "application/json",
 			`{"id":"msg_a","type":"message","role":"assistant","model":"GLM-5.3",
 			  "stop_reason":"end_turn","usage":{"input_tokens":6,"output_tokens":3},
 			  "content":[{"type":"text","text":"回答"}]}`
-	}
+	})
 	code, body := post(f, t, "sk-test", `{"model":"glm-5.3-flash","input":"你好"}`)
 	if code != http.StatusOK {
 		t.Fatalf("应 200: %d %s", code, body)
@@ -259,12 +259,12 @@ func TestResponsesE2ENonStream(t *testing.T) {
 
 func TestResponsesE2EStream(t *testing.T) {
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) {
+	f.setResponder(func(int) (int, string, string) {
 		return http.StatusOK, "text/event-stream",
 			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"GLM-5.3\",\"usage\":{\"input_tokens\":4}}}\n\n" +
 				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"回复\"}}\n\n" +
 				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-	}
+	})
 	code, body := post(f, t, "sk-test", `{"model":"glm-5.3-flash","input":"hi","stream":true}`)
 	if code != http.StatusOK {
 		t.Fatalf("应 200: %d %s", code, body)

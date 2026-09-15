@@ -45,7 +45,7 @@ func TestUnsupportedToolControlsRejectedBeforeUpstream(t *testing.T) {
 		} {
 			t.Run(api+"/"+tc.name, func(t *testing.T) {
 				f := newFixture(t)
-				f.respond = replyText
+				f.setResponder(replyText)
 				body := compatRequest(api)
 				fn := body["tools"].([]any)[0].(map[string]any)
 				if api == "chat" {
@@ -100,7 +100,7 @@ func TestToolControlsReachUpstream(t *testing.T) {
 		} {
 			t.Run(api+"/"+tc.name, func(t *testing.T) {
 				f := newFixture(t)
-				f.respond = replyText
+				f.setResponder(replyText)
 				body := compatRequest(api)
 				body["parallel_tool_calls"] = tc.parallel
 				if tc.choice == "named" {
@@ -156,7 +156,7 @@ func TestThinkingControlsOverHTTP(t *testing.T) {
 		} {
 			t.Run(api+"/"+tc.name, func(t *testing.T) {
 				f := newFixture(t)
-				f.respond = replyText
+				f.setResponder(replyText)
 				body := compatRequest(api)
 				if api == "chat" {
 					body["reasoning_effort"], body["max_tokens"] = tc.effort, tc.limit
@@ -198,12 +198,12 @@ func TestFunctionCallsRoundTripOverHTTP(t *testing.T) {
 	for _, api := range []string{"chat", "responses"} {
 		t.Run(api, func(t *testing.T) {
 			f := newFixture(t)
-			f.respond = func(call int) (int, string, string) {
+			f.setResponder(func(call int) (int, string, string) {
 				if call == 1 {
 					return http.StatusOK, "application/json", `{"id":"tool_round","model":"GLM-5.3","stop_reason":"tool_use","usage":{"input_tokens":4,"output_tokens":7},"content":[{"type":"thinking","thinking":"查询两个城市","signature":"private-fixture-signature"},{"type":"tool_use","id":"call_a","name":"get_weather","input":{"city":"杭州"}},{"type":"tool_use","id":"call_b","name":"get_weather","input":{"city":"上海"}}]}`
 				}
 				return replyText(call)
-			}
+			})
 			body := compatRequest(api)
 			status, raw := postCompat(t, f, api, body)
 			if status != http.StatusOK {
@@ -281,7 +281,7 @@ func TestPiZaiThinkingSwitchOverHTTP(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
-			f.respond = replyText
+			f.setResponder(replyText)
 			body := compatRequest("chat")
 			body["max_tokens"] = 16384
 			body["thinking"] = map[string]any{"type": "enabled", "clear_thinking": false}

@@ -56,7 +56,7 @@ func mixedToolStream(t *testing.T) string {
 
 func TestMixedResponsesStreamPreservesInterleavedTools(t *testing.T) {
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) { return http.StatusOK, "text/event-stream", mixedToolStream(t) }
+	f.setResponder(func(int) (int, string, string) { return http.StatusOK, "text/event-stream", mixedToolStream(t) })
 	body := compatRequest("responses")
 	body["stream"] = true
 	status, raw := postCompat(t, f, "responses", body)
@@ -112,9 +112,9 @@ func TestMixedResponsesStreamPreservesInterleavedTools(t *testing.T) {
 
 func TestResponsesSSELifecycleOverHTTP(t *testing.T) {
 	f := newFixture(t)
-	f.respond = func(int) (int, string, string) {
+	f.setResponder(func(int) (int, string, string) {
 		return http.StatusOK, "text/event-stream", responseTextStream
-	}
+	})
 	body := compatRequest("responses")
 	body["stream"], body["parallel_tool_calls"] = true, false
 	status, raw := postCompat(t, f, "responses", body)
@@ -163,7 +163,7 @@ func TestResponsesStreamTerminationOverHTTP(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
-			f.respond = func(int) (int, string, string) { return http.StatusOK, "text/event-stream", tc.stream }
+			f.setResponder(func(int) (int, string, string) { return http.StatusOK, "text/event-stream", tc.stream })
 			body := compatRequest("responses")
 			body["stream"] = true
 			status, raw := postCompat(t, f, "responses", body)
@@ -193,10 +193,10 @@ func TestResponsesStreamTerminationOverHTTP(t *testing.T) {
 
 func TestResponsesJSONReflectsLimitAndParallelOption(t *testing.T) {
 	f := newFixture(t)
-	f.respond = func(call int) (int, string, string) {
+	f.setResponder(func(call int) (int, string, string) {
 		status, contentType, body := replyText(call)
 		return status, contentType, strings.ReplaceAll(body, "end_turn", "max_tokens")
-	}
+	})
 	body := compatRequest("responses")
 	body["parallel_tool_calls"] = false
 	status, raw := postCompat(t, f, "responses", body)
