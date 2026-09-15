@@ -43,10 +43,12 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	oldDB, oldZai, oldData := config.DBPath, config.UpstreamZai, config.DataDir
+	oldDB, oldZai, oldFallback, oldData := config.DBPath, config.UpstreamZai, config.UpstreamZaiFallback, config.DataDir
 	config.DBPath = filepath.Join(t.TempDir(), "accounts.db")
 	config.DataDir = t.TempDir()
-	t.Cleanup(func() { config.DBPath, config.UpstreamZai, config.DataDir = oldDB, oldZai, oldData })
+	t.Cleanup(func() {
+		config.DBPath, config.UpstreamZai, config.UpstreamZaiFallback, config.DataDir = oldDB, oldZai, oldFallback, oldData
+	})
 
 	f := &fixture{}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

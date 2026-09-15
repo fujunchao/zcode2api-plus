@@ -46,45 +46,23 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 		out["system"] = []any{map[string]any{"type": "text", "text": inst}}
 	}
 
-	// reasoning.effort → output_config.effort（§5.8 契约）
-	if reasoning, ok := body["reasoning"].(map[string]any); ok {
-		if effort, ok := reasoning["effort"].(string); ok && effort != "" {
-			out["output_config"] = map[string]any{"effort": effort}
-		}
+	thinking, err := resolveThinking(body, numberOr(out["max_tokens"], 0))
+	if err != nil {
+		return nil, err
 	}
-	// 思维链：同一档位再翻译成 Anthropic 侧的 thinking 块。output_config.effort 是否
-	// 被上游识别未经验证，thinking 才是 Anthropic 协议里的标准开关；两者并存，
-	// 任一被上游支持即可生效，互不冲突。
-	if thinking := resolveThinking(body, numberOr(out["max_tokens"], 8192)); thinking != nil {
+	if thinking != nil {
 		out["thinking"] = thinking
+		// 保留既有 effort 提示，但不覆盖显式 thinking，也不在关闭思考时追加启用提示。
+		if thinking["type"] == "enabled" && body["thinking"] == nil && body["reasoning_effort"] == nil {
+			if reasoning, ok := body["reasoning"].(map[string]any); ok {
+				effort := strings.ToLower(strings.TrimSpace(stringOf(reasoning["effort"])))
+				out["output_config"] = map[string]any{"effort": effort}
+			}
+		}
 	}
 
-	// 扁平 tools（Responses 形态：type/name/description/parameters 直列）
-	if rawTools, ok := body["tools"].([]any); ok && len(rawTools) > 0 {
-		tools := make([]any, 0, len(rawTools))
-		for _, raw := range rawTools {
-			t, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			name, _ := t["name"].(string)
-			if name == "" {
-				continue
-			}
-			entry := map[string]any{"name": name}
-			if d, ok := t["description"].(string); ok && d != "" {
-				entry["description"] = d
-			}
-			if params := t["parameters"]; params != nil {
-				entry["input_schema"] = params
-			} else {
-				entry["input_schema"] = map[string]any{"type": "object", "properties": map[string]any{}}
-			}
-			tools = append(tools, entry)
-		}
-		if len(tools) > 0 {
-			out["tools"] = tools
-		}
+	if err := applyTools(body, out, true); err != nil {
+		return nil, err
 	}
 
 	messages, err := convertResponsesInput(body["input"])
@@ -114,7 +92,7 @@ func convertResponsesInput(input any) ([]any, error) {
 		var pendingBlocks []any // 当前 user 消息累积（function_call_output 归并）
 		flushUser := func() {
 			if len(pendingBlocks) > 0 {
-				messages = append(messages, map[string]any{"role": "user", "content": pendingBlocks})
+				messages = appendAnthropicMessage(messages, map[string]any{"role": "user", "content": pendingBlocks})
 				pendingBlocks = nil
 			}
 		}
@@ -134,7 +112,7 @@ func convertResponsesInput(input any) ([]any, error) {
 					return nil, err
 				}
 				flushUser()
-				messages = append(messages, map[string]any{"role": role, "content": blocks})
+				messages = appendAnthropicMessage(messages, map[string]any{"role": role, "content": blocks})
 			case "function_call":
 				// assistant 的历史工具调用 → tool_use block（独立 assistant 消息）
 				input := map[string]any{}
@@ -142,7 +120,7 @@ func convertResponsesInput(input any) ([]any, error) {
 					_ = json.Unmarshal([]byte(rawArgs), &input)
 				}
 				flushUser()
-				messages = append(messages, map[string]any{
+				messages = appendAnthropicMessage(messages, map[string]any{
 					"role": "assistant",
 					"content": []any{map[string]any{
 						"type": "tool_use", "id": item["call_id"],
@@ -223,16 +201,30 @@ func ConvertResponsesResponse(payload map[string]any) map[string]any {
 		}
 	}
 	output, _ := messageToResponsesOutput(payload)
+	status, incompleteDetails := responsesCompletion(payload["stop_reason"])
+	if status == "incomplete" && len(output) > 0 {
+		output[len(output)-1].(map[string]any)["status"] = "incomplete"
+	}
 	return map[string]any{
 		"id":                  "resp_" + id,
 		"object":              "response",
 		"created_at":          float64(time.Now().Unix()),
 		"model":               payload["model"],
-		"status":              "completed",
+		"status":              status,
+		"incomplete_details":  incompleteDetails,
+		"error":               nil,
 		"output":              output,
 		"parallel_tool_calls": true,
 		"usage":               responsesUsage(payload["usage"]),
 	}
+}
+
+// responsesCompletion 区分正常完成与输出预算截断；工具调用结束本身仍是 completed。
+func responsesCompletion(stopReason any) (string, any) {
+	if stopReason == "max_tokens" {
+		return "incomplete", map[string]any{"reason": "max_output_tokens"}
+	}
+	return "completed", nil
 }
 
 // messageToResponsesOutput 把 Anthropic content 转换为 output item 数组：
@@ -296,7 +288,9 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 			}},
 		})
 	}
-	output = append(output, messageItem)
+	if len(texts) > 0 {
+		output = append(output, messageItem)
+	}
 	output = append(output, calls...)
 	return output, true
 }
@@ -351,12 +345,16 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	gateway.NormalizeBody(anthropicReq, false)
 
 	stream, _ := body["stream"].(bool)
+	parallelTools := true
+	if parallel, ok := body["parallel_tool_calls"].(bool); ok {
+		parallelTools = parallel
+	}
 	result := h.Engine.RunMessages(r.Context(), anthropicReq, gateway.IncomingHeaders(r),
 		func(d gateway.Delivery) error {
 			if stream {
-				return deliverResponsesStream(w, d)
+				return deliverResponsesStream(w, d, parallelTools)
 			}
-			return deliverResponsesJSON(w, d)
+			return deliverResponsesJSON(w, d, parallelTools)
 		})
 	if result.Delivered {
 		return
@@ -365,7 +363,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 // deliverResponsesJSON 非流式交付。
-func deliverResponsesJSON(w http.ResponseWriter, d gateway.Delivery) error {
+func deliverResponsesJSON(w http.ResponseWriter, d gateway.Delivery, parallelTools bool) error {
 	buffered, err := io.ReadAll(d.Body)
 	if err != nil {
 		return err
@@ -380,12 +378,13 @@ func deliverResponsesJSON(w http.ResponseWriter, d gateway.Delivery) error {
 		writeError(w, http.StatusBadGateway, "上游响应缺少消息内容", "invalid_upstream_response")
 		return nil
 	}
+	converted["parallel_tool_calls"] = parallelTools
 	gateway.WriteJSON(w, http.StatusOK, converted)
 	return nil
 }
 
 // deliverResponsesStream 流式交付：上游 SSE → response.* 事件流。
-func deliverResponsesStream(w http.ResponseWriter, d gateway.Delivery) error {
+func deliverResponsesStream(w http.ResponseWriter, d gateway.Delivery, parallelTools bool) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
@@ -401,7 +400,7 @@ func deliverResponsesStream(w http.ResponseWriter, d gateway.Delivery) error {
 			flusher.Flush()
 		}
 		return nil
-	})
+	}, parallelTools)
 	if err != nil {
 		return err
 	}

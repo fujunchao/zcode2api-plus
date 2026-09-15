@@ -158,7 +158,7 @@ func TestResponsesStreamEvents(t *testing.T) {
 	if err := reencodeResponsesSSE(strings.NewReader(upstream), func(ev string) error {
 		events = append(events, ev)
 		return nil
-	}); err != nil {
+	}, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,8 +168,10 @@ func TestResponsesStreamEvents(t *testing.T) {
 		names = append(names, strings.TrimPrefix(name, "event: "))
 	}
 	want := []string{
-		"response.created", "response.output_text.delta",
+		"response.created", "response.in_progress", "response.output_item.added", "response.content_part.added", "response.output_text.delta",
 		"response.output_item.added", "response.function_call_arguments.delta",
+		"response.output_text.done", "response.content_part.done", "response.output_item.done",
+		"response.function_call_arguments.done", "response.output_item.done",
 		"response.completed",
 	}
 	if len(names) != len(want) {
@@ -358,7 +360,7 @@ func TestResponsesStreamEmitsReasoningEvents(t *testing.T) {
 	if err := reencodeResponsesSSE(strings.NewReader(upstream), func(ev string) error {
 		events = append(events, ev)
 		return nil
-	}); err != nil {
+	}, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -368,9 +370,19 @@ func TestResponsesStreamEmitsReasoningEvents(t *testing.T) {
 	}
 	want := []string{
 		"response.created",
+		"response.in_progress",
 		"response.output_item.added",
+		"response.reasoning_summary_part.added",
 		"response.reasoning_summary_text.delta",
+		"response.output_item.added",
+		"response.content_part.added",
 		"response.output_text.delta",
+		"response.reasoning_summary_text.done",
+		"response.reasoning_summary_part.done",
+		"response.output_item.done",
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
 		"response.completed",
 	}
 	if len(names) != len(want) {

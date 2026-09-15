@@ -53,6 +53,31 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+  # 真实客户端只连接 httptest，不读取账号、不访问真实模型；SDK 依赖安装在临时目录。
+  sdk-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install test-only clients
+        run: |
+          python -m pip install openai==2.30.0
+          npm install --prefix "$RUNNER_TEMP/pi-client" --ignore-scripts --no-audit --no-fund @earendil-works/pi-ai@0.85.1
+      - name: Test official SDK and Pi adapter
+        env:
+          ZCODE_TEST_CLIENTS: python,pi
+          ZCODE_PI_AI_MODULE: ${{ runner.temp }}/pi-client/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js
+        run: go test -race -count=1 -timeout=180s ./internal/openai -run '^TestClientSDKCompatibility$' -v
+
   # 平台矩阵下只做编译：确认可交叉编译（与 release.yml 的目标一致），不重复跑测试
   cross-build:
     runs-on: ubuntu-latest

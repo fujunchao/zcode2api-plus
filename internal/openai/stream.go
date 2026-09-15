@@ -5,6 +5,7 @@ package openai
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 )
@@ -35,20 +36,23 @@ func reencodeSSE(body io.Reader, includeUsage bool, write func(string) error) er
 			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		case line == "":
 			if err := flush(); err != nil {
-				return err
+				return enc.fail(err)
 			}
 			reset()
 		}
 		// 注释行（: keepalive）与其他行忽略
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return enc.fail(err)
 	}
 	// 流以事件收尾而非空行时同样分发
 	if event != "" || data.Len() > 0 {
 		if err := flush(); err != nil {
-			return err
+			return enc.fail(err)
 		}
+	}
+	if !enc.finished {
+		return enc.fail(fmt.Errorf("上游串流在 message_stop 之前结束: %w", io.ErrUnexpectedEOF))
 	}
 	return nil
 }
@@ -59,21 +63,31 @@ type sseEncoder struct {
 
 	id           string
 	model        string
-	toolIndexes  map[int]float64 // Anthropic block index → OpenAI tool_calls index
-	toolCount    float64
+	tools        map[int]*chatStreamTool // Anthropic block index → 独立工具状态
+	toolOrder    []*chatStreamTool
+	finished     bool
 	inputUsage   map[string]any // message_start 的 usage（input 系）
 	outputUsage  map[string]any // message_delta 的 usage（output）
 	includeUsage bool
 }
 
+type chatStreamTool struct {
+	index   float64
+	initial string
+	hasArgs bool
+}
+
 // dispatch 分发一个已解析的上游事件。
 func (e *sseEncoder) dispatch(event, data string) error {
-	if data == "" || data == "[DONE]" {
+	if data == "" || data == "[DONE]" || e.finished {
 		return nil
 	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
-		return nil // 非 JSON 数据跳过（对齐引擎透传容错）
+		return fmt.Errorf("上游串流事件不是合法 JSON: %w", err)
+	}
+	if event == "" {
+		event, _ = payload["type"].(string)
 	}
 
 	switch event {
@@ -83,14 +97,18 @@ func (e *sseEncoder) dispatch(event, data string) error {
 		return e.onContentBlockStart(payload)
 	case "content_block_delta":
 		return e.onContentBlockDelta(payload)
+	case "content_block_stop":
+		index, _ := payload["index"].(float64)
+		return e.flushToolInput(e.tools[int(index)])
 	case "message_delta":
 		return e.onMessageDelta(payload)
 	case "message_stop":
 		return e.onMessageStop()
 	case "error":
-		return e.emit(map[string]any{"error": payload})
+		upstreamError, _ := payload["error"].(map[string]any)
+		return fmt.Errorf("上游串流错误: %s", stringOr(upstreamError["message"], "上游返回错误事件"))
 	default:
-		// ping / content_block_stop 等事件丢弃
+		// ping 等无内容事件丢弃
 		return nil
 	}
 }
@@ -115,12 +133,21 @@ func (e *sseEncoder) onContentBlockStart(payload map[string]any) error {
 		return nil
 	}
 	index, _ := payload["index"].(float64)
-	toolIndex := e.toolCount
-	e.toolCount++
-	if e.toolIndexes == nil {
-		e.toolIndexes = map[int]float64{}
+	toolIndex := float64(len(e.toolOrder))
+	if e.tools == nil {
+		e.tools = map[int]*chatStreamTool{}
 	}
-	e.toolIndexes[int(index)] = toolIndex
+	input := block["input"]
+	if input == nil {
+		input = map[string]any{}
+	}
+	initial, err := marshalCompact(input)
+	if err != nil {
+		return err
+	}
+	tool := &chatStreamTool{index: toolIndex, initial: initial}
+	e.tools[int(index)] = tool
+	e.toolOrder = append(e.toolOrder, tool)
 	delta := map[string]any{"tool_calls": []any{map[string]any{
 		"index": toolIndex,
 		"id":    block["id"],
@@ -147,16 +174,15 @@ func (e *sseEncoder) onContentBlockDelta(payload map[string]any) error {
 		return e.emit(chunk(e.id, e.model, map[string]any{"content": text}, nil))
 	case "input_json_delta":
 		index, _ := payload["index"].(float64)
-		toolIndex := e.toolIndexes[int(index)]
+		tool := e.tools[int(index)]
+		if tool == nil {
+			return fmt.Errorf("上游工具参数引用了未声明的内容块 %d", int(index))
+		}
 		partial, _ := deltaObj["partial_json"].(string)
 		if partial == "" {
 			return nil
 		}
-		delta := map[string]any{"tool_calls": []any{map[string]any{
-			"index":    toolIndex,
-			"function": map[string]any{"arguments": partial},
-		}}}
-		return e.emit(chunk(e.id, e.model, delta, nil))
+		return e.emitToolArguments(tool, partial)
 	case "thinking_delta":
 		// 扩展思考增量 → reasoning_content（DeepSeek / GLM 系 OpenAI 兼容端点的
 		// 惯例字段：增量只带 reasoning_content，不带 content，客户端据此渲染思考过程）
@@ -179,14 +205,24 @@ func (e *sseEncoder) onMessageDelta(payload map[string]any) error {
 		e.outputUsage = u
 	}
 	deltaObj, _ := payload["delta"].(map[string]any)
-	stopReason := any(nil)
-	if deltaObj != nil {
-		stopReason = mapStopReason(deltaObj["stop_reason"])
+	if stringOf(deltaObj["stop_reason"]) == "" {
+		return nil // 纯 usage 更新不是终止信号
+	}
+	stopReason := mapStopReason(deltaObj["stop_reason"])
+	for _, tool := range e.toolOrder {
+		if err := e.flushToolInput(tool); err != nil {
+			return err
+		}
 	}
 	return e.emit(chunk(e.id, e.model, map[string]any{}, stopReason))
 }
 
 func (e *sseEncoder) onMessageStop() error {
+	for _, tool := range e.toolOrder {
+		if err := e.flushToolInput(tool); err != nil {
+			return err
+		}
+	}
 	if e.includeUsage {
 		merged := mergeUsage(e.inputUsage, e.outputUsage)
 		data, err := marshalCompact(usageChunk(e.id, e.model, merged))
@@ -197,7 +233,38 @@ func (e *sseEncoder) onMessageStop() error {
 			return err
 		}
 	}
-	return e.write("data: [DONE]\n\n")
+	if err := e.write("data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	e.finished = true
+	return nil
+}
+
+func (e *sseEncoder) emitToolArguments(tool *chatStreamTool, arguments string) error {
+	tool.hasArgs = true
+	delta := map[string]any{"tool_calls": []any{map[string]any{
+		"index": tool.index, "function": map[string]any{"arguments": arguments},
+	}}}
+	return e.emit(chunk(e.id, e.model, delta, nil))
+}
+
+func (e *sseEncoder) flushToolInput(tool *chatStreamTool) error {
+	if tool == nil || tool.hasArgs {
+		return nil
+	}
+	return e.emitToolArguments(tool, tool.initial)
+}
+
+func (e *sseEncoder) fail(cause error) error {
+	if !e.finished {
+		e.finished = true
+		if err := e.emit(map[string]any{"error": map[string]any{
+			"message": cause.Error(), "type": "upstream_stream_error", "code": "server_error",
+		}}); err != nil {
+			return err
+		}
+	}
+	return cause
 }
 
 // emit 序列化并写出一个 chunk 事件。

@@ -219,6 +219,7 @@ func TestToolsAndToolChoiceMapping(t *testing.T) {
 	// named choice → {type:"tool", name}
 	out = convertInput(t, map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{},
+		"tools": wantToolsForChoice(),
 		"tool_choice": map[string]any{"type": "function",
 			"function": map[string]any{"name": "get_weather"}},
 	})
@@ -236,10 +237,15 @@ func TestToolsAndToolChoiceMapping(t *testing.T) {
 	}
 	out = convertInput(t, map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{}, "tool_choice": "required",
+		"tools": wantToolsForChoice(),
 	})
 	if !reflect.DeepEqual(out["tool_choice"], mustJSON(t, `{"type":"any"}`)) {
 		t.Fatalf("required 应映射 type:any: %v", out["tool_choice"])
 	}
+}
+
+func wantToolsForChoice() []any {
+	return []any{map[string]any{"type": "function", "function": map[string]any{"name": "get_weather"}}}
 }
 
 func TestNGreaterThanOneRejected(t *testing.T) {
@@ -311,12 +317,12 @@ func TestReasoningEffortEnablesThinking(t *testing.T) {
 	}
 }
 
-func TestReasoningEffortUnknownValueIgnored(t *testing.T) {
-	out := convertInput(t, map[string]any{
+func TestReasoningEffortUnknownValueRejected(t *testing.T) {
+	_, err := ConvertRequest(map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "extreme",
 	})
-	if _, ok := out["thinking"]; ok {
-		t.Fatalf("未知档位不应开启思考: %v", out["thinking"])
+	if err == nil {
+		t.Fatal("未知档位应明确报错，不得静默关闭思考")
 	}
 }
 
@@ -332,15 +338,14 @@ func TestThinkingBudgetLeavesRoomForAnswer(t *testing.T) {
 	}
 }
 
-func TestThinkingOmittedWhenNoRoom(t *testing.T) {
-	// 预算连最小思考都装不下（8192 的一半 4096 尚可，调小到 1024 则一半仅 512）：宁可不启用，
-	// 也不擅自放大 max_tokens
-	out := convertInput(t, map[string]any{
+func TestThinkingRejectedWhenNoRoom(t *testing.T) {
+	// 不静默关闭显式请求的思考，也不擅自放大 max_tokens。
+	_, err := ConvertRequest(map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{},
 		"reasoning_effort": "high", "max_tokens": float64(1024),
 	})
-	if _, ok := out["thinking"]; ok {
-		t.Fatalf("无空间时不应开启思考: %v", out["thinking"])
+	if err == nil {
+		t.Fatal("预算不足应明确报错")
 	}
 }
 

@@ -1,28 +1,26 @@
-// Responses 流式重编码：上游 Anthropic SSE → OpenAI Responses 的 response.* 事件。
-// 事件序列：response.created →（output_item.added / reasoning_summary_text.delta /
-// output_text.delta / function_call_arguments.delta）→ response.completed。
+// Responses 流式重编码：按上游内容块维护稳定的输出项目索引，补全项目与内容生命周期。
+// 工具参数按 Anthropic block index 路由，不能把交错增量一律写入最后一个工具。
 package openai
 
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"time"
 )
 
-// reencodeResponsesSSE 读取上游 SSE 并写出 Responses 事件流。
-func reencodeResponsesSSE(body io.Reader, write func(string) error) error {
+func reencodeResponsesSSE(body io.Reader, write func(string) error, parallelTools bool) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
-	enc := &responsesEncoder{write: write, startedAt: time.Now()}
+	enc := &responsesEncoder{
+		write: write, startedAt: time.Now(), parallelTools: parallelTools,
+		blocks: map[int]*responsesBlock{}, counts: map[string]int{},
+	}
 	event := ""
 	var data strings.Builder
-
 	flush := func() error { return enc.dispatch(event, data.String()) }
-	reset := func() { event, data = "", strings.Builder{} }
-
 	for scanner.Scan() {
 		line := scanner.Text()
 		switch {
@@ -35,255 +33,357 @@ func reencodeResponsesSSE(body io.Reader, write func(string) error) error {
 			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		case line == "":
 			if err := flush(); err != nil {
-				return err
+				return enc.fail(err)
 			}
-			reset()
+			event, data = "", strings.Builder{}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return err
+		return enc.fail(err)
 	}
 	if event != "" || data.Len() > 0 {
-		return flush()
+		if err := flush(); err != nil {
+			return enc.fail(err)
+		}
+	}
+	if !enc.finished {
+		return enc.fail(fmt.Errorf("上游串流在 message_stop 之前结束: %w", io.ErrUnexpectedEOF))
 	}
 	return nil
 }
 
-// responsesEncoder 跨事件流状态。
-type responsesEncoder struct {
-	write     func(string) error
-	startedAt time.Time
+// responsesBlock 的 outputIndex 创建后不再改变；items 保存首次声明顺序。
+type responsesBlock struct {
+	kind        string
+	outputIndex int
+	item        map[string]any
+	part        map[string]any
+	text        strings.Builder
+	initialArgs string
+	hasArgs     bool
+}
 
+type responsesEncoder struct {
+	write         func(string) error
+	startedAt     time.Time
 	respID        string
 	model         string
 	created       float64
 	finished      bool
+	stopReason    string
+	sequence      int
+	parallelTools bool
 	inputUsage    map[string]any
 	outputUsage   map[string]any
-	textParts     []string
-	functionCalls []any // 完整 function_call item（completed 时回填 output）
-
-	reasoningID   string   // reasoning output item 的 id；空表示本次回應无思考块
-	reasoningText []string // 思考增量累积（completed 时写入 summary）
+	blocks        map[int]*responsesBlock
+	items         []*responsesBlock
+	counts        map[string]int
 }
 
-// emit 写出一个 `event: X\ndata: {...}\n\n` 事件。
 func (e *responsesEncoder) emit(name string, payload map[string]any) error {
 	payload["type"] = name
-	data, err := marshalCompact(payload)
+	payload["sequence_number"] = e.sequence
+	e.sequence++
+	raw, err := marshalCompact(payload)
 	if err != nil {
 		return err
 	}
-	return e.write("event: " + name + "\ndata: " + data + "\n\n")
+	return e.write("event: " + name + "\ndata: " + raw + "\n\n")
 }
 
 func (e *responsesEncoder) dispatch(event, data string) error {
-	if data == "" || data == "[DONE]" {
+	if data == "" || data == "[DONE]" || e.finished {
 		return nil
 	}
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(data), &payload); err != nil {
-		return nil
+		return fmt.Errorf("上游串流事件不是合法 JSON: %w", err)
 	}
-
+	if event == "" {
+		event, _ = payload["type"].(string)
+	}
 	switch event {
 	case "message_start":
 		return e.onMessageStart(payload)
 	case "content_block_start":
-		return e.onContentBlockStart(payload)
+		block, _ := payload["content_block"].(map[string]any)
+		kind, _ := block["type"].(string)
+		if kind != "text" && kind != "thinking" && kind != "tool_use" {
+			return nil
+		}
+		index, _ := payload["index"].(float64)
+		b, err := e.openBlock(int(index), kind, block)
+		if err != nil {
+			return err
+		}
+		if kind == "text" {
+			return e.appendDelta(b, stringOf(block["text"]))
+		}
+		if kind == "thinking" {
+			return e.appendDelta(b, stringOf(block["thinking"]))
+		}
 	case "content_block_delta":
 		return e.onContentBlockDelta(payload)
 	case "message_delta":
-		if u, ok := payload["usage"].(map[string]any); ok {
-			e.outputUsage = u
+		if usage, ok := payload["usage"].(map[string]any); ok {
+			e.outputUsage = usage
 		}
-		return nil
+		if delta, ok := payload["delta"].(map[string]any); ok {
+			if reason := stringOf(delta["stop_reason"]); reason != "" {
+				e.stopReason = reason
+			}
+		}
 	case "message_stop":
 		return e.onMessageStop()
-	default:
-		return nil
+	case "error":
+		upstreamError, _ := payload["error"].(map[string]any)
+		return fmt.Errorf("上游串流错误: %s", stringOr(upstreamError["message"], "上游返回错误事件"))
 	}
+	// content_block_stop 暂不输出 done：待 message_stop 时按项目顺序统一完成，
+	// 让所有 done 事件都处于最终 response 之前，并保留交错工具参数的独立缓冲。
+	return nil
 }
 
 func (e *responsesEncoder) onMessageStart(payload map[string]any) error {
 	message, _ := payload["message"].(map[string]any)
-	if message == nil {
-		return nil
-	}
 	e.respID = stringOr(message["id"], "unknown")
-	e.model = stringOr(message["model"], "")
+	e.model = stringOf(message["model"])
 	e.created = float64(e.startedAt.Unix())
-	if u, ok := message["usage"].(map[string]any); ok {
-		e.inputUsage = u
+	e.inputUsage, _ = message["usage"].(map[string]any)
+	if err := e.emit("response.created", map[string]any{"response": e.responseEnvelope("in_progress")}); err != nil {
+		return err
 	}
-	return e.emit("response.created", map[string]any{
-		"response": e.responseEnvelope("in_progress", nil),
-	})
+	return e.emit("response.in_progress", map[string]any{"response": e.responseEnvelope("in_progress")})
 }
 
-func (e *responsesEncoder) onContentBlockStart(payload map[string]any) error {
-	block, _ := payload["content_block"].(map[string]any)
-	if block == nil {
+func (e *responsesEncoder) itemID(prefix, kind string) string {
+	id := prefix + e.respID
+	if n := e.counts[kind]; n > 0 {
+		id = fmt.Sprintf("%s_%d", id, n)
+	}
+	e.counts[kind]++
+	return id
+}
+
+func (e *responsesEncoder) openBlock(sourceIndex int, kind string, raw map[string]any) (*responsesBlock, error) {
+	b := &responsesBlock{kind: kind, outputIndex: len(e.items)}
+	switch kind {
+	case "text":
+		b.item = map[string]any{
+			"type": "message", "id": e.itemID("msg_", kind), "role": "assistant",
+			"status": "in_progress", "content": []any{},
+		}
+		b.part = map[string]any{"type": "output_text", "text": "", "annotations": []any{}, "logprobs": []any{}}
+	case "thinking":
+		b.item = map[string]any{
+			"type": "reasoning", "id": e.itemID("rs_", kind),
+			"status": "in_progress", "summary": []any{},
+		}
+		b.part = map[string]any{"type": "summary_text", "text": ""}
+	case "tool_use":
+		id, name := stringOf(raw["id"]), stringOf(raw["name"])
+		if id == "" || name == "" {
+			return nil, fmt.Errorf("上游工具块缺少 id 或 name")
+		}
+		b.item = map[string]any{
+			"type": "function_call", "id": "fc_" + id, "call_id": id,
+			"name": name, "arguments": "", "status": "in_progress",
+		}
+		input := raw["input"]
+		if input == nil {
+			input = map[string]any{}
+		}
+		b.initialArgs, _ = marshalCompact(input)
+	}
+	e.blocks[sourceIndex] = b
+	e.items = append(e.items, b)
+	if err := e.emit("response.output_item.added", map[string]any{
+		"output_index": b.outputIndex, "item": b.item,
+	}); err != nil {
+		return nil, err
+	}
+	switch kind {
+	case "text":
+		b.item["content"] = []any{b.part}
+		if err := e.emit("response.content_part.added", b.partEvent()); err != nil {
+			return nil, err
+		}
+	case "thinking":
+		b.item["summary"] = []any{b.part}
+		if err := e.emit("response.reasoning_summary_part.added", b.partEvent()); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
+func (b *responsesBlock) location() map[string]any {
+	out := map[string]any{"item_id": b.item["id"], "output_index": b.outputIndex}
+	switch b.kind {
+	case "text":
+		out["content_index"] = 0
+	case "thinking":
+		out["summary_index"] = 0
+	}
+	return out
+}
+
+func (b *responsesBlock) partEvent() map[string]any {
+	out := b.location()
+	out["part"] = b.part
+	return out
+}
+
+func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
+	delta, _ := payload["delta"].(map[string]any)
+	kind, text := "", ""
+	switch delta["type"] {
+	case "text_delta":
+		kind, text = "text", stringOf(delta["text"])
+	case "thinking_delta":
+		kind, text = "thinking", stringOf(delta["thinking"])
+	case "input_json_delta":
+		kind, text = "tool_use", stringOf(delta["partial_json"])
+	default:
+		return nil // signature_delta / redacted_thinking 不对客户端暴露
+	}
+	if text == "" {
 		return nil
 	}
-	switch block["type"] {
+	index, _ := payload["index"].(float64)
+	b := e.blocks[int(index)]
+	if b == nil || b.kind != kind {
+		if kind == "tool_use" {
+			return fmt.Errorf("上游工具参数引用了未声明的内容块 %d", int(index))
+		}
+		// 容忍兼容上游省略 text/thinking 的 start 事件：先声明项目再投递增量。
+		var err error
+		b, err = e.openBlock(int(index), kind, nil)
+		if err != nil {
+			return err
+		}
+	}
+	return e.appendDelta(b, text)
+}
+
+func (e *responsesEncoder) appendDelta(b *responsesBlock, text string) error {
+	if text == "" {
+		return nil
+	}
+	b.text.WriteString(text)
+	payload := b.location()
+	payload["delta"] = text
+	switch b.kind {
+	case "text":
+		b.part["text"] = b.text.String()
+		payload["logprobs"] = []any{}
+		return e.emit("response.output_text.delta", payload)
 	case "thinking":
-		// 思考块占一个 reasoning output item（Responses 惯例：reasoning 项排在
-		// message 项之前，故其 index 恒为 0）。同一回應的后续思考块合并进同一项。
-		if e.reasoningID != "" || len(e.functionCalls) > 0 {
-			return nil // 已声明过，或乱序到来（Anthropic 保证思考块先于工具调用）
-		}
-		e.reasoningID = "rs_" + e.respID
-		return e.emit("response.output_item.added", map[string]any{
-			"output_index": float64(0),
-			"item": map[string]any{
-				"type":    "reasoning",
-				"id":      e.reasoningID,
-				"summary": []any{},
-				"status":  "in_progress",
-			},
-		})
+		b.part["text"] = b.text.String()
+		return e.emit("response.reasoning_summary_text.delta", payload)
 	case "tool_use":
-		item := map[string]any{
-			"type":      "function_call",
-			"id":        "fc_" + stringOf(block["id"]),
-			"call_id":   block["id"],
-			"name":      block["name"],
-			"arguments": "",
-			"status":    "in_progress",
-		}
-		e.functionCalls = append(e.functionCalls, item)
-		return e.emit("response.output_item.added", map[string]any{
-			// message item 占 baseIndex()；function_call 依次排在其后
-			"output_index": e.baseIndex() + float64(len(e.functionCalls)),
-			"item":         item,
-		})
+		b.hasArgs = true
+		b.item["arguments"] = b.text.String()
+		return e.emit("response.function_call_arguments.delta", payload)
 	}
 	return nil
 }
 
-// baseIndex 返回 message item 的 output_index：存在 reasoning item 时为 1，否则为 0。
-// 与 onMessageStop 组装 output 数组的顺序（reasoning → message → function_call）一致。
-func (e *responsesEncoder) baseIndex() float64 {
-	if e.reasoningID != "" {
-		return 1
-	}
-	return 0
-}
-
-func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
-	deltaObj, _ := payload["delta"].(map[string]any)
-	if deltaObj == nil {
-		return nil
-	}
-	switch deltaObj["type"] {
-	case "text_delta":
-		text, _ := deltaObj["text"].(string)
-		if text == "" {
-			return nil
+func (e *responsesEncoder) finishBlock(b *responsesBlock, status string) error {
+	b.item["status"] = status
+	payload := b.location()
+	switch b.kind {
+	case "text":
+		payload["text"], payload["logprobs"] = b.text.String(), []any{}
+		if err := e.emit("response.output_text.done", payload); err != nil {
+			return err
 		}
-		e.textParts = append(e.textParts, text)
-		return e.emit("response.output_text.delta", map[string]any{
-			"item_id": "msg_" + e.respID,
-			"delta":   text,
-		})
-	case "input_json_delta":
-		partial, _ := deltaObj["partial_json"].(string)
-		if partial == "" {
-			return nil
+		if err := e.emit("response.content_part.done", b.partEvent()); err != nil {
+			return err
 		}
-		itemID := ""
-		if len(e.functionCalls) > 0 {
-			if item, ok := e.functionCalls[len(e.functionCalls)-1].(map[string]any); ok {
-				item["arguments"] = stringOf(item["arguments"]) + partial
-				// item_id 必须与 output_item.added 一致（同一 function_call item），
-				// 否则客户端无法把增量关联到对应工具调用。
-				itemID = stringOf(item["id"])
+	case "thinking":
+		payload["text"] = b.text.String()
+		if err := e.emit("response.reasoning_summary_text.done", payload); err != nil {
+			return err
+		}
+		if err := e.emit("response.reasoning_summary_part.done", b.partEvent()); err != nil {
+			return err
+		}
+	case "tool_use":
+		if !b.hasArgs {
+			if err := e.appendDelta(b, b.initialArgs); err != nil {
+				return err
 			}
 		}
-		return e.emit("response.function_call_arguments.delta", map[string]any{
-			"item_id": itemID,
-			"delta":   partial,
-		})
-	case "thinking_delta":
-		// 思考增量 → reasoning summary 增量（summary 是 Responses 暴露思考内容的
-		// 正式载体；raw 思考内容不对外）。未声明 reasoning item 时丢弃（见上）。
-		text, _ := deltaObj["thinking"].(string)
-		if text == "" || e.reasoningID == "" {
-			return nil
+		payload["arguments"], payload["name"] = b.item["arguments"], b.item["name"]
+		if err := e.emit("response.function_call_arguments.done", payload); err != nil {
+			return err
 		}
-		e.reasoningText = append(e.reasoningText, text)
-		return e.emit("response.reasoning_summary_text.delta", map[string]any{
-			"item_id": e.reasoningID,
-			"delta":   text,
-		})
-	case "signature_delta":
-		// 思考签名仅供上游校验，属内部凭据，不向客户端暴露
-		return nil
-	default:
-		return nil
 	}
+	return e.emit("response.output_item.done", map[string]any{"output_index": b.outputIndex, "item": b.item})
 }
 
 func (e *responsesEncoder) onMessageStop() error {
 	if e.finished {
 		return nil
 	}
-	e.finished = true
-	// 组装完整 output：reasoning item（若有）→ message item → function_call items
-	messageItem := map[string]any{
-		"type":   "message",
-		"id":     "msg_" + e.respID,
-		"role":   "assistant",
-		"status": "completed",
-		"content": []any{map[string]any{
-			"type":        "output_text",
-			"text":        strings.Join(e.textParts, ""),
-			"annotations": []any{},
-		}},
-	}
-	for _, raw := range e.functionCalls {
-		if item, ok := raw.(map[string]any); ok {
-			item["status"] = "completed"
+	status, _ := responsesCompletion(e.stopReason)
+	for i, b := range e.items {
+		itemStatus := "completed"
+		if status == "incomplete" && i == len(e.items)-1 {
+			itemStatus = "incomplete"
+		}
+		if err := e.finishBlock(b, itemStatus); err != nil {
+			return err
 		}
 	}
-	output := make([]any, 0, 2+len(e.functionCalls))
-	if e.reasoningID != "" {
-		output = append(output, map[string]any{
-			"type":   "reasoning",
-			"id":     e.reasoningID,
-			"status": "completed",
-			"summary": []any{map[string]any{
-				"type": "summary_text",
-				"text": strings.Join(e.reasoningText, ""),
-			}},
-		})
-	}
-	output = append(output, messageItem)
-	output = append(output, e.functionCalls...)
-	return e.emit("response.completed", map[string]any{
-		"response": e.responseEnvelope("completed", output),
-	})
+	e.finished = true
+	return e.emit("response."+status, map[string]any{"response": e.responseEnvelope(status)})
 }
 
-// responseEnvelope 组装 response 对象（created/completed 事件共用）。
-func (e *responsesEncoder) responseEnvelope(status string, output []any) map[string]any {
-	if output == nil {
-		output = []any{}
+// fail 通过终止事件交付失败，同时返回错误，避免引擎把中断串流累计为完整交付。
+func (e *responsesEncoder) fail(cause error) error {
+	if e.finished {
+		return cause
+	}
+	if e.respID == "" {
+		if err := e.onMessageStart(nil); err != nil {
+			return err
+		}
+	}
+	for _, b := range e.items {
+		b.item["status"] = "incomplete"
+	}
+	e.finished = true
+	response := e.responseEnvelope("failed")
+	response["error"] = map[string]any{"code": "server_error", "message": cause.Error()}
+	if err := e.emit("response.failed", map[string]any{"response": response}); err != nil {
+		return err
+	}
+	return cause
+}
+
+func (e *responsesEncoder) responseEnvelope(status string) map[string]any {
+	output := make([]any, 0, len(e.items))
+	for _, b := range e.items {
+		output = append(output, b.item)
+	}
+	var usage any
+	if status != "in_progress" {
+		usage = responsesUsage(mergeRawUsage(e.inputUsage, e.outputUsage))
+	}
+	var incompleteDetails any
+	if status == "incomplete" {
+		_, incompleteDetails = responsesCompletion(e.stopReason)
 	}
 	return map[string]any{
-		"id":         "resp_" + e.respID,
-		"object":     "response",
-		"created_at": e.created,
-		"model":      e.model,
-		"status":     status,
-		"output":     output,
-		"usage":      responsesUsage(mergeRawUsage(e.inputUsage, e.outputUsage)),
+		"id": "resp_" + e.respID, "object": "response", "created_at": e.created,
+		"model": e.model, "status": status, "output": output, "usage": usage,
+		"parallel_tool_calls": e.parallelTools, "error": nil, "incomplete_details": incompleteDetails,
 	}
 }
 
-// mergeRawUsage 合并 message_start（input 系）与 message_delta（output）的
-// Anthropic 形态 usage（键保持 input_tokens/output_tokens）。
+// 合并 message_start（input 系）与 message_delta（output）的 Anthropic usage。
 func mergeRawUsage(input, output map[string]any) map[string]any {
 	merged := map[string]any{}
 	for k, v := range input {

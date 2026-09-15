@@ -182,6 +182,14 @@ func TestEnsureRejectsBadSignature(t *testing.T) {
 // macOS 的 Chromium.app bundle 以符号链接组织 Framework：
 // 解包必须保留 symlink，否则解出的安装不可用。
 func TestExtractTarGzPreservesSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows 未开启开发者模式时，普通进程没有创建符号链接的权限。
+		// 先独立探测环境能力；实际解包失败仍由下方断言捕获，Linux CI 不跳过。
+		probe := filepath.Join(t.TempDir(), "symlink-probe")
+		if err := os.Symlink("target", probe); err != nil {
+			t.Skipf("当前 Windows 环境不能创建符号链接: %v", err)
+		}
+	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)

@@ -1,0 +1,37 @@
+{
+  "providers": {
+    "zcode2api": {
+      "baseUrl": "http://127.0.0.1:3000/v1",
+      "api": "openai-completions",
+      "apiKey": "$ZCODE_GATEWAY_KEY",
+      "compat": {
+        "thinkingFormat": "openai",
+        "supportsReasoningEffort": true,
+        "supportsStrictMode": false,
+        "supportsStore": false,
+        "supportsUsageInStreaming": true,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "GLM-5.3",
+          "name": "ZCode GLM-5.3",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "maxTokens": 16384,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          }
+        }
+      ]
+    }
+  }
+}

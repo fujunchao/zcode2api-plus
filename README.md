@@ -126,6 +126,17 @@ JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件�
 `billing/preview` 按優先級逐個 `billing/claim`（驗證碼 3007 自動換碼重試一次）。
 後台賬號頁另有「領取套餐」按鈕（工具欄全量 + JWT 賬號行內單賬號）。
 
+## 工具调用与思考配置
+
+网关支持函数工具协议转换，实际工具由 Pi 等客户端执行，不在服务端执行命令。
+Chat Completions 支持 `tool_calls`、`reasoning_content`；Responses 补齐文本、思考摘要及函数工具的流事件。
+思考可选 `none/minimal/low/medium/high`，预算最多占输出上限一半；使用 high 的完整 8192 预算时，
+请把 `max_tokens`（Responses 为 `max_output_tokens`）设为至少 16384。
+不支持的工具类型、`strict:true`、思考档位或不足的思考预算会明确返回 400。
+
+Pi 专用配置见 [examples/pi-models.json](examples/pi-models.json)；字段解释、测试命令和兼容边界见
+[客户端兼容说明](docs/client-compatibility.md)。已有 Pi 配置请合并条目，不要覆盖其它提供商。
+
 ## 發佈與開發
 
 - 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物並上傳 Releases。

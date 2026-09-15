@@ -203,10 +203,11 @@ meta(key TEXT PK, value TEXT)
 | `temperature` / `top_p` | 透传 |
 | `stop`（string 或 array） | → `stop_sequences` |
 | `stream` | true → OpenAI chunk 流；false → JSON |
-| `tools` / `tool_choice` | tools → Anthropic tools（`parameters` → `input_schema`）；choice `auto/none` 透传语义、named → `{type:"tool",name}` |
+| `tools` / `tool_choice` | 仅支持 function 工具，`parameters` → `input_schema`；`auto/none` 保留语义、`required` → `any`、named → `{type:"tool",name}`；强制的函数必须已声明，重复名称/不支持的类型/`strict:true` 明确 400 |
+| `parallel_tool_calls` | 转换为 `tool_choice.disable_parallel_tool_use` 的反值；未指定 choice 时补 auto，none 时不附并行开关 |
 | `n` | 仅支持 1，>1 返回 400 |
-| `reasoning_effort`（顶层） | 映射为 Anthropic `thinking` 块：`minimal/low/medium/high` → `budget_tokens` 1024/2048/4096/8192；预算**上限取 `max_tokens` 的一半**（`max_tokens` 是思考+正文总上限，给满会让正文被截断），低于 1024 则不启用——**不擅自放大 `max_tokens`** |
-| `thinking`（Anthropic 形态，客户端自带） | 原样透传并优先于 `reasoning_effort`，含 `type:"disabled"` 显式关闭 |
+| `reasoning_effort`（顶层） | `none` 显式关闭；`minimal/low/medium/high` → 预算 1024/2048/4096/8192，**上限取 `max_tokens` 一半**；输出上限不足 2048 或档位不支持时明确 400，不静默关闭、不擅自增加上限 |
+| `thinking`（客户端自带） | 显式预算校验后优先于 effort；disabled 始终优先。Pi ZAI/DeepSeek 的 enabled 开关无预算时，按 effort 补齐，缺省 medium，不上行 `clear_thinking` |
 | `presence_penalty` / `frequency_penalty` / `logprobs` / `user` 等 | 静默忽略（README 声明） |
 
 **响应转换（Anthropic → OpenAI）：**
@@ -221,6 +222,8 @@ meta(key TEXT PK, value TEXT)
   `tool_calls` delta（id/name）+ `input_json_delta` → `arguments` 增量；`message_delta` →
   `finish_reason` 终止 chunk；`message_stop` → `data: [DONE]`；`ping` 事件丢弃；
   `stream_options.include_usage` 时在终止前附 usage chunk。
+- 没有参数增量的工具在块结束时补发初始 input；同角色的相邻消息合并，确保同轮多个工具及回传结果成组送达上游。
+- 上游 error、非法 JSON 或缺少 message_stop 的断流必须发送 `upstream_stream_error`，不发送正常 `[DONE]`，也不累计为完整交付。
 - **思维链（Go 版增量）**：`thinking` block → `message.reasoning_content`
   （DeepSeek / GLM 系 OpenAI 兼容端点的惯例字段；无思考块时**不写该键**）；
   流式 `thinking_delta` → 增量 chunk 的 `delta.reasoning_content`（只带该字段、不带 `content`），
@@ -228,19 +231,22 @@ meta(key TEXT PK, value TEXT)
   多轮历史中的 `reasoning_content` **不回灌**为 thinking 块（缺签名，上游会拒），见 §8 风险表。
 - UsageCollector 在重编码旁路照常解析 Anthropic 事件——账号调度统计不受转换影响。
 
-### 5.8 `/v1/responses`（已规划，延后实现——决策：先 completions，后 Responses）
+### 5.8 `/v1/responses`（无状态兼容层）
 
 - 定位：服务 Codex CLI 等 Responses 生态客户端；复用 §5.7 的引擎与转换基建，增量约 300-500 行。
 - v1 范围：`instructions` → system；`input`（字符串 / 类型化 item 数组：message、function_call、
   function_call_output）→ messages；扁平 `tools` → Anthropic tools；`max_output_tokens` → `max_tokens`；
   `reasoning.effort` → 上游 `output_config.effort`，**并同时**按 §5.7 档位表翻译为 `thinking` 块
-  （`output_config.effort` 是否被上游识别未经验证，两者并存互不冲突）；输出端 text → `output_text`、
+  （只有按 effort 启用思考时保留辅助 output_config；显式 thinking 或关闭思考时不追加另一套开关）；输出端 text → `output_text`、
   tool_use → `function_call`、thinking → `reasoning` item（`summary[].summary_text` 承载思考内容，
-  按惯例排在 message item 之前，`output_index` 相应后移）；流式重编码为 `response.*` 事件序列
+  流中按上游内容块首次声明顺序分配连续 `output_index`，不插入虚构空 message）；流式重编码为 `response.*` 事件序列
   （`response.output_text.delta`、`response.reasoning_summary_text.delta`、`response.output_item.added` 等）。
 - **状态化划界**：无状态用法全支持（`store:false` + 每轮完整历史，Codex 默认即此）；
   带 `previous_response_id` 的请求 v1 返回明确 400；内存 LRU 回放列为后续可选增强，不阻塞。
-- 排期：M4 的 completions 验收通过后启动，避免两个转换层并行开发。
+- 工具控制与 §5.7 共用实现，Responses 的 named choice 使用扁平 `name`；响应反映调用方的 parallel_tool_calls。
+- SSE 补齐 created/in_progress、output_item added/done、content_part added/done、文本/思考摘要/工具参数的 delta/done，所有事件携带连续 sequence_number，内容带 content_index 或 summary_index。
+- 工具参数按上游 block index 分别累积，支持交错增量；最后一个项目的 done 位于终止 response 之前。
+- 正常结束为 completed；max_tokens 截断为 incomplete + reason=max_output_tokens；上游错误/非法 JSON/断流为 failed，不伪装完成。
 
 ### 5.9 套餐自动领取（Go 版增量，2026-09-10 新增）
 
@@ -347,6 +353,14 @@ meta(key TEXT PK, value TEXT)
   本次仅吸收上游核心修复，不引入其部署脚本；后台限制内网访问的部署说明另行维护。
   若确需反代支持，应改为显式配置可信代理列表，而非无条件信任该头。
 
+### M10 工具、思考与真实客户端兼容（2026-09-15）
+- [x] 合入上游 7675309 核心修复，保留本仓库 Docker/GHCR/数据卷及思考功能。
+- [x] 工具控制参数共用转换与校验；Pi 开关式 thinking、none 及预算校验。
+- [x] Responses 完整项目生命周期、交错工具流与异常终止；Chat 初始工具 input 与断流错误。
+- [x] HTTP 回归覆盖工具结果闭环、思考档位、错误参数、流式项目关联。
+- [x] 官方 OpenAI Python SDK 2.30.0 与 Pi 0.85.1 适配器通过本地 mock 上游闭环，测试见 client_sdk_test.go。
+- [ ] 真实 Z.AI 账号与实际 Pi 会话在线验收（离线 SDK 回归不代替上游能力验证）。
+
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
@@ -368,7 +382,7 @@ meta(key TEXT PK, value TEXT)
 | Go 无 jsdom 兜底 | 接受——jsdom 本已被风控判死；人工回填为最终兜底 |
 | rod 版本 API 变动 | go.mod 锁定 minor 版本 |
 | 开启 thinking 后多轮会话历史缺 thinking 块 | Anthropic 语义下续聊需回灌上一轮 thinking（含签名）；OpenAI 形态客户端只回传正文与 `reasoning_content`，缺签名无法合规回灌。当前策略：历史不回灌、按上游实际行为验收；若上游强制要求，则改为仅在客户端显式传 Anthropic `thinking` 时开启，或增加开关 |
-| thinking 的 `budget_tokens` 与 `max_tokens` 冲突 | 预算上限取 `max_tokens` 一半，给正文留同等空间（贴近 `max_tokens` 会让正文被立刻截断，比不思考更糟）；低于 1024 时不启用思考，宁可不思考也不擅自放大 `max_tokens` |
+| thinking 的 `budget_tokens` 与 `max_tokens` 冲突 | 档位预算上限取 max_tokens 一半；容纳不下最低预算时明确 400，避免用户误以为思考已开启；显式预算必须至少 1024 且小于输出上限 |
 
 ## 9. 交付形态
 
