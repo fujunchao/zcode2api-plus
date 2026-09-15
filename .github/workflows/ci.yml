@@ -17,6 +17,13 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      # 手动触发时可指定多个平台，用来验证 release.yml 的多架构路径（含 QEMU 下的
+      # 运行阶段 apt），而不必真的推 tag 发版。默认只构建本机平台。
+      platforms:
+        description: "镜像构建平台（逗号分隔）"
+        required: false
+        default: "linux/amd64"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -84,8 +91,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          # 单平台构建即可验证 Dockerfile；多架构留给 release.yml
-          platforms: linux/amd64
+          # 常规运行只验本机平台（快）；手动触发可传多平台验 release.yml 的路径。
+          # 始终不推送——推 GHCR 只在 release.yml 推 tag 时发生。
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
