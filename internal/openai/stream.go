@@ -157,8 +157,19 @@ func (e *sseEncoder) onContentBlockDelta(payload map[string]any) error {
 			"function": map[string]any{"arguments": partial},
 		}}}
 		return e.emit(chunk(e.id, e.model, delta, nil))
+	case "thinking_delta":
+		// 扩展思考增量 → reasoning_content（DeepSeek / GLM 系 OpenAI 兼容端点的
+		// 惯例字段：增量只带 reasoning_content，不带 content，客户端据此渲染思考过程）
+		text, _ := deltaObj["thinking"].(string)
+		if text == "" {
+			return nil
+		}
+		return e.emit(chunk(e.id, e.model, map[string]any{"reasoning_content": text}, nil))
+	case "signature_delta":
+		// 思考签名仅供上游校验，属内部凭据，不向客户端暴露
+		return nil
 	default:
-		// thinking_delta 等未知增量忽略
+		// 其余未知增量忽略
 		return nil
 	}
 }

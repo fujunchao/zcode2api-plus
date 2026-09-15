@@ -41,10 +41,12 @@ func ConvertResponse(payload map[string]any) map[string]any {
 }
 
 // messageToOpenAI 把 Anthropic message 内容转换为 OpenAI message：
-// text blocks 拼接为 content；tool_use → tool_calls（arguments 序列化为
-// JSON 字符串）。两者共存时 content 保留、tool_calls 并列。
+// text blocks 拼接为 content；thinking blocks 拼接为 reasoning_content
+//（DeepSeek / GLM 系 OpenAI 兼容端点的惯例字段，国内客户端据此渲染思考过程）；
+// tool_use → tool_calls（arguments 序列化为 JSON 字符串）。三者共存时各自并列。
 func messageToOpenAI(message map[string]any) (map[string]any, []any) {
 	texts := ""
+	reasoning := ""
 	var toolCalls []any
 	if rawBlocks, ok := message["content"].([]any); ok {
 		for _, raw := range rawBlocks {
@@ -56,6 +58,9 @@ func messageToOpenAI(message map[string]any) (map[string]any, []any) {
 			case "text":
 				t, _ := block["text"].(string)
 				texts += t
+			case "thinking":
+				t, _ := block["thinking"].(string)
+				reasoning += t
 			case "tool_use":
 				args, err := marshalCompact(block["input"])
 				if err != nil {
@@ -83,6 +88,10 @@ func messageToOpenAI(message map[string]any) (map[string]any, []any) {
 	} else {
 		// 仅工具调用：OpenAI 惯例 content 为 null
 		out["content"] = nil
+	}
+	if reasoning != "" {
+		// 无思考块时不写该键，避免给不认这个字段的客户端塞一个空串
+		out["reasoning_content"] = reasoning
 	}
 	return out, toolCalls
 }

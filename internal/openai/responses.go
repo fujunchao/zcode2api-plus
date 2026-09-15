@@ -52,6 +52,12 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 			out["output_config"] = map[string]any{"effort": effort}
 		}
 	}
+	// 思维链：同一档位再翻译成 Anthropic 侧的 thinking 块。output_config.effort 是否
+	// 被上游识别未经验证，thinking 才是 Anthropic 协议里的标准开关；两者并存，
+	// 任一被上游支持即可生效，互不冲突。
+	if thinking := resolveThinking(body, numberOr(out["max_tokens"], 8192)); thinking != nil {
+		out["thinking"] = thinking
+	}
 
 	// 扁平 tools（Responses 形态：type/name/description/parameters 直列）
 	if rawTools, ok := body["tools"].([]any); ok && len(rawTools) > 0 {
@@ -230,10 +236,13 @@ func ConvertResponsesResponse(payload map[string]any) map[string]any {
 }
 
 // messageToResponsesOutput 把 Anthropic content 转换为 output item 数组：
-// text block → message item（content[0] 为 output_text）；tool_use → function_call item。
+// thinking → reasoning item（summary 承载思考内容）；text block → message item
+// （content[0] 为 output_text）；tool_use → function_call item。
+// 顺序遵循 Responses 惯例：reasoning → message → function_call。
 func messageToResponsesOutput(message map[string]any) ([]any, bool) {
-	var output []any
+	var calls []any
 	texts := []string{}
+	reasoning := []string{}
 	rawBlocks, _ := message["content"].([]any)
 	for _, raw := range rawBlocks {
 		block, ok := raw.(map[string]any)
@@ -241,6 +250,11 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 			continue
 		}
 		switch block["type"] {
+		case "thinking":
+			t, _ := block["thinking"].(string)
+			if t != "" {
+				reasoning = append(reasoning, t)
+			}
 		case "text":
 			t, _ := block["text"].(string)
 			texts = append(texts, t)
@@ -249,7 +263,7 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 			if err != nil {
 				args = "{}"
 			}
-			output = append(output, map[string]any{
+			calls = append(calls, map[string]any{
 				"type":      "function_call",
 				"id":        "fc_" + stringOf(block["id"]),
 				"call_id":   block["id"],
@@ -270,8 +284,21 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 			"annotations": []any{},
 		}},
 	}
-	// message item 在前、function_call 在后（Responses 惯例）
-	return append([]any{messageItem}, output...), true
+	output := make([]any, 0, 2+len(calls))
+	if len(reasoning) > 0 {
+		output = append(output, map[string]any{
+			"type":   "reasoning",
+			"id":     "rs_" + stringOf(message["id"]),
+			"status": "completed",
+			"summary": []any{map[string]any{
+				"type": "summary_text",
+				"text": strings.Join(reasoning, ""),
+			}},
+		})
+	}
+	output = append(output, messageItem)
+	output = append(output, calls...)
+	return output, true
 }
 
 // responsesUsage Anthropic usage → Responses usage（直接 token 计数）。

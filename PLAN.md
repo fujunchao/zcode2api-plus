@@ -201,6 +201,8 @@ meta(key TEXT PK, value TEXT)
 | `stream` | true → OpenAI chunk 流；false → JSON |
 | `tools` / `tool_choice` | tools → Anthropic tools（`parameters` → `input_schema`）；choice `auto/none` 透传语义、named → `{type:"tool",name}` |
 | `n` | 仅支持 1，>1 返回 400 |
+| `reasoning_effort`（顶层） | 映射为 Anthropic `thinking` 块：`minimal/low/medium/high` → `budget_tokens` 1024/2048/4096/8192；`budget_tokens` 收缩到 `max_tokens-1`（上游要求严格小于），装不下则不启用——**不擅自放大 `max_tokens`** |
+| `thinking`（Anthropic 形态，客户端自带） | 原样透传并优先于 `reasoning_effort`，含 `type:"disabled"` 显式关闭 |
 | `presence_penalty` / `frequency_penalty` / `logprobs` / `user` 等 | 静默忽略（README 声明） |
 
 **响应转换（Anthropic → OpenAI）：**
@@ -215,6 +217,11 @@ meta(key TEXT PK, value TEXT)
   `tool_calls` delta（id/name）+ `input_json_delta` → `arguments` 增量；`message_delta` →
   `finish_reason` 终止 chunk；`message_stop` → `data: [DONE]`；`ping` 事件丢弃；
   `stream_options.include_usage` 时在终止前附 usage chunk。
+- **思维链（Go 版增量）**：`thinking` block → `message.reasoning_content`
+  （DeepSeek / GLM 系 OpenAI 兼容端点的惯例字段；无思考块时**不写该键**）；
+  流式 `thinking_delta` → 增量 chunk 的 `delta.reasoning_content`（只带该字段、不带 `content`），
+  `signature_delta` 与 `redacted_thinking` 不外泄（签名属内部凭据）。
+  多轮历史中的 `reasoning_content` **不回灌**为 thinking 块（缺签名，上游会拒），见 §8 风险表。
 - UsageCollector 在重编码旁路照常解析 Anthropic 事件——账号调度统计不受转换影响。
 
 ### 5.8 `/v1/responses`（已规划，延后实现——决策：先 completions，后 Responses）
@@ -222,8 +229,11 @@ meta(key TEXT PK, value TEXT)
 - 定位：服务 Codex CLI 等 Responses 生态客户端；复用 §5.7 的引擎与转换基建，增量约 300-500 行。
 - v1 范围：`instructions` → system；`input`（字符串 / 类型化 item 数组：message、function_call、
   function_call_output）→ messages；扁平 `tools` → Anthropic tools；`max_output_tokens` → `max_tokens`；
-  `reasoning.effort` → 上游 `output_config.effort`；输出端 text → `output_text`、tool_use → `function_call`
-  item；流式重编码为 `response.*` 事件序列（`response.output_text.delta` 等）。
+  `reasoning.effort` → 上游 `output_config.effort`，**并同时**按 §5.7 档位表翻译为 `thinking` 块
+  （`output_config.effort` 是否被上游识别未经验证，两者并存互不冲突）；输出端 text → `output_text`、
+  tool_use → `function_call`、thinking → `reasoning` item（`summary[].summary_text` 承载思考内容，
+  按惯例排在 message item 之前，`output_index` 相应后移）；流式重编码为 `response.*` 事件序列
+  （`response.output_text.delta`、`response.reasoning_summary_text.delta`、`response.output_item.added` 等）。
 - **状态化划界**：无状态用法全支持（`store:false` + 每轮完整历史，Codex 默认即此）；
   带 `previous_response_id` 的请求 v1 返回明确 400；内存 LRU 回放列为后续可选增强，不阻塞。
 - 排期：M4 的 completions 验收通过后启动，避免两个转换层并行开发。
@@ -320,6 +330,8 @@ meta(key TEXT PK, value TEXT)
 | Account JSON 字段错漏导致 db 互读失败 | M0 就做互通验收；结构体 tag 对照 dataclass 逐一 review |
 | Go 无 jsdom 兜底 | 接受——jsdom 本已被风控判死；人工回填为最终兜底 |
 | rod 版本 API 变动 | go.mod 锁定 minor 版本 |
+| 开启 thinking 后多轮会话历史缺 thinking 块 | Anthropic 语义下续聊需回灌上一轮 thinking（含签名）；OpenAI 形态客户端只回传正文与 `reasoning_content`，缺签名无法合规回灌。当前策略：历史不回灌、按上游实际行为验收；若上游强制要求，则改为仅在客户端显式传 Anthropic `thinking` 时开启，或增加开关 |
+| thinking 的 `budget_tokens` 与 `max_tokens` 冲突 | 收缩到 `max_tokens-1`；装不下（≤1024）时不启用思考，宁可不思考也不擅自放大 `max_tokens` |
 
 ## 9. 交付形态
 

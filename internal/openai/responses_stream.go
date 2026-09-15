@@ -1,6 +1,6 @@
 // Responses 流式重编码：上游 Anthropic SSE → OpenAI Responses 的 response.* 事件。
-// 事件序列：response.created →（output_item.added / output_text.delta /
-// function_call_arguments.delta）→ response.completed。
+// 事件序列：response.created →（output_item.added / reasoning_summary_text.delta /
+// output_text.delta / function_call_arguments.delta）→ response.completed。
 package openai
 
 import (
@@ -62,6 +62,9 @@ type responsesEncoder struct {
 	outputUsage   map[string]any
 	textParts     []string
 	functionCalls []any // 完整 function_call item（completed 时回填 output）
+
+	reasoningID   string   // reasoning output item 的 id；空表示本次回應无思考块
+	reasoningText []string // 思考增量累积（completed 时写入 summary）
 }
 
 // emit 写出一个 `event: X\ndata: {...}\n\n` 事件。
@@ -120,22 +123,52 @@ func (e *responsesEncoder) onMessageStart(payload map[string]any) error {
 
 func (e *responsesEncoder) onContentBlockStart(payload map[string]any) error {
 	block, _ := payload["content_block"].(map[string]any)
-	if block == nil || block["type"] != "tool_use" {
+	if block == nil {
 		return nil
 	}
-	item := map[string]any{
-		"type":      "function_call",
-		"id":        "fc_" + stringOf(block["id"]),
-		"call_id":   block["id"],
-		"name":      block["name"],
-		"arguments": "",
-		"status":    "in_progress",
+	switch block["type"] {
+	case "thinking":
+		// 思考块占一个 reasoning output item（Responses 惯例：reasoning 项排在
+		// message 项之前，故其 index 恒为 0）。同一回應的后续思考块合并进同一项。
+		if e.reasoningID != "" || len(e.functionCalls) > 0 {
+			return nil // 已声明过，或乱序到来（Anthropic 保证思考块先于工具调用）
+		}
+		e.reasoningID = "rs_" + e.respID
+		return e.emit("response.output_item.added", map[string]any{
+			"output_index": float64(0),
+			"item": map[string]any{
+				"type":    "reasoning",
+				"id":      e.reasoningID,
+				"summary": []any{},
+				"status":  "in_progress",
+			},
+		})
+	case "tool_use":
+		item := map[string]any{
+			"type":      "function_call",
+			"id":        "fc_" + stringOf(block["id"]),
+			"call_id":   block["id"],
+			"name":      block["name"],
+			"arguments": "",
+			"status":    "in_progress",
+		}
+		e.functionCalls = append(e.functionCalls, item)
+		return e.emit("response.output_item.added", map[string]any{
+			// message item 占 baseIndex()；function_call 依次排在其后
+			"output_index": e.baseIndex() + float64(len(e.functionCalls)),
+			"item":         item,
+		})
 	}
-	e.functionCalls = append(e.functionCalls, item)
-	return e.emit("response.output_item.added", map[string]any{
-		"output_index": float64(len(e.functionCalls)), // message item 占 index 0
-		"item":         item,
-	})
+	return nil
+}
+
+// baseIndex 返回 message item 的 output_index：存在 reasoning item 时为 1，否则为 0。
+// 与 onMessageStop 组装 output 数组的顺序（reasoning → message → function_call）一致。
+func (e *responsesEncoder) baseIndex() float64 {
+	if e.reasoningID != "" {
+		return 1
+	}
+	return 0
 }
 
 func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
@@ -168,6 +201,21 @@ func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
 			"item_id": "fc_" + stringOf(payload["index"]),
 			"delta":   partial,
 		})
+	case "thinking_delta":
+		// 思考增量 → reasoning summary 增量（summary 是 Responses 暴露思考内容的
+		// 正式载体；raw 思考内容不对外）。未声明 reasoning item 时丢弃（见上）。
+		text, _ := deltaObj["thinking"].(string)
+		if text == "" || e.reasoningID == "" {
+			return nil
+		}
+		e.reasoningText = append(e.reasoningText, text)
+		return e.emit("response.reasoning_summary_text.delta", map[string]any{
+			"item_id": e.reasoningID,
+			"delta":   text,
+		})
+	case "signature_delta":
+		// 思考签名仅供上游校验，属内部凭据，不向客户端暴露
+		return nil
 	default:
 		return nil
 	}
@@ -178,7 +226,7 @@ func (e *responsesEncoder) onMessageStop() error {
 		return nil
 	}
 	e.finished = true
-	// 组装完整 output：message item 在前、function_call items 在后
+	// 组装完整 output：reasoning item（若有）→ message item → function_call items
 	messageItem := map[string]any{
 		"type": "message",
 		"id":   "msg_" + e.respID,
@@ -195,7 +243,20 @@ func (e *responsesEncoder) onMessageStop() error {
 			item["status"] = "completed"
 		}
 	}
-	output := append([]any{messageItem}, e.functionCalls...)
+	output := make([]any, 0, 2+len(e.functionCalls))
+	if e.reasoningID != "" {
+		output = append(output, map[string]any{
+			"type":   "reasoning",
+			"id":     e.reasoningID,
+			"status": "completed",
+			"summary": []any{map[string]any{
+				"type": "summary_text",
+				"text": strings.Join(e.reasoningText, ""),
+			}},
+		})
+	}
+	output = append(output, messageItem)
+	output = append(output, e.functionCalls...)
 	return e.emit("response.completed", map[string]any{
 		"response": e.responseEnvelope("completed", output),
 	})

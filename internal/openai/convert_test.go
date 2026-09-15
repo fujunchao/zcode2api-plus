@@ -283,3 +283,82 @@ func TestOpenAIDirectivesSilentlyIgnored(t *testing.T) {
 		}
 	}
 }
+
+// ── 思维链（§5.7 增量）────────────────────────────────────────────────────────
+
+func TestNoThinkingByDefault(t *testing.T) {
+	// 未表达推理意图时不得主动开启思考：否则会改变既有用户的响应形态与 token 消耗
+	out := convertInput(t, map[string]any{"model": "glm-5.3-flash", "messages": []any{}})
+	if _, ok := out["thinking"]; ok {
+		t.Fatalf("默认不应写入 thinking: %v", out["thinking"])
+	}
+}
+
+func TestReasoningEffortEnablesThinking(t *testing.T) {
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "high",
+	})
+	thinking, ok := out["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("reasoning_effort 应开启 thinking: %v", out)
+	}
+	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(8192) {
+		t.Fatalf("high 档 thinking 块不符: %v", thinking)
+	}
+}
+
+func TestReasoningEffortUnknownValueIgnored(t *testing.T) {
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "extreme",
+	})
+	if _, ok := out["thinking"]; ok {
+		t.Fatalf("未知档位不应开启思考: %v", out["thinking"])
+	}
+}
+
+func TestThinkingBudgetClampedToMaxTokens(t *testing.T) {
+	// 上游要求 budget_tokens 严格小于 max_tokens
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{},
+		"reasoning_effort": "high", "max_tokens": float64(2000),
+	})
+	thinking, _ := out["thinking"].(map[string]any)
+	if thinking["budget_tokens"] != float64(1999) {
+		t.Fatalf("budget 应收缩到 max_tokens-1: %v", thinking)
+	}
+}
+
+func TestThinkingOmittedWhenNoRoom(t *testing.T) {
+	// 预算连最小思考都装不下：宁可不启用，也不擅自放大 max_tokens
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{},
+		"reasoning_effort": "high", "max_tokens": float64(1024),
+	})
+	if _, ok := out["thinking"]; ok {
+		t.Fatalf("无空间时不应开启思考: %v", out["thinking"])
+	}
+}
+
+func TestExplicitThinkingTakesPrecedence(t *testing.T) {
+	// 客户端自带 Anthropic 形态 thinking 时原样透传，不被 reasoning_effort 覆盖
+	explicit := map[string]any{"type": "enabled", "budget_tokens": float64(3000)}
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{},
+		"thinking": explicit, "reasoning_effort": "low",
+	})
+	if got, _ := out["thinking"].(map[string]any); !reflect.DeepEqual(got, explicit) {
+		t.Fatalf("显式 thinking 应优先: %v", got)
+	}
+}
+
+func TestExplicitThinkingDisabledRespected(t *testing.T) {
+	// 显式关闭思考时不得因 reasoning_effort 又被打开
+	out := convertInput(t, map[string]any{
+		"model": "glm-5.3-flash", "messages": []any{},
+		"thinking": map[string]any{"type": "disabled"}, "reasoning_effort": "high",
+	})
+	got, _ := out["thinking"].(map[string]any)
+	if got == nil || got["type"] != "disabled" {
+		t.Fatalf("显式 disabled 应透传: %v", got)
+	}
+}

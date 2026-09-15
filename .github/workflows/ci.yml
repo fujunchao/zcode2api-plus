@@ -1,0 +1,71 @@
+# CI：编译 + 静态检查 + 全量测试（含 -race）。
+#
+# 为什么放 CI 而不只靠本机：
+#   1. 冷缓存下首次本机构建要编译 modernc.org/libc（纯 Go 转译的 SQLite）与 rod，
+#      实测十余分钟；CI 有 go build cache，重复运行只需几分钟。
+#   2. `-race` 需要 gcc/cc，本机没有，CI 的 ubuntu-latest 自带——这正好解掉
+#      HANDOFF/PLAN 里「M5/M6 的 -race 验收本机做不了」这条欠账。
+#   3. 本仓库是公开仓库，Actions 分钟数不计费。
+#
+# 全量测试均为 httptest 本地环回或显式 t.Skip（真机用例需 ZCODE_REAL_BROWSER_TEST=1），
+# 故本工作流不联网、不需要浏览器，可直接跑。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败
+      - name: Test (race)
+        run: go test -race ./...
+
+  # 平台矩阵下只做编译：确认可交叉编译（与 release.yml 的目标一致），不重复跑测试
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/zcode2api

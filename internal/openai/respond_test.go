@@ -41,6 +41,9 @@ func TestConvertResponseText(t *testing.T) {
 	if msg["role"] != "assistant" || msg["content"] != "你好" {
 		t.Fatalf("message 不符: %v", msg)
 	}
+	if _, ok := msg["reasoning_content"]; ok {
+		t.Fatal("无思考块时不应出现 reasoning_content 键")
+	}
 	if choice["finish_reason"] != "stop" {
 		t.Fatalf("end_turn 应映射为 stop: %v", choice["finish_reason"])
 	}
@@ -292,16 +295,22 @@ func TestStreamIncludeUsageAppendsChunk(t *testing.T) {
 	}
 }
 
-func TestStreamPingAndUnknownDropped(t *testing.T) {
-	// ping 与 thinking_delta 丢弃，不产生 chunk
+func TestStreamPingDroppedAndThinkingMapped(t *testing.T) {
+	// ping 丢弃；thinking_delta 产出 reasoning_content 增量；signature_delta 不暴露
 	feed := `event: message_start
 data: {"type":"message_start","message":{"id":"m","model":"GLM-5.3","usage":{}}}
 
 event: ping
 data: {"type":"ping"}
 
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"嗯"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}
 
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
@@ -310,15 +319,50 @@ event: message_stop
 data: {"type":"message_stop"}
 
 `
-	var n int
-	if err := reencodeSSE(strings.NewReader(feed), false, func(string) error {
-		n++
+	var chunks []map[string]any
+	if err := reencodeSSE(strings.NewReader(feed), false, func(event string) error {
+		if event == "data: [DONE]\n\n" {
+			return nil // 终止标记单独测
+		}
+		if !strings.HasPrefix(event, "data: ") {
+			t.Fatalf("chunk 应为 data: 行: %q", event)
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(event, "data: ")), &m); err != nil {
+			t.Fatalf("chunk JSON 非法: %v (%q)", err, event)
+		}
+		chunks = append(chunks, m)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 { // 首 chunk + finish chunk + [DONE]
-		t.Fatalf("ping/thinking 应丢弃，实际 chunk 数 %d", n)
+	// 首 chunk + reasoning_content 增量 + finish chunk（ping / signature_delta 丢弃）
+	if len(chunks) != 3 {
+		t.Fatalf("应有 3 个数据 chunk，实际 %d: %v", len(chunks), chunks)
+	}
+	delta := chunks[1]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+	if !reflect.DeepEqual(delta, map[string]any{"reasoning_content": "嗯"}) {
+		t.Fatalf("thinking_delta 应映射为 reasoning_content: %v", delta)
+	}
+}
+
+func TestConvertResponseThinkingToReasoningContent(t *testing.T) {
+	// 非流式：thinking block → reasoning_content；redacted_thinking 无明文可映射，丢弃
+	out := ConvertResponse(map[string]any{
+		"id": "msg_t", "model": "GLM-5.3", "stop_reason": "end_turn",
+		"usage": map[string]any{"input_tokens": 3, "output_tokens": 9},
+		"content": []any{
+			map[string]any{"type": "thinking", "thinking": "先算 1+1", "signature": "c2ln"},
+			map[string]any{"type": "redacted_thinking", "data": "xxx"},
+			map[string]any{"type": "text", "text": "等于 2"},
+		},
+	})
+	msg := out["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["reasoning_content"] != "先算 1+1" {
+		t.Fatalf("thinking 应映射为 reasoning_content: %v", msg)
+	}
+	if msg["content"] != "等于 2" {
+		t.Fatalf("正文不应被思考内容污染: %v", msg["content"])
 	}
 }
 

@@ -62,6 +62,11 @@ func TestResponsesConvertItems(t *testing.T) {
 	if oc["effort"] != "high" {
 		t.Fatalf("reasoning.effort 未映射: %v", got["output_config"])
 	}
+	// 同一档位还应翻译成上游的 thinking 块（output_config.effort 是否被识别未验证）
+	thinking, _ := got["thinking"].(map[string]any)
+	if thinking == nil || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(8192) {
+		t.Fatalf("reasoning.effort 应同时开启 thinking: %v", got["thinking"])
+	}
 	msgs, _ := got["messages"].([]any)
 	// user → assistant(tool_use) → user(tool_result) 共 3 条
 	if len(msgs) != 3 {
@@ -264,4 +269,102 @@ func post(f *fixture, t *testing.T, key, payload string) (int, string) {
 		}
 	}
 	return resp.StatusCode, string(raw)
+}
+
+// ── 思维链（§5.8 增量）────────────────────────────────────────────────────────
+
+func TestResponsesThinkingBecomesReasoningItem(t *testing.T) {
+	got := ConvertResponsesResponse(map[string]any{
+		"id": "msg_r", "model": "GLM-5.3", "stop_reason": "end_turn",
+		"usage": map[string]any{"input_tokens": 5, "output_tokens": 7},
+		"content": []any{
+			map[string]any{"type": "thinking", "thinking": "先想", "signature": "c2ln"},
+			map[string]any{"type": "text", "text": "答案 2"},
+		},
+	})
+	if got == nil {
+		t.Fatal("不应返回 nil")
+	}
+	output, _ := got["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("应 reasoning + message 两个 item: %v", output)
+	}
+	reasoning := output[0].(map[string]any)
+	if reasoning["type"] != "reasoning" || reasoning["status"] != "completed" {
+		t.Fatalf("首 item 应为 reasoning: %v", reasoning)
+	}
+	summary, _ := reasoning["summary"].([]any)
+	if len(summary) != 1 || summary[0].(map[string]any)["text"] != "先想" {
+		t.Fatalf("summary 未承载思考内容: %v", reasoning["summary"])
+	}
+	msgItem := output[1].(map[string]any)
+	if msgItem["type"] != "message" {
+		t.Fatalf("次 item 应为 message: %v", msgItem)
+	}
+	if text := msgItem["content"].([]any)[0].(map[string]any); text["text"] != "答案 2" {
+		t.Fatalf("正文不应被思考内容污染: %v", text)
+	}
+}
+
+func TestResponsesStreamEmitsReasoningEvents(t *testing.T) {
+	upstream := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"m9","model":"GLM-5.3","usage":{"input_tokens":4}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想一下"}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"答案是 2"}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var events []string
+	if err := reencodeResponsesSSE(strings.NewReader(upstream), func(ev string) error {
+		events = append(events, ev)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	names := make([]string, 0, len(events))
+	for _, ev := range events {
+		names = append(names, strings.TrimPrefix(strings.SplitN(ev, "\n", 2)[0], "event: "))
+	}
+	want := []string{
+		"response.created",
+		"response.output_item.added",
+		"response.reasoning_summary_text.delta",
+		"response.output_text.delta",
+		"response.completed",
+	}
+	if len(names) != len(want) {
+		t.Fatalf("事件序列不符: %v", names)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("第 %d 个事件应为 %s: %v", i, want[i], names)
+		}
+	}
+
+	last := events[len(events)-1]
+	if !strings.Contains(last, `"type":"summary_text"`) || !strings.Contains(last, "先想一下") {
+		t.Fatalf("reasoning summary 未回填思考内容: %s", last)
+	}
+	// reasoning item 必须排在 message item 之前（与 output_index 分配一致）
+	if r, m := strings.Index(last, `"type":"reasoning"`), strings.Index(last, `"type":"message"`); r < 0 || m < 0 || r > m {
+		t.Fatalf("reasoning item 应排在 message 之前: %s", last)
+	}
+	if strings.Contains(last, "c2ln") {
+		t.Fatalf("思考签名不应出现在响应中: %s", last)
+	}
 }
