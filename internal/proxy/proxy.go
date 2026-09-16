@@ -38,3 +38,29 @@ func NormalizeProxyURL(raw string) (*string, error) {
 	}
 	return &trimmed, nil
 }
+
+// MaskURL 隐藏代理 URL 里的密码，供错误文案与日志使用。
+// 代理凭据不该出现在对使用者展示的报错里；解析失败时原样返回（此时也没有密码可泄）。
+//
+// 手工拼装而不是改写 u.User 再 u.String()：url.UserPassword 会把 * 转义成 %2A，
+// 展示出来是 http://user:%2A%2A%2A@host 这种看不出意图的东西。
+func MaskURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.User == nil {
+		return raw
+	}
+	if _, hasPassword := parsed.User.Password(); !hasPassword {
+		return parsed.String()
+	}
+	masked := parsed.Scheme + "://" + parsed.User.Username() + ":***@" + parsed.Host
+	if parsed.Path != "" {
+		masked += parsed.Path
+	}
+	if parsed.RawQuery != "" {
+		masked += "?" + parsed.RawQuery
+	}
+	if parsed.Fragment != "" {
+		masked += "#" + parsed.Fragment
+	}
+	return masked
+}

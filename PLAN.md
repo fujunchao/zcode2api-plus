@@ -328,6 +328,24 @@ meta(key TEXT PK, value TEXT)
   跨机搬运反而有害（导入后重新分配更合理）；领取状态是瞬时状态。
 - ⚠️ 迁移会改变存量账号的 `X-Device-Mid`，上游可能识别为「换了台机器」，需在线观察。
 
+### 5.11 登录与出站线路（Go 版增量，2026-09-16 新增）
+
+- **代理必须在建立登录会话时选定**（`POST /login/start` 可带 `proxy_id`，或直接给
+  `proxy_url`）。理由是登录、API Key 兑换、随后的额度刷新与自动领取属于**同一条出站链路**：
+  只在登录本身走代理、后续直连，等于拿真实 IP 去打上游——那恰恰是需要代理的人最不想要的。
+  所以会话一建立，出口就锁定（前端在选择器上置灰并说明原因）。
+- 线路 ID 不存在、或地址协议不在 `proxy.AllowedSchemes`（http/https/socks4/socks5/socks5h）
+  内，一律**提前 400**，不要把坏代理带进会话等兑换时才炸。
+- `oauth.ExchangeCode` / `ExchangeAPIKey` 及其内部的 `postJSON` / `getJSON` / `postJSONAuth`
+  全部接受 `proxyURL`；空值时用零值 `http.Client`（**保留环境变量 `HTTP_PROXY` 的既有语义**，
+  不要改成 `proxy.ClientFor("")`，那会显式关掉环境代理）。
+- 网络错误文案经代理时附带**已脱敏**的代理地址（`proxy.MaskURL` 把密码换成 `***`），
+  使使用者能区分"上游挂了"和"代理不通"；代理密码不得出现在响应体与日志里。
+- 登录成功后把线路写到账号（`proxy_id` → `AssignProxyProfile`；裸地址 → `account.ProxyURL`
+  并解除线路指派）。**未指定时保持账号原有指派不动**——重新登录不该把已有线路清掉。
+- 后端 `test` 覆盖：真发 CONNECT 到假代理（证明请求确实经代理）、非法代理提前报错、
+  脱敏不泄密码、`resolveLoginProxy` 三条分支。
+
 ## 6. 里程碑
 
 ### M0 骨架 + 数据层
@@ -458,6 +476,17 @@ meta(key TEXT PK, value TEXT)
   `TestClaimSurfacesUpstreamNextAt`、`TestApplyClaimOutcomePersists`、`TestClaimGateIsExclusive` 等。
 - [ ] 存量迁移后在线观察：上游是否把 `X-Device-Mid` 变更识别为「换了台机器」。
 - [ ] 真实账号领取一次，确认 `claim.next_at` 与上游 `ends_at` 一致。
+
+### M14 登录即可选定出站线路（v2.0.6-go）
+- [x] `POST /login/start` 接受 `proxy_id`（线路）或 `proxy_url`（裸地址），
+  非法/未知一律提前 400；契约见 §5.11。
+- [x] `oauth.ExchangeCode` / `ExchangeAPIKey` 及其内部请求全部按会话代理出站；
+  未指定时保留环境变量 `HTTP_PROXY` 语义。
+- [x] 代理地址脱敏（`proxy.MaskURL`）后才进错误文案与后台回显，密码不外泄。
+- [x] 登录成功后线路写入账号，且**发生在** API Key 兑换 / 额度刷新 / 自动领取之前。
+- [x] 回归：真发 CONNECT 到假代理、非法代理提前报错、脱敏、`resolveLoginProxy` 分支、
+  `/admin/api/login/start` 回显与未知线路 400。
+- [ ] 真实线路（http / socks5）在线验收：经代理完成一次完整 OAuth 登录。
 
 ## 7. 测试策略
 

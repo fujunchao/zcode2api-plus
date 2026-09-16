@@ -121,6 +121,12 @@ Restart=on-failure
 支持 `http(s)://`（CONNECT）與 `socks4://`、`socks5://`、`socks5h://`（socks5h
 由代理解析域名）。代理無效時回退直連並記錄 `last_error`。
 
+**登入時即可選線路**：新增帳號對話框的「授權登入」頁有出口線路下拉，
+本次登入會用它完成授權碼交換與 API Key 兌換，登入成功後線路一併寫入賬號
+（`/admin/api/login/start` 接受 `proxy_id`，或直接給 `proxy_url`）。
+會這樣做是因為「登入 → 兌換 API Key → 刷新額度 → 領取活動」是同一條出站鏈路，
+只在登入本身走代理等於拿真實 IP 去打上游。線路不存在或協議不受支持會直接 400。
+
 ## 套餐自動領取
 
 JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件上報 →

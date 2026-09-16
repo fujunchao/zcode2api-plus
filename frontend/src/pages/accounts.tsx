@@ -86,6 +86,7 @@ export function AccountsPage() {
   const [adding, setAdding] = useState(false)
   /* 授權登入流程狀態 */
   const [flow, setFlow] = useState<{ flowId: string; url: string } | null>(null)
+  const [loginProxyLabel, setLoginProxyLabel] = useState('')
   const [callbackUrl, setCallbackUrl] = useState('')
   const [loginStatus, setLoginStatus] = useState('')
   const [loginErr, setLoginErr] = useState(false)
@@ -133,6 +134,7 @@ export function AccountsPage() {
     setAddProxy(PROXY_DIRECT)
     setAddTab('login')
     setFlow(null)
+    setLoginProxyLabel('')
     setCallbackUrl('')
     setLoginStatus('')
     setLoginErr(false)
@@ -164,9 +166,18 @@ export function AccountsPage() {
   async function startLogin() {
     setStarting(true)
     try {
-      const d = await api<{ flow_id: string; authorize_url: string }>('POST', '/login/start')
+      /* 出口線路必須在這裡定：「登入、額度查詢、活動領取」是同一條出站鏈路，
+         後端會把它寫進帳號，登入後再改就晚了。 */
+      const d = await api<{ flow_id: string; authorize_url: string; proxy?: string }>('POST', '/login/start', {
+        proxy_id: addProxy === PROXY_DIRECT ? null : addProxy,
+      })
       setFlow({ flowId: d.flow_id, url: d.authorize_url })
-      setLoginStatus('已產生授權連結，複製到瀏覽器開啟並完成 Z.AI 登入…')
+      setLoginProxyLabel(d.proxy || '')
+      setLoginStatus(
+        d.proxy
+          ? `已產生授權連結（本次登入經線路 ${d.proxy}），複製到瀏覽器開啟並完成 Z.AI 登入…`
+          : '已產生授權連結，複製到瀏覽器開啟並完成 Z.AI 登入…',
+      )
       setLoginErr(false)
     } catch (e) {
       toast.error('發起登入失敗：' + errMsg(e))
@@ -779,6 +790,15 @@ export function AccountsPage() {
               <p className="text-xs text-muted-foreground">
                 Z.AI 只允許 ZCode 官方回呼地址，需要在登入完成後複製一次瀏覽器地址，不需要提供帳號密碼。
               </p>
+              <div className="flex flex-col gap-2">
+                <Label>出口線路</Label>
+                <ProxySelect value={addProxy} onChange={setAddProxy} proxies={proxies} disabled={Boolean(flow)} />
+                <p className="text-[11px] leading-tight text-muted-foreground">
+                  {flow
+                    ? `本次登入的出口已鎖定${loginProxyLabel ? `（${loginProxyLabel}）` : '（直連）'}；如需更換請取消後重新開始。`
+                    : '登入、額度查詢與活動領取都會走這條線路；選定後寫入帳號，之後仍可單獨修改。'}
+                </p>
+              </div>
               {!flow ? (
                 <Button className="h-10 w-full" disabled={starting} onClick={() => void startLogin()}>
                   {starting ? <Loader2 className="animate-spin" /> : null}
@@ -943,14 +963,16 @@ function ProxySelect({
   onChange,
   proxies,
   legacy = false,
+  disabled = false,
 }: {
   value: string
   onChange: (v: string) => void
   proxies: ProxyProfile[]
   legacy?: boolean
+  disabled?: boolean
 }) {
   return (
-    <Select value={value} onValueChange={onChange}>
+    <Select value={value} onValueChange={onChange} disabled={disabled}>
       <SelectTrigger className="w-full">
         <SelectValue />
       </SelectTrigger>

@@ -142,7 +142,7 @@ func cmdLogin(args []string) {
 		fmt.Println(web.Red + "❌ 授权失败: state 校验失败" + web.Reset)
 		return
 	}
-	result, err := flow.ExchangeCode(code, state)
+	result, err := flow.ExchangeCode(code, state, "")
 	if err != nil {
 		fmt.Println(web.Red + "❌ 授权失败: " + err.Error() + web.Reset)
 		return
@@ -186,7 +186,7 @@ func cmdLogin(args []string) {
 		_ = cm.Close()
 	}
 	if result.AccessToken != "" {
-		if key, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil {
+		if key, err := oauth.ExchangeAPIKey(result.AccessToken, ""); err == nil {
 			if _, err := st.AddAccount(model.ProviderZai, "oauth-apikey", key); err == nil {
 				fmt.Println(web.Green + "✔ 已兑换并保存 API Key: " + key[:min(8, len(key))] + "..." + web.Reset)
 			}

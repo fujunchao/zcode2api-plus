@@ -291,3 +291,28 @@ func TestSocks5LocalResolveFallsBackToIPv6(t *testing.T) {
 		t.Fatalf("ATYP=0x04 应带 16 字节地址，得到 %d", len(seenAddr))
 	}
 }
+
+func TestMaskURL(t *testing.T) {
+	// 代理凭据不该出现在面向使用者的报错里。
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"带密码", "http://user:s3cret@1.2.3.4:8080", "http://user:***@1.2.3.4:8080"},
+		{"仅用户名", "http://user@1.2.3.4:8080", "http://user@1.2.3.4:8080"},
+		{"无凭据", "socks5://1.2.3.4:1080", "socks5://1.2.3.4:1080"},
+		{"空串", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := MaskURL(c.in); got != c.want {
+				t.Fatalf("got %q want %q", got, c.want)
+			}
+		})
+	}
+	// 解析失败时原样返回（此时也没有密码可泄）。
+	if got := MaskURL("://bad"); got != "://bad" {
+		t.Fatalf("解析失败应原样返回: %q", got)
+	}
+}

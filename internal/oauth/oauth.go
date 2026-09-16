@@ -15,6 +15,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"zcode2api/internal/proxy"
 )
 
 const (
@@ -26,6 +28,26 @@ const (
 
 // extractTimeout HTTP 请求超时（对齐 Python httpx timeout=30）。
 const exchangeTimeout = 30 * time.Second
+
+// clientFor 构造登录链路的出站客户端。
+// 指定代理时走代理（http/https/socks4/socks5，与账号出站口径一致）；
+// 未指定时返回零值客户端——保留环境变量 HTTP_PROXY 的既有语义，不要改成
+// proxy.ClientFor("")，那会显式关掉环境代理。
+func clientFor(proxyURL string, timeout time.Duration) (*http.Client, error) {
+	if strings.TrimSpace(proxyURL) == "" {
+		return &http.Client{Timeout: timeout}, nil
+	}
+	return proxy.ClientFor(proxyURL, timeout)
+}
+
+// requestError 统一网络错误文案；经代理时附带（已脱敏的）代理地址，
+// 否则使用者分不清"上游挂了"和"代理不通"。
+func requestError(proxyURL string, err error) error {
+	if strings.TrimSpace(proxyURL) == "" {
+		return fmt.Errorf("上游请求失败: %v", err)
+	}
+	return fmt.Errorf("上游请求失败（经代理 %s）: %v", proxy.MaskURL(proxyURL), err)
+}
 
 // Flow 一次登录会话（对应 Python ZaiAuthFlow）。
 type Flow struct {
@@ -151,7 +173,9 @@ type ExchangeResult struct {
 }
 
 // ExchangeCode 用回调 code 兑换 Coding Plan JWT 等凭证。
-func (f *Flow) ExchangeCode(code, state string) (*ExchangeResult, error) {
+// proxyURL 非空时经该代理出站（登录链路必须与账号日常出站同一出口，
+// 否则会出现"登录走代理、用的时候直连"这种自相矛盾的状态）。
+func (f *Flow) ExchangeCode(code, state, proxyURL string) (*ExchangeResult, error) {
 	if code == "" {
 		return nil, errors.New("OAuth 回调缺少授权码")
 	}
@@ -163,7 +187,7 @@ func (f *Flow) ExchangeCode(code, state string) (*ExchangeResult, error) {
 		"redirect_uri": f.RedirectURI,
 		"state":        state,
 	}
-	body, err := postJSON(tokenURL, payload)
+	body, err := postJSON(tokenURL, payload, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -232,11 +256,14 @@ func codeIsZero(code any) bool {
 }
 
 // ExchangeAPIKey OAuth access_token → 业务 token → 机构/项目 → API Key
-// （对齐 Python exchange_api_key 的完整链路）。
-func ExchangeAPIKey(accessToken string) (string, error) {
-	client := &http.Client{Timeout: exchangeTimeout}
+// （对齐 Python exchange_api_key 的完整链路）。proxyURL 语义同 ExchangeCode。
+func ExchangeAPIKey(accessToken, proxyURL string) (string, error) {
+	client, err := clientFor(proxyURL, exchangeTimeout)
+	if err != nil {
+		return "", err
+	}
 	bizToken, err := func() (string, error) {
-		body, err := postJSON("https://api.z.ai/api/auth/z/login", map[string]string{"token": accessToken})
+		body, err := postJSON("https://api.z.ai/api/auth/z/login", map[string]string{"token": accessToken}, proxyURL)
 		if err != nil {
 			return "", err
 		}
@@ -258,7 +285,7 @@ func ExchangeAPIKey(accessToken string) (string, error) {
 		return "", err
 	}
 
-	info, err := getJSON(client, "https://api.z.ai/api/biz/customer/getCustomerInfo", bizToken)
+	info, err := getJSON(client, "https://api.z.ai/api/biz/customer/getCustomerInfo", bizToken, proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -277,14 +304,14 @@ func ExchangeAPIKey(accessToken string) (string, error) {
 	projID, _ := proj["projectId"].(string)
 	keyURL := fmt.Sprintf("https://api.z.ai/api/biz/v1/organization/%s/projects/%s/api_keys", orgID, projID)
 
-	keys, err := getJSON(client, keyURL, bizToken)
+	keys, err := getJSON(client, keyURL, bizToken, proxyURL)
 	if err != nil {
 		return "", err
 	}
 	keyList, _ := keys["data"].([]any)
 	keyObj := findNamed(keyList, "zcode-api-key")
 	if keyObj == nil {
-		created, err := postJSONAuth(client, keyURL, bizToken, map[string]string{"name": "zcode-api-key"})
+		created, err := postJSONAuth(client, keyURL, bizToken, map[string]string{"name": "zcode-api-key"}, proxyURL)
 		if err != nil {
 			return "", err
 		}
@@ -294,7 +321,7 @@ func ExchangeAPIKey(accessToken string) (string, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return "", errors.New("获取 API Key 失败")
 	}
-	copied, err := getJSON(client, keyURL+"/copy/"+apiKey, bizToken)
+	copied, err := getJSON(client, keyURL+"/copy/"+apiKey, bizToken, proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -339,12 +366,16 @@ func findNamed(items []any, name string) map[string]any {
 }
 
 // postJSON POST JSON 并返回响应体（非 2xx 或业务码非 0 视为失败）。
-func postJSON(url string, payload any) ([]byte, error) {
-	client := &http.Client{Timeout: exchangeTimeout}
-	data, _ := json.Marshal(payload)
-	res, err := client.Post(url, "application/json", bytes.NewReader(data))
+// proxyURL 为空即直连。
+func postJSON(endpoint string, payload any, proxyURL string) ([]byte, error) {
+	client, err := clientFor(proxyURL, exchangeTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("上游请求失败: %v", err)
+		return nil, err
+	}
+	data, _ := json.Marshal(payload)
+	res, err := client.Post(endpoint, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return nil, requestError(proxyURL, err)
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
@@ -358,9 +389,9 @@ func postJSON(url string, payload any) ([]byte, error) {
 }
 
 // postJSONAuth 带鉴权头的 POST（创建 API Key 用）。
-func postJSONAuth(client *http.Client, url, token string, payload any) (map[string]any, error) {
+func postJSONAuth(client *http.Client, endpoint, token string, payload any, proxyURL string) (map[string]any, error) {
 	data, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +399,7 @@ func postJSONAuth(client *http.Client, url, token string, payload any) (map[stri
 	req.Header.Set("Authorization", "Bearer "+token)
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("上游请求失败: %v", err)
+		return nil, requestError(proxyURL, err)
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
@@ -386,15 +417,15 @@ func postJSONAuth(client *http.Client, url, token string, payload any) (map[stri
 }
 
 // getJSON 带鉴权头的 GET。
-func getJSON(client *http.Client, url, token string) (map[string]any, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func getJSON(client *http.Client, endpoint, token, proxyURL string) (map[string]any, error) {
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("上游请求失败: %v", err)
+		return nil, requestError(proxyURL, err)
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
