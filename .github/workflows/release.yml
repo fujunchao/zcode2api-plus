@@ -56,11 +56,11 @@ jobs:
           files: zcode2api-*
           body_path: release-notes.md
 
-  # 多架構容器鏡像 → ghcr.io/<repo>。linux/amd64 與 linux/arm64 都有 cloakbrowser
-  # 的預構建補丁 Chromium，故兩個架構都能自動求解驗證碼。
-  # 構建階段用 $BUILDPLATFORM（原生速度）交叉編譯，故 QEMU 只需支撐運行階段的 apt。
+  # 多架构容器镜像 → ghcr.io/<repo>。linux/amd64 与 linux/arm64 都有 cloakbrowser
+  # 的预构建补丁 Chromium，故两个架构都能自动求解验证码。
+  # 构建阶段用 $BUILDPLATFORM（原生速度）交叉编译，故 QEMU 只需支撑运行阶段的 apt。
   #
-  # 實測（v2.0.2-go）：公開倉庫的 package 默認即可匿名 pull，無需手動改可見性。
+  # 实测（v2.0.2-go）：公开仓库的 package 默认即可匿名 pull，无需手动改可见性。
   image:
     runs-on: ubuntu-latest
     permissions:
