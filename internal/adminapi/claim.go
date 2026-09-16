@@ -107,12 +107,14 @@ func claimCooldownUntil(outcomes []map[string]any, now time.Time, captchaSec, re
 }
 
 // applyClaimOutcome 把一次领取结果写回账号（含上游给的下次可领时间）并落库。
+// ClaimState 视为不可变：在这里基于快照生成新对象、经 SetClaimState 原子替换
+// （领取在后台 goroutine 写、后台快照在读，CI 的 -race 实测抓到过竞态）。
 func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]any, now time.Time) {
 	captchaSec, retrySec, _ := h.Store.ClaimCooldowns()
-	if acc.Claim == nil {
-		acc.Claim = &model.ClaimState{}
+	next := acc.ClaimView()
+	if next == nil {
+		next = &model.ClaimState{}
 	}
-	state := acc.Claim
 	succeeded := false
 	for _, o := range outcomes {
 		if ok, _ := o["ok"].(bool); ok {
@@ -120,16 +122,17 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 			break
 		}
 	}
-	state.NextAt = claimCooldownUntil(outcomes, now, captchaSec, retrySec)
+	next.NextAt = claimCooldownUntil(outcomes, now, captchaSec, retrySec)
 	if succeeded {
 		ts := float64(now.Unix())
-		state.ClaimedAt = &ts
-		state.LastError = nil
+		next.ClaimedAt = &ts
+		next.LastError = nil
 	} else if len(outcomes) > 0 {
 		if msg, _ := outcomes[0]["message"].(string); msg != "" {
-			state.LastError = &msg
+			next.LastError = &msg
 		}
 	}
+	acc.SetClaimState(next)
 	if err := h.Store.UpdateAccount(acc); err != nil {
 		web.Warn("claim", "领取状态落库失败: "+err.Error())
 	}

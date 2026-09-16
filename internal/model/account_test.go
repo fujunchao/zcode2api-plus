@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -230,6 +231,49 @@ func TestClaimNextAt(t *testing.T) {
 	if got := acc.ClaimNextAt(); got == nil || *got != next {
 		t.Fatalf("ClaimNextAt 不符: %v", got)
 	}
+}
+
+// TestClaimStateConcurrentAccess 压 Claim 的并发不变量：领取在后台 goroutine 写、
+// 后台快照与序列化在读，全部必须经过 claimMu。CI 的 -race 曾抓到
+// applyClaimOutcome 与 PublicView 的真实竞态（run 35091374551），本用例把同类
+// 并发固定下来——写入方换快照，读方同时做快照、取值与编码，任何一处漏锁都会在
+// -race 下报出。
+func TestClaimStateConcurrentAccess(t *testing.T) {
+	acc := Create(ProviderZai, "race", "sk-race")
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(stop)
+		for i := 0; i < 300; i++ {
+			ts := float64(i)
+			acc.SetClaimState(&ClaimState{ClaimedAt: &ts, NextAt: &ts})
+		}
+	}()
+
+	for r := 0; r < 3; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = acc.ClaimView()
+				_ = acc.ClaimNextAt()
+				_ = acc.PublicView(time.Unix(0, 0))
+				if _, err := json.Marshal(acc); err != nil {
+					t.Errorf("序列化失败: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestClaimStateRoundTrip(t *testing.T) {

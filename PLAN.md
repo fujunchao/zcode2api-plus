@@ -308,6 +308,11 @@ meta(key TEXT PK, value TEXT)
 - **不做后台周期重试**：网关是长驻服务，定时领取会产生持续的上游流量；
   保持"入池一次 + 手动"两个触发点。
 - 业务码与 `next_at` 经 `claim.FailureOutcome` 回传，`adminapi` 据此落盘，不解析错误文案。
+- **`Claim` 的并发访问统一走锁**：领取在后台 goroutine 写、后台快照与落库序列化在读
+  （CI 的 `-race` 实测抓到过竞态，run 35091374551）。`Account` 内嵌 `claimMu`，
+  读写走 `SetClaimState`/`ClaimView`，序列化由 `MarshalJSON` 在锁内完成；
+  已发布的 `ClaimState` 视为不可变（改动一律生成新快照整体替换）。
+  回归 `TestClaimStateConcurrentAccess`（-race 下压该不变量）。
 
 #### 5.9.2 领取设定与每日定时（2026-09-16 新增）
 
@@ -519,6 +524,8 @@ meta(key TEXT PK, value TEXT)
   尊重 `claim.next_at`、错过不补跑、批量尊重串行闸门。
 - [x] 回归：store 访问器回退与钳制、设置 API 往返与非法值、`shouldFireClaim` 判定、
   开关关闭零动作、定时批量跳过冷却账号。
+- [x] 修掉 CI `-race` 抓到的领取状态竞态（`Claim` 的读写与序列化统一走 `claimMu`，
+  见 §5.9.1）；回归 `TestClaimStateConcurrentAccess`。
 - [ ] 在线观察定时批量的上游节奏（账号较多时 1s 间隔是否合适）。
 
 ## 7. 测试策略

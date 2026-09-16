@@ -4,6 +4,7 @@
 package model
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -100,7 +102,14 @@ type Account struct {
 	// 多个账号被上游按设备关联；每账号一份即隔离。缺失时回退全局值（见 DeviceMidOr）。
 	VirtualDeviceMid *string `json:"virtual_device_mid"`
 	// Claim 套餐领取状态（含上游给的「下次可领时间」）；见 ClaimState。
+	// 读写必须走 SetClaimState/ClaimView，序列化由 MarshalJSON 在锁内完成
+	// （claimMu 保护）：领取在后台 goroutine 写、后台快照与序列化在读，
+	// CI 的 -race 实测抓到过竞态。
 	Claim *ClaimState `json:"claim"`
+
+	// claimMu 保护 Claim 指针的替换与读取。Account 一律按指针使用、从不按值复制，
+	// 故可内嵌锁；已发布的 ClaimState 视为不可变（改动一律生成新快照整体替换）。
+	claimMu sync.Mutex
 
 	// RateLimitStreak 连续被瞬时限流的次数，成功调用后归零，用于选择递进冷却档位。
 	// 刻意不序列化：accounts.data 的 JSON 键集是与 Python 版互读的硬契约，
@@ -193,10 +202,46 @@ func (a *Account) DeviceMidOr(fallback string) string {
 
 // ClaimNextAt 下次可领时间（未记录时为 nil）。已过期的等待由调用方判断。
 func (a *Account) ClaimNextAt() *float64 {
+	if v := a.ClaimView(); v != nil {
+		return v.NextAt
+	}
+	return nil
+}
+
+// SetClaimState 原子替换领取状态。传入的快照此后视为不可变——后续改动必须
+// 基于副本生成新对象再整体替换，禁止就地改字段（否则 marshal/读侧又会产生竞态）。
+func (a *Account) SetClaimState(next *ClaimState) {
+	a.claimMu.Lock()
+	defer a.claimMu.Unlock()
+	a.Claim = next
+}
+
+// ClaimView 返回领取状态的快照（值的浅拷贝，与后续改动解耦）；未记录时为 nil。
+func (a *Account) ClaimView() *ClaimState {
+	a.claimMu.Lock()
+	defer a.claimMu.Unlock()
 	if a.Claim == nil {
 		return nil
 	}
-	return a.Claim.NextAt
+	c := *a.Claim
+	return &c
+}
+
+// MarshalJSON 在锁内完成整个账号的编码。Claim 的读取方除了后台快照还有序列化
+// （落库走 persistAccountLocked 的 json 编码），后者不经过 ClaimView；若不在
+// 这里上锁，后台领取 goroutine 的替换写入仍会与编码读取相撞。
+// 别名类型剥掉方法集，避免递归调用本方法；转义策略与 store.marshalJSON 一致。
+func (a *Account) MarshalJSON() ([]byte, error) {
+	a.claimMu.Lock()
+	defer a.claimMu.Unlock()
+	type plain Account
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode((*plain)(a)); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // JWTUserID 解 JWT payload 的用户标识（user_id 优先，sub 兜底）；解析失败返回空串。
@@ -476,7 +521,7 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		"created_at":      a.CreatedAt,
 		"archived_at":     a.ArchivedAt,
 		"user_id":         a.UserID,
-		"claim":           a.Claim,
+		"claim":           a.ClaimView(),
 		// 暴露设备指纹便于后台核对账号间是否已相互隔离（管理员接口，非公开）。
 		"virtual_device_mid": a.VirtualDeviceMid,
 	}
