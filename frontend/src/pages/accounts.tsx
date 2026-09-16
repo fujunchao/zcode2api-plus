@@ -635,6 +635,7 @@ export function AccountsPage() {
                         <>
                           <QuotaRows account={a} />
                           <PlanRows account={a} />
+                          <ClaimHint account={a} />
                         </>
                       )}
                     </TableCell>
@@ -652,8 +653,17 @@ export function AccountsPage() {
                           </Button>
                         )}
                         {a.mode === 'jwt' && (
-                          <Button variant="ghost" size="icon-sm" title="領取活動套餐" onClick={() => void claimOne(a)}>
-                            {claiming.has(a.id) ? <Loader2 className="animate-spin" /> : <Gift />}
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            title={claimCooling(a) ? `${claimStateText(a)}；點擊仍可強制領取` : '領取活動套餐'}
+                            onClick={() => void claimOne(a)}
+                          >
+                            {claiming.has(a.id) ? (
+                              <Loader2 className="animate-spin" />
+                            ) : (
+                              <Gift className={claimCooling(a) ? 'opacity-40' : undefined} />
+                            )}
                           </Button>
                         )}
                         <Button variant="ghost" size="icon-sm" title="重置 Token 統計" onClick={() => resetStats(a)}>
@@ -958,6 +968,38 @@ function ProxySelect({
 }
 
 /* 累計 Tokens 欄：入／出／快取三行 */
+/* claimCooling 是否仍在領取冷卻期（後端只對自動路徑生效，手動仍可強制）。 */
+function claimCooling(a: Account): boolean {
+  const next = a.claim?.next_at
+  return typeof next === 'number' && next > Date.now() / 1000
+}
+
+/* humanizeGap 未來時間的粗略間隔描述。 */
+function humanizeGap(seconds: number): string {
+  if (seconds < 3600) return `約 ${Math.max(1, Math.ceil(seconds / 60))} 分鐘後`
+  if (seconds < 86400) return `約 ${Math.ceil(seconds / 3600)} 小時後`
+  return `約 ${Math.ceil(seconds / 86400)} 天後`
+}
+
+/* claimStateText 領取狀態的一行說明（無可顯示資訊時返回空串）。 */
+function claimStateText(a: Account): string {
+  const claim = a.claim
+  if (!claim) return ''
+  const now = Date.now() / 1000
+  if (typeof claim.next_at === 'number' && claim.next_at > now) {
+    return `下次可領取 ${fmtDate(claim.next_at)}（${humanizeGap(claim.next_at - now)}）`
+  }
+  if (claim.last_error) return `上次領取失敗：${claim.last_error}`
+  return ''
+}
+
+/* ClaimHint 方案欄下方的領取狀態次要文案。 */
+function ClaimHint({ account }: { account: Account }) {
+  const text = claimStateText(account)
+  if (!text) return null
+  return <p className="mt-1 text-[11px] leading-tight text-muted-foreground">{text}</p>
+}
+
 function TokensCell({ account }: { account: Account }) {
   const t = account.total_tokens || { input: 0, output: 0, cache_creation: 0, cache_read: 0 }
   const i = Number(t.input) || 0

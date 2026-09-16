@@ -118,6 +118,8 @@
 | 业务码语义 | `1005`(HTTP 200)=当日额度用完；`3007`=验证码失效；`3010`=并发准入；F001=风控指纹拒绝 |
 | 冷却 / 刷新 | `COOLING_SECONDS=300`（连接失败与 503 的固定值，同时是瞬时限流阶梯的封顶）、`QUOTA_REFRESH_INTERVAL=60`（0=关闭，运行中可改） |
 | 瞬时限流冷却阶梯 | 同一账号连续被限流 30s → 60s → 120s → `COOLING_SECONDS`；任意一次成功调用后归零 |
+| 领取冷却（仅自动路径） | 优先用上游 `data.plan.ends_at`；缺失时按成因分档：验证码类与 1005/1003 取 `CLAIM_CAPTCHA_COOLDOWN=3600`，其余取 `CLAIM_RETRY_COOLDOWN=600`（秒） |
+| 「刷新资格」节流 | `CLAIM_PREVIEW_COOLDOWN=60`（秒，内存态；0=关闭） |
 | 验证码缓存 | Node/人工令牌 45s；配置 600s；浏览器令牌**不缓存** |
 | 验证码池 | workers=1、startup=90s、request=45s、queue=60s、shutdown=10s、失败冷却=60s |
 | 后台限速 | 单 IP 滑动窗口 300s 内失败 10 次 → 一律 429，成功清零 |
@@ -170,7 +172,15 @@ meta(key TEXT PK, value TEXT)
   disabled_models,plan,plans,usage,use_count,fail_count,total_input_tokens,total_output_tokens,
   total_cache_creation_tokens,total_cache_read_tokens,last_used_at,last_checked_at,cooling_until,
   last_error,proxy_url,proxy_id,created_at`；未知字段忽略（对齐 `Account.from_dict`）。
-- 导出/导入格式（`version:1` + `providers.{name,mode,secret,disabled_models}`）保持一致。
+- **Go 增量键**（原约定为"不新增键"，2026-09-16 重新评估：Python 侧已退休，
+  多余键只会被 `json.loads` 原样保留、旧版读 Go 数据也不受影响，故该约定已放开为"只增不减"）：
+  `archived_at`（归档）、`user_id`（身份判据）、`virtual_device_mid`（每账号设备指纹）、
+  `claim`（领取状态，见 §5.9.1 / §5.10）。键集由 `TestJSONContractWithPython` 逐个钉死
+  （现 32 键，并额外断言 `claim` 的嵌套键名）。纯运行期退避状态（如 `RateLimitStreak`）
+  仍用 `json:"-"`，不进该集合。
+- 导出/导入格式（`version:1` + `providers.{name,mode,secret,disabled_models}`）保持一致——
+  刻意不含 Go 增量键：设备指纹是机器绑定的，跨机搬运反而有害（导入后重新分配更合理），
+  领取状态则是瞬时状态。
 - 两个版本可交替打开同一个 db（不做 schema 迁移）。
 
 ### 5.5 验证码（照抄 `captcha_browser.py` 的思路与字符串）
@@ -274,13 +284,49 @@ meta(key TEXT PK, value TEXT)
   1005 今日名额用完 / 3001 参数错误 / 3007 验证码失败（换码重试一次）/ 401 未登录。
 - 激活上报：preview 前对 `https://zcode.z.ai/api/v1/event/report` 发 `app_launch` +
   `app_daily_active` 两事件（16 字段体，无 Authorization；疑似活动投放资格信号；
-  失败仅记日志不阻断）。device_mid 沿用本机持久化标识。
+  失败仅记日志不阻断）。device_mid 取**账号自己的指纹**（见 §5.10）。
 - 触发点：入池后（批量添加 / OAuth 完成 / CLI login）后台自动全量领取 +
   Admin API `GET /claim/preview`、`POST /claim`（account_ids 可选，冷却账号跳过）+
   前端账单页按钮（工具栏全量 + JWT 账号行内单账号）。
 - 复用项：鉴权头与 quota 同源（`X-ZCode-App-Version`/`X-Platform`/`X-Device-Mid`）；
   请求走账号代理（与 Python 版 make_async_client 语义一致）；
   验证码经 M5 的 captcha manager 求解/人工回填。
+
+#### 5.9.1 领取状态、冷却与并发（2026-09-16 新增，v2.0.6 排期）
+
+对齐 zcode-switch 的 autoClaim 设计补齐三处（此前只有"入池领一次"）：
+
+- **上游给的 `next_at` 必须留住**：上游在成功响应与 1005（当日名额用完）里都会给出
+  `data.plan.ends_at` ——那是它自己算好的下次可领时间，此前只取了错误文案把时间丢掉。
+  现落到 `Account.claim.next_at`（兼容秒/毫秒时间戳），后端与前端据此倒计时。
+- **冷却只作用于自动路径**：手动点按钮（`POST /claim`）始终可强制触发——用户点了
+  没反应是最糟的交互，冷却的目的是避免自动路径白打上游，而不是拦用户。
+  自动路径在 `claim.next_at` 未到期时直接跳过。
+- **单槽串行闸门**：`claimGate`（容量 1，非阻塞抢占）。上游按账号维度做验证码与领取
+  风控，并发领取只会互相挤兑 captcha 池；批量导入 20 个账号时尤其明显。
+  抢不到即跳过该账号（**不排队**——把 goroutine 堆着等与并发并无区别）。
+- **不做后台周期重试**：网关是长驻服务，定时领取会产生持续的上游流量；
+  保持"入池一次 + 手动"两个触发点。
+- 业务码与 `next_at` 经 `claim.FailureOutcome` 回传，`adminapi` 据此落盘，不解析错误文案。
+
+### 5.10 账户身份与设备指纹（Go 版增量，2026-09-16 新增）
+
+- **身份与凭据解耦**：`accounts.data` 新增 `user_id`（JWT payload 的 `user_id`，`sub` 兜底）。
+  同一个号的 token 每次登录都会变，只比凭据字节会让它变成"另一条记录"。
+  入池判重按 **user_id → email → 凭据** 三轮优先级遍历（`Store.duplicateLocked`）：
+  必须分遍而不能单遍取首个命中——单遍会让列表里靠前的低优先级判据抢先于靠后的高优先级判据。
+  `user_id` 一律由 `secret` 派生，故手动添加 / 导入 / CLI 路径自动获得身份判定；
+  OAuth 路径额外传入 email（该类 token 形态当场拿不到邮箱）。
+- **每账号设备指纹**：新增 `virtual_device_mid`。此前全仓只有一份全局 `device_mid.txt`
+  （`config.DeviceMid()`），同一台机器上的 N 个账号共用一个设备标识，等于主动给上游递关联线索。
+  取值走 `Account.DeviceMidOr(fallback)`：有账号指纹用账号的，缺失才回退全局值。
+  回退值由调用方传入，`model` 包不因此依赖 `config`。
+- **存量为一次性迁移**（`Store.migrateAccountIdentity`，`load()` 末尾，幂等）：
+  回填缺失的 `virtual_device_mid` 与 `user_id`，仅在有改动时落库。
+  **不删除、不合并任何存量账号**——判重只作用于新增。
+- **导出格式刻意不加新字段**：`ExportPayload` 保持 version 1。设备指纹是机器绑定的，
+  跨机搬运反而有害（导入后重新分配更合理）；领取状态是瞬时状态。
+- ⚠️ 迁移会改变存量账号的 `X-Device-Mid`，上游可能识别为「换了台机器」，需在线观察。
 
 ## 6. 里程碑
 
@@ -389,10 +435,29 @@ meta(key TEXT PK, value TEXT)
   等待期间 ctx 取消即放弃（`sleepCtx`）。
 - [x] 冷却按连续被限流次数递进 30s → 60s → 120s → `COOLING_SECONDS`；
   `MarkRateLimited` / `ResetRateLimitStreak` 导出，sync 与 async 两条路径共用。
-- [x] 连续计数以 `json:"-"` 挂在 Account 上（不新增 `accounts.data` 键，避免破坏与 Python 版的互读契约）。
+- [x] 连续计数以 `json:"-"` 挂在 Account 上（当时为避免破坏 Python 互读契约而不新增键；
+  该理由已在 M13 重新评估——Python 侧已退休，`accounts.data` 开始接纳 Go 增量键）。
 - [x] 回归：`TestTransientRateLimitRetrySucceedsInPlace`、`TestTransientRateLimitCoolingEscalates`
   及 asyncpool 同名两例。
 - [ ] 1302／1305 的窗口量级在线验证（若为分钟级，原地重试无意义，应改为继续缩短冷却）。
+
+### M13 账户身份、设备指纹与领取状态（v2.0.6-go）
+- [x] 借鉴 zcode-switch（`pjpv/zcode-switch`，Tauri 桌面多账号切换器）的 autoClaim 设计，
+  补齐领取状态落盘、冷却分档与单槽串行闸门；契约见 §5.9.1。
+- [x] 保住上游在成功与 1005 响应里给出的 `data.plan.ends_at`（此前只取了错误文案），
+  落到 `Account.claim.next_at`；`ClaimError` 携带 code/nextAt 供调用方使用。
+- [x] 领取状态落盘（`Account.claim`）：长驻服务重启后不再把刚领过的账号重领一遍。
+- [x] 身份与凭据解耦：新增 `user_id`，入池判重按 user_id → email → 凭据 三轮优先级遍历；
+  `saveOAuthAccount` 提前传入 email（否则对"重新登录"这个主场景无效）。契约见 §5.10。
+- [x] 每账号设备指纹 `virtual_device_mid`（此前全局一份），四处注入点改走
+  `Account.DeviceMidOr(config.DeviceMid())`；`model` 不依赖 `config`。
+- [x] 存量一次性迁移（幂等）：回填 mid 与 user_id，不删除/合并任何存量账号。
+- [x] `accounts.data` 契约测试同步（29 → 32 键），并钉住 `claim` 的嵌套键名。
+- [x] 回归：`TestAddAccountDedupByUserIDAcrossTokenRefresh`、
+  `TestAddAccountDedupPrefersUserIDOverEmail`、`TestMigrationBackfillsIdentityAndIsIdempotent`、
+  `TestClaimSurfacesUpstreamNextAt`、`TestApplyClaimOutcomePersists`、`TestClaimGateIsExclusive` 等。
+- [ ] 存量迁移后在线观察：上游是否把 `X-Device-Mid` 变更识别为「换了台机器」。
+- [ ] 真实账号领取一次，确认 `claim.next_at` 与上游 `ends_at` 一致。
 
 ## 7. 测试策略
 

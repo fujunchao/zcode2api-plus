@@ -21,3 +21,6 @@ js-code/
 
 # 协作 agent 的本地记忆与工作区状态（含路径、调试结论等本机信息，不入库）
 .workbuddy/
+
+# 只读参照用的第三方仓库克隆（本身是独立 git 仓库，不得作为 gitlink 混入本仓库）
+/zcode-switch/

@@ -5,6 +5,7 @@ package model
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -42,9 +43,22 @@ type Usage struct {
 	CacheRead     int
 }
 
-// Account 与 Python 版 dataclass 字段一一对应（json tag 即 asdict 输出的键）。
-// 可空字段使用指针且**不带 omitempty**：Python 的 json.dumps 会输出 null 键，
-// 两版序列化形态必须完全一致才能互读同一数据库。
+// ClaimState 套餐领取状态（Go 增量）。上游在 1005（当日名额用完）与成功响应里都会
+// 给出 data.plan.ends_at 作为下次可领时间，此前只取了错误文案、把时间丢掉了。
+//
+// 长驻服务场景下必须落盘：领取状态只存内存时，重启会把刚领过的账号再领一遍
+// ——上游 1003 虽然幂等，但白耗验证码与风控额度。
+type ClaimState struct {
+	ClaimedAt *float64 `json:"claimed_at"` // 上次成功领取时间
+	NextAt    *float64 `json:"next_at"`    // 下次可领时间（上游 ends_at，缺失时按失败类型推算）
+	LastError *string  `json:"last_error"` // 上次失败原因（面向使用者文案）
+}
+
+// Account 的 json tag 与 Python 版 dataclass（asdict 输出的 snake_case 键）对齐，
+// 使两版可读同一个 accounts.db。可空字段使用指针且**不带 omitempty**。
+//
+// Go 增量字段（Python 侧 json.loads 会原样保留，旧版读取时缺失即 nil）：
+// user_id、virtual_device_mid、claim、archived_at。
 type Account struct {
 	ID       string  `json:"id"`
 	Name     string  `json:"name"`
@@ -78,6 +92,15 @@ type Account struct {
 	ProxyID                  *string  `json:"proxy_id"`
 	CreatedAt                float64  `json:"created_at"`
 	ArchivedAt               *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
+
+	// UserID 上游用户标识（JWT payload 的 user_id，sub 兜底）。身份判据，优先级最高：
+	// 同一个号的 token 会刷新，只比凭据字节会让它变成"另一条记录"。
+	UserID *string `json:"user_id"`
+	// VirtualDeviceMid 账号独立设备指纹。全局唯一一份 device_mid 会让同一台机器上的
+	// 多个账号被上游按设备关联；每账号一份即隔离。缺失时回退全局值（见 DeviceMidOr）。
+	VirtualDeviceMid *string `json:"virtual_device_mid"`
+	// Claim 套餐领取状态（含上游给的「下次可领时间」）；见 ClaimState。
+	Claim *ClaimState `json:"claim"`
 
 	// RateLimitStreak 连续被瞬时限流的次数，成功调用后归零，用于选择递进冷却档位。
 	// 刻意不序列化：accounts.data 的 JSON 键集是与 Python 版互读的硬契约，
@@ -155,6 +178,72 @@ func (a *Account) Secret() string {
 		return derefString(a.JWTToken)
 	}
 	return derefString(a.APIKey)
+}
+
+// DeviceMidOr 返回账号的设备指纹；未分配时回退 fallback（通常是全局固定值）。
+// 回退值由调用方传入：model 包刻意不依赖 config，以保持只依赖标准库。
+func (a *Account) DeviceMidOr(fallback string) string {
+	if a.VirtualDeviceMid != nil {
+		if mid := strings.TrimSpace(*a.VirtualDeviceMid); mid != "" {
+			return mid
+		}
+	}
+	return fallback
+}
+
+// ClaimNextAt 下次可领时间（未记录时为 nil）。已过期的等待由调用方判断。
+func (a *Account) ClaimNextAt() *float64 {
+	if a.Claim == nil {
+		return nil
+	}
+	return a.Claim.NextAt
+}
+
+// JWTUserID 解 JWT payload 的用户标识（user_id 优先，sub 兜底）；解析失败返回空串。
+// 官方客户端的事件上报以 user_id 标识用户；本仓库同时用它作为账号身份判据——
+// 同一个号的 token 会刷新、凭据字节会变，但 user_id 不变。
+// 只做 base64url 解码，不校验签名（凭据真伪由上游判定）。
+func JWTUserID(token string) string {
+	payload := jwtPayload(token)
+	if payload == "" {
+		return ""
+	}
+	var claims map[string]any
+	if err := json.Unmarshal([]byte(payload), &claims); err != nil {
+		return ""
+	}
+	for _, key := range []string{"user_id", "sub"} {
+		if s, ok := claims[key].(string); ok {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
+
+// jwtPayload 取 JWT 第二段并 base64url 解码；形态不合法返回空串。
+func jwtPayload(token string) string {
+	first := strings.Index(token, ".")
+	if first < 0 {
+		return ""
+	}
+	second := strings.Index(token[first+1:], ".")
+	if second < 0 {
+		return ""
+	}
+	seg := token[first+1 : first+1+second]
+	if seg == "" {
+		return ""
+	}
+	// payload 段通常去掉了 base64 填充，两种解码器都要试。
+	if raw, err := base64.RawURLEncoding.DecodeString(seg); err == nil {
+		return string(raw)
+	}
+	if padded, err := base64.URLEncoding.DecodeString(seg); err == nil {
+		return string(padded)
+	}
+	return ""
 }
 
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。
@@ -386,6 +475,10 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		"proxy_id":        a.ProxyID,
 		"created_at":      a.CreatedAt,
 		"archived_at":     a.ArchivedAt,
+		"user_id":         a.UserID,
+		"claim":           a.Claim,
+		// 暴露设备指纹便于后台核对账号间是否已相互隔离（管理员接口，非公开）。
+		"virtual_device_mid": a.VirtualDeviceMid,
 	}
 }
 

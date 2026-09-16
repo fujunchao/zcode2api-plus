@@ -111,6 +111,18 @@ var (
 	CoolingSeconds       = envInt("ZCODE_COOLING_SECONDS", 300)       // 限流冷却（秒）
 )
 
+// ── 套餐领取 ────────────────────────────────────────────────────────────────
+// 冷却只拦自动路径（账号入池触发的领取），手动点按钮始终可强制触发：
+// 用户点了没反应是最糟的交互，冷却的目的是避免自动路径白打上游。
+var (
+	// 自动领取失败后的重试冷却（秒）：验证码不可用或已领过但上游没给 ends_at 时用。
+	ClaimCaptchaCooldownSeconds = max(60, envInt("ZCODE_CLAIM_CAPTCHA_COOLDOWN", 3600))
+	// 其他失败（网络/参数）后的冷却（秒）。
+	ClaimRetryCooldownSeconds = max(30, envInt("ZCODE_CLAIM_RETRY_COOLDOWN", 600))
+	// 「刷新资格」这个只读探测的冷却（秒），避免前端每次加载都打上游。
+	ClaimPreviewCooldownSeconds = max(0, envInt("ZCODE_CLAIM_PREVIEW_COOLDOWN", 60))
+)
+
 // ── 上游端点 ────────────────────────────────────────────────────────────────
 var (
 	UpstreamZai         = env("ZAI_UPSTREAM_URL", "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")
@@ -153,6 +165,10 @@ func DeviceMid() string {
 	})
 	return deviceMid
 }
+
+// NewDeviceMid 生成新的设备指纹，供每账号分配（见 model.Account.VirtualDeviceMid）。
+// 与全局 DeviceMid() 不同：它不写 device_mid.txt，而是随账号存进 accounts.data。
+func NewDeviceMid() string { return newUUID() }
 
 // newUUID 生成 UUIDv4（不引入第三方依赖）。
 func newUUID() string {

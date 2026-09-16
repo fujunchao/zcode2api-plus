@@ -109,16 +109,26 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult) (*model.Account
 	if name == "" {
 		name = "oauth-login"
 	}
-	account, err := h.Store.AddAccount(model.ProviderZai, name, result.Token)
+	// 邮箱必须在入池时就传入：每次登录的 token 都不同，只比凭据字节会把同一个号
+	// 建成两条记录（见 store.AddAccountWithIdentity 的三级判重）。
+	account, err := h.Store.AddAccountWithIdentity(model.ProviderZai, name, result.Token, email)
 	if err != nil {
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
 	if email != "" {
-		account.Email = &email
+		dirty := false
+		if account.Email == nil || *account.Email == "" {
+			// 命中的既有账号可能早于本次改造入库，尚无邮箱记录。
+			account.Email = &email
+			dirty = true
+		}
 		if account.Name == "oauth-login" {
 			account.Name = email
+			dirty = true
 		}
-		_ = h.Store.UpdateAccount(account)
+		if dirty {
+			_ = h.Store.UpdateAccount(account)
+		}
 	}
 	if result.AccessToken != "" {
 		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken); err == nil && apiKey != "" {

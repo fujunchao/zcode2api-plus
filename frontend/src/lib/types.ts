@@ -50,6 +50,17 @@ export interface Account {
   proxy_id: string | null
   created_at: number
   archived_at: number | null
+  user_id: string | null
+  virtual_device_mid: string | null
+  claim: ClaimState | null
+}
+
+/** 套餐领取状态（后端 model.ClaimState）。 */
+export interface ClaimState {
+  claimed_at: number | null
+  /** 下次可领时间（上游给的 ends_at，或按失败成因推算）。 */
+  next_at: number | null
+  last_error: string | null
 }
 
 export interface Stats {

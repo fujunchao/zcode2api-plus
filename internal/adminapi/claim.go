@@ -1,20 +1,55 @@
 // 套餐领取端点（/admin/api/claim/*）：对应 Python 版 admin_api.py 的
 // claim_preview / claim_plans，以及入池自动领取触发点（批量添加 / OAuth）。
+//
+// 本轮补齐三处（借鉴 zcode-switch 的 autoClaim 设计）：
+//   - 领取状态落盘：含上游给的「下次可领时间」，重启不再把刚领过的账号重领一遍；
+//   - 冷却分档：只拦自动路径，手动触发始终可强制；
+//   - 单槽串行：批量导入多个账号时不再同时轰验证码池。
 package adminapi
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"zcode2api/internal/claim"
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/web"
 )
 
 // autoClaimTasks 强引用持有后台自动领取任务（对齐 Python _auto_claim_tasks）。
 var autoClaimTasks sync.WaitGroup
+
+// claimGate 容量固定的串行闸门：非阻塞抢占，抢不到即放弃。
+type claimGate chan struct{}
+
+func newClaimGate() claimGate { return make(claimGate, 1) }
+
+// acquire 非阻塞抢占闸门。抢不到返回 false：入池触发的领取本轮放弃即可，
+// 把 goroutine 堆在这儿等与并发并无区别，只是换了个地方排队。
+func (g claimGate) acquire() bool {
+	select {
+	case g <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g claimGate) release() { <-g }
+
+// claimSlot 领取串行闸门。上游按账号维度做验证码与领取风控，并发领取只会互相
+// 挤兑 captcha 池——批量导入 20 个账号时尤其明显。
+var claimSlot = newClaimGate()
+
+// previewGate 「刷新资格」的只读节流。内存态即可：重启后重新探测本就是期望行为。
+var (
+	previewGateMu sync.Mutex
+	previewGateAt = map[string]time.Time{}
+)
 
 // jwtAccounts 全部/指定 ID 的 JWT 账号（对齐 Python _jwt_accounts）。
 func (h *Handler) jwtAccounts(ids []string) []*model.Account {
@@ -38,8 +73,106 @@ func (h *Handler) jwtAccounts(ids []string) []*model.Account {
 	return out
 }
 
+// ── 冷却与状态落盘 ──────────────────────────────────────────────────────────
+
+// claimCooldownActive 自动路径是否仍在冷却中。
+// 只拦自动路径：手动点按钮不受限——用户点了没反应是最糟的交互。
+func claimCooldownActive(acc *model.Account, now time.Time) bool {
+	next := acc.ClaimNextAt()
+	return next != nil && float64(now.Unix()) < *next
+}
+
+// claimCooldownUntil 计算下次可领时间。优先用上游给的 ends_at——那是它自己算好的
+// 节奏，比在本地拍一个时长更准；没有时才按失败成因分档（对齐 zcode-switch）：
+// 验证码类与「已领过但上游没给时间」取长档，其余取短档。
+func claimCooldownUntil(outcomes []map[string]any, now time.Time) *float64 {
+	long := float64(now.Unix()) + float64(config.ClaimCaptchaCooldownSeconds)
+	short := float64(now.Unix()) + float64(config.ClaimRetryCooldownSeconds)
+	for _, o := range outcomes {
+		if next, ok := numberOf(o["next_at"]); ok && next > 0 {
+			v := next
+			return &v
+		}
+	}
+	for _, o := range outcomes {
+		if captcha, _ := o["captcha"].(bool); captcha {
+			return &long
+		}
+		if code, ok := numberOf(o["code"]); ok && (code == 1005 || code == 1003 || code == 3007) {
+			return &long
+		}
+	}
+	return &short
+}
+
+// applyClaimOutcome 把一次领取结果写回账号（含上游给的下次可领时间）并落库。
+func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]any, now time.Time) {
+	if acc.Claim == nil {
+		acc.Claim = &model.ClaimState{}
+	}
+	state := acc.Claim
+	succeeded := false
+	for _, o := range outcomes {
+		if ok, _ := o["ok"].(bool); ok {
+			succeeded = true
+			break
+		}
+	}
+	state.NextAt = claimCooldownUntil(outcomes, now)
+	if succeeded {
+		ts := float64(now.Unix())
+		state.ClaimedAt = &ts
+		state.LastError = nil
+	} else if len(outcomes) > 0 {
+		if msg, _ := outcomes[0]["message"].(string); msg != "" {
+			state.LastError = &msg
+		}
+	}
+	if err := h.Store.UpdateAccount(acc); err != nil {
+		web.Warn("claim", "领取状态落库失败: "+err.Error())
+	}
+}
+
+// numberOf 宽松取数值（JSON 解析一律 float64，代码内构造的可能是 int）。
+func numberOf(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+// previewCooling 只读探测是否仍在节流窗口内。
+func previewCooling(id string, now time.Time) bool {
+	if config.ClaimPreviewCooldownSeconds <= 0 {
+		return false
+	}
+	previewGateMu.Lock()
+	defer previewGateMu.Unlock()
+	last, ok := previewGateAt[id]
+	return ok && now.Sub(last) < time.Duration(config.ClaimPreviewCooldownSeconds)*time.Second
+}
+
+// markPreview 记录本次探测时间。
+func markPreview(id string, now time.Time) {
+	previewGateMu.Lock()
+	defer previewGateMu.Unlock()
+	previewGateAt[id] = now
+}
+
+// ── 触发点 ──────────────────────────────────────────────────────────────────
+
 // scheduleAutoClaim 入池后后台自动领取（fire-and-forget；对齐 _schedule_auto_claim）。
+// 冷却中直接跳过：上游已在响应里给出下次可领时间，到点前重试只是白打一次上游。
 func (h *Handler) scheduleAutoClaim(acc *model.Account) {
+	if claimCooldownActive(acc, time.Now()) {
+		web.Ok("claim", fmt.Sprintf("账号 %s 仍在领取冷却期，跳过自动领取", acc.Name))
+		return
+	}
 	svc := claim.NewService(h.Captcha)
 	autoClaimTasks.Add(1)
 	go func() {
@@ -49,7 +182,12 @@ func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 				web.Warn("claim", "自动领取任务异常（已兜底）")
 			}
 		}()
-		_ = svc.AutoClaimAllPlans(acc)
+		if !claimSlot.acquire() {
+			web.Ok("claim", fmt.Sprintf("账号 %s 已有领取任务在跑，本轮跳过", acc.Name))
+			return
+		}
+		defer claimSlot.release()
+		h.applyClaimOutcome(acc, svc.AutoClaimAllPlans(acc), time.Now())
 	}()
 }
 
@@ -61,9 +199,9 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 		ids = []string{v}
 	}
 	svc := claim.NewService(h.Captcha)
+	now := time.Now()
 	out := []map[string]any{}
 	for _, acc := range h.jwtAccounts(ids) {
-		now := time.Now()
 		if !acc.IsSelectable(now) && acc.Status == model.StatusCooling {
 			out = append(out, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "plans": []any{},
@@ -72,6 +210,17 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+		// 这是纯只读探测，但每次都要打两次上游（激活上报 + preview），
+		// 页面反复加载时会累积成无谓流量，故加一层短节流。
+		if previewCooling(acc.ID, now) {
+			out = append(out, map[string]any{
+				"account_id": acc.ID, "account_name": acc.Name, "plans": []any{},
+				"error":     "刷新過於頻繁，請稍後再試",
+				"activated": false, "activation_error": nil,
+			})
+			continue
+		}
+		markPreview(acc.ID, now)
 		activationError := claim.ReportActivationEvents(acc)
 		activated := activationError == ""
 		entry := map[string]any{
@@ -95,6 +244,8 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 
 // handleClaim POST /admin/api/claim（body 可选 account_ids / plan_id）
 // 缺省对全部 JWT 账号自动选最优套餐；冷却账号跳过（上游写流量，风控期不加剧）。
+//
+// 与自动路径的区别：不检查冷却（手动即强制），但仍走同一个串行闸门。
 func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	payload, apiErr := decodeBody(r)
 	if apiErr != nil {
@@ -120,14 +271,24 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+		if !claimSlot.acquire() {
+			outcomes = append(outcomes, map[string]any{
+				"account_id": acc.ID, "account_name": acc.Name, "ok": false,
+				"message": "已有領取任務在執行，請稍後重試",
+			})
+			continue
+		}
 		svc := claim.NewService(h.Captcha)
-		result, err := svc.Claim(acc, planID)
+		result, err := func() (map[string]any, error) {
+			defer claimSlot.release() // 领取本身串行，之后的额度刷新不必占着闸门
+			return svc.Claim(acc, planID)
+		}()
+		now := time.Now()
 		if err != nil {
 			web.Warn("claim", "账号 "+acc.Name+" 领取失败: "+err.Error())
-			outcomes = append(outcomes, map[string]any{
-				"account_id": acc.ID, "account_name": acc.Name,
-				"ok": false, "message": err.Error(),
-			})
+			outcome := claim.FailureOutcome(acc, planID, err)
+			outcomes = append(outcomes, outcome)
+			h.applyClaimOutcome(acc, []map[string]any{outcome}, now)
 			continue
 		}
 		h.Quota.RefreshAccounts([]*model.Account{acc})
@@ -138,6 +299,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 			outcome[k] = v
 		}
 		outcomes = append(outcomes, outcome)
+		h.applyClaimOutcome(acc, []map[string]any{outcome}, now)
 	}
 	ok := 0
 	for _, o := range outcomes {

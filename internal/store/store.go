@@ -233,7 +233,44 @@ func (s *Store) load() error {
 		}
 	}
 	s.accounts = accounts
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return s.migrateAccountIdentity()
+}
+
+// migrateAccountIdentity 一次性回填 Go 增量身份字段（幂等，仅有改动时落库）：
+//   - virtual_device_mid：此前全局共用一份 device_mid，同一台机器上的多个账号
+//     会被上游按设备关联，这里给每个账号分配独立指纹；
+//   - user_id：旧数据只存凭据，token 一刷新同一个号就变成"另一条记录"。
+//
+// 刻意不删除、不合并任何存量账号——查重只作用于新增（见 AddAccountWithIdentity）。
+func (s *Store) migrateAccountIdentity() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, list := range s.accounts {
+		for _, acc := range list {
+			changed := false
+			if acc.VirtualDeviceMid == nil || strings.TrimSpace(*acc.VirtualDeviceMid) == "" {
+				mid := config.NewDeviceMid()
+				acc.VirtualDeviceMid = &mid
+				changed = true
+			}
+			if (acc.UserID == nil || *acc.UserID == "") && acc.Mode == "jwt" && acc.JWTToken != nil {
+				if uid := model.JWTUserID(*acc.JWTToken); uid != "" {
+					acc.UserID = &uid
+					changed = true
+				}
+			}
+			if !changed {
+				continue
+			}
+			if err := s.persistAccountLocked(acc); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ── 持久化（调用方须持有 s.mu）──────────────────────────────────────────────
@@ -558,24 +595,79 @@ func (s *Store) allAccountsLocked() []*model.Account {
 
 // ── 账号增删改 ──────────────────────────────────────────────────────────────
 
-// AddAccount 添加账号；重复 token 直接返回既有账号（对齐 Python 版）。
+// AddAccount 添加账号；同一账号（按身份或凭据判定）已存在时直接返回既有记录。
 func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error) {
+	return s.AddAccountWithIdentity(provider, name, secret, "")
+}
+
+// AddAccountWithIdentity 带身份信息入池。email 只有 OAuth 路径需要传（该类 token
+// 形态拿不到邮箱）；user_id 一律从 secret 派生，故手动添加 / 导入 / CLI 路径自动获得身份。
+//
+// 判重按优先级分三轮遍历，而不是单遍取首个命中：单遍会让列表里靠前的低优先级判据
+// （凭据相同）抢先于靠后的高优先级判据（同一个 user_id），把"同一账号换了 token"
+// 误判成两个账号。
+func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*model.Account, error) {
 	if _, ok := s.providersSet()[provider]; !ok {
 		return nil, fmt.Errorf("不支持的 provider: %s", provider)
 	}
 	acc := model.Create(provider, name, secret)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, a := range s.accounts[provider] {
-		if a.Secret() != "" && a.Secret() == acc.Secret() {
-			return a, nil // 跳过重复 token
+	if acc.Mode == "jwt" {
+		if uid := model.JWTUserID(acc.Secret()); uid != "" {
+			acc.UserID = &uid
 		}
 	}
+	if trimmed := strings.TrimSpace(email); trimmed != "" {
+		acc.Email = &trimmed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing := s.duplicateLocked(provider, acc); existing != nil {
+		return existing, nil // 同一账号：返回既有记录，不新建
+	}
+	// 每账号独立设备指纹：全局共用一份会让同机多账号被上游按设备关联。
+	mid := config.NewDeviceMid()
+	acc.VirtualDeviceMid = &mid
 	s.accounts[provider] = append(s.accounts[provider], acc)
 	if err := s.persistAccountLocked(acc); err != nil {
 		return nil, err
 	}
 	return acc, nil
+}
+
+// duplicateLocked 按 user_id → email → 凭据 三轮判定是否已存在同一账号。
+// 高优先级判据未命中时才降级：token 会刷新而凭据字节会变，且不同账号可能共用邮箱。
+func (s *Store) duplicateLocked(provider string, acc *model.Account) *model.Account {
+	list := s.accounts[provider]
+	if uid := derefStr(acc.UserID); uid != "" {
+		for _, a := range list {
+			if derefStr(a.UserID) == uid {
+				return a
+			}
+		}
+	}
+	if email := derefStr(acc.Email); email != "" {
+		for _, a := range list {
+			if derefStr(a.Email) == email {
+				return a
+			}
+		}
+	}
+	if secret := strings.TrimSpace(acc.Secret()); secret != "" {
+		for _, a := range list {
+			if a.Secret() == secret {
+				return a
+			}
+		}
+	}
+	return nil
+}
+
+// derefStr 取字符串指针值并去空白（nil 返回空串）。
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return strings.TrimSpace(*p)
 }
 
 func (s *Store) providersSet() map[string]bool {

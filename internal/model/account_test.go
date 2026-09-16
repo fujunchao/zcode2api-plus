@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -8,7 +9,7 @@ import (
 )
 
 // pythonAccountJSON 模拟 Python 版 json.dumps(asdict(account)) 的输出形态：
-// 全部 28 个键都在（含 null），Account 的 json tag 必须与之完全对齐。
+// 全部 32 个键都在（含 null），Account 的 json tag 必须与之完全对齐。
 const pythonAccountJSON = `{
   "id": "glm-acc-1a2b3c4d",
   "name": "test",
@@ -44,12 +45,18 @@ const pythonAccountJSON = `{
   "last_error": null,
   "proxy_url": null,
   "proxy_id": null,
-  "created_at": 1700000001.5
+  "created_at": 1700000001.5,
+  "archived_at": null,
+  "user_id": "u-1700000000-a1b2c3",
+  "virtual_device_mid": "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+  "claim": {"claimed_at": 1700000002.5, "next_at": 1700003600.0, "last_error": null}
 }`
 
-// pythonAccountKeys Python dataclass asdict 输出的全部键（序列化契约）。
-// archived_at 是 Go 版新增（归档功能）：Python 侧已退休，旧版 JSON 读取时缺失即 nil，
-// Python json.loads 对多出的键会原样保留在 dict 中，不影响旧数据互读。
+// pythonAccountKeys 序列化契约的全部键。
+// 前四个 Go 增量字段：archived_at（归档）、user_id（身份判据）、
+// virtual_device_mid（每账号设备指纹）、claim（领取状态）——Python 侧已退休，
+// 旧版 json.loads 对多出的键会原样保留在 dict 中，不影响旧数据互读；
+// 本测试现在保护的是 Go 自身的往返一致性。
 var pythonAccountKeys = []string{
 	"id", "name", "provider", "mode", "email", "jwt_token", "api_key",
 	"enabled", "status", "quota", "exhausted_models", "disabled_models",
@@ -57,6 +64,7 @@ var pythonAccountKeys = []string{
 	"total_input_tokens", "total_output_tokens", "total_cache_creation_tokens",
 	"total_cache_read_tokens", "last_used_at", "last_checked_at", "cooling_until",
 	"last_error", "proxy_url", "proxy_id", "created_at", "archived_at",
+	"user_id", "virtual_device_mid", "claim",
 }
 
 func TestJSONContractWithPython(t *testing.T) {
@@ -82,6 +90,38 @@ func TestJSONContractWithPython(t *testing.T) {
 	}
 	if !reflect.DeepEqual(acc.ExhaustedModels, []string{}) {
 		t.Fatalf("空列表应保持 [] 而非 nil: %v", acc.ExhaustedModels)
+	}
+	if acc.UserID == nil || *acc.UserID != "u-1700000000-a1b2c3" {
+		t.Fatalf("user_id 不符: %v", acc.UserID)
+	}
+	if acc.VirtualDeviceMid == nil || *acc.VirtualDeviceMid != "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d" {
+		t.Fatalf("virtual_device_mid 不符: %v", acc.VirtualDeviceMid)
+	}
+	if acc.Claim == nil || acc.Claim.ClaimedAt == nil || acc.Claim.NextAt == nil {
+		t.Fatalf("claim 未解析: %+v", acc.Claim)
+	}
+	if *acc.Claim.ClaimedAt != 1700000002.5 || *acc.Claim.NextAt != 1700003600.0 {
+		t.Fatalf("claim 时间不符: %+v", acc.Claim)
+	}
+	if acc.Claim.LastError != nil {
+		t.Fatalf("claim.last_error 应为 nil: %v", acc.Claim.LastError)
+	}
+	// 嵌套对象的键名也要钉住，否则 claim 内部改错 tag 不会被上面那层发现。
+	claimOut, err := json.Marshal(acc.Claim)
+	if err != nil {
+		t.Fatalf("claim 序列化失败: %v", err)
+	}
+	var claimKeys map[string]any
+	if err := json.Unmarshal(claimOut, &claimKeys); err != nil {
+		t.Fatalf("claim 回读失败: %v", err)
+	}
+	if len(claimKeys) != 3 {
+		t.Fatalf("claim 键数量不符: %v", claimKeys)
+	}
+	for _, k := range []string{"claimed_at", "next_at", "last_error"} {
+		if _, ok := claimKeys[k]; !ok {
+			t.Fatalf("claim 缺少键 %s: %v", k, claimKeys)
+		}
 	}
 
 	// 序列化回 JSON 后，键集合必须与 Python asdict 完全一致（双向互通的前提）。
@@ -113,6 +153,125 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// jwtWithPayload 构造 header.<payload>.sig 形态的 token（payload 为明文 JSON）。
+func jwtWithPayload(payload string) string {
+	enc := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	return "header." + enc + ".sig"
+}
+
+func TestJWTUserID(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"user_id 优先", `{"user_id":"u-1","sub":"s-1"}`, "u-1"},
+		{"仅 sub 时兜底", `{"sub":"s-1"}`, "s-1"},
+		{"user_id 空串则看 sub", `{"user_id":"","sub":"s-1"}`, "s-1"},
+		{"都没有", `{"email":"a@b.c"}`, ""},
+		{"payload 非 JSON", `not-json`, ""},
+		{"user_id 非字符串", `{"user_id":12345}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := JWTUserID(jwtWithPayload(tc.payload)); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("畸形 token 不 panic", func(t *testing.T) {
+		for _, token := range []string{"", "abc", "a.b", "..", "a..c", ".", "a.b.c.d"} {
+			if got := JWTUserID(token); got != "" {
+				t.Fatalf("token %q 应返回空串，实际 %q", token, got)
+			}
+		}
+	})
+
+	t.Run("带 base64 填充", func(t *testing.T) {
+		// 部分实现保留 '=' 填充，两种解码器都要能处理。
+		padded := base64.URLEncoding.EncodeToString([]byte(`{"user_id":"u-pad"}`))
+		if got := JWTUserID("h." + padded + ".s"); got != "u-pad" {
+			t.Fatalf("填充形态解析失败: %q", got)
+		}
+	})
+}
+
+func TestDeviceMidOr(t *testing.T) {
+	acc := &Account{}
+	if got := acc.DeviceMidOr("global"); got != "global" {
+		t.Fatalf("未分配时应回退全局值: %q", got)
+	}
+	blank := "   "
+	acc.VirtualDeviceMid = &blank
+	if got := acc.DeviceMidOr("global"); got != "global" {
+		t.Fatalf("空白值应视为未分配: %q", got)
+	}
+	mid := "mid-acc-1"
+	acc.VirtualDeviceMid = &mid
+	if got := acc.DeviceMidOr("global"); got != "mid-acc-1" {
+		t.Fatalf("应优先用账号自己的指纹: %q", got)
+	}
+}
+
+func TestClaimNextAt(t *testing.T) {
+	acc := &Account{}
+	if acc.ClaimNextAt() != nil {
+		t.Fatal("无 claim 状态时应返回 nil")
+	}
+	acc.Claim = &ClaimState{}
+	if acc.ClaimNextAt() != nil {
+		t.Fatal("claim 存在但 next_at 缺失时应返回 nil")
+	}
+	next := 1700003600.0
+	acc.Claim = &ClaimState{NextAt: &next}
+	if got := acc.ClaimNextAt(); got == nil || *got != next {
+		t.Fatalf("ClaimNextAt 不符: %v", got)
+	}
+}
+
+func TestClaimStateRoundTrip(t *testing.T) {
+	claimed, next := 1700000002.5, 1700003600.0
+	msg := "上游限流"
+	acc := &Account{ID: "a", Claim: &ClaimState{ClaimedAt: &claimed, NextAt: &next, LastError: &msg}}
+	raw, err := json.Marshal(acc)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	back, err := FromJSON(raw)
+	if err != nil {
+		t.Fatalf("反序列化失败: %v", err)
+	}
+	if back.Claim == nil || back.Claim.ClaimedAt == nil || back.Claim.NextAt == nil || back.Claim.LastError == nil {
+		t.Fatalf("claim 往返丢失字段: %+v", back.Claim)
+	}
+	if *back.Claim.ClaimedAt != claimed || *back.Claim.NextAt != next || *back.Claim.LastError != msg {
+		t.Fatalf("claim 往返值不符: %+v", back.Claim)
+	}
+}
+
+func TestNewFieldsSerializedAsNull(t *testing.T) {
+	// 契约要求可空字段不带 omitempty：Python 的 json.dumps 会输出 null 键，
+	// 缺键会让两边序列化形态不一致。
+	raw, err := json.Marshal(&Account{})
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("回读失败: %v", err)
+	}
+	for _, k := range []string{"user_id", "virtual_device_mid", "claim"} {
+		v, ok := got[k]
+		if !ok {
+			t.Fatalf("缺少键 %s", k)
+		}
+		if string(v) != "null" {
+			t.Fatalf("%s 应为 null，实际 %s", k, v)
+		}
+	}
 }
 
 func TestCreate(t *testing.T) {

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,128 @@ func openAt(t *testing.T, path string) *Store {
 
 func newTestStore(t *testing.T) *Store {
 	return openAt(t, filepath.Join(t.TempDir(), "accounts.db"))
+}
+
+// jwtFor 构造 payload 含指定 user_id 的 JWT（形态与 model.JWTUserID 的解析一致）。
+func jwtFor(userID string) string {
+	enc := base64.RawURLEncoding.EncodeToString([]byte(`{"user_id":"` + userID + `"}`))
+	return "header." + enc + ".sig"
+}
+
+func TestAddAccountDedupByUserIDAcrossTokenRefresh(t *testing.T) {
+	// 同一个号重新登录时 token 字节会变，只比凭据会把一条记录变成两条。
+	s := newTestStore(t)
+	first, err := s.AddAccount(model.ProviderZai, "a1", jwtFor("u-1"))
+	if err != nil {
+		t.Fatalf("首次入池失败: %v", err)
+	}
+	if first.UserID == nil || *first.UserID != "u-1" {
+		t.Fatalf("user_id 未从 secret 派生: %v", first.UserID)
+	}
+
+	// 同一 user_id、不同 token 字节。
+	second, err := s.AddAccount(model.ProviderZai, "a1-again", jwtFor("u-1")+"x")
+	if err != nil {
+		t.Fatalf("重复入池失败: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("应命中既有账号: got %s want %s", second.ID, first.ID)
+	}
+	if got := len(s.ListAccounts(model.ProviderZai)); got != 1 {
+		t.Fatalf("不应新建记录，实际 %d 条", got)
+	}
+}
+
+func TestAddAccountDedupPrefersUserIDOverEmail(t *testing.T) {
+	// 单遍遍历会按列表顺序命中靠前的低优先级判据（邮箱），把"同一账号换了 token"
+	// 误判成另一个账号。三轮遍历必须让 user_id 先胜出。
+	s := newTestStore(t)
+	byEmail, err := s.AddAccountWithIdentity(model.ProviderZai, "by-email", "plain-key-1", "shared@example.com")
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if byEmail.UserID != nil {
+		t.Fatalf("apiKey 模式不应有 user_id: %v", byEmail.UserID)
+	}
+	byUserID, err := s.AddAccount(model.ProviderZai, "by-user-id", jwtFor("u-2"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+
+	// 同时匹配「靠前账号的邮箱」与「靠后账号的 user_id」。
+	got, err := s.AddAccountWithIdentity(model.ProviderZai, "new", jwtFor("u-2"), "shared@example.com")
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if got.ID != byUserID.ID {
+		t.Fatalf("user_id 应优先于 email: got %s want %s", got.ID, byUserID.ID)
+	}
+	if n := len(s.ListAccounts(model.ProviderZai)); n != 2 {
+		t.Fatalf("不应新建记录，实际 %d 条", n)
+	}
+}
+
+func TestAddAccountAssignsDistinctDeviceMid(t *testing.T) {
+	s := newTestStore(t)
+	a1, err := s.AddAccount(model.ProviderZai, "a1", jwtFor("u-a"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	a2, err := s.AddAccount(model.ProviderZai, "a2", jwtFor("u-b"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if a1.VirtualDeviceMid == nil || *a1.VirtualDeviceMid == "" {
+		t.Fatal("新账号应分配设备指纹")
+	}
+	if a2.VirtualDeviceMid == nil || *a2.VirtualDeviceMid == "" {
+		t.Fatal("新账号应分配设备指纹")
+	}
+	if *a1.VirtualDeviceMid == *a2.VirtualDeviceMid {
+		t.Fatalf("不同账号不应共用设备指纹: %s", *a1.VirtualDeviceMid)
+	}
+}
+
+func TestMigrationBackfillsIdentityAndIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	s := openAt(t, path)
+
+	// 模拟改造前的旧数据：只有凭据，没有 user_id / virtual_device_mid 键。
+	legacy := `{"id":"legacy-1","name":"old","provider":"zai","mode":"jwt",` +
+		`"jwt_token":"` + jwtFor("u-legacy") + `","api_key":null,"email":null,` +
+		`"enabled":true,"status":"active","created_at":1}`
+	if _, err := s.db.Exec(
+		`INSERT OR REPLACE INTO accounts (id, provider, name, mode, status, enabled, created_at, data)
+		 VALUES (?,?,?,?,?,?,?,?)`,
+		"legacy-1", model.ProviderZai, "old", "jwt", model.StatusActive, 1, 1.0, legacy); err != nil {
+		t.Fatalf("写入旧数据失败: %v", err)
+	}
+	_ = s.Close()
+
+	// 重开：迁移应回填两个字段。
+	s2 := openAt(t, path)
+	acc := s2.Find(model.ProviderZai, "legacy-1")
+	if acc == nil {
+		t.Fatal("旧账号在迁移后丢失")
+	}
+	if acc.UserID == nil || *acc.UserID != "u-legacy" {
+		t.Fatalf("user_id 未回填: %v", acc.UserID)
+	}
+	if acc.VirtualDeviceMid == nil || *acc.VirtualDeviceMid == "" {
+		t.Fatal("virtual_device_mid 未回填")
+	}
+	mid := *acc.VirtualDeviceMid
+	_ = s2.Close()
+
+	// 再开一次：迁移必须幂等，不能重新分配指纹。
+	s3 := openAt(t, path)
+	again := s3.Find(model.ProviderZai, "legacy-1")
+	if again == nil || again.VirtualDeviceMid == nil {
+		t.Fatal("账号在二次迁移后丢失")
+	}
+	if *again.VirtualDeviceMid != mid {
+		t.Fatalf("迁移非幂等: %s -> %s", mid, *again.VirtualDeviceMid)
+	}
 }
 
 func TestBootstrapGeneratesKeys(t *testing.T) {

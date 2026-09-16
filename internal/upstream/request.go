@@ -84,7 +84,7 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		"X-ZCode-App-Version": config.ZcodeClientVersion,
 		"X-ZCode-Agent":       "glm",
 		"HTTP-Referer":        "https://zcode.z.ai/",
-		"X-Device-Mid":        config.DeviceMid(),
+		"X-Device-Mid":        acc.DeviceMidOr(config.DeviceMid()),
 	}
 	if verifyParam != "" {
 		headers["X-Aliyun-Captcha-Verify-Param"] = verifyParam

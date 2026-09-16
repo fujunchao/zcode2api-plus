@@ -151,14 +151,19 @@ func cmdLogin(args []string) {
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	if result.Token != "" {
-		acc, err := st.AddAccount(model.ProviderZai, "oauth-login", result.Token)
+		email := ""
+		if result.Email != nil {
+			email = strings.TrimSpace(*result.Email)
+		}
+		// 邮箱在入池时就传入：每次登录 token 都不同，只比凭据字节会把同一个号建成两条。
+		acc, err := st.AddAccountWithIdentity(model.ProviderZai, "oauth-login", result.Token, email)
 		if err != nil {
 			fmt.Println(web.Red + "❌ 保存 JWT 账号失败: " + err.Error() + web.Reset)
 			return
 		}
-		if result.Email != nil && strings.TrimSpace(*result.Email) != "" {
-			acc.Email = result.Email
-			acc.Name = *result.Email
+		// 命中的既有账号可能还叫 oauth-login，用邮箱正名。
+		if email != "" && acc.Name != email {
+			acc.Name = email
 			_ = st.UpdateAccount(acc)
 		}
 		fmt.Println(web.Green + fmt.Sprintf("\n✔ 已保存 Coding Plan JWT 账号: %s (%s)", acc.Name, acc.ID) + web.Reset)

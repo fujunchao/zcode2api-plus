@@ -110,7 +110,7 @@ Restart=on-failure
 | 變量 | 默認 | 說明 |
 |------|------|------|
 | `ZCODE_PORT` / `ZCODE_HOST` | 3000 / 0.0.0.0 | 監聽地址 |
-| `ZCODE_DATA_DIR` | `./data` | 賬號庫、密鑰、設備指紋 |
+| `ZCODE_DATA_DIR` | `./data` | 賬號庫、密鑰、全局設備指紋（每賬號指紋存於賬號庫） |
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
 | `ZCODE_ASYNC_ENABLED` | — | 掛載 /async/v1/messages 空閒池 |
@@ -126,6 +126,19 @@ Restart=on-failure
 JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件上報 →
 `billing/preview` 按優先級逐個 `billing/claim`（驗證碼 3007 自動換碼重試一次）。
 後台賬號頁另有「領取套餐」按鈕（工具欄全量 + JWT 賬號行內單賬號）。
+
+領取狀態會落盤到賬號（`claim.next_at` 為上游給出的下次可領時間，前端顯示倒計時）。
+冷卻只作用於**自動**路徑：手動點按鈕始終可強制領取——用戶點了沒反應是最糟的交互。
+自動領取走單槽串行閘門，批量導入多個賬號時不會同時轟驗證碼池。
+
+## 賬號身份與設備指紋
+
+- 入池判重按 **user_id → email → 憑據** 三級：同一個號重新登錄時 token 字節會變，
+  只看憑據會把它建成兩條記錄。`user_id` 取自 JWT payload（`sub` 兜底），
+  手動添加 / 導入 / CLI 路徑自動獲得。
+- 每個賬號有**獨立的設備指紋**（`virtual_device_mid`）。此前全倉共用一份全局
+  `device_mid.txt`，同一台機器上的多個賬號會被上游按設備關聯；缺失時才回退全局值。
+  升級後首次啟動會為存量賬號一次性補齊（冪等）。
 
 ## 工具调用与思考配置
 

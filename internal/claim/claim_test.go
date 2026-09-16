@@ -5,6 +5,7 @@ package claim
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -183,6 +184,117 @@ func TestClaimBusinessCodes(t *testing.T) {
 				t.Fatalf("code %s 应报 %q: %v", c.code, c.wantSub, err)
 			}
 		})
+	}
+}
+
+func TestClaimSurfacesUpstreamNextAt(t *testing.T) {
+	// 上游在成功响应与 1005 里都会给 data.plan.ends_at——这是它自己算好的
+	// 下次可领时间，此前只取了错误文案把时间丢掉。
+	t.Run("成功响应回带 next_at", func(t *testing.T) {
+		acc := newTestAccount(t)
+		up := &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+			"/billing/claim": func(upstreamCall) (int, string) {
+				return 200, `{"code":0,"data":{"plan":{"starts_at":1700000000,"ends_at":1700003600}}}`
+			},
+		}}
+		svc := &Service{Captcha: newSolvedManager(t), Client: up}
+		result, err := svc.Claim(acc, "p1")
+		if err != nil {
+			t.Fatalf("领取应成功: %v", err)
+		}
+		if next, ok := result["next_at"].(float64); !ok || next != 1700003600 {
+			t.Fatalf("应回带上游 ends_at: %v", result)
+		}
+	})
+
+	t.Run("1005 带出 ends_at 与业务码", func(t *testing.T) {
+		acc := newTestAccount(t)
+		up := &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+			"/billing/claim": func(upstreamCall) (int, string) {
+				return 200, `{"code":1005,"msg":"quota","data":{"plan":{"ends_at":1700007200}}}`
+			},
+		}}
+		svc := &Service{Captcha: newSolvedManager(t), Client: up}
+		_, err := svc.Claim(acc, "p1")
+		var ce *ClaimError
+		if !errors.As(err, &ce) {
+			t.Fatalf("应为业务失败: %v", err)
+		}
+		if ce.Code() != 1005 {
+			t.Fatalf("业务码不符: %d", ce.Code())
+		}
+		if ce.NextAt() == nil || *ce.NextAt() != 1700007200 {
+			t.Fatalf("应带出 ends_at: %v", ce.NextAt())
+		}
+	})
+
+	t.Run("毫秒时间戳归一为秒", func(t *testing.T) {
+		acc := newTestAccount(t)
+		up := &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+			"/billing/claim": func(upstreamCall) (int, string) {
+				return 200, `{"code":0,"data":{"plan":{"ends_at":1700003600000}}}`
+			},
+		}}
+		svc := &Service{Captcha: newSolvedManager(t), Client: up}
+		result, err := svc.Claim(acc, "p1")
+		if err != nil {
+			t.Fatalf("领取应成功: %v", err)
+		}
+		if next, _ := result["next_at"].(float64); next != 1700003600 {
+			t.Fatalf("毫秒应归一为秒: %v", result["next_at"])
+		}
+	})
+
+	t.Run("缺 ends_at 时不写入该键", func(t *testing.T) {
+		acc := newTestAccount(t)
+		up := &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+			"/billing/claim": func(upstreamCall) (int, string) {
+				return 200, `{"code":0,"data":{}}`
+			},
+		}}
+		svc := &Service{Captcha: newSolvedManager(t), Client: up}
+		result, err := svc.Claim(acc, "p1")
+		if err != nil {
+			t.Fatalf("领取应成功: %v", err)
+		}
+		if _, ok := result["next_at"]; ok {
+			t.Fatalf("缺 ends_at 时不应有 next_at 键: %v", result)
+		}
+	})
+}
+
+func TestClaimUsesAccountDeviceMid(t *testing.T) {
+	// 每账号独立指纹：有值时必须用账号自己的，缺失才回退全局值。
+	newUpstream := func() *fakeBilling {
+		return &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+			"/billing/claim": func(upstreamCall) (int, string) { return 200, `{"code":0,"data":{}}` },
+		}}
+	}
+
+	acc := newTestAccount(t)
+	mid := "mid-acc-1"
+	acc.VirtualDeviceMid = &mid
+	up := newUpstream()
+	svc := &Service{Captcha: newSolvedManager(t), Client: up}
+	if _, err := svc.Claim(acc, "p1"); err != nil {
+		t.Fatalf("领取应成功: %v", err)
+	}
+	if got := up.requests[0].Headers.Get("X-Device-Mid"); got != "mid-acc-1" {
+		t.Fatalf("应使用账号自己的设备指纹: %q", got)
+	}
+
+	acc2 := newTestAccount(t)
+	up2 := newUpstream()
+	svc2 := &Service{Captcha: newSolvedManager(t), Client: up2}
+	if _, err := svc2.Claim(acc2, "p1"); err != nil {
+		t.Fatalf("领取应成功: %v", err)
+	}
+	global := config.DeviceMid()
+	if global == "" {
+		t.Fatal("全局设备指纹不应为空")
+	}
+	if got := up2.requests[0].Headers.Get("X-Device-Mid"); got != global {
+		t.Fatalf("未分配时应回退全局值: got %q want %q", got, global)
 	}
 }
 

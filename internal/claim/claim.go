@@ -7,13 +7,13 @@ package claim
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,9 +25,32 @@ import (
 )
 
 // ClaimError 业务失败（含上游 code 语义），消息面向使用者。
-type ClaimError struct{ msg string }
+// nextAt 是上游在响应里已经算好的「下次可领时间」（data.plan.ends_at）——
+// 此前只取了错误文案把时间丢掉，导致自动路径无法按上游节奏冷却、后台也无法倒计时。
+type ClaimError struct {
+	msg    string
+	code   int
+	nextAt *float64
+	// captcha 标记失败源于本机验证码不可用（浏览器求解失败或人工参数缺失），
+	// 而非上游判定——这类失败等的是人工回填，冷却应取最长档。
+	captcha bool
+}
 
 func (e *ClaimError) Error() string { return e.msg }
+
+// Code 上游业务码；非业务失败（网络/解码/本机验证码）为 0。
+func (e *ClaimError) Code() int { return e.code }
+
+// NextAt 下次可领时间（unix 秒）；上游未提供时为 nil。
+func (e *ClaimError) NextAt() *float64 { return e.nextAt }
+
+// IsCaptchaFailure 失败是否源于本机验证码不可用。
+func (e *ClaimError) IsCaptchaFailure() bool { return e.captcha }
+
+// businessError 构造带业务码与可领时间的失败；失败文案沿用 claimFail 映射。
+func businessError(code int, body map[string]any, nextAt *float64) *ClaimError {
+	return &ClaimError{msg: failMessage(code, body), code: code, nextAt: nextAt}
+}
 
 var claimFail = map[int]string{
 	1001: "套餐不存在",
@@ -135,86 +158,97 @@ func ParsePlan(raw map[string]any) map[string]any {
 }
 
 // JWTUserID JWT payload 的 user_id（官方客户端事件上报以 user_id 标识用户）。
-// user_id 优先，sub 兜底；解析失败回空串。
-func JWTUserID(jwtToken string) string {
-	parts := splitJWT(jwtToken)
-	if parts == "" {
-		return ""
+// 实现已下沉到 model——账号身份判据（跨 token 刷新识别同一账号）也在用它，
+// 而 claim 依赖 model，不能反向引用。此处保留导出 API，调用点无需变动。
+func JWTUserID(jwtToken string) string { return model.JWTUserID(jwtToken) }
+
+// parsePlanWindow 取响应里 data.plan 的起止时间（unix 秒）。
+// 上游在成功响应与 1005（当日名额用完）里都会给出 ends_at 作为下次可领时间——
+// 这是它自己算好的节奏，比在本地拍一个冷却时长更准。
+func parsePlanWindow(body map[string]any) (startsAt, endsAt *float64) {
+	data, ok := body["data"].(map[string]any)
+	if !ok {
+		return nil, nil
 	}
-	var claims map[string]any
-	if err := json.Unmarshal([]byte(parts), &claims); err != nil {
-		return ""
+	plan, ok := data["plan"].(map[string]any)
+	if !ok {
+		return nil, nil
 	}
-	for _, key := range []string{"user_id", "sub"} {
-		if s, ok := claims[key].(string); ok && s != "" {
-			return s
-		}
-	}
-	return ""
+	return unixSeconds(plan["starts_at"]), unixSeconds(plan["ends_at"])
 }
 
-// splitJWT 解 base64url payload（第一、二个点之间）；无效返回空串。
-func splitJWT(token string) string {
-	first := strings.Index(token, ".")
-	if first < 0 {
-		return ""
+// unixSeconds 宽松取时间戳（float64 / int / json.Number / 数字字符串），缺失返回 nil。
+func unixSeconds(v any) *float64 {
+	switch n := v.(type) {
+	case float64:
+		return normalizeEpoch(n)
+	case int:
+		return normalizeEpoch(float64(n))
+	case int64:
+		return normalizeEpoch(float64(n))
+	case json.Number:
+		if f, err := n.Float64(); err == nil {
+			return normalizeEpoch(f)
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(n), 64); err == nil {
+			return normalizeEpoch(f)
+		}
 	}
-	second := strings.Index(token[first+1:], ".")
-	if second < 0 {
-		return ""
+	return nil
+}
+
+// normalizeEpoch 毫秒时间戳归一为秒；非正值视为缺失。
+func normalizeEpoch(v float64) *float64 {
+	if v <= 0 {
+		return nil
 	}
-	seg := token[first+1 : first+1+second]
-	if seg == "" {
-		return ""
+	if v > 1e12 {
+		v /= 1000
 	}
-	if padded, err := base64.URLEncoding.DecodeString(seg); err == nil {
-		return string(padded)
-	}
-	if raw, err := base64.RawURLEncoding.DecodeString(seg); err == nil {
-		return string(raw)
-	}
-	return ""
+	return &v
 }
 
 // billingRequest 统一计费请求：网络错误/鉴权失败统一转 ClaimError。
 func (s *Service) billingRequest(acc *model.Account, method, path string, headers map[string]string, payload []byte) (map[string]any, error) {
 	req, err := http.NewRequest(method, config.ZcodeBillingBase+path, bytes.NewReader(payload))
 	if err != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游網路錯誤: %v", err)}
+		return nil, &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", err)}
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	res, err := s.clientFor(acc).Do(req)
 	if err != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游網路錯誤: %v", err)}
+		return nil, &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", err)}
 	}
 	defer res.Body.Close()
 	raw, readErr := io.ReadAll(res.Body)
 	if res.StatusCode == 401 || res.StatusCode == 403 {
 		text := lower(raw)
 		if !containsAny(text, "captcha", "verify") {
-			return nil, &ClaimError{fmt.Sprintf("鑑權失敗 HTTP %d", res.StatusCode)}
+			return nil, &ClaimError{msg: fmt.Sprintf("鑑權失敗 HTTP %d", res.StatusCode)}
 		}
 	}
 	if readErr != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游回應讀取失敗: %v", readErr)}
+		return nil, &ClaimError{msg: fmt.Sprintf("上游回應讀取失敗: %v", readErr)}
 	}
 	var body map[string]any
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, &ClaimError{fmt.Sprintf("上游回應非 JSON HTTP %d", res.StatusCode)}
+		return nil, &ClaimError{msg: fmt.Sprintf("上游回應非 JSON HTTP %d", res.StatusCode)}
 	}
 	return body, nil
 }
 
 // authHeaders 计费端点鉴权头（与 quota._auth_headers 同源形态）。
+// X-Device-Mid 取账号自己的指纹（缺失回退全局值）：同机多账号共用一份会被上游关联。
 func authHeaders(acc *model.Account) map[string]string {
 	headers := map[string]string{
 		"Content-Type":        "application/json",
 		"User-Agent":          config.UserAgent,
 		"X-ZCode-App-Version": config.ZcodeClientVersion,
 		"X-Platform":          config.ZcodeClientPlatform,
-		"X-Device-Mid":        config.DeviceMid(),
+		"X-Device-Mid":        acc.DeviceMidOr(config.DeviceMid()),
 		"HTTP-Referer":        "https://zcode.z.ai/",
 	}
 	if acc.Mode == "jwt" && acc.JWTToken != nil {
@@ -232,7 +266,7 @@ func ReportActivationEvents(acc *model.Account) string {
 	if userID == "" {
 		return "JWT 無 user_id，跳過激活上報"
 	}
-	deviceMid := config.DeviceMid()
+	deviceMid := acc.DeviceMidOr(config.DeviceMid())
 	for _, element := range ActivationElements {
 		if err := PostActivationEvent(userID, element, deviceMid); err != nil {
 			return fmt.Sprintf("激活事件 %s 上報失敗: %v", element, err)
@@ -251,7 +285,8 @@ func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
 		return nil, err
 	}
 	if code := BusinessCode(body); code != 0 {
-		return nil, &ClaimError{failMessage(code, body)}
+		_, endsAt := parsePlanWindow(body)
+		return nil, businessError(code, body, endsAt)
 	}
 	var rawPlans []any
 	if data, ok := body["data"].(map[string]any); ok {
@@ -279,7 +314,7 @@ func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
 // 返回 {plan_id, plan_name, grants}；3007（验证码失败）自动换码重试一次。
 func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, error) {
 	if acc.Mode != "jwt" || acc.JWTToken == nil || *acc.JWTToken == "" {
-		return nil, &ClaimError{"僅 Coding Plan (JWT) 賬號支持領取"}
+		return nil, &ClaimError{msg: "僅 Coding Plan (JWT) 賬號支持領取"}
 	}
 
 	planName := ""
@@ -290,7 +325,7 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 			return nil, err
 		}
 		if len(plans) == 0 {
-			return nil, &ClaimError{"沒有待領取的套餐"}
+			return nil, &ClaimError{msg: "沒有待領取的套餐"}
 		}
 		best := plans[0]
 		planID, _ = best["plan_id"].(string)
@@ -307,7 +342,10 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 	for attempt := 1; attempt <= 2; attempt++ {
 		token, err := s.Captcha.GetVerifyParam(nil)
 		if err != nil || token == nil {
-			return nil, &ClaimError{"驗證碼求解失敗或已停用，請到後台驗證碼頁面回填參數"}
+			return nil, &ClaimError{
+				msg:     "驗證碼求解失敗或已停用，請到後台驗證碼頁面回填參數",
+				captcha: true,
+			}
 		}
 		headers := claimHeaders(acc, token.VerifyParam, token.Region)
 		payload, _ := json.Marshal(map[string]string{"plan_id": planID})
@@ -316,16 +354,23 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 			return nil, err
 		}
 		code := BusinessCode(body)
+		_, endsAt := parsePlanWindow(body)
 		if code == 0 {
-			return map[string]any{"plan_id": planID, "plan_name": planName, "grants": grants}, nil
+			out := map[string]any{"plan_id": planID, "plan_name": planName, "grants": grants}
+			if endsAt != nil {
+				// 上游自己算好的下次可领时间，供调用方落盘与倒计时展示。
+				// 缺省时不写该键，避免 *float64(nil) 这类形态混进 outcome。
+				out["next_at"] = *endsAt
+			}
+			return out, nil
 		}
 		if code == 3007 && attempt == 1 {
 			web.Warn("claim", fmt.Sprintf("账号 %s 验证码被拒，换码重试", acc.Name))
 			s.Captcha.Invalidate()
-			lastErr = &ClaimError{failMessage(code, body)}
+			lastErr = businessError(code, body, endsAt)
 			continue
 		}
-		return nil, &ClaimError{failMessage(code, body)}
+		return nil, businessError(code, body, endsAt)
 	}
 	if lastErr == nil {
 		lastErr = errors.New("領取失敗")
@@ -361,6 +406,7 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 
 	plans, err := s.PreviewPlans(acc)
 	if err != nil {
+		outcomes = append(outcomes, FailureOutcome(acc, "", err))
 		var ce *ClaimError
 		if errors.As(err, &ce) {
 			web.Ok("claim", fmt.Sprintf("账号 %s 无可领套餐（%s）", acc.Name, err))
@@ -378,10 +424,7 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 		planID, _ := plan["plan_id"].(string)
 		result, err := s.Claim(acc, planID)
 		if err != nil {
-			outcomes = append(outcomes, map[string]any{
-				"account_id": acc.ID, "account_name": acc.Name,
-				"ok": false, "plan_id": planID, "message": err.Error(),
-			})
+			outcomes = append(outcomes, FailureOutcome(acc, planID, err))
 			web.Warn("claim", fmt.Sprintf("账号 %s 自动领取 %s 失败: %v", acc.Name, planID, err))
 			continue
 		}
@@ -399,6 +442,27 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 		web.Ok("claim", fmt.Sprintf("账号 %s 自动领取成功: %s", acc.Name, planName))
 	}
 	return outcomes
+}
+
+// FailureOutcome 领取失败的 outcome。带上业务码与上游给出的下次可领时间，
+// 调用方（adminapi）据此决定冷却档位并落盘，不必再解析错误文案。
+func FailureOutcome(acc *model.Account, planID string, err error) map[string]any {
+	out := map[string]any{
+		"account_id": acc.ID, "account_name": acc.Name,
+		"ok": false, "message": err.Error(),
+	}
+	if planID != "" {
+		out["plan_id"] = planID
+	}
+	var ce *ClaimError
+	if errors.As(err, &ce) {
+		out["code"] = ce.Code()
+		if next := ce.NextAt(); next != nil {
+			out["next_at"] = *next
+		}
+		out["captcha"] = ce.IsCaptchaFailure()
+	}
+	return out
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────

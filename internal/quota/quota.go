@@ -70,13 +70,14 @@ func NewService(st *store.Store) *Service {
 func (s *Service) SetNow(fn func() time.Time) { s.now = fn }
 
 // authHeaders 对齐 quota._auth_headers：额度端点必须携带完整设备信息。
+// X-Device-Mid 取账号自己的指纹（缺失回退全局值）：同机多账号共用一份会被上游关联。
 func authHeaders(acc *model.Account) map[string]string {
 	headers := map[string]string{
 		"Content-Type":        "application/json",
 		"User-Agent":          config.UserAgent,
 		"X-ZCode-App-Version": config.ZcodeClientVersion,
 		"X-Platform":          config.ZcodeClientPlatform,
-		"X-Device-Mid":        config.DeviceMid(),
+		"X-Device-Mid":        acc.DeviceMidOr(config.DeviceMid()),
 		"HTTP-Referer":        "https://zcode.z.ai/",
 	}
 	if acc.Mode == "jwt" && acc.JWTToken != nil {
