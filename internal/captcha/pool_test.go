@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,15 +173,28 @@ func TestPoolSolveRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	// 不断言派发顺序：空闲槽位靠抢 g.idle 这个缓冲 channel 归属（serveLoop 每轮求解
+	// 结束后自行归队），谁先完成谁先被取，顺序由 goroutine 调度决定，-race 下会变。
+	// 改为与顺序无关的不变式：token 第二段是该 worker 自己的自增计数，故
+	// 「worker X 第 k 次出现时计数必须为 k-1」恒成立。
+	seen := map[string]int{}
 	for i := 0; i < 3; i++ {
 		tok, err := p.Solve(ctx)
 		if err != nil {
 			t.Fatalf("第 %d 次求解失败: %v", i, err)
 		}
-		// 轮询顺序 w0→w1→w0；worker 内部调用计数随求解递增
-		if tok != fmt.Sprintf("token-w%d-%d", i%2, i/2) {
-			t.Fatalf("token 应来自对应 worker: %q", tok)
+		worker, nStr, ok := strings.Cut(strings.TrimPrefix(tok, "token-"), "-")
+		if !ok {
+			t.Fatalf("token 形状不符: %q", tok)
 		}
+		n, convErr := strconv.Atoi(nStr)
+		if convErr != nil {
+			t.Fatalf("token 序号不是数字: %q", tok)
+		}
+		if n != seen[worker] {
+			t.Fatalf("worker %s 第 %d 次被调用时计数应为 %d: %q", worker, seen[worker]+1, seen[worker], tok)
+		}
+		seen[worker]++
 	}
 	st := p.StatsSnapshot()
 	if st.Started != 2 || st.Requests != 3 {

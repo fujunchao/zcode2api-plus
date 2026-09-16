@@ -382,6 +382,18 @@ meta(key TEXT PK, value TEXT)
 - [x] Pi 示例启用两种模型的原生 max，并隐藏不支持的关闭思考选项。
 - [x] Python/Pi SDK 回归覆盖两种模型、high/max 与两种请求格式，断言真正上行的 effort。
 
+### M12 限流重试与递进冷却（v2.0.5-go）
+- [x] 三类同账号重试预算拆成独立计数（`attemptBudget`），3010 不再被验证码重试挤掉等待次数，
+  延迟也不再取错档位；`TestCaptchaRetryDoesNotConsumeBusyBudget` 钉住该不变式。
+- [x] 瞬时限流改为**先原地重试 1 次**（1s ±20% 抖动，`JitteredDelay`）再用尽冷却换号；
+  等待期间 ctx 取消即放弃（`sleepCtx`）。
+- [x] 冷却按连续被限流次数递进 30s → 60s → 120s → `COOLING_SECONDS`；
+  `MarkRateLimited` / `ResetRateLimitStreak` 导出，sync 与 async 两条路径共用。
+- [x] 连续计数以 `json:"-"` 挂在 Account 上（不新增 `accounts.data` 键，避免破坏与 Python 版的互读契约）。
+- [x] 回归：`TestTransientRateLimitRetrySucceedsInPlace`、`TestTransientRateLimitCoolingEscalates`
+  及 asyncpool 同名两例。
+- [ ] 1302／1305 的窗口量级在线验证（若为分钟级，原地重试无意义，应改为继续缩短冷却）。
+
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
