@@ -67,6 +67,9 @@ func setup(t *testing.T) (*http.ServeMux, *store.Store, *fakeBilling) {
 		t.Fatalf("打开存储失败: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
+	// 入池自动领取是 fire-and-forget：必须等它们收尾再关库、还原 config，
+	// 否则 goroutine 会在别人的 TempDir 写 device_mid.txt、对已关闭的库落状态。
+	t.Cleanup(autoClaimTasks.Wait)
 	mux := http.NewServeMux()
 	qs := quota.NewService(st)
 	// 默认应答：合法 JSON 但无套餐（错误路径不改账号状态，测试断言不受干扰）

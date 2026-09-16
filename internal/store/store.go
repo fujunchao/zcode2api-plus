@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -349,6 +350,78 @@ func (s *Store) QuotaRefreshInterval() int {
 		return config.QuotaRefreshInterval
 	}
 	return max(0, n)
+}
+
+// ── 套餐領取設定 ────────────────────────────────────────────────────────────
+//
+// 环境变量（ZCODE_CLAIM_*）只是**默认值**：这些键缺失或非法时回退 config，
+// 落库后以后台设置页为准，改完即生效（领取冷却与调度器每轮都重新读取）。
+
+// claimScheduleTimeRe 合法的每日定时点（本地时区 HH:MM）。
+var claimScheduleTimeRe = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
+
+// claimScheduleTimeDefault 定时点非法时的回退值。
+const claimScheduleTimeDefault = "23:00"
+
+// ClaimAutoEnabled 入池自动领取开关（批量添加 / OAuth 登录后是否自动领取一次）。
+// 刻意只约束自动路径：手动点按钮始终可用。
+func (s *Store) ClaimAutoEnabled() bool { return s.claimBool("claim_auto_enabled", true) }
+
+// ClaimScheduleEnabled 每日定时领取开关。默认关闭：升级/新装不该在用户无感知时
+// 自发产生每日上游流量，由管理员在设置页打开。
+func (s *Store) ClaimScheduleEnabled() bool { return s.claimBool("claim_schedule_enabled", false) }
+
+// ClaimScheduleTime 每日定时领取的本地时间点（HH:MM）；非法回退 23:00。
+func (s *Store) ClaimScheduleTime() string {
+	v, ok := s.GetSetting("claim_schedule_time")
+	if !ok {
+		return claimScheduleTimeDefault
+	}
+	if t := strings.TrimSpace(v); ValidClaimScheduleTime(t) {
+		return t
+	}
+	return claimScheduleTimeDefault
+}
+
+// ValidClaimScheduleTime 校验每日定时点格式（HH:MM，本地时区）。
+func ValidClaimScheduleTime(v string) bool {
+	return claimScheduleTimeRe.MatchString(strings.TrimSpace(v))
+}
+
+// ClaimCooldowns 领取冷却三档（秒）：验证码类 / 其他失败 / 「刷新资格」节流。
+func (s *Store) ClaimCooldowns() (captchaSec, retrySec, previewSec int) {
+	captchaSec = s.claimInt("claim_captcha_cooldown", config.ClaimCaptchaCooldownSeconds, 60)
+	retrySec = s.claimInt("claim_retry_cooldown", config.ClaimRetryCooldownSeconds, 30)
+	previewSec = s.claimInt("claim_preview_cooldown", config.ClaimPreviewCooldownSeconds, 0)
+	return captchaSec, retrySec, previewSec
+}
+
+// claimBool 读取布尔设置：真值集合与 envBool 一致，缺失回退 def。
+func (s *Store) claimBool(key string, def bool) bool {
+	v, ok := s.GetSetting(key)
+	if !ok {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return def
+}
+
+// claimInt 读取整数设置并钳到下限；缺失或非法回退 def。
+func (s *Store) claimInt(key string, def, min int) int {
+	v, ok := s.GetSetting(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return def
+	}
+	return max(min, n)
 }
 
 // ── 代理設定 ────────────────────────────────────────────────────────────────

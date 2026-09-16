@@ -56,7 +56,8 @@ func serve() {
 	engine.OnQuotaRefresh = func(acc *model.Account) { _ = qs.FetchQuota(acc) }
 	gw := gateway.Handler{Engine: engine, Auth: authSvc}
 	gw.Register(mux)
-	adminapi.New(st, authSvc, cm, qs).Register(mux)
+	admin := adminapi.New(st, authSvc, cm, qs)
+	admin.Register(mux)
 
 	// OpenAI 兼容层：/v1/chat/completions 复用同一引擎（M4）
 	openai.New(engine, authSvc).Register(mux)
@@ -73,6 +74,11 @@ func serve() {
 	mon := qs.NewMonitor()
 	mon.Start()
 	defer mon.Stop()
+
+	// 每日定时领取调度器：实时读后台设置，开关关闭时为空转（每 30s 看一次）
+	sched := adminapi.NewClaimScheduler(admin)
+	sched.Start()
+	defer sched.Stop()
 
 	printBanner(st)
 

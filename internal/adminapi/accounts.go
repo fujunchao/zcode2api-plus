@@ -460,10 +460,17 @@ func (h *Handler) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	captchaSec, retrySec, previewSec := h.Store.ClaimCooldowns()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"admin_key":              h.Store.AdminKey(),
 		"gateway_key":            h.Store.GatewayKey(),
 		"quota_refresh_interval": h.Store.QuotaRefreshInterval(),
+		"claim_auto_enabled":     h.Store.ClaimAutoEnabled(),
+		"claim_schedule_enabled": h.Store.ClaimScheduleEnabled(),
+		"claim_schedule_time":    h.Store.ClaimScheduleTime(),
+		"claim_captcha_cooldown": captchaSec,
+		"claim_retry_cooldown":   retrySec,
+		"claim_preview_cooldown": previewSec,
 	})
 }
 
@@ -508,7 +515,99 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// ── 套餐领取 ── 全部即时生效：冷却与定时调度每轮都重新读设置。
+	if v, ok := payload["claim_auto_enabled"]; ok {
+		b, valid := pyBool(v)
+		if !valid {
+			writeAPIError(w, errBadRequest("入池自动领取开关需为布尔值"))
+			return
+		}
+		if err := h.Store.SetSetting("claim_auto_enabled", boolText(b)); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	if v, ok := payload["claim_schedule_enabled"]; ok {
+		b, valid := pyBool(v)
+		if !valid {
+			writeAPIError(w, errBadRequest("每日定时领取开关需为布尔值"))
+			return
+		}
+		if err := h.Store.SetSetting("claim_schedule_enabled", boolText(b)); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	if v, ok := payload["claim_schedule_time"]; ok {
+		t := strings.TrimSpace(strOf(v))
+		if !store.ValidClaimScheduleTime(t) {
+			writeAPIError(w, errBadRequest("定时时间需为 HH:MM（如 23:00）"))
+			return
+		}
+		if err := h.Store.SetSetting("claim_schedule_time", t); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	// 三个冷却共用同一套解析；负数按既有 quota_refresh_interval 的语义钳到下限。
+	cooldownKeys := []struct {
+		key string
+		min int
+	}{
+		{"claim_captcha_cooldown", 60},
+		{"claim_retry_cooldown", 30},
+		{"claim_preview_cooldown", 0},
+	}
+	for _, item := range cooldownKeys {
+		v, ok := payload[item.key]
+		if !ok {
+			continue
+		}
+		n, valid := pyInt(v)
+		if !valid {
+			writeAPIError(w, errBadRequest(item.key+" 必须是非负整数（秒）"))
+			return
+		}
+		if err := h.Store.SetSetting(item.key, strconv.Itoa(max(item.min, n))); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// pyBool 对应 Python bool() 的宽松转换：bool 原样、数字 0/1、常见布尔字符串；
+// 其余类型视为 TypeError（调用方回 400）。
+func pyBool(v any) (bool, bool) {
+	switch t := v.(type) {
+	case bool:
+		return t, true
+	case float64:
+		switch t {
+		case 0:
+			return false, true
+		case 1:
+			return true, true
+		}
+		return false, false
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		}
+		return false, false
+	}
+	return false, false
+}
+
+// boolText 布尔值的规范存储形态（store.claimBool 可解析）。
+func boolText(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
 
 // pyInt 对应 Python int() 的宽松转换：float 截断、数字字符串解析、bool 转换；

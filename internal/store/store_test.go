@@ -156,6 +156,76 @@ func TestMigrationBackfillsIdentityAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestClaimSettingAccessors(t *testing.T) {
+	s := newTestStore(t)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("SetSetting 失败: %v", err)
+		}
+	}
+
+	// 键缺失 → 回退默认：入池默认开启，定时默认关闭（升级不该自发产生每日上游流量）。
+	if !s.ClaimAutoEnabled() {
+		t.Fatal("入池自动领取默认应开启")
+	}
+	if s.ClaimScheduleEnabled() {
+		t.Fatal("定时领取默认应关闭")
+	}
+	if got := s.ClaimScheduleTime(); got != "23:00" {
+		t.Fatalf("定时点默认应 23:00: %q", got)
+	}
+	captcha, retry, preview := s.ClaimCooldowns()
+	if captcha != config.ClaimCaptchaCooldownSeconds || retry != config.ClaimRetryCooldownSeconds ||
+		preview != config.ClaimPreviewCooldownSeconds {
+		t.Fatalf("默认冷却应取 config: %d/%d/%d", captcha, retry, preview)
+	}
+
+	// 合法值生效。
+	must(s.SetSetting("claim_auto_enabled", "false"))
+	must(s.SetSetting("claim_schedule_enabled", "true"))
+	must(s.SetSetting("claim_schedule_time", "07:30"))
+	must(s.SetSetting("claim_captcha_cooldown", "120"))
+	must(s.SetSetting("claim_preview_cooldown", "0"))
+	if s.ClaimAutoEnabled() {
+		t.Fatal("开关应已关闭")
+	}
+	if !s.ClaimScheduleEnabled() {
+		t.Fatal("定时应已开启")
+	}
+	if got := s.ClaimScheduleTime(); got != "07:30" {
+		t.Fatalf("定时点应 07:30: %q", got)
+	}
+	captcha, _, preview = s.ClaimCooldowns()
+	if captcha != 120 || preview != 0 {
+		t.Fatalf("冷却应生效: %d/%d/%d", captcha, retry, preview)
+	}
+	// 低于下限的值钳到下限（retry ≥ 30）。
+	must(s.SetSetting("claim_retry_cooldown", "5"))
+	if _, retry, _ = s.ClaimCooldowns(); retry != 30 {
+		t.Fatalf("retry 应钳到下限 30: %d", retry)
+	}
+
+	// 非法值回退默认，而不是把配置锁死在坏值上。
+	must(s.SetSetting("claim_schedule_time", "25:00"))
+	if got := s.ClaimScheduleTime(); got != "23:00" {
+		t.Fatalf("非法时间应回退 23:00: %q", got)
+	}
+	must(s.SetSetting("claim_auto_enabled", "maybe"))
+	if !s.ClaimAutoEnabled() {
+		t.Fatal("非法布尔应回退默认 true")
+	}
+	must(s.SetSetting("claim_captcha_cooldown", "abc"))
+	if c, _, _ := s.ClaimCooldowns(); c != config.ClaimCaptchaCooldownSeconds {
+		t.Fatalf("非法数字应回退 config 默认: %d", c)
+	}
+	// on/off 这类写法也要能认。
+	must(s.SetSetting("claim_auto_enabled", "off"))
+	if s.ClaimAutoEnabled() {
+		t.Fatal("off 应视为关闭")
+	}
+}
+
 func TestBootstrapGeneratesKeys(t *testing.T) {
 	s := newTestStore(t)
 	if s.AdminKey() == "" || s.AdminKey() == "zcode" {

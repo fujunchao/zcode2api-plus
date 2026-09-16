@@ -104,6 +104,12 @@ export interface SettingsResponse {
   admin_key: string
   gateway_key: string
   quota_refresh_interval: number
+  claim_auto_enabled: boolean
+  claim_schedule_enabled: boolean
+  claim_schedule_time: string
+  claim_captcha_cooldown: number
+  claim_retry_cooldown: number
+  claim_preview_cooldown: number
 }
 
 export interface EgressInfo {
