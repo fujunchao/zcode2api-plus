@@ -38,10 +38,23 @@ jobs:
           OUT="zcode2api-${GOOS}-${GOARCH}${EXT}"
           CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$OUT" ./cmd/zcode2api
 
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          # v2.0.5/2.0.6 的 Release 描述都是空的：softprops/action-gh-release 不带 body 时
+          # 并不会采用 tag message。发版说明统一放在 docs/releases/<tag>.md，
+          # 存在就采用，不存在给一行指向仓库的兜底。
+          if [ -f "docs/releases/${GITHUB_REF_NAME}.md" ]; then
+            cp "docs/releases/${GITHUB_REF_NAME}.md" release-notes.md
+          else
+            printf '完整发版说明见仓库内 docs/releases/%s.md。\n' "${GITHUB_REF_NAME}" > release-notes.md
+          fi
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: zcode2api-*
+          body_path: release-notes.md
 
   # 多架構容器鏡像 → ghcr.io/<repo>。linux/amd64 與 linux/arm64 都有 cloakbrowser
   # 的預構建補丁 Chromium，故兩個架構都能自動求解驗證碼。

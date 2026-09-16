@@ -24,3 +24,6 @@ js-code/
 
 # 只读参照用的第三方仓库克隆（本身是独立 git 仓库，不得作为 gitlink 混入本仓库）
 /zcode-switch/
+
+# release 工作流生成的发版说明副本（源文件在 docs/releases/）
+/release-notes.md
