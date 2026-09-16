@@ -20,29 +20,30 @@
 
 **移植（与 Python 版 1:1 对齐）：**
 
-- [ ] `/v1/messages` 网关：多账号轮询、SSE/JSON 流式透传、错误分类与自动换号
-- [ ] `/v1/models`（Anthropic / OpenAI 双兼容超集形态，见 §5.7）
-- [ ] `/v1/chat/completions` **OpenAI（GPT）兼容层——Go 版增量功能**：请求/响应双向转换 +
+- [x] `/v1/messages` 网关：多账号轮询、SSE/JSON 流式透传、错误分类与自动换号
+- [x] `/v1/models`（Anthropic / OpenAI 双兼容超集形态，见 §5.7）
+- [x] `/v1/chat/completions` **OpenAI（GPT）兼容层——Go 版增量功能**：请求/响应双向转换 +
   流式 SSE 重编码 + 工具调用，同步走网关引擎（详见 §5.7）
-- [ ] `/v1/responses`（OpenAI Responses API，服务 Codex CLI 生态；**排期在 completions 验收之后**，划界见 §5.8）
-- [ ] `/async/v1/messages`：ticket + SSE keepalive + 流中断终止语义（`_MidStreamError`）
-- [ ] 账号状态机（active/exhausted/cooling/invalid/disabled）+ 按模型可用性调度
-- [ ] 额度监控（`billing/balance` 解析、多订阅合并、15s 缓存 + 并发去重、后台周期刷新）
-- [ ] 调度 token 统计（UsageCollector：SSE `message_start`/`message_delta`、JSON 顶层 usage）
-- [ ] Admin API `/admin/api/*` 全部端点 + SPA 托管（`/admin/*` catch-all 回落 index.html）
-- [ ] 鉴权：后台密钥（含单 IP 失败限速 10 次/5 分钟）+ 网关密钥（fail-closed）
-- [ ] OAuth 登录（Z.AI 授权 → JWT 入池 → API Key 兑换链）
-- [ ] 账号级出站代理（http/https/socks4/socks5/socks5h）+ 命名代理管理 + 出口探测
-- [ ] 验证码：真实 Chromium 池（rod）+ 人工回填兜底
-- [ ] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
-- [ ] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
+- [x] `/v1/responses`（OpenAI Responses API，服务 Codex CLI 生态；**排期在 completions 验收之后**，划界见 §5.8）
+- [x] `/async/v1/messages`：ticket + SSE keepalive + 流中断终止语义（`_MidStreamError`）
+- [x] 账号状态机（active/exhausted/cooling/invalid/disabled）+ 按模型可用性调度
+- [x] 额度监控（`billing/balance` 解析、多订阅合并、15s 缓存 + 并发去重、后台周期刷新）
+- [x] 调度 token 统计（UsageCollector：SSE `message_start`/`message_delta`、JSON 顶层 usage）
+- [x] Admin API `/admin/api/*` 全部端点 + SPA 托管（`/admin/*` catch-all 回落 index.html）
+- [x] 鉴权：后台密钥（含单 IP 失败限速 10 次/5 分钟）+ 网关密钥（fail-closed）
+- [x] OAuth 登录（Z.AI 授权 → JWT 入池 → API Key 兑换链）
+- [x] 账号级出站代理（http/https/socks4/socks5/socks5h）+ 命名代理管理 + 出口探测
+- [x] 验证码：真实 Chromium 池（rod）+ 人工回填兜底
+- [x] SQLite 持久化（accounts + meta，WAL）与 **Python 版数据库互通**
+- [x] CLI 子命令（serve / login / add-account / accounts / remove-account / quota / status / set-admin-key / export / import）
 - [x] Release CI（2026-09-11 定案：放弃 Docker 裸二进制交付；GitHub Actions 推 v* tag 构建 linux/darwin/windows × amd64/arm64 并上传 Releases）— `.github/workflows/release.yml`
 - [x] **容器化交付（2026-09-15 决策翻转：Docker 重新纳入）**：多阶段 `Dockerfile`
   （golang:1.25-bookworm 构建 → debian:bookworm-slim 运行，非 root uid 10001）+ `docker-compose.yml`
   + `.dockerignore`；CI 每次 push 构建镜像当守门员，推 `v*` tag 时构建 linux/amd64 + linux/arm64
   多架构镜像并发布到 GHCR。翻转依据见 §9。
-- [ ] **套餐自动领取（Go 版增量，2026-09-10 后新增，Python 主仓已上线）**：billing/preview + billing/claim、
-  激活事件上报、业务码翻译、3007 换码重试、入池自动领取（对照 Python 主仓 `app/claim.py` + `app/telemetry.py`，见 §5.9）
+- [x] **套餐自动领取（Go 版增量，2026-09-10 后新增，Python 主仓已上线）**：billing/preview + billing/claim、
+  激活事件上报、业务码翻译、3007 换码重试、入池自动领取（对照 Python 主仓 `app/claim.py` + `app/telemetry.py`，见 §5.9）；
+  后续补齐领取状态落盘 / 冷却 / 定时（M13、M15）
 
 **明确不移植：**
 
@@ -381,8 +382,8 @@ meta(key TEXT PK, value TEXT)
 - [x] go.mod / 目录骨架 / config（全部 `ZCODE_*` 环境变量）— `internal/config/config.go`
 - [x] model.Account + 状态机 + 模型可用性 + JSON 契约单测 — `internal/model/`
 - [x] store：SQLite 单连接 + 密钥引导（随机生成、`zcode` 轮换）+ 轮询游标 + 代理 + 导入导出 + 单测 — `internal/store/`
-- [ ] **互通验收**：用 Python 版生成的真实 `data/accounts.db` 打开 → 账号/设置完整可读，Go 写回后 Python 版也能读
-  （代码就绪；需在有 Go 工具链的设备执行 `go test ./...` 实测）
+- [ ] **既有库兼容验收**：用真实 `data/accounts.db`（含存量账号）打开 → 账号/设置完整可读、迁移幂等、写回后再次读取一致
+  （原「与 Python 版互读」目标已随 Python 侧退休改写；`-race` 与全量测试已在 CI 覆盖，真实库的打开仍待真机验证）
 ### M1 网关核心
 - [x] build_request（头 + zcode_system 注入 + 剔除表 + 客户端头过滤）— `internal/upstream/`
 - [x] 请求整形 + 错误分类链 + 模型白名单 + UsageCollector（含单测）— `internal/gateway/{body,classify,usage}.go`
@@ -393,8 +394,9 @@ meta(key TEXT PK, value TEXT)
 - [x] httptest e2e：鉴权、透传、白名单、401/402/429 码族/3010/500 透传、1005、JWT 注入、验证码 503（13 组用例）
 - [ ] **验收**：真实账号非流式 + 流式各打通一次（需验证码：待 M4 浏览器池或 M2 人工回填端点）
 ### M2 Admin API + 鉴权 + SPA
-- [ ] auth（Bearer + 限速）、admin_api 全部端点、embed dist + catch-all
-- [ ] **验收**：浏览器完整走一遍后台 UI（登录/账号/代理/设置/验证码页）；限速单测
+- [x] auth（Bearer + 限速）、admin_api 全部端点、embed dist + catch-all
+- [ ] **验收**：浏览器完整走一遍后台 UI（登录/账号/代理/设置/验证码页）
+  （限速单测已由 `TestVerifyAdminKeyLimitsFailures` / `TestVerifyAdminKeySuccessResetsFailures` 覆盖）
 ### M3 额度监控 + async
 - [x] fetch_quota（解析 + 多订阅合并 + 15s 缓存 + inflight 去重 + 清理）+ 后台 monitor
 - [x] /async/v1/messages（ticket 全语义）

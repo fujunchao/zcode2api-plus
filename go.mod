@@ -2,10 +2,9 @@ module zcode2api
 
 go 1.25.0
 
-// 依赖在对应里程碑落地时通过 go get 添加（本机未安装 Go，无法执行 go mod tidy）：
-//   M0: modernc.org/sqlite        （纯 Go SQLite，无 CGo）
-//   M4: github.com/go-rod/rod     （验证码求解，驱动 cloakbrowser 下载的 Chromium）
-//   可选: github.com/joho/godotenv （.env 加载；也可自写约 30 行替代）
+// 直接依赖（其余 require 为间接依赖，交由 go mod tidy 维护）：
+//   modernc.org/sqlite    纯 Go SQLite（无 CGo），账号库存储
+//   github.com/go-rod/rod 验证码求解，驱动 cloakbrowser 下载的 Chromium
 
 require (
 	github.com/go-rod/rod v0.116.2
