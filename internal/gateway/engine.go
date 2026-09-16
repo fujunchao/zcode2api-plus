@@ -45,6 +45,10 @@ type Engine struct {
 
 	// BusyRetryDelays 3010 并发准入的重试延迟（默认 1s/2s；测试可缩短）。
 	BusyRetryDelays []time.Duration
+	// RateLimitRetryDelay 瞬时限流原地重试的等待时长（默认 1s；测试可置 0）。
+	// 与 BusyRetryDelays 分开配置，两者语义不同：3010 是模型级准入、换号无用，
+	// 瞬时限流只值一次对冲。
+	RateLimitRetryDelay time.Duration
 	// OnQuotaRefresh 成功/耗尽后触发的额度刷新（M3 接入 quota 包；nil 跳过）。
 	OnQuotaRefresh func(acc *model.Account)
 
@@ -57,11 +61,12 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		client = defaultUpstreamClient()
 	}
 	return &Engine{
-		Store:           st,
-		Captcha:         cm,
-		Client:          client,
-		BusyRetryDelays: []time.Duration{time.Second, 2 * time.Second},
-		now:             time.Now,
+		Store:               st,
+		Captcha:             cm,
+		Client:              client,
+		BusyRetryDelays:     defaultBusyRetryDelays,
+		RateLimitRetryDelay: RateLimitRetryDelay,
+		now:                 time.Now,
 	}
 }
 
@@ -104,12 +109,22 @@ type runResult struct {
 	Body      any
 }
 
-// attemptResult 单次账号尝试的出路：retryCaptcha（同账号换令牌重试）、
+// attemptResult 单次账号尝试的出路：retrySame（同账号再试一次）、
 // switchAccount（换下一个账号）、final（终止并返回）。
 type attemptResult struct {
-	retryCaptcha  bool
+	retrySame     bool
 	switchAccount bool
 	final         runResult
+}
+
+// attemptBudget 单账号内的三类重试预算，各自独立计数。
+// 此前三者共用同一个循环变量 captchaAttempt：一次验证码重试就会吃掉 3010 的
+// 等待预算，且 BusyRetryDelays 会按验证码次数取到错误下标——语义完全不同的两件事
+// 共用一个数，扩展时会咬人。
+type attemptBudget struct {
+	captcha int // 验证码刷新（含首次尝试，上限 MaxCaptchaRetries）
+	busy    int // 3010 并发准入等待（上限 len(BusyRetryDelays)）
+	rate    int // 瞬时限流原地重试（上限 MaxRateLimitRetries）
 }
 
 // RunMessages 执行完整循环。body 是入口 NormalizeBody 后的请求体；
@@ -128,7 +143,7 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		}
 		tried[acc.ID] = true
 		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, deliver)
-		if res.retryCaptcha {
+		if res.retrySame {
 			continue
 		}
 		if res.switchAccount {
@@ -147,7 +162,9 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		"所有账号均不可用或额度已用完，请在后台检查账号状态")
 }
 
-// tryAccount 单个账号的尝试：内层为验证码重试（对齐 MAX_CAPTCHA_RETRIES）。
+// tryAccount 单个账号的尝试：内层为同账号重试（验证码刷新 / 3010 等待 / 瞬时限流）。
+// 循环的每一次 continue 都必须先从 attemptBudget 对应类目里扣一次预算，二者手动
+// 保持一致——预算之和加首次尝试即循环上界，任何一条路径漏记账都会让循环不收敛。
 func (e *Engine) tryAccount(
 	ctx context.Context,
 	reqID string,
@@ -160,14 +177,18 @@ func (e *Engine) tryAccount(
 ) attemptResult {
 	needsCaptcha := acc.Mode == "jwt"
 
-	for captchaAttempt := range MaxCaptchaRetries {
+	var b attemptBudget
+	budget := 1 + MaxCaptchaRetries + len(e.BusyRetryDelays) + MaxRateLimitRetries
+
+	for range budget {
 		var verifyParam, verifyRegion string
 		if needsCaptcha {
 			token, err := e.Captcha.GetVerifyParam(ctx)
 			if err != nil {
 				e.Captcha.Invalidate()
-				if captchaAttempt+1 < MaxCaptchaRetries {
-					web.Warn(reqID, fmt.Sprintf("验证码自动求解失败，刷新令牌重试（第 %d 次）", captchaAttempt+1))
+				b.captcha++
+				if b.captcha < MaxCaptchaRetries {
+					web.Warn(reqID, fmt.Sprintf("验证码自动求解失败，刷新令牌重试（第 %d 次）", b.captcha))
 					continue
 				}
 				return attemptResult{final: e.captchaRequired(reqID, err.Error())}
@@ -210,8 +231,8 @@ func (e *Engine) tryAccount(
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, modelName, needsCaptcha, resp, captchaAttempt)
-			if res.retryCaptcha {
+			res := e.handleUpstreamError(ctx, reqID, acc, modelName, needsCaptcha, resp, &b)
+			if res.retrySame {
 				continue
 			}
 			return res
@@ -231,8 +252,8 @@ func (e *Engine) tryAccount(
 				web.ReqErr(reqID, fmt.Sprintf("上游错误体读取失败（账号 %s）", acc.Name))
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_error", textPreview(err.Error()))}
 			}
-			res := e.handleUpstreamJSON(reqID, acc, modelName, needsCaptcha, stream, contentType, buffered, captchaAttempt, deliver)
-			if res.retryCaptcha {
+			res := e.handleUpstreamJSON(reqID, acc, modelName, needsCaptcha, stream, contentType, buffered, &b, deliver)
+			if res.retrySame {
 				continue
 			}
 			return res
@@ -242,7 +263,7 @@ func (e *Engine) tryAccount(
 		return e.deliverStream(reqID, acc, contentType, resp, deliver)
 	}
 
-	// 验证码重试次数耗尽
+	// 预算耗尽（防御分支：每个 continue 都已各自记账，正常路径不会走到这里）
 	if needsCaptcha {
 		return attemptResult{final: e.captchaRequired(reqID, "验证码重试次数已耗尽")}
 	}
@@ -257,7 +278,7 @@ func (e *Engine) handleUpstreamError(
 	modelName string,
 	needsCaptcha bool,
 	resp *http.Response,
-	captchaAttempt int,
+	b *attemptBudget,
 ) attemptResult {
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -271,15 +292,16 @@ func (e *Engine) handleUpstreamError(
 	// 1) 验证码挑战（响应头 / code=3007 / F001 与文本仅限 400/403）
 	if needsCaptcha && IsCaptchaError(text, resp.StatusCode, resp.Header) {
 		e.Captcha.Invalidate()
-		web.Warn(reqID, fmt.Sprintf("账号 %s 验证码失效，刷新重试（第 %d 次）", acc.Name, captchaAttempt+1))
-		if captchaAttempt+1 >= MaxCaptchaRetries {
+		b.captcha++
+		web.Warn(reqID, fmt.Sprintf("账号 %s 验证码失效，刷新重试（第 %d 次）", acc.Name, b.captcha))
+		if b.captcha >= MaxCaptchaRetries {
 			detail := "上游连续拒绝验证码"
 			if hasCaptchaChallengeHeader(resp.Header) {
 				detail = "上游持续返回验证码挑战"
 			}
 			return attemptResult{final: e.captchaRequired(reqID, detail)}
 		}
-		return attemptResult{retryCaptcha: true}
+		return attemptResult{retrySame: true}
 	}
 
 	// 2) 鉴权失败是强信号（JWT 上游为裸 401 空 body；api.z.ai 为 type=1000/1001/1003）
@@ -299,15 +321,14 @@ func (e *Engine) handleUpstreamError(
 
 	// 4) 429 且 code=3010：模型并发准入限制，账号仍可用，按原版客户端延迟重试
 	if IsModelConcurrencyLimit(resp.StatusCode, text) {
-		if captchaAttempt < len(e.BusyRetryDelays) {
-			delay := e.BusyRetryDelays[captchaAttempt]
+		if b.busy < len(e.BusyRetryDelays) {
+			delay := e.BusyRetryDelays[b.busy]
+			b.busy++
 			web.Warn(reqID, fmt.Sprintf("模型并发准入受限，%g s 后重试（账号仍可用）", delay.Seconds()))
-			select {
-			case <-ctx.Done():
+			if !sleepCtx(ctx, delay) {
 				return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
-			case <-time.After(delay):
 			}
-			return attemptResult{retryCaptcha: true}
+			return attemptResult{retrySame: true}
 		}
 		web.Warn(reqID, fmt.Sprintf("模型并发准入持续受限（账号 %s），保留账号状态", acc.Name))
 		return attemptResult{final: runResult{
@@ -316,16 +337,29 @@ func (e *Engine) handleUpstreamError(
 		}}
 	}
 
-	// 5) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
+	// 5) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 先原地重试，用尽才冷却换号
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
 			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
 			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
 			e.fireRefresh(acc)
-		} else {
-			e.mark(acc, model.StatusCooling, "上游限流 HTTP 429")
-			web.Warn(reqID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
+			return attemptResult{switchAccount: true}
 		}
+		// 瞬时限流的窗口可能只有数秒，先给同一账号一次原地重试的机会。不给多次：
+		// 池子里通常还有别的账号，换号成本是百毫秒级，而每次原地等待都是确定的
+		// 秒级延迟，且大概率仍然失败、最后照样要换号。
+		if b.rate < MaxRateLimitRetries {
+			b.rate++
+			delay := JitteredDelay(e.RateLimitRetryDelay)
+			web.Warn(reqID, fmt.Sprintf("账号 %s 被瞬时限流 429，%g s 后原地重试", acc.Name, delay.Seconds()))
+			if !sleepCtx(ctx, delay) {
+				return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
+			}
+			return attemptResult{retrySame: true}
+		}
+		secs := e.markRateLimited(acc, "上游限流 HTTP 429")
+		web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次被限流，冷却 %d s 后切换下一个",
+			acc.Name, acc.RateLimitStreak, secs))
 		return attemptResult{switchAccount: true}
 	}
 
@@ -356,7 +390,7 @@ func (e *Engine) handleUpstreamJSON(
 	stream bool,
 	contentType string,
 	buffered []byte,
-	captchaAttempt int,
+	b *attemptBudget,
 	deliver DeliverFunc,
 ) attemptResult {
 	text := string(buffered)
@@ -371,11 +405,12 @@ func (e *Engine) handleUpstreamJSON(
 
 	case needsCaptcha && code == "3007":
 		e.Captcha.Invalidate()
-		web.Warn(reqID, fmt.Sprintf("帳號 %s 驗證碼失效，刷新重試（第 %d 次）", acc.Name, captchaAttempt+1))
-		if captchaAttempt+1 >= MaxCaptchaRetries {
+		b.captcha++
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 驗證碼失效，刷新重試（第 %d 次）", acc.Name, b.captcha))
+		if b.captcha >= MaxCaptchaRetries {
 			return attemptResult{final: e.captchaRequired(reqID, "上游連續拒絕驗證碼")}
 		}
-		return attemptResult{retryCaptcha: true}
+		return attemptResult{retrySame: true}
 
 	case code != "" && code != "0":
 		e.bumpFail(acc)
@@ -492,12 +527,19 @@ func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg st
 	MarkModelExhausted(e.Store, acc, modelName, errMsg)
 }
 
+// markRateLimited 瞬时限流的递进冷却，返回本次写入的冷却秒数（见 MarkRateLimited）。
+func (e *Engine) markRateLimited(acc *model.Account, errMsg string) int {
+	return MarkRateLimited(e.Store, acc, errMsg, e.now())
+}
+
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
 // （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
 	acc.UseCount++
 	ts := float64(e.now().UnixNano()) / 1e9
 	acc.LastUsedAt = &ts
+	// 成功即认为限流窗口已过：清零连续计数，下一次再被限流从最短档重新起算。
+	ResetRateLimitStreak(acc)
 	if acc.Status == model.StatusCooling || acc.Status == model.StatusExhausted {
 		acc.Status = model.StatusActive
 	}
@@ -529,6 +571,20 @@ func (e *Engine) captchaRequired(reqID, detail string) runResult {
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
+
+// sleepCtx 等待 delay 或 ctx 结束；返回 false 表示请求已被取消。
+// 所有重试等待都走这里：等待期间客户端可能已经断开，继续重试只是白烧上游配额。
+func sleepCtx(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
+}
 
 // marshalJSON 与 Python json.dumps(ensure_ascii=False) 对齐：不转义 HTML 字符。
 func marshalJSON(v any) ([]byte, error) {

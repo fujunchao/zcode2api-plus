@@ -109,13 +109,15 @@
 
 | 项 | 值 |
 |----|----|
-| `MAX_CAPTCHA_RETRIES` / `MAX_ACCOUNT_ATTEMPTS` | 3 / 5 |
+| `MAX_CAPTCHA_RETRIES` / `MAX_ACCOUNT_ATTEMPTS` / `MAX_RATE_LIMIT_RETRIES` | 3 / 5 / 1 |
 | 3010 并发准入重试延迟 | 1s、2s（第 3 次失败原样回传 429） |
+| 瞬时限流原地重试 | 1 次，等待 1s（±20% 抖动）；用尽才冷却换号 |
 | 对外模型白名单 | `glm-5.3-flash`、`GLM-5.3`（normalize 后比对） |
 | `MODEL_NAME_MAP` | 仅 `{"glm-5.3": "GLM-5.3"}` |
-| 429 额度上限码族 | 1113、1308-1311、1313、1316-1321 → 标记该模型 exhausted；其余 429 → cooling |
+| 429 额度上限码族 | 1113、1308-1311、1313、1316-1321 → 标记该模型 exhausted；其余 429（瞬时限流）→ 原地重试 1 次后按阶梯冷却 |
 | 业务码语义 | `1005`(HTTP 200)=当日额度用完；`3007`=验证码失效；`3010`=并发准入；F001=风控指纹拒绝 |
-| 冷却 / 刷新 | `COOLING_SECONDS=300`、`QUOTA_REFRESH_INTERVAL=60`（0=关闭，运行中可改） |
+| 冷却 / 刷新 | `COOLING_SECONDS=300`（连接失败与 503 的固定值，同时是瞬时限流阶梯的封顶）、`QUOTA_REFRESH_INTERVAL=60`（0=关闭，运行中可改） |
+| 瞬时限流冷却阶梯 | 同一账号连续被限流 30s → 60s → 120s → `COOLING_SECONDS`；任意一次成功调用后归零 |
 | 验证码缓存 | Node/人工令牌 45s；配置 600s；浏览器令牌**不缓存** |
 | 验证码池 | workers=1、startup=90s、request=45s、queue=60s、shutdown=10s、失败冷却=60s |
 | 后台限速 | 单 IP 滑动窗口 300s 内失败 10 次 → 一律 429，成功清零 |
@@ -128,9 +130,21 @@
 2. 401/403 → 账号 `invalid`，换号（JWT 上游为**裸 401 空 body**；api.z.ai 为 `error.type=1000/1001/1003`）
 3. 402 → 该模型 exhausted，换号 + 触发额度刷新
 4. 429 且 code∈3010 → 等待重试（账号状态不变）
-5. 429 且 code∈额度上限码族 → 该模型 exhausted 换号；其余 429 → cooling 换号
-6. 503 → cooling 换号
+5. 429 且 code∈额度上限码族 → 该模型 exhausted 换号；其余 429（瞬时限流）→ **原地重试 1 次**，用尽才按递进阶梯冷却换号
+6. 503 → cooling 换号（固定 `COOLING_SECONDS`，不走阶梯）
 7. 其余 → **不做状态推断，原样透传上游响应**
+
+同账号重试有三类，**预算各自独立**（`internal/gateway` 的 `attemptBudget`）：验证码刷新
+（`MAX_CAPTCHA_RETRIES`，含首次尝试）、3010 并发准入等待（`len(BusyRetryDelays)`）、瞬时限流原地重试
+（`MAX_RATE_LIMIT_RETRIES`）。三者曾共用同一个循环变量：一次验证码重试就会吃掉 3010 的等待预算，
+且延迟会按验证码次数取到错误下标，到第三次迭代时 3010 直接把 429 回传客户端。
+`TestCaptchaRetryDoesNotConsumeBusyBudget` 为这条不变式做回归。
+
+**为什么瞬时限流只重试一次**：池子里通常还有别的账号，换号成本是百毫秒级；原地等待是确定的秒级
+延迟，且被限流后立刻重试大概率仍然失败。一次对冲只用来捞「限流窗口秒级复位」这种情况。
+**为什么冷却仍要设**：原地重试用尽后若不给调度器门禁，下一个请求会再次选中同一账号并重复失败，
+形成热循环，比冷却更糟——该改的是时长（递进阶梯）而不是有无。冷却到期由 `IsSelectable`
+自动放行（`EffectiveStatus` 同时返回 active），任意一次成功调用也会立刻清零阶梯计数。
 
 ### 5.3 上游请求
 

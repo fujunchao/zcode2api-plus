@@ -42,7 +42,7 @@ func ConvertResponse(payload map[string]any) map[string]any {
 
 // messageToOpenAI 把 Anthropic message 内容转换为 OpenAI message：
 // text blocks 拼接为 content；thinking blocks 拼接为 reasoning_content
-//（DeepSeek / GLM 系 OpenAI 兼容端点的惯例字段，国内客户端据此渲染思考过程）；
+// （DeepSeek / GLM 系 OpenAI 兼容端点的惯例字段，国内客户端据此渲染思考过程）；
 // tool_use → tool_calls（arguments 序列化为 JSON 字符串）。三者共存时各自并列。
 func messageToOpenAI(message map[string]any) (map[string]any, []any) {
 	texts := ""

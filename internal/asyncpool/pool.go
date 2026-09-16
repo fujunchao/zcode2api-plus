@@ -57,13 +57,22 @@ type Pool struct {
 	Captcha *captcha.Manager
 	Client  *http.Client // nil 时使用与网关一致的上游客户端
 
+	// RateLimitRetryDelay 瞬时限流原地重试的等待时长（默认 gateway.RateLimitRetryDelay；测试可置 0）。
+	RateLimitRetryDelay time.Duration
+
 	mu      sync.Mutex
 	tickets map[string]*ticket
 }
 
 // NewPool 创建空闲池。
 func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
-	return &Pool{Store: st, Auth: au, Captcha: cm, tickets: map[string]*ticket{}}
+	return &Pool{
+		Store:               st,
+		Auth:                au,
+		Captcha:             cm,
+		RateLimitRetryDelay: gateway.RateLimitRetryDelay,
+		tickets:             map[string]*ticket{},
+	}
 }
 
 // Register 在 mux 上注册异步路由（调用方按 config.AsyncEnabled 决定是否挂载，
@@ -383,7 +392,43 @@ func (p *Pool) emitError(ctx context.Context, ticketID, message, errType string)
 	})
 }
 
-// attemptUpstream 发起一次上游请求并处理响应。
+// attemptUpstream 发起一次上游请求；瞬时限流（非额度码族的 429）先在本账号
+// 原地重试一次，重试用尽才递进冷却并把换号交给外层——与 engine 的 sync 路径
+// 保持同一套语义。重试次数与延迟都取自 gateway，两条路径不会各自漂移。
+func (p *Pool) attemptUpstream(
+	ctx context.Context,
+	ticketID string,
+	acc *model.Account,
+	modelName string,
+	req upstream.Request,
+	payload []byte,
+) (bool, error) {
+	for rateAttempt := 0; ; rateAttempt++ {
+		midStream, err := p.attemptUpstreamOnce(ctx, ticketID, acc, modelName, req, payload)
+		if err == nil || midStream {
+			return midStream, err
+		}
+		var rl errRateLimited
+		if !errors.As(err, &rl) {
+			return false, err
+		}
+		if rateAttempt >= gateway.MaxRateLimitRetries {
+			secs := gateway.MarkRateLimited(p.Store, acc, "上游限流 HTTP 429", time.Now())
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次被限流，冷却 %d s 后切换下一个",
+				acc.Name, acc.RateLimitStreak, secs))
+			return false, errNetwork{rl.body}
+		}
+		delay := gateway.JitteredDelay(p.RateLimitRetryDelay)
+		web.Warn(ticketID, fmt.Sprintf("账号 %s 被瞬时限流 429，%g s 后原地重试", acc.Name, delay.Seconds()))
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
+// attemptUpstreamOnce 发起一次上游请求并处理响应（瞬时限流不在此重试）。
 // 返回 (midStream, err)：
 //   - 200 流完整转发（done 已投递）→ (false, nil)；
 //   - 已发出过 chunk 后流中断 → (true, err)（调用方终止票务，不得重试）；
@@ -391,7 +436,7 @@ func (p *Pool) emitError(ctx context.Context, ticketID, message, errType string)
 //
 // 非 200 的错误分类（验证码 / 429+503 冷却 / 其余原样透传）在此内联处理，
 // 与 Python 版 _process_ticket 的分支顺序一致。
-func (p *Pool) attemptUpstream(
+func (p *Pool) attemptUpstreamOnce(
 	ctx context.Context,
 	ticketID string,
 	acc *model.Account,
@@ -450,17 +495,16 @@ func (p *Pool) attemptUpstream(
 			return false, errNetwork{bodyText}
 		}
 
-		// 429：额度上限码族 → 该模型耗尽；其余瞬时限流 → 冷却
+		// 429：额度上限码族 → 该模型耗尽
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if gateway.IsQuotaExhaustedCode(bodyText) {
 				gateway.MarkModelExhausted(p.Store, acc, modelName,
 					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
-			} else {
-				gateway.MarkAccount(p.Store, acc, model.StatusCooling, "上游限流 HTTP 429", time.Now())
-				web.Warn(ticketID, fmt.Sprintf("账号 %s 被限流 429，切换下一个", acc.Name))
+				return false, errNetwork{bodyText}
 			}
-			return false, errNetwork{bodyText}
+			// 其余为瞬时限流：此处不标状态，交由 attemptUpstream 决定原地重试还是冷却
+			return false, errRateLimited{body: bodyText}
 		}
 
 		// 503 → 冷却换号
@@ -505,6 +549,12 @@ type errNetwork struct{ body string }
 
 func (e errNetwork) Error() string { return e.body }
 
+// errRateLimited 瞬时限流（非额度码族的 429）：账号尚未标任何状态，
+// 由 attemptUpstream 决定是原地重试还是递进冷却后换号。
+type errRateLimited struct{ body string }
+
+func (e errRateLimited) Error() string { return e.body }
+
 // forwardSSE 把上游 SSE 行转成 ticket chunk 事件，并累计账号 token 用量。
 // 完整结束时投递 done 并返回 (false, nil)；转发开始后中断时返回
 // (true, err)，零 chunk 时返回 (false, err) 由调用方换号重试。
@@ -542,6 +592,8 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	// 统计落库失败不应触发换号重发
 	usage.Finish()
 	acc.AccumulateTokens(usage.AsDict())
+	// 与 engine.success 对齐：成功即认为限流窗口已过，清零连续计数。
+	gateway.ResetRateLimitStreak(acc)
 	if err := p.Store.UpdateAccount(acc); err != nil {
 		web.Warn("async", "用量统计落库失败: "+err.Error())
 	}

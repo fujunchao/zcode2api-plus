@@ -78,6 +78,13 @@ type Account struct {
 	ProxyID                  *string  `json:"proxy_id"`
 	CreatedAt                float64  `json:"created_at"`
 	ArchivedAt               *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
+
+	// RateLimitStreak 连续被瞬时限流的次数，成功调用后归零，用于选择递进冷却档位。
+	// 刻意不序列化：accounts.data 的 JSON 键集是与 Python 版互读的硬契约，
+	// 为纯运行期退避状态新增键会破坏该契约；而它只决定「下一次冷却取哪一档」，
+	// 进程重启后归零（下次按最低档冷却）没有正确性影响。
+	// 进程内 sync（engine）与 async（asyncpool）共享同一个 *Account 对象。
+	RateLimitStreak int `json:"-"`
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -347,23 +354,24 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		planSource = a.Plans
 	}
 	return map[string]any{
-		"id":               a.ID,
-		"name":             a.Name,
-		"email":            a.Email,
-		"provider":         a.Provider,
-		"mode":             a.Mode,
-		"token_masked":     masked,
-		"enabled":          a.Enabled,
-		"status":           a.EffectiveStatus(now),
-		"quota":            a.Quota,
-		"exhausted_models": a.ExhaustedModels,
-		"disabled_models":  a.DisabledModels,
-		"plan":             a.Plan,
-		"plans":            a.Plans,
-		"plan_name":        PlanText(planSource),
-		"plan_is_trial":    IsTrialPlan(planSource),
-		"use_count":        a.UseCount,
-		"fail_count":       a.FailCount,
+		"id":                a.ID,
+		"name":              a.Name,
+		"email":             a.Email,
+		"provider":          a.Provider,
+		"mode":              a.Mode,
+		"token_masked":      masked,
+		"enabled":           a.Enabled,
+		"status":            a.EffectiveStatus(now),
+		"quota":             a.Quota,
+		"exhausted_models":  a.ExhaustedModels,
+		"disabled_models":   a.DisabledModels,
+		"plan":              a.Plan,
+		"plans":             a.Plans,
+		"plan_name":         PlanText(planSource),
+		"plan_is_trial":     IsTrialPlan(planSource),
+		"use_count":         a.UseCount,
+		"fail_count":        a.FailCount,
+		"rate_limit_streak": a.RateLimitStreak,
 		"total_tokens": map[string]int{
 			"input":          a.TotalInputTokens,
 			"output":         a.TotalOutputTokens,

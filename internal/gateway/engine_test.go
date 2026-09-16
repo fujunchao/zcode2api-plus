@@ -77,6 +77,8 @@ func newFixture(t *testing.T) *fixture {
 	f.cm = captcha.NewManager()
 	f.eng = NewEngine(f.st, f.cm, nil)
 	f.eng.BusyRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	// 瞬时限流的原地重试同样注入零延迟，避免每个相关用例都真等 1 秒
+	f.eng.RateLimitRetryDelay = 0
 	h := &Handler{Engine: f.eng, Auth: auth.New(f.st)}
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -308,7 +310,7 @@ func Test429QuotaFamilyExhaustsAndRateLimitCools(t *testing.T) {
 			t.Fatalf("上限族应标记模型耗尽而保留账号: %+v", got)
 		}
 	})
-	t.Run("1302 瞬时限流→cooling", func(t *testing.T) {
+	t.Run("1302 瞬时限流→原地重试一次后递进冷却", func(t *testing.T) {
 		f := newFixture(t)
 		f.respond = jsonResp(429, `{"code":1302,"msg":"rate limited"}`)
 		acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
@@ -320,7 +322,111 @@ func Test429QuotaFamilyExhaustsAndRateLimitCools(t *testing.T) {
 		if len(got.ExhaustedModels) != 0 {
 			t.Fatalf("瞬时限流不应标记耗尽: %v", got.ExhaustedModels)
 		}
+		// 首次 429 先原地重试一次，用尽才冷却换号
+		if f.callCount() != 1+MaxRateLimitRetries {
+			t.Fatalf("应原地重试 %d 次后放弃: callCount=%d", MaxRateLimitRetries, f.callCount())
+		}
+		if got.RateLimitStreak != 1 {
+			t.Fatalf("连续限流计数应为 1: %d", got.RateLimitStreak)
+		}
+		// 首次被限流走阶梯最低档 30s，而不是连接失败/503 的 CoolingSeconds(300s)
+		want := float64(time.Now().Add(30*time.Second).UnixNano()) / 1e9
+		if diff := *got.CoolingUntil - want; diff > 5 || diff < -5 {
+			t.Fatalf("首次限流冷却应约 30s: cooling_until=%v", *got.CoolingUntil)
+		}
 	})
+}
+
+// 瞬时限流只值一次对冲：原地重试成功就不该把账号标成冷却。
+func TestTransientRateLimitRetrySucceedsInPlace(t *testing.T) {
+	f := newFixture(t)
+	f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+		if n == 1 {
+			return jsonResp(429, `{"code":1302,"msg":"rate limited"}`)(n, nil)
+		}
+		return jsonResp(200, okUpstreamJSON)(n, nil)
+	}
+	acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 200 || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("限流后原地重试应成功: %d %s", status, raw)
+	}
+	if f.callCount() != 1+MaxRateLimitRetries {
+		t.Fatalf("应恰好原地重试 %d 次: %d", MaxRateLimitRetries, f.callCount())
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive {
+		t.Fatalf("重试成功不得把账号标为冷却: %s", got.Status)
+	}
+	if got.RateLimitStreak != 0 {
+		t.Fatalf("成功后连续限流计数应清零: %d", got.RateLimitStreak)
+	}
+}
+
+// 递进冷却阶梯：连续被限流才逐级加重，任意一次成功调用后回到最低档。
+func TestTransientRateLimitCoolingEscalates(t *testing.T) {
+	st := openStore(t)
+	acc, _ := st.AddAccount(model.ProviderZai, "a", "sk-1")
+	now := time.Now()
+
+	want := []int{30, 60, 120, config.CoolingSeconds}
+	for i, secs := range want {
+		if got := MarkRateLimited(st, acc, "上游限流 HTTP 429", now); got != secs {
+			t.Fatalf("第 %d 次限流冷却应为 %ds，实得 %ds", i+1, secs, got)
+		}
+		if acc.RateLimitStreak != i+1 {
+			t.Fatalf("连续计数应递增到 %d: %d", i+1, acc.RateLimitStreak)
+		}
+	}
+	// 超出阶梯长度后封顶，不再继续加重
+	if got := MarkRateLimited(st, acc, "上游限流 HTTP 429", now); got != config.CoolingSeconds {
+		t.Fatalf("超出阶梯应封顶在 %ds: %d", config.CoolingSeconds, got)
+	}
+	// 成功调用后计数清零，下次从最低档重新起算
+	ResetRateLimitStreak(acc)
+	if got := MarkRateLimited(st, acc, "上游限流 HTTP 429", now); got != 30 {
+		t.Fatalf("成功调用后应回到最低档 30s: %d", got)
+	}
+}
+
+// 三类重试各有独立预算：一次验证码重试不得吃掉 3010 的等待次数。
+// 此前三者共用循环变量 captchaAttempt，验证码先重试一次后 3010 就只剩一次机会，
+// 到第三次迭代时 2 < len(BusyRetryDelays) 为假，直接把 429 回传客户端。
+func TestCaptchaRetryDoesNotConsumeBusyBudget(t *testing.T) {
+	f := newFixture(t)
+	oldBrowser := config.CaptchaBrowserEnabled
+	config.CaptchaBrowserEnabled = true
+	t.Cleanup(func() { config.CaptchaBrowserEnabled = oldBrowser })
+	f.cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
+		return captcha.DefaultConfig, nil // 避免测试触网
+	})
+	f.cm.SetSolver(stubSolver{token: "token-1"})
+
+	f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+		switch n {
+		case 1:
+			return jsonResp(400, `{"code":3007,"msg":"verify token invalid"}`)(n, nil)
+		case 2, 3:
+			return jsonResp(429, `{"code":3010,"msg":"model admission concurrency limit exceeded"}`)(n, nil)
+		default:
+			return jsonResp(200, okUpstreamJSON)(n, nil)
+		}
+	}
+	acc, _ := f.st.AddAccount(model.ProviderZai, "j", "header.payload.sig")
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 200 || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("验证码重试后 3010 应仍保有完整预算: %d %s", status, raw)
+	}
+	// 1 次验证码被拒 + 2 次 3010 等待 + 1 次成功 = 4 次上游调用
+	if f.callCount() != 4 {
+		t.Fatalf("应为 4 次上游调用（各类预算互不挤占）: %d", f.callCount())
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive {
+		t.Fatalf("全链路不应改变账号状态: %s", got.Status)
+	}
 }
 
 func Test3010RetriesThenSucceeds(t *testing.T) {

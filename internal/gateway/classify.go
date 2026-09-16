@@ -6,23 +6,82 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/store"
 )
 
 const (
-	// MaxCaptchaRetries 单账号内验证码失效重试上限。
+	// MaxCaptchaRetries 单账号内验证码失效重试上限（含首次尝试的总次数）。
 	MaxCaptchaRetries = 3
 	// MaxAccountAttempts 单次请求最多尝试的账号数。
 	MaxAccountAttempts = 5
+	// MaxRateLimitRetries 瞬时限流（非额度码族的 429）在同一账号上的原地重试次数。
+	// 池子里通常还有别的账号，换号成本是百毫秒级；原地等待只用来对冲「限流窗口
+	// 秒级复位」这一种可能，因此只给一次机会，不跟随 3010 的多轮等待。
+	MaxRateLimitRetries = 1
+	// RateLimitRetryDelay 瞬时限流原地重试的基准等待时长（实际施加 ±20% 抖动）。
+	RateLimitRetryDelay = time.Second
 )
 
-// startPlanBusyRetryDelays 原版客户端对 Start Plan 的 3010 等待 1s、2s 重试；
+// defaultBusyRetryDelays 原版客户端对 Start Plan 的 3010 等待 1s、2s 重试；
 // 账号仍然可用，不能把模型准入限制写成账号 cooling。
-var startPlanBusyRetryDelays = []time.Duration{time.Second, 2 * time.Second}
+var defaultBusyRetryDelays = []time.Duration{time.Second, 2 * time.Second}
+
+// rateLimitCoolingSteps 瞬时限流的递进冷却阶梯（秒）：同一账号连续被限流则逐级
+// 加重，任意一次成功调用后归零。第 4 次起落到 config.CoolingSeconds（默认 300s），
+// 与连接失败/503 同值——阶梯最重也只与硬故障惩罚持平，不会更重。
+var rateLimitCoolingSteps = []int{30, 60, 120}
+
+// transientCoolingSeconds 取「连续第 streak 次被瞬时限流」对应的冷却时长（秒）。
+func transientCoolingSeconds(streak int) int {
+	if streak < 1 {
+		streak = 1
+	}
+	if streak > len(rateLimitCoolingSteps) {
+		return config.CoolingSeconds
+	}
+	if secs := rateLimitCoolingSteps[streak-1]; secs < config.CoolingSeconds {
+		return secs
+	}
+	return config.CoolingSeconds
+}
+
+// MarkRateLimited 记录一次瞬时限流（非额度码族的 429）并按连续次数递进冷却。
+// 返回本次实际写入的冷却秒数，供日志展示。
+// 与 MarkAccount(cooling) 的区别：那条用于连接失败/503 等硬故障，时长固定为
+// config.CoolingSeconds；瞬时 429 的窗口可能只有数秒，用固定 300s 惩罚过重。
+func MarkRateLimited(st *store.Store, acc *model.Account, errMsg string, now time.Time) int {
+	acc.RateLimitStreak++
+	secs := transientCoolingSeconds(acc.RateLimitStreak)
+	until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
+	acc.Status = model.StatusCooling
+	acc.CoolingUntil = &until
+	acc.LastError = &errMsg
+	_ = st.UpdateAccount(acc)
+	return secs
+}
+
+// ResetRateLimitStreak 成功调用后清零「连续被限流」计数。
+// sync 与 async 两条请求路径都必须调用，否则同一账号会出现「一边归零、一边继续
+// 递增」的分歧——这正是两条路径必须共用状态机的老问题。
+func ResetRateLimitStreak(acc *model.Account) {
+	acc.RateLimitStreak = 0
+}
+
+// JitteredDelay 给重试等待施加 ±20% 抖动：多个请求在同一瞬间被限流时，
+// 避免它们在同一瞬间一起重试，也避免一批账号在同一瞬间集体复活。
+func JitteredDelay(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
+}
 
 // ModelNameMap Z.AI 上游模型名大小写敏感；仅映射开放清单内的模型，
 // 其余写法本就会被白名单拒绝，无需维护映射。

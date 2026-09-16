@@ -158,6 +158,7 @@ func newTestPool(t *testing.T) (*Pool, *store.Store, *captcha.Manager, *fakeSolv
 		return captcha.Config{Enabled: true, Prefix: "no8xfe", Region: "sgp", SceneID: "11xygtvd"}, nil
 	})
 	p := NewPool(st, auth.New(st), cm)
+	p.RateLimitRetryDelay = 0 // 与 config.AsyncMaxRetries=0 同理：避免退避等待
 	return p, st, cm, solver
 }
 
@@ -660,11 +661,12 @@ func TestUpstreamErrorDeliveredAsEvent(t *testing.T) {
 }
 
 func TestRateLimitMarksCoolingAndRetries(t *testing.T) {
-	// 429：账号进入冷却，换号重试；无更多账号时报 max_retries。
+	// 429：先对同一账号原地重试一次，用尽才递进冷却并换号；无更多账号时报 max_retries。
 	p, st, _, _ := newTestPool(t)
 	addJWTAccount(t, st, "cooling-acc")
 
 	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":1302,"msg":"rate limited"}`},
 		{status: http.StatusTooManyRequests, body: `{"code":1302,"msg":"rate limited"}`},
 	}}
 	config.UpstreamZai = up.start(t).URL
@@ -678,12 +680,53 @@ func TestRateLimitMarksCoolingAndRetries(t *testing.T) {
 	if errObj == nil || errObj["type"] != "max_retries" {
 		t.Fatalf("重试耗尽应报 max_retries: %v", events)
 	}
+	// 首次 + 一次原地重试 = 2 次上游调用，之后才标冷却
+	if up.callCount() != 1+gateway.MaxRateLimitRetries {
+		t.Fatalf("应原地重试 %d 次: %d", gateway.MaxRateLimitRetries, up.callCount())
+	}
 	acc := st.ListAccounts(model.ProviderZai)[0]
 	if acc.Status != model.StatusCooling {
 		t.Fatalf("429 应进入冷却: %s", acc.Status)
 	}
 	if acc.LastError == nil || !strings.Contains(*acc.LastError, "HTTP 429") {
 		t.Fatalf("last_error 应记录 429: %v", acc.LastError)
+	}
+	if acc.RateLimitStreak != 1 {
+		t.Fatalf("连续限流计数应为 1: %d", acc.RateLimitStreak)
+	}
+}
+
+// 瞬时限流原地重试成功时不得把账号标成冷却（与 engine 的 sync 路径同语义）。
+func TestRateLimitRetrySucceedsInPlace(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "retry-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusTooManyRequests, body: `{"code":1302,"msg":"rate limited"}`},
+		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: [DONE]`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-retry", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-retry")
+
+	events := drainEvents(tk)
+	types := make([]string, 0, len(events))
+	for _, ev := range events {
+		types = append(types, ev.Type)
+	}
+	if strings.Join(types, ",") != "ready,chunk,done" {
+		t.Fatalf("限流后原地重试应成功: %v", events)
+	}
+	if up.callCount() != 1+gateway.MaxRateLimitRetries {
+		t.Fatalf("应恰好原地重试 %d 次: %d", gateway.MaxRateLimitRetries, up.callCount())
+	}
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusActive {
+		t.Fatalf("重试成功不得把账号标为冷却: %s", acc.Status)
+	}
+	if acc.RateLimitStreak != 0 {
+		t.Fatalf("成功后连续限流计数应清零: %d", acc.RateLimitStreak)
 	}
 }
 
