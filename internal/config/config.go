@@ -131,7 +131,9 @@ var (
 	// ZCode 计费 / 额度查询端点（不可配置，与官方客户端一致）。
 	ZcodeBillingBase = "https://zcode.z.ai/api/v1/zcode-plan"
 
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.7.7")
+	// 官方客户端版本号：随请求头 / URL 参数上行，用于伪装成官方客户端。
+	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.11.2")
 	// 与 Python 版保持一致的客户端平台标识；旧的 win32 参数已失效。
 	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", "win32-x64")
 
@@ -139,6 +141,17 @@ var (
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
 	AppVersion = "2.0.7-go"
+)
+
+// ── 遥测设备伪装 ────────────────────────────────────────────────────────────
+// 激活事件体里的设备字段。刻意**不跟随运行环境**：网关多跑在 Linux 容器里，
+// 而 X-Platform / User-Agent 都声称桌面客户端，跟随环境会让 body 与请求头
+// 自相矛盾（上游可交叉比对，据此判定「非官方客户端」而不投放活动套餐）。
+// 三项都应与 ZcodeClientPlatform 相符：Windows 客户端报内核串，如 10.0.26100。
+var (
+	ZcodeClientOSVersion = env("ZCODE_CLIENT_OS_VERSION", "10.0.26100")
+	ZcodeClientLanguage  = env("ZCODE_CLIENT_LANGUAGE", "zh-CN")
+	ZcodeClientTimezone  = env("ZCODE_CLIENT_TIMEZONE", "Asia/Shanghai")
 )
 
 // ── 设备身份 ────────────────────────────────────────────────────────────────

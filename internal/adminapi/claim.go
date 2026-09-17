@@ -422,6 +422,14 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+		// 领取前补一次当日活跃上报：上游以「官方客户端当日活跃」为活动套餐的投放
+		// 资格，而手动领取不像「刷新资格」那样经过 handleClaimPreview。漏掉这一步
+		// 时 preview 会直接返回空套餐（对照 zcode-switch：claim_refresh 必先上报）。
+		// 放在闸门之外——它不改账号状态、无需串行；失败也不阻断，上游按
+		// device_mid + 日期去重，同一账号重复上报无害。
+		if activationError := claim.ReportActivationEvents(acc); activationError != "" {
+			web.Warn("claim", fmt.Sprintf("账号 %s 激活上报失败: %s", acc.Name, activationError))
+		}
 		if !claimSlot.acquire() {
 			outcomes = append(outcomes, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "ok": false,

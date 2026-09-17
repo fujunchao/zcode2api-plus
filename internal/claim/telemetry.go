@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -30,49 +29,41 @@ const activationScreen = "2560x1440"
 // eventClient 上报客户端（测试可注入；默认 10s 超时直连）。
 var eventClient = &http.Client{Timeout: 10 * time.Second}
 
-// osVersion 对齐 platform.release() 语义（Windows 下 platform.version() 同源
-// 为内核版本串；Go 无直接等价，返回空由上游按形态校验兜底也可，这里取
-// GOOS 通用做法：unix 读 uname，windows 取空串——上游不校验具体值）。
-func osVersion() string {
-	return ""
-}
-
-// timezone 本机 IANA 时区名；取不到时回退 UTC（上报失败不阻断 preview）。
-func timezone() string {
-	if tz := strings.TrimSpace(os.Getenv("TZ")); tz != "" {
-		return tz
+// DeviceOSCategory 把客户端平台标识（win32-x64 / darwin-arm64 / linux-x64）映射为
+// 事件体的 device_os_category。
+//
+// 刻意**不跟随 runtime.GOOS**：网关多跑在 Linux 容器里，而请求头与 UA 都声称桌面
+// 客户端，跟随运行环境会让 body 与头自相矛盾（上游可交叉比对）。仅当平台标识无法
+// 识别时才退回运行环境，至少保证有自洽的真值。
+func DeviceOSCategory(platform string) string {
+	p := strings.ToLower(strings.TrimSpace(platform))
+	switch {
+	case strings.HasPrefix(p, "win32"), strings.HasPrefix(p, "win64"),
+		strings.HasPrefix(p, "windows"):
+		return "windows"
+	case strings.HasPrefix(p, "darwin"), strings.HasPrefix(p, "mac"),
+		strings.HasPrefix(p, "osx"):
+		return "macos"
+	case strings.HasPrefix(p, "linux"):
+		return "linux"
 	}
-	if raw, err := os.ReadFile("/etc/timezone"); err == nil {
-		if name := strings.TrimSpace(string(raw)); name != "" {
-			return name
-		}
+	switch runtime.GOOS {
+	case "windows":
+		return "windows"
+	case "darwin":
+		return "macos"
 	}
-	return "UTC"
-}
-
-// language 本机 locale 语言标签（LC_ALL / LC_MESSAGES / LANG）。
-func language() string {
-	for _, key := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
-		raw := strings.TrimSpace(os.Getenv(key))
-		if raw != "" {
-			return strings.ReplaceAll(strings.SplitN(raw, ".", 2)[0], "_", "-")
-		}
-	}
-	return "en-US"
+	return "linux"
 }
 
 // BuildActivationEventBody 激活事件体（官方 sendReport 字段集固定这 16 个）。
+// 设备字段取自 config 的伪装配置而非运行环境（理由见 config 与 DeviceOSCategory）：
+// 时区/语言/系统版本空着或跟随容器，会与请求头的 win32-x64 形成可交叉比对的矛盾。
 func BuildActivationEventBody(element, userID, deviceMid string) map[string]any {
-	osCategory := map[string]string{
-		"windows": "windows", "darwin": "macos",
-	}[runtime.GOOS]
-	if osCategory == "" {
-		osCategory = "linux"
-	}
 	return map[string]any{
 		"event_id":           newUUID(),
-		"client_timezone":    timezone(),
-		"client_language":    language(),
+		"client_timezone":    config.ZcodeClientTimezone,
+		"client_language":    config.ZcodeClientLanguage,
 		"element_name":       element,
 		"event_region":       "app",
 		"event_type":         "view",
@@ -81,8 +72,8 @@ func BuildActivationEventBody(element, userID, deviceMid string) map[string]any 
 		"user_id":            userID,
 		"screen_resolution":  activationScreen,
 		"app_version":        config.ZcodeClientVersion,
-		"device_os_category": osCategory,
-		"device_os_version":  osVersion(),
+		"device_os_category": DeviceOSCategory(config.ZcodeClientPlatform),
+		"device_os_version":  config.ZcodeClientOSVersion,
 		"device_mid":         deviceMid,
 		"mac_id":             "",
 		"marketing_params":   "{}",
