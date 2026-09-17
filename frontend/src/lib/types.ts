@@ -123,6 +123,19 @@ export interface EgressInfo {
   latency_ms?: number
 }
 
+/* 一鍵測試全部線路的單條結果：出口資訊 + 該線路的標識與成敗。 */
+export interface ProxyTestResult extends EgressInfo {
+  id: string
+  name: string
+  ok: boolean
+  error?: string
+}
+
+export interface TestAllResponse {
+  results: ProxyTestResult[]
+  summary: { total: number; ok: number; fail: number }
+}
+
 export interface UsageRankingRow {
   name: string
   provider: string

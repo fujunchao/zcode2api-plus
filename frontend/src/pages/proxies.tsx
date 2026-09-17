@@ -18,7 +18,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { api, errMsg } from '@/lib/api'
 import { proxyScheme } from '@/lib/format'
-import type { EgressInfo, ProxyProfile } from '@/lib/types'
+import type { EgressInfo, ProxyProfile, TestAllResponse } from '@/lib/types'
 
 interface ProxiesResponse {
   profiles: ProxyProfile[]
@@ -62,6 +62,7 @@ export function ProxiesPage() {
   const [current, setCurrent] = useState<CurrentResult>({ state: 'idle' })
   const [testingCurrent, setTestingCurrent] = useState(false)
   const [rowResults, setRowResults] = useState<Record<string, RowResult>>({})
+  const [testingAll, setTestingAll] = useState(false)
 
   const [modalOpen, setModalOpen] = useState(false)
   const [editingId, setEditingId] = useState('')
@@ -156,6 +157,43 @@ export function ProxiesPage() {
     }
   }
 
+  /* 一鍵測試全部「啟用」線路：後端併發探測（8 路），返回後逐行回填結果。
+     單條最壞 36s（三個出口服務依次 12s 逾時），故測試期間按鈕禁用。 */
+  async function testAll() {
+    const targets = profiles.filter((p) => p.enabled)
+    if (!targets.length) {
+      toast.info('沒有可測試的線路')
+      return
+    }
+    setTestingAll(true)
+    setRowResults((m) => {
+      const next = { ...m }
+      for (const p of targets) next[p.id] = { state: 'testing', text: '正在測試線路…' }
+      return next
+    })
+    try {
+      const d = await api<TestAllResponse>('POST', '/proxies/test-all')
+      setRowResults((m) => {
+        const next = { ...m }
+        for (const r of d.results) {
+          next[r.id] = r.ok
+            ? { state: 'ok', text: formatProbe(r) }
+            : { state: 'error', text: r.error || '測試失敗' }
+        }
+        return next
+      })
+      if (d.summary.fail > 0) {
+        toast.warning(`線路測試完成：成功 ${d.summary.ok}／失敗 ${d.summary.fail}`)
+      } else {
+        toast.success(`線路測試完成：${d.summary.total} 條全部正常`)
+      }
+    } catch (e) {
+      toast.error('批量測試失敗：' + errMsg(e))
+    } finally {
+      setTestingAll(false)
+    }
+  }
+
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
       {/* 頁首 */}
@@ -167,6 +205,14 @@ export function ProxiesPage() {
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => void testCurrentLine()} disabled={testingCurrent}>
             <Activity /> 測試目前線路
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void testAll()}
+            disabled={testingAll || !profiles.length}
+          >
+            <Activity /> {testingAll ? '正在測試全部…' : '測試全部線路'}
           </Button>
           <Button size="sm" onClick={() => openModal()}>
             <Plus /> 新增代理

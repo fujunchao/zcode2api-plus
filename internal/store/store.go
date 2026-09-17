@@ -605,6 +605,78 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 	return true, s.persistAccountLocked(acc)
 }
 
+// freeProxyProfilesLocked 列出「启用中且未被任何账号占用」的线路。
+// 占用判定只看 ProxyID —— 手工填 proxy_url 的账号不占用命名线路。
+// 注意 listProxyProfilesLocked 不过滤 Enabled，这里必须自筛。
+func (s *Store) freeProxyProfilesLocked() []ProxyProfile {
+	taken := map[string]bool{}
+	for _, a := range s.allAccountsLocked() {
+		if id := derefStr(a.ProxyID); id != "" {
+			taken[id] = true
+		}
+	}
+	out := []ProxyProfile{}
+	for _, p := range s.listProxyProfilesLocked() {
+		if p.Enabled && !taken[p.ID] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// PickFreeProxyProfile 挑一条空闲线路但不写入任何账号。
+//
+// 登录会话需要在账号建立之前就把出口定下来（token 交换、API Key 兑换、额度刷新、
+// 活动领取是同一条出站链路），所以不能等到 AutoAssignProxies 那一步。
+func (s *Store) PickFreeProxyProfile() (ProxyProfile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if free := s.freeProxyProfilesLocked(); len(free) > 0 {
+		return free[0], true
+	}
+	return ProxyProfile{}, false
+}
+
+// AutoAssignProxies 给一批账号分配「尚未被任何账号占用」的代理线路。
+//
+// 单锁内原子完成：先按当前占用情况选出可用候选，再按 accountIDs 顺序逐个分配，
+// 因此批量导入不会把同一条线路分给两个账号。候选不足时剩余账号保持直连
+// （ProxyID/ProxyURL 均为 nil），由第二个返回值回报，供调用方提示用户。
+//
+// 注意：刻意不复用 AssignProxyProfile——它会自行加锁，在持锁上下文里调用会死锁。
+func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]string, directFallback []string) {
+	assigned = map[string]string{}
+	directFallback = []string{}
+	if len(accountIDs) == 0 {
+		return assigned, directFallback
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	free := s.freeProxyProfilesLocked()
+	for _, id := range accountIDs {
+		acc := s.findAnyLocked(id)
+		if acc == nil {
+			continue
+		}
+		if len(free) == 0 {
+			directFallback = append(directFallback, id)
+			continue
+		}
+		p := free[0]
+		free = free[1:]
+		profileID, profileURL := p.ID, p.URL
+		acc.ProxyID = &profileID
+		acc.ProxyURL = &profileURL
+		if err := s.persistAccountLocked(acc); err != nil {
+			directFallback = append(directFallback, id)
+			continue
+		}
+		assigned[id] = profileID
+	}
+	return assigned, directFallback
+}
+
 // ── 账号读取 ────────────────────────────────────────────────────────────────
 
 // ListAccounts 列出账号；provider 为空表示全部。
@@ -670,7 +742,8 @@ func (s *Store) allAccountsLocked() []*model.Account {
 
 // AddAccount 添加账号；同一账号（按身份或凭据判定）已存在时直接返回既有记录。
 func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error) {
-	return s.AddAccountWithIdentity(provider, name, secret, "")
+	acc, _, err := s.AddAccountWithIdentity(provider, name, secret, "")
+	return acc, err
 }
 
 // AddAccountWithIdentity 带身份信息入池。email 只有 OAuth 路径需要传（该类 token
@@ -679,9 +752,12 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 // 判重按优先级分三轮遍历，而不是单遍取首个命中：单遍会让列表里靠前的低优先级判据
 // （凭据相同）抢先于靠后的高优先级判据（同一个 user_id），把"同一账号换了 token"
 // 误判成两个账号。
-func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*model.Account, error) {
+//
+// 第二个返回值 isNew 区分「本次新建」与「命中既有记录」：调用方（OAuth 重登、
+// 自动分配代理线路）需要据此决定是否施加只对新号生效的默认值。
+func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*model.Account, bool, error) {
 	if _, ok := s.providersSet()[provider]; !ok {
-		return nil, fmt.Errorf("不支持的 provider: %s", provider)
+		return nil, false, fmt.Errorf("不支持的 provider: %s", provider)
 	}
 	acc := model.Create(provider, name, secret)
 	if acc.Mode == "jwt" {
@@ -695,16 +771,16 @@ func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*m
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing := s.duplicateLocked(provider, acc); existing != nil {
-		return existing, nil // 同一账号：返回既有记录，不新建
+		return existing, false, nil // 同一账号：返回既有记录，不新建
 	}
 	// 每账号独立设备指纹：全局共用一份会让同机多账号被上游按设备关联。
 	mid := config.NewDeviceMid()
 	acc.VirtualDeviceMid = &mid
 	s.accounts[provider] = append(s.accounts[provider], acc)
 	if err := s.persistAccountLocked(acc); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return acc, nil
+	return acc, true, nil
 }
 
 // duplicateLocked 按 user_id → email → 凭据 三轮判定是否已存在同一账号。
@@ -975,9 +1051,12 @@ type ImportPayload struct {
 	Providers map[string][]importItem `json:"providers"`
 }
 
-// ImportAccounts 导入账号，返回导入数量。
-func (s *Store) ImportAccounts(payload ImportPayload) (int, error) {
+// ImportAccounts 导入账号，返回导入数量与本次「新建」的账号 ID。
+// 命中既有记录（重复导入）时计数仍递增，但不计入 newIDs —— 调用方据此只给新号
+// 分配代理线路，不会去动老号已有的线路指派。
+func (s *Store) ImportAccounts(payload ImportPayload) (int, []string, error) {
 	count := 0
+	newIDs := []string{}
 	for provider, items := range payload.Providers {
 		if !s.providersSet()[provider] {
 			continue
@@ -987,20 +1066,23 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, error) {
 			if secret == "" {
 				continue
 			}
-			acc, err := s.AddAccount(provider, item.Name, secret)
+			acc, isNew, err := s.AddAccountWithIdentity(provider, item.Name, secret, "")
 			if err != nil {
-				return count, err
+				return count, newIDs, err
 			}
 			if item.DisabledModels != nil {
 				acc.SetDisabledModels(item.DisabledModels)
 				if err := s.UpdateAccount(acc); err != nil {
-					return count, err
+					return count, newIDs, err
 				}
+			}
+			if isNew {
+				newIDs = append(newIDs, acc.ID)
 			}
 			count++
 		}
 	}
-	return count, nil
+	return count, newIDs, nil
 }
 
 // ── 内部工具 ────────────────────────────────────────────────────────────────

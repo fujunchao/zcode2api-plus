@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"zcode2api/internal/store"
@@ -122,6 +123,64 @@ func (h *Handler) handleTestProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.writeProbe(w, target)
+}
+
+// testAllConcurrency 批量探测的并发上限：单条最坏 36s（三个出口服务依次 12s 超时），
+// 取 8 与额度刷新的并发度一致；正常情况首个服务几百毫秒即返回。
+const testAllConcurrency = 8
+
+// handleTestAllProxies 并发探测全部「启用」的线路，逐条返回结果供页面逐行渲染。
+//
+// 刻意不落库（与单条检测一致）：出口信息是瞬时观测值，缓存它反而会掩盖线路已经失效。
+// 未启用的线路不参与——它们的线路本来就不会被账号使用。
+func (h *Handler) handleTestAllProxies(w http.ResponseWriter, r *http.Request) {
+	profiles := []store.ProxyProfile{}
+	for _, p := range h.Store.ListProxyProfiles() {
+		if p.Enabled {
+			profiles = append(profiles, p)
+		}
+	}
+
+	// 每 goroutine 只写自己的下标，无需额外加锁。
+	results := make([]map[string]any, len(profiles))
+	sem := make(chan struct{}, testAllConcurrency)
+	var wg sync.WaitGroup
+	for i, p := range profiles {
+		wg.Add(1)
+		go func(i int, p store.ProxyProfile) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			entry := map[string]any{"id": p.ID, "name": p.Name}
+			info, err := h.probe(p.URL)
+			if err != nil {
+				entry["ok"] = false
+				entry["error"] = err.Error()
+				results[i] = entry
+				return
+			}
+			entry["ok"] = true
+			for k, v := range info {
+				entry[k] = v
+			}
+			results[i] = entry
+		}(i, p)
+	}
+	wg.Wait()
+
+	okCount := 0
+	for _, e := range results {
+		if ok, _ := e["ok"].(bool); ok {
+			okCount++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"results": results,
+		"summary": map[string]any{
+			"total": len(results), "ok": okCount, "fail": len(results) - okCount,
+		},
+	})
 }
 
 func payloadEnabled(payload map[string]any) bool {

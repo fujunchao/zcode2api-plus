@@ -16,39 +16,64 @@ func TestResolveLoginProxy(t *testing.T) {
 	}
 
 	t.Run("未指定即直连", func(t *testing.T) {
-		url, id, apiErr := h.resolveLoginProxy(map[string]any{})
-		if url != "" || id != "" || apiErr != nil {
-			t.Fatalf("got (%q, %q, %v)", url, id, apiErr)
+		url, id, auto, apiErr := h.resolveLoginProxy(map[string]any{})
+		if url != "" || id != "" || auto || apiErr != nil {
+			t.Fatalf("got (%q, %q, %v, %v)", url, id, auto, apiErr)
 		}
 	})
 	t.Run("线路 ID 解析为地址", func(t *testing.T) {
-		url, id, apiErr := h.resolveLoginProxy(map[string]any{"proxy_id": profile.ID})
+		url, id, auto, apiErr := h.resolveLoginProxy(map[string]any{"proxy_id": profile.ID})
 		if apiErr != nil {
 			t.Fatalf("不应报错: %v", apiErr)
+		}
+		if auto {
+			t.Fatal("显式指定线路不应标记为自动")
 		}
 		if url != "http://1.2.3.4:8080" || id != profile.ID {
 			t.Fatalf("got (%q, %q)", url, id)
 		}
 	})
 	t.Run("未知线路 400", func(t *testing.T) {
-		_, _, apiErr := h.resolveLoginProxy(map[string]any{"proxy_id": "no-such-line"})
+		_, _, _, apiErr := h.resolveLoginProxy(map[string]any{"proxy_id": "no-such-line"})
 		if apiErr == nil || apiErr.status != http.StatusBadRequest {
 			t.Fatalf("应 400: %v", apiErr)
 		}
 	})
 	t.Run("直接给地址", func(t *testing.T) {
-		url, id, apiErr := h.resolveLoginProxy(map[string]any{"proxy_url": "  socks5://u:p@1.2.3.4:1080  "})
+		url, id, auto, apiErr := h.resolveLoginProxy(map[string]any{"proxy_url": "  socks5://u:p@1.2.3.4:1080  "})
 		if apiErr != nil {
 			t.Fatalf("不应报错: %v", apiErr)
+		}
+		if auto {
+			t.Fatal("直接给地址不应标记为自动")
 		}
 		if url != "socks5://u:p@1.2.3.4:1080" || id != "" {
 			t.Fatalf("got (%q, %q)", url, id)
 		}
 	})
 	t.Run("非法协议 400", func(t *testing.T) {
-		_, _, apiErr := h.resolveLoginProxy(map[string]any{"proxy_url": "ftp://1.2.3.4"})
+		_, _, _, apiErr := h.resolveLoginProxy(map[string]any{"proxy_url": "ftp://1.2.3.4"})
 		if apiErr == nil || apiErr.status != http.StatusBadRequest {
 			t.Fatalf("应 400: %v", apiErr)
+		}
+	})
+	// 「自動」要在会话建立时就定下出口，否则整条登录链路的出口不一致。
+	t.Run("自动挑中空闲线路", func(t *testing.T) {
+		url, id, auto, apiErr := h.resolveLoginProxy(map[string]any{"proxy_id": proxyIDAuto})
+		if apiErr != nil {
+			t.Fatalf("不应报错: %v", apiErr)
+		}
+		if !auto {
+			t.Fatal("应标记为自动挑出")
+		}
+		if url != "http://1.2.3.4:8080" || id != profile.ID {
+			t.Fatalf("应挑中唯一空闲线路，got (%q, %q)", url, id)
+		}
+	})
+	t.Run("显式直连不分配", func(t *testing.T) {
+		url, id, auto, apiErr := h.resolveLoginProxy(map[string]any{"proxy_id": proxyIDDirect})
+		if apiErr != nil || url != "" || id != "" || auto {
+			t.Fatalf("got (%q, %q, %v, %v)", url, id, auto, apiErr)
 		}
 	})
 }

@@ -68,7 +68,7 @@ func TestAddAccountDedupPrefersUserIDOverEmail(t *testing.T) {
 	// 单遍遍历会按列表顺序命中靠前的低优先级判据（邮箱），把"同一账号换了 token"
 	// 误判成另一个账号。三轮遍历必须让 user_id 先胜出。
 	s := newTestStore(t)
-	byEmail, err := s.AddAccountWithIdentity(model.ProviderZai, "by-email", "plain-key-1", "shared@example.com")
+	byEmail, _, err := s.AddAccountWithIdentity(model.ProviderZai, "by-email", "plain-key-1", "shared@example.com")
 	if err != nil {
 		t.Fatalf("入池失败: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestAddAccountDedupPrefersUserIDOverEmail(t *testing.T) {
 	}
 
 	// 同时匹配「靠前账号的邮箱」与「靠后账号的 user_id」。
-	got, err := s.AddAccountWithIdentity(model.ProviderZai, "new", jwtFor("u-2"), "shared@example.com")
+	got, _, err := s.AddAccountWithIdentity(model.ProviderZai, "new", jwtFor("u-2"), "shared@example.com")
 	if err != nil {
 		t.Fatalf("入池失败: %v", err)
 	}
@@ -525,9 +525,12 @@ func TestExportImportRoundtrip(t *testing.T) {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		t.Fatal(err)
 	}
-	count, err := s2.ImportAccounts(parsed)
+	count, newIDs, err := s2.ImportAccounts(parsed)
 	if err != nil || count != 1 {
 		t.Fatalf("导入失败: count=%d err=%v", count, err)
+	}
+	if len(newIDs) != 1 {
+		t.Fatalf("应返回 1 个新建账号 ID，实际 %d", len(newIDs))
 	}
 	got := s2.Find(model.ProviderZai, "exp")
 	if got == nil || got.Secret() != "header.payload.sig" {
@@ -590,5 +593,144 @@ func TestProxyProfiles(t *testing.T) {
 	}
 	if _, err := s.AssignProxyProfile(acc.ID, "proxy-nope"); err == nil {
 		t.Fatal("指派不存在的线路应报错")
+	}
+}
+
+func TestAutoAssignProxies(t *testing.T) {
+	// 建 n 个账号并返回它们的 ID（每个用不同 user_id，避免被三级判重合并）。
+	newAccounts := func(t *testing.T, s *Store, names ...string) []string {
+		t.Helper()
+		ids := []string{}
+		for _, n := range names {
+			acc, err := s.AddAccount(model.ProviderZai, n, jwtFor("uid-"+n))
+			if err != nil {
+				t.Fatalf("入池 %s 失败: %v", n, err)
+			}
+			ids = append(ids, acc.ID)
+		}
+		return ids
+	}
+
+	t.Run("无线路时全部回退直连", func(t *testing.T) {
+		s := newTestStore(t)
+		ids := newAccounts(t, s, "a1", "a2")
+		assigned, fallback := s.AutoAssignProxies(ids)
+		if len(assigned) != 0 || len(fallback) != 2 {
+			t.Fatalf("应全部回退直连: assigned=%v fallback=%v", assigned, fallback)
+		}
+		if got := s.Find(model.ProviderZai, ids[0]); got.ProxyID != nil || got.ProxyURL != nil {
+			t.Fatalf("回退后不应带代理: %v / %v", got.ProxyID, got.ProxyURL)
+		}
+	})
+
+	t.Run("按顺序分配且不足的回退直连", func(t *testing.T) {
+		s := newTestStore(t)
+		p1, err := s.AddProxyProfile("line-1", "http://1.1.1.1:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		p2, err := s.AddProxyProfile("line-2", "socks5://2.2.2.2:1080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		ids := newAccounts(t, s, "a1", "a2", "a3", "a4", "a5")
+
+		assigned, fallback := s.AutoAssignProxies(ids)
+		if len(assigned) != 2 || len(fallback) != 3 {
+			t.Fatalf("应 2 条分配、3 条直连: assigned=%d fallback=%d", len(assigned), len(fallback))
+		}
+		if assigned[ids[0]] != p1.ID || assigned[ids[1]] != p2.ID {
+			t.Fatalf("应按传入顺序分配: %v", assigned)
+		}
+		// 必须落库：重新读出来的账号同样带线路。
+		got := s.Find(model.ProviderZai, ids[0])
+		if got.ProxyID == nil || *got.ProxyID != p1.ID ||
+			got.ProxyURL == nil || *got.ProxyURL != p1.URL {
+			t.Fatalf("线路未落库: %+v", got)
+		}
+	})
+
+	t.Run("跳过已被占用的线路", func(t *testing.T) {
+		s := newTestStore(t)
+		p1, err := s.AddProxyProfile("line-1", "http://1.1.1.1:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		p2, err := s.AddProxyProfile("line-2", "http://2.2.2.2:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		old := newAccounts(t, s, "old")[0]
+		if ok, err := s.AssignProxyProfile(old, p1.ID); !ok || err != nil {
+			t.Fatalf("指派失败: %v %v", ok, err)
+		}
+		fresh := newAccounts(t, s, "fresh")[0]
+
+		assigned, fallback := s.AutoAssignProxies([]string{fresh})
+		if len(fallback) != 0 {
+			t.Fatalf("还有空閒线路，不应回退: %v", fallback)
+		}
+		if assigned[fresh] != p2.ID {
+			t.Fatalf("应跳过已占用的 line-1 拿到 line-2: %v", assigned)
+		}
+	})
+
+	t.Run("停用的线路不参与分配", func(t *testing.T) {
+		s := newTestStore(t)
+		if _, err := s.AddProxyProfile("off", "http://1.1.1.1:8080", false); err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		id := newAccounts(t, s, "a1")[0]
+		assigned, fallback := s.AutoAssignProxies([]string{id})
+		if len(assigned) != 0 || len(fallback) != 1 {
+			t.Fatalf("停用线路不应被分配: assigned=%v fallback=%v", assigned, fallback)
+		}
+	})
+
+	t.Run("已被占用的线路不会被重复分配", func(t *testing.T) {
+		s := newTestStore(t)
+		p1, err := s.AddProxyProfile("line-1", "http://1.1.1.1:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		ids := newAccounts(t, s, "a1", "a2")
+
+		if _, fallback := s.AutoAssignProxies([]string{ids[0]}); len(fallback) != 0 {
+			t.Fatalf("首个账号应拿到线路: %v", fallback)
+		}
+		assigned, fallback := s.AutoAssignProxies([]string{ids[1]})
+		if len(assigned) != 0 || len(fallback) != 1 {
+			t.Fatalf("线路已被占用，第二个账号应回退直连: assigned=%v fallback=%v", assigned, fallback)
+		}
+		// 前一个账号的指派不能被后续调用改动。
+		if got := s.Find(model.ProviderZai, ids[0]); got.ProxyID == nil || *got.ProxyID != p1.ID {
+			t.Fatalf("已有指派不应被改动: %+v", got.ProxyID)
+		}
+	})
+}
+
+func TestPickFreeProxyProfile(t *testing.T) {
+	s := newTestStore(t)
+	if _, ok := s.PickFreeProxyProfile(); ok {
+		t.Fatal("没有任何线路时应返回 false")
+	}
+	p, err := s.AddProxyProfile("line-1", "http://1.1.1.1:8080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	got, ok := s.PickFreeProxyProfile()
+	if !ok || got.ID != p.ID {
+		t.Fatalf("应挑中唯一空閒线路: %+v ok=%v", got, ok)
+	}
+	// 「只挑不写」：调用本身不占用线路、也不改账号——登录会话需要在账号建立前定出口。
+	acc, err := s.AddAccount(model.ProviderZai, "a1", jwtFor("uid-pick"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if _, ok := s.PickFreeProxyProfile(); !ok {
+		t.Fatal("Pick 不应写入占用（账号尚未指派时线路应仍为空閒）")
+	}
+	if acc.ProxyID != nil || acc.ProxyURL != nil {
+		t.Fatalf("Pick 不应改动账号: %v / %v", acc.ProxyID, acc.ProxyURL)
 	}
 }

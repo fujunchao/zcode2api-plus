@@ -27,6 +27,9 @@ type loginSession struct {
 	flow     *oauth.Flow
 	proxyURL string // 已解析的代理地址（空 = 直连）
 	proxyID  string // 代理线路 ID（用于写入账号；空表示非线路）
+	// auto 表示这条线路是「自動」挑出来的、而非用户显式选定：命中既有账号时
+	// 保留它原本的指派，避免重登把老号的线路换掉。
+	auto bool
 }
 
 var (
@@ -61,24 +64,35 @@ func errUpstream(msg string) *apiError { return &apiError{http.StatusBadGateway,
 // 两者都为空即直连。
 //
 // 线路不存在或地址非法一律提前 400——不要把坏代理带进会话，等兑换时才炸。
-func (h *Handler) resolveLoginProxy(payload map[string]any) (string, string, *apiError) {
-	profileID := strings.TrimSpace(strOf(firstTruthy(payload["proxy_id"])))
-	if profileID != "" {
+func (h *Handler) resolveLoginProxy(payload map[string]any) (string, string, bool, *apiError) {
+	raw := strings.TrimSpace(strOf(firstTruthy(payload["proxy_id"])))
+	// 「自動」：当场挑一条空閒線路把出口定下来，保证「token 交換 → 兌換 → 刷新 →
+	// 領取」整条链路走同一个出口。挑不到就直連——不报错，与新增账号同口径。
+	if raw == proxyIDAuto {
+		if p, ok := h.Store.PickFreeProxyProfile(); ok {
+			return p.URL, p.ID, true, nil
+		}
+		return "", "", true, nil
+	}
+	if raw == proxyIDDirect {
+		return "", "", false, nil
+	}
+	if raw != "" {
 		for _, p := range h.Store.ListProxyProfiles() {
-			if p.ID == profileID {
-				return p.URL, p.ID, nil
+			if p.ID == raw {
+				return p.URL, p.ID, false, nil
 			}
 		}
-		return "", "", errBadRequest("代理線路不存在")
+		return "", "", false, errBadRequest("代理線路不存在")
 	}
 	normalized, err := proxy.NormalizeProxyURL(strOf(firstTruthy(payload["proxy_url"])))
 	if err != nil {
-		return "", "", errBadRequest(err.Error())
+		return "", "", false, errBadRequest(err.Error())
 	}
 	if normalized == nil {
-		return "", "", nil
+		return "", "", false, nil
 	}
-	return *normalized, "", nil
+	return *normalized, "", false, nil
 }
 
 // handleLoginStart POST /admin/api/login/start（body 可选 proxy_id / proxy_url）
@@ -90,7 +104,7 @@ func (h *Handler) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	if apiErr != nil {
 		payload = map[string]any{}
 	}
-	proxyURL, proxyID, proxyErr := h.resolveLoginProxy(payload)
+	proxyURL, proxyID, proxyAuto, proxyErr := h.resolveLoginProxy(payload)
 	if proxyErr != nil {
 		writeAPIError(w, proxyErr)
 		return
@@ -102,7 +116,7 @@ func (h *Handler) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loginFlowsMu.Lock()
-	loginFlows[flowID] = &loginSession{flow: flow, proxyURL: proxyURL, proxyID: proxyID}
+	loginFlows[flowID] = &loginSession{flow: flow, proxyURL: proxyURL, proxyID: proxyID, auto: proxyAuto}
 	loginFlowsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"flow_id":       flowID,
@@ -171,7 +185,7 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 	}
 	// 邮箱必须在入池时就传入：每次登录的 token 都不同，只比凭据字节会把同一个号
 	// 建成两条记录（见 store.AddAccountWithIdentity 的三级判重）。
-	account, err := h.Store.AddAccountWithIdentity(model.ProviderZai, name, result.Token, email)
+	account, isNew, err := h.Store.AddAccountWithIdentity(model.ProviderZai, name, result.Token, email)
 	if err != nil {
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
@@ -191,11 +205,26 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 		}
 	}
 	// 线路必须在兑换与刷新之前落到账号上：这三步都要出站。
-	if apiErr := h.applyLoginProxy(account, session); apiErr != nil {
-		return nil, apiErr
+	// 「自動」挑出的线路命中既有账号时不覆盖原指派——重登不该换掉老号的线路；
+	// 此时 account.ProxyURL 保持老号原值，后续出站仍走它。
+	if !(session != nil && session.auto && !isNew) {
+		if apiErr := h.applyLoginProxy(account, session); apiErr != nil {
+			return nil, apiErr
+		}
+	}
+	// 兜底：仍没有线路的新号（例如 /login/start 时池里还没有空閒线路）再试一次。
+	// AutoAssignProxies 改的是 store 里的同一个对象，account 立即反映新线路。
+	if isNew && account.ProxyURL == nil {
+		_, _ = h.Store.AutoAssignProxies([]string{account.ID})
+	}
+	// 出站地址一律以账号上落定的值为准：自动分配刚挑了线路时 session.proxyURL
+	// 是空的，若继续用它会让「兑换走直连、刷额度走线路」两条路不一致。
+	accountProxy := ""
+	if account.ProxyURL != nil {
+		accountProxy = *account.ProxyURL
 	}
 	if result.AccessToken != "" {
-		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken, session.proxyURL); err == nil && apiKey != "" {
+		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken, accountProxy); err == nil && apiKey != "" {
 			account.APIKey = &apiKey
 			_ = h.Store.UpdateAccount(account)
 		} else if err != nil {

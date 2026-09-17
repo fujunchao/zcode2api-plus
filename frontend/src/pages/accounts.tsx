@@ -45,6 +45,8 @@ import { STATUS_LABEL, type Account, type AccountStatus, type AccountsResponse, 
 /* 頂層「直連」的 Select 哨兵值：Radix Select 不允許空字串 value */
 const PROXY_DIRECT = '__direct__'
 const PROXY_LEGACY = '__legacy__'
+/* 「自動挑一條空閒線路」的哨兵值：新增帳號的預設；後端同樣認識這個值。 */
+const PROXY_AUTO = '__auto__'
 
 const STATUS_BADGE: Record<AccountStatus, string> = {
   active: 'bg-emerald-100 text-emerald-700',
@@ -73,6 +75,12 @@ export function AccountsPage() {
   const liveAccounts = allAccounts.filter((a) => a.archived_at == null)
   const proxies = data?.proxies ?? []
   const availableModels = data?.models ?? []
+  /* 「自動」選項顯示的空閒線路數：啟用中且未被任何帳號指派。
+     手工填 proxy_url 的帳號不佔用命名線路（與後端 AutoAssignProxies 的判定一致）。 */
+  const usedProxyIds = new Set(
+    liveAccounts.map((a) => a.proxy_id).filter((id): id is string => Boolean(id)),
+  )
+  const freeProxyCount = proxies.filter((p) => p.enabled && !usedProxyIds.has(p.id)).length
 
   const [filter, setFilter] = useState<FilterKey>('all')
   const [showArchived, setShowArchived] = useState(false)
@@ -82,7 +90,7 @@ export function AccountsPage() {
   const [addOpen, setAddOpen] = useState(false)
   const [addTab, setAddTab] = useState<'login' | 'paste'>('login')
   const [tokensText, setTokensText] = useState('')
-  const [addProxy, setAddProxy] = useState(PROXY_DIRECT)
+  const [addProxy, setAddProxy] = useState(PROXY_AUTO)
   const [adding, setAdding] = useState(false)
   /* 授權登入流程狀態 */
   const [flow, setFlow] = useState<{ flowId: string; url: string } | null>(null)
@@ -131,7 +139,7 @@ export function AccountsPage() {
   /* ── 新增 ── */
   function openAdd() {
     setTokensText('')
-    setAddProxy(PROXY_DIRECT)
+    setAddProxy(PROXY_AUTO)
     setAddTab('login')
     setFlow(null)
     setLoginProxyLabel('')
@@ -149,12 +157,15 @@ export function AccountsPage() {
     }
     setAdding(true)
     try {
-      const d = await api<{ count: number }>('POST', '/accounts', {
+      const d = await api<{ count: number; direct_fallback?: number }>('POST', '/accounts', {
         tokens: list,
-        proxy_id: addProxy === PROXY_DIRECT ? null : addProxy,
+        proxy_id: addProxy,
       })
       setAddOpen(false)
       toast.success(`新增 ${d.count} 個帳號`)
+      if (d.direct_fallback) {
+        toast.warning(`其中 ${d.direct_fallback} 個沒有空閒線路，已使用直連`)
+      }
       invalidate()
     } catch (e) {
       toast.error('新增失敗：' + errMsg(e))
@@ -169,7 +180,7 @@ export function AccountsPage() {
       /* 出口線路必須在這裡定：「登入、額度查詢、活動領取」是同一條出站鏈路，
          後端會把它寫進帳號，登入後再改就晚了。 */
       const d = await api<{ flow_id: string; authorize_url: string; proxy?: string }>('POST', '/login/start', {
-        proxy_id: addProxy === PROXY_DIRECT ? null : addProxy,
+        proxy_id: addProxy,
       })
       setFlow({ flowId: d.flow_id, url: d.authorize_url })
       setLoginProxyLabel(d.proxy || '')
@@ -792,7 +803,7 @@ export function AccountsPage() {
               </p>
               <div className="flex flex-col gap-2">
                 <Label>出口線路</Label>
-                <ProxySelect value={addProxy} onChange={setAddProxy} proxies={proxies} disabled={Boolean(flow)} />
+                <ProxySelect value={addProxy} onChange={setAddProxy} proxies={proxies} disabled={Boolean(flow)} freeCount={freeProxyCount} />
                 <p className="text-[11px] leading-tight text-muted-foreground">
                   {flow
                     ? `本次登入的出口已鎖定${loginProxyLabel ? `（${loginProxyLabel}）` : '（直連）'}；如需更換請取消後重新開始。`
@@ -843,7 +854,7 @@ export function AccountsPage() {
               </div>
               <div className="flex flex-col gap-2">
                 <Label>出口線路</Label>
-                <ProxySelect value={addProxy} onChange={setAddProxy} proxies={proxies} />
+                <ProxySelect value={addProxy} onChange={setAddProxy} proxies={proxies} freeCount={freeProxyCount} />
               </div>
             </TabsContent>
           </Tabs>
@@ -957,19 +968,22 @@ function StatCell({ label, value, color, icon }: { label: string; value: string;
   )
 }
 
-/* 出口線路下拉：直連／（編輯時）舊版自訂代理／線路清單 */
+/* 出口線路下拉：自動／直連／（編輯時）舊版自訂代理／線路清單。
+   freeCount 只在「新增」場景傳入——傳了才顯示「自動」選項，編輯走顯式選擇。 */
 function ProxySelect({
   value,
   onChange,
   proxies,
   legacy = false,
   disabled = false,
+  freeCount,
 }: {
   value: string
   onChange: (v: string) => void
   proxies: ProxyProfile[]
   legacy?: boolean
   disabled?: boolean
+  freeCount?: number
 }) {
   return (
     <Select value={value} onValueChange={onChange} disabled={disabled}>
@@ -977,6 +991,11 @@ function ProxySelect({
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
+        {freeCount !== undefined && (
+          <SelectItem value={PROXY_AUTO}>
+            {freeCount > 0 ? `自動（${freeCount} 條空閒線路）` : '自動（無空閒線路，將直連）'}
+          </SelectItem>
+        )}
         <SelectItem value={PROXY_DIRECT}>直連（不使用代理）</SelectItem>
         {legacy && <SelectItem value={PROXY_LEGACY}>舊版自訂代理（保持不變）</SelectItem>}
         {proxies.map((p) => (

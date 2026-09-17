@@ -156,10 +156,27 @@ func cmdLogin(args []string) {
 			email = strings.TrimSpace(*result.Email)
 		}
 		// 邮箱在入池时就传入：每次登录 token 都不同，只比凭据字节会把同一个号建成两条。
-		acc, err := st.AddAccountWithIdentity(model.ProviderZai, "oauth-login", result.Token, email)
+		acc, isNew, err := st.AddAccountWithIdentity(model.ProviderZai, "oauth-login", result.Token, email)
 		if err != nil {
 			fmt.Println(web.Red + "❌ 保存 JWT 账号失败: " + err.Error() + web.Reset)
 			return
+		}
+		// 新号自动挑一条未被占用的线路（CLI 没有代理参数，与后台默认行为一致）；
+		// 重登命中的老号保持原指派不动。
+		if isNew {
+			assigned, fallback := st.AutoAssignProxies([]string{acc.ID})
+			if pid := assigned[acc.ID]; pid != "" {
+				label := pid
+				for _, p := range st.ListProxyProfiles() {
+					if p.ID == pid {
+						label = p.Name
+						break
+					}
+				}
+				fmt.Println(web.Dim + "  已自動指派線路: " + label + web.Reset)
+			} else if len(fallback) > 0 {
+				fmt.Println(web.Dim + "  無空閒線路，已使用直連" + web.Reset)
+			}
 		}
 		// 命中的既有账号可能还叫 oauth-login，用邮箱正名。
 		if email != "" && acc.Name != email {
@@ -386,12 +403,18 @@ func cmdImport(args []string) {
 	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
-	count, err := st.ImportAccounts(payload)
+	count, newIDs, err := st.ImportAccounts(payload)
 	if err != nil {
 		fmt.Println(web.Red + "❌ 导入失败: " + err.Error() + web.Reset)
 		return
 	}
+	// 导入的新号同样自动分配未占用线路（只针对本次新建，重复导入不动老号）。
+	assigned, fallback := st.AutoAssignProxies(newIDs)
 	fmt.Println(web.Green + fmt.Sprintf("✔ 已导入 %d 个账号", count) + web.Reset)
+	if len(newIDs) > 0 {
+		fmt.Println(web.Dim + fmt.Sprintf("  已自動指派線路 %d 條，%d 個帳號使用直連",
+			len(assigned), len(fallback)) + web.Reset)
+	}
 }
 
 func or(s, fallback string) string {

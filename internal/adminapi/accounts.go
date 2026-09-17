@@ -54,6 +54,13 @@ func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// 添加账号时 proxy_id 的两个保留值：前端用它区分「自动挑一条空闲线路」与「就要直连」。
+// 其余取值一律按代理配置 ID 处理；null / 键缺省同样按「自动」处理（兼容旧前端）。
+const (
+	proxyIDAuto   = "__auto__"
+	proxyIDDirect = "__direct__"
+)
+
 func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 	payload, apiErr := decodeBody(r)
 	if apiErr != nil {
@@ -75,19 +82,35 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hasProfile := false
-	if _, ok := payload["proxy_id"]; ok { // 按键存在判定，与 Python "proxy_id" in payload 一致
-		hasProfile = true
+	// proxy_id 三种语义：
+	//   __auto__ / null / 键缺省 → 建号后自动挑一条「未被占用的线路」；
+	//   __direct__ / 空串        → 显式直连（不分配）；
+	//   其余取值                 → 按代理配置 ID 指派。
+	// null 视作「自动」是为了兼容旧前端——它把「直連」编码成 null 发出来。
+	autoAssign := true
+	profileID := ""
+	if v, ok := payload["proxy_id"]; ok {
+		switch raw := strings.TrimSpace(strOf(v)); {
+		case v == nil, raw == proxyIDAuto:
+			autoAssign = true
+		case raw == "", raw == proxyIDDirect:
+			autoAssign = false
+		default:
+			autoAssign = false
+			profileID = raw
+		}
 	}
-	profileID := strOf(firstTruthy(payload["proxy_id"]))
-	if profileID != "" && !h.profileExists(profileID) {
+	hasProfile := !autoAssign && profileID != ""
+	if hasProfile && !h.profileExists(profileID) {
 		writeAPIError(w, errBadRequest("代理配置不存在"))
 		return
 	}
 
+	// 手工代理只在「显式直连（含 __direct__/空串）」时才看：自动分配会自己挑线路，
+	// 指定了 profile 时则以 profile 为准（与原语义一致）。
 	hasProxy := false
 	var proxyURL *string
-	if v, ok := payload["proxy_url"]; ok && !hasProfile {
+	if v, ok := payload["proxy_url"]; ok && !autoAssign && !hasProfile {
 		u, err := proxy.NormalizeProxyURL(strOf(v))
 		if err != nil {
 			writeAPIError(w, errBadRequest(err.Error()))
@@ -127,6 +150,13 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		added = append(added, acc.ID)
 	}
+	// 自动分配必须排在额度刷新之前：刷新要出站，而 clientFor 只认账号上的 ProxyURL，
+	// 线路得先落到账号上（与登录链路「先写线路再兑换/刷新」的约定一致）。
+	assignedCount, fallbackCount := 0, 0
+	if autoAssign {
+		assigned, fallback := h.Store.AutoAssignProxies(added)
+		assignedCount, fallbackCount = len(assigned), len(fallback)
+	}
 	// 对新增的 jwt 账号立即刷新一次额度（仅 zai；对齐 add_accounts 尾段）
 	addedSet := map[string]bool{}
 	for _, id := range added {
@@ -145,7 +175,11 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 			h.scheduleAutoClaim(acc)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"count": len(added), "ids": added})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count": len(added), "ids": added,
+		// assigned/direct_fallback 供前端提示「有账号没能用上线路」。
+		"assigned": assignedCount, "direct_fallback": fallbackCount,
+	})
 }
 
 // parseTokens 归一 tokens 字段：字符串按行拆分、数组逐项 strip，过滤空值。
@@ -639,10 +673,16 @@ func (h *Handler) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errBadRequest("请求体不是合法 JSON"))
 		return
 	}
-	count, err := h.Store.ImportAccounts(payload)
+	count, newIDs, err := h.Store.ImportAccounts(payload)
 	if err != nil {
 		writeError500(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"count": count})
+	// 导入的账号同样自动分配未占用线路（只针对本次新建的，重复导入不会动老号）；
+	// 线路不足的部分保持直连并通过 direct_fallback 回报，供前端提示。
+	assigned, fallback := h.Store.AutoAssignProxies(newIDs)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":    count,
+		"assigned": len(assigned), "direct_fallback": len(fallback),
+	})
 }
