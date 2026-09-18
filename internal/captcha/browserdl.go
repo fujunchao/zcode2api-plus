@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -276,6 +277,23 @@ func extractArchive(archive []byte, archiveName, dest string) error {
 	return extractTarGz(archive, dest)
 }
 
+// safeArchiveName 校验压缩包条目里的相对名字（Linkname 等）不会逃出解包目录。
+//
+// 只判 ".." 前缀不够：`a/../../etc/passwd` 这类形态不以 ".." 开头，但清理之后
+// 就落到解包目录之外——必须按清理后的结果判定。
+func safeArchiveName(raw string) error {
+	// Windows 的 filepath.IsAbs("/etc/passwd") 为 false（缺盘符），只靠它会让校验
+	// 结果随平台漂移。tar 条目本就该是相对路径，故显式再挡一次前导分隔符。
+	if filepath.IsAbs(raw) || strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, `\`) {
+		return errors.New("绝对路径")
+	}
+	cleaned := filepath.Clean(raw)
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return errors.New("路径逃逸解包目录")
+	}
+	return nil
+}
+
 func extractTarGz(archive []byte, dest string) error {
 	gz, err := gzip.NewReader(strings.NewReader(string(archive)))
 	if err != nil {
@@ -327,7 +345,12 @@ func extractTarGz(archive []byte, dest string) error {
 				return fmt.Errorf("创建符号链接失败 %s: %w", hdr.Name, err)
 			}
 		case tar.TypeLink:
-			// 硬链接：解包内相对路径，直接复制内容而非建链（跨设备安全）
+			// 硬链接：解包内相对路径，直接复制内容而非建链（跨设备安全）。
+			// 源路径必须校验：本分支是「读取 dest 之外的文件再写进来」，
+			// 未校验的 Linkname 可把容器内任意文件的内容复制进解包目录。
+			if err := safeArchiveName(hdr.Linkname); err != nil {
+				return fmt.Errorf("压缩包含非法硬链接 %s -> %s: %w", hdr.Name, hdr.Linkname, err)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}

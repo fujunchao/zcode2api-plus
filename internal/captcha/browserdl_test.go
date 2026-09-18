@@ -255,3 +255,84 @@ func TestExtractTarGzRejectsEscapingSymlink(t *testing.T) {
 		t.Fatal("逃逸目录的符号链接应被拒绝")
 	}
 }
+
+// safeArchiveName 的边界：只有「清理后仍落在解包目录内」的相对路径才放行。
+// 单独测这个纯函数，是为了覆盖那些「不以 .. 开头、清理后才逃逸」的形态。
+func TestSafeArchiveName(t *testing.T) {
+	sep := string(filepath.Separator)
+	cases := []struct {
+		raw    string
+		escape bool
+	}{
+		{"lib.so", false},
+		{"sub/lib.so", false},
+		{"./lib.so", false},
+		{"a/b/../c", false}, // 清理后是 a/c，仍在目录内
+		{"..", true},
+		{"../secret", true},
+		{"../../etc/passwd", true},
+		{"a/../../secret", true}, // 不以 .. 开头，但清理后逃逸
+		{"a/b/../../../x", true},
+		{"/etc/passwd", true},
+		{".." + sep + "secret", true},
+	}
+	for _, c := range cases {
+		err := safeArchiveName(c.raw)
+		if c.escape && err == nil {
+			t.Errorf("name=%q 应被拒绝", c.raw)
+		}
+		if !c.escape && err != nil {
+			t.Errorf("name=%q 应被接受: %v", c.raw, err)
+		}
+	}
+}
+
+// tarGzWithHardlink 打包一个「lib.so + 指向 linkTarget 的硬链接」压缩包。
+func tarGzWithHardlink(t *testing.T, linkTarget string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "lib.so", Mode: 0o644, Size: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("lib")); err != nil {
+		t.Fatal(err)
+	}
+	hdr := &tar.Header{Name: "linked", Typeflag: tar.TypeLink, Linkname: linkTarget, Mode: 0o644}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// 硬链接的源路径同样必须校验：本分支会读取 dest 之外的文件并复制进来，
+// 未校验的 Linkname 等于把容器内任意文件的内容搬进解包目录。
+func TestExtractTarGzRejectsEscapingHardlink(t *testing.T) {
+	for _, target := range []string{"../../etc/passwd", "a/../../secret", "/etc/passwd"} {
+		if err := extractTarGz(tarGzWithHardlink(t, target), t.TempDir()); err == nil {
+			t.Fatalf("逃逸硬链接 %q 应被拒绝", target)
+		}
+	}
+}
+
+// 合法的包内硬链接仍应照常解出（校验不能把正常安装包也挡掉）。
+func TestExtractTarGzCopiesLegitHardlink(t *testing.T) {
+	dest := t.TempDir()
+	if err := extractTarGz(tarGzWithHardlink(t, "lib.so"), dest); err != nil {
+		t.Fatalf("包内硬链接应可解包: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dest, "linked"))
+	if err != nil {
+		t.Fatalf("硬链接应已复制为普通文件: %v", err)
+	}
+	if string(data) != "lib" {
+		t.Fatalf("内容不符: %q", data)
+	}
+}
