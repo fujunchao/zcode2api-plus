@@ -509,7 +509,7 @@ func (p *Pool) attemptUpstreamOnce(
 
 		// 503 → 冷却换号
 		if resp.StatusCode == http.StatusServiceUnavailable {
-			acc.FailCount++
+			p.bumpFail(acc)
 			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling,
 				"上游服務不可用 HTTP 503", time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
@@ -517,8 +517,7 @@ func (p *Pool) attemptUpstreamOnce(
 		}
 
 		// 其余错误：原样回传上游错误体，终止本票
-		acc.FailCount++
-		_ = p.Store.UpdateAccount(acc)
+		p.bumpFail(acc)
 		p.emit(ctx, ticketID, ticketEvent{
 			Type: "error",
 			Data: map[string]any{"error": map[string]any{"message": bodyText, "type": "upstream_error"}},
@@ -566,8 +565,7 @@ func (p *Pool) handleUpstreamJSON(
 		return false, errCaptchaRejected
 
 	case code != "" && code != "0":
-		acc.FailCount++
-		_ = p.Store.UpdateAccount(acc)
+		p.bumpFail(acc)
 		p.emit(ctx, ticketID, ticketEvent{
 			Type: "error",
 			Data: map[string]any{"error": map[string]any{
@@ -581,8 +579,7 @@ func (p *Pool) handleUpstreamJSON(
 
 	// 业务码缺失 / 为 0：本票据承诺的是 SSE 流，上游却回了 JSON 正文。
 	// 当作成功转发会破坏 chunk 契约（同步路径同样判为无效流），故投递错误后终止。
-	acc.FailCount++
-	_ = p.Store.UpdateAccount(acc)
+	p.bumpFail(acc)
 	p.emit(ctx, ticketID, ticketEvent{
 		Type: "error",
 		Data: map[string]any{"error": map[string]any{
@@ -617,6 +614,14 @@ func (e errNetwork) Error() string { return e.body }
 type errRateLimited struct{ body string }
 
 func (e errRateLimited) Error() string { return e.body }
+
+// bumpFail 记一次失败计数。改的是 store 锁内的「当前」对象：acc 是 Select 交出的
+// 账号副本，直接 `acc.FailCount++` 既不落库、也会与并发读写相撞。
+func (p *Pool) bumpFail(acc *model.Account) {
+	_, _ = p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		live.FailCount++
+	})
+}
 
 // forwardSSE 把上游 SSE 行转成 ticket chunk 事件，并累计账号 token 用量。
 // 完整结束时投递 done 并返回 (false, nil)；转发开始后中断时返回
@@ -654,10 +659,12 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 
 	// 统计落库失败不应触发换号重发
 	usage.Finish()
-	acc.AccumulateTokens(usage.AsDict())
-	// 与 engine.success 对齐：成功即认为限流窗口已过，清零连续计数。
-	gateway.ResetRateLimitStreak(acc)
-	if err := p.Store.UpdateAccount(acc); err != nil {
+	got := usage.AsDict()
+	if _, err := p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		live.AccumulateTokens(got)
+		// 与 engine.success 对齐：成功即认为限流窗口已过，清零连续计数。
+		gateway.ResetRateLimitStreak(live)
+	}); err != nil {
 		web.Warn("async", "用量统计落库失败: "+err.Error())
 	}
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
