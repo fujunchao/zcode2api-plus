@@ -241,7 +241,9 @@ func newRodWorker(ctx context.Context, bin string, cfg Config) (*RodWorker, erro
 	// NoDefaultDevice：rod 默认设备模拟（LaptopWithMDPI）会用 CDP 改写 UA 与视口，
 	// 覆盖补丁二进制的指纹输出，必须关闭（playwright 侧无设备模拟）。
 	if err := b.Connect(); err != nil {
-		_ = b.Close()
+		// 连接都没建立，不对这个浏览器对象调 Close()：它尚无可用会话，rod 的
+		// Browser.Close 会试图在未连接的对象上操作（上游把这一处判定为 nil panic）。
+		// 此处的资源清理由 launcher 负责——它会杀掉刚启动的进程并删除临时目录。
 		l.Cleanup()
 		return nil, fmt.Errorf("浏览器连接失败: %w", err)
 	}

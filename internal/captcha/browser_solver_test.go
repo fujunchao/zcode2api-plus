@@ -315,6 +315,75 @@ func TestBrowserSolverConfigChangeDoesNotAbortInFlight(t *testing.T) {
 	}
 }
 
+// 并发冷启动只应拉起一个池。每个池背后都是真实的浏览器进程，启动还要等就绪，
+// 不能让每个并发调用者各启一个、再把多余的丢掉。
+func TestBrowserSolverConcurrentColdStartBuildsOnePool(t *testing.T) {
+	s := NewBrowserSolver()
+	var mu sync.Mutex
+	poolCount := 0
+	s.SetPoolFactory(func(Config) *Pool {
+		mu.Lock()
+		poolCount++
+		mu.Unlock()
+		time.Sleep(100 * time.Millisecond) // 模拟浏览器启动耗时
+		f := &scriptFactory{}
+		return newStartedFakePool(t, f.create, 1)
+	})
+
+	const n = 5
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			_, _ = s.Solve(context.Background(), solveCfg("cn"))
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	got := poolCount
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("并发冷启动应只建一个池，实际 %d 个", got)
+	}
+}
+
+// 启动浏览器最长可到 90s（CaptchaBrowserStartupTimeout），Close 不能被它挡住——
+// 否则停机时 defer 里的 cm.Close() 会一直等，容器只能被强杀。
+func TestBrowserSolverCloseIsNotBlockedByStartup(t *testing.T) {
+	s := NewBrowserSolver()
+	created := make(chan *Pool, 1)
+	s.SetPoolFactory(func(Config) *Pool {
+		time.Sleep(300 * time.Millisecond) // 模拟耗时的浏览器启动
+		f := &scriptFactory{}
+		p := newStartedFakePool(t, f.create, 1)
+		created <- p
+		return p
+	})
+
+	go func() { _, _ = s.Solve(context.Background(), solveCfg("cn")) }()
+	time.Sleep(50 * time.Millisecond) // 让它进入启动阶段
+
+	begin := time.Now()
+	if err := s.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if elapsed := time.Since(begin); elapsed > 150*time.Millisecond {
+		t.Fatalf("Close 被启动阻塞了 %v", elapsed)
+	}
+
+	// 启动完成后那个池必须被丢弃并关闭，不能挂到一个已关闭的求解器上。
+	p := <-created
+	deadline := time.Now().Add(2 * time.Second)
+	for p.IsStarted() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p.IsStarted() {
+		t.Fatal("求解器已关闭，启动完成的池应被关闭而不是挂上")
+	}
+}
+
 // blockingWorker 在 onSolve 中执行测试指定的阻塞逻辑，完成后返回固定令牌。
 type blockingWorker struct {
 	onSolve func()

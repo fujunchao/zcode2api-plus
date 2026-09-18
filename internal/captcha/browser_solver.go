@@ -28,6 +28,15 @@ type BrowserSolver struct {
 	retired  *Pool
 	// failureUntil 启动失败后的冷却截止（单调时钟）。
 	failureUntil time.Time
+	// closed 求解器已关闭。启动是在锁外做的，启动期间可能有人调用 Close——
+	// 没有这个标记，启动完成后的池会被挂到一个已关闭的求解器上、再也没人回收。
+	closed bool
+
+	// starting 非 nil 表示已有调用者正在锁外启动「startingKey」这个配置键的池，
+	// 关闭即表示启动结束。作用是避免并发冷启动时各自拉起一个浏览器进程
+	//（每个都是真进程、启动还要等就绪），同时仍然不持锁做启动。
+	starting    chan struct{}
+	startingKey string
 
 	// now 可注入时钟（测试用）。
 	now func() time.Time
@@ -79,7 +88,7 @@ func (s *BrowserSolver) Solve(ctx context.Context, cfg Config) (string, error) {
 		return "", fmt.Errorf("%w：验证码配置缺少 sceneId、region 或 prefix", ErrUnavailable)
 	}
 
-	pool, release, err := s.acquirePool(cfg, key)
+	pool, release, err := s.acquirePool(ctx, cfg, key)
 	if err != nil {
 		return "", err
 	}
@@ -99,63 +108,125 @@ func (s *BrowserSolver) Solve(ctx context.Context, cfg Config) (string, error) {
 // acquirePool 取（必要时启动/重建）可用的池，并登记一次在途使用。
 // 返回的 release 必须在求解结束后调用：它负责在池已被配置变更淘汰时关闭旧池，
 // 从而保证「不中止在途求解」与「旧池最终被回收」两者兼得。
-func (s *BrowserSolver) acquirePool(cfg Config, key string) (*Pool, func(), error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.now().Before(s.failureUntil) {
-		return nil, nil, fmt.Errorf("%w：浏览器池冷却中", ErrUnavailable)
-	}
-	pool, err := s.ensurePoolLocked(cfg, key)
-	if err != nil {
-		return nil, nil, err
-	}
-	s.inFlight++
-	release := func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.inFlight--
-		// 最后一个归还者关闭已被淘汰的旧池
-		if s.inFlight == 0 && s.retired != nil {
-			s.retired.Stop()
-			s.retired = nil
+//
+// 锁的边界：`pool.Start()` / `pool.Stop()` 都可能阻塞数十秒（启动总超时 90s、
+// 停机超时 10s），因此一律在锁外执行。持锁做这两件事会把所有求解者、以及停机
+// 时的 Close 一并钉住——后者会让容器等不到优雅退出而被强杀。
+func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string) (*Pool, func(), error) {
+	for {
+		// 已取消的调用者不必进入临界区，更不该为它淘汰掉正在服务的旧池。
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
 		}
+
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return nil, nil, fmt.Errorf("%w：求解器已关闭", ErrUnavailable)
+		}
+		if s.now().Before(s.failureUntil) {
+			s.mu.Unlock()
+			return nil, nil, fmt.Errorf("%w：浏览器池冷却中", ErrUnavailable)
+		}
+		if s.pool != nil && s.poolKey == key && s.pool.IsStarted() {
+			s.inFlight++
+			release := s.releaseAfterUse()
+			s.mu.Unlock()
+			return s.pool, release, nil
+		}
+		// 同键已有调用者在启动：等它结束再重试，避免重复拉起浏览器进程。
+		if s.starting != nil && s.startingKey == key {
+			wait := s.starting
+			s.mu.Unlock()
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+			continue
+		}
+		// 由本调用者负责启动：先在锁内登记，并摘掉旧池的引用（免得它在锁外
+		// 启动期间被别的调用者取走当成当前池用）；真正要关的池留到锁外再停。
+		done := make(chan struct{})
+		s.starting, s.startingKey = done, key
+		stopNow := s.retireCurrentLocked()
+		newPool := s.newPool
+		s.mu.Unlock()
+
+		if stopNow != nil {
+			stopNow.Stop()
+		}
+		pool := newPool(cfg)
+		startErr := pool.Start()
+
+		s.mu.Lock()
+		s.starting, s.startingKey = nil, ""
+		close(done) // 先唤醒等待者，它们会在下一次循环里看到结果
+		switch {
+		case startErr != nil:
+			cooldown := time.Duration(config.CaptchaBrowserFailureCooldown) * time.Second
+			s.failureUntil = s.now().Add(cooldown)
+			s.mu.Unlock()
+			web.Warn("captcha", fmt.Sprintf(
+				"真实浏览器池不可用，%s 内回退人工回填: %s", cooldown, redact(startErr.Error())))
+			return nil, nil, fmt.Errorf("%w：浏览器池启动失败", ErrUnavailable)
+		case s.closed:
+			s.mu.Unlock()
+			pool.Stop()
+			return nil, nil, fmt.Errorf("%w：求解器已关闭", ErrUnavailable)
+		case s.now().Before(s.failureUntil):
+			// 启动期间有别的调用者启动失败并进入冷却。
+			s.mu.Unlock()
+			pool.Stop()
+			return nil, nil, fmt.Errorf("%w：浏览器池冷却中", ErrUnavailable)
+		}
+		s.pool = pool
+		s.poolKey = key
+		s.inFlight++
+		release := s.releaseAfterUse()
+		s.mu.Unlock()
+
+		web.Ok("captcha", fmt.Sprintf("真实浏览器验证码池已就绪（%d 个 worker）", config.CaptchaBrowserWorkers))
+		return pool, release, nil
 	}
-	return pool, release, nil
 }
 
-// ensurePoolLocked 取已启动的池，必要时启动；配置键变化时重建（调用方持锁）。
-func (s *BrowserSolver) ensurePoolLocked(cfg Config, key string) (*Pool, error) {
-	if s.pool != nil && s.poolKey == key && s.pool.IsStarted() {
-		return s.pool, nil
-	}
-	if s.pool != nil {
-		// 配置变更：有在途求解时延迟关闭（标记 retired，由最后一个归还者 Stop），
-		// 否则立即关闭（对齐 _stop_browser_pool）。
-		if s.inFlight > 0 {
-			if s.retired != nil {
-				s.retired.Stop()
-			}
-			s.retired = s.pool
-		} else {
-			s.pool.Stop()
+// releaseAfterUse 生成「归还一次在途使用」的闭包。最后一个归还者负责关闭已被
+// 淘汰的旧池；关闭可能阻塞到停机超时，故同样在锁外做。
+func (s *BrowserSolver) releaseAfterUse() func() {
+	return func() {
+		s.mu.Lock()
+		s.inFlight--
+		var pending *Pool
+		if s.inFlight == 0 && s.retired != nil {
+			pending = s.retired
+			s.retired = nil
 		}
-		s.pool = nil
-		s.poolKey = ""
+		s.mu.Unlock()
+		if pending != nil {
+			pending.Stop()
+		}
 	}
+}
 
-	pool := s.newPool(cfg)
-	if err := pool.Start(); err != nil {
-		cooldown := time.Duration(config.CaptchaBrowserFailureCooldown) * time.Second
-		s.failureUntil = s.now().Add(cooldown)
-		web.Warn("captcha", fmt.Sprintf(
-			"真实浏览器池不可用，%s 内回退人工回填: %s", cooldown, redact(err.Error())))
-		return nil, fmt.Errorf("%w：浏览器池启动失败", ErrUnavailable)
+// retireCurrentLocked 摘掉当前池的引用（调用方持锁），返回需要在锁外关闭的池。
+//
+// 有在途求解时把当前池标记为 retired 延迟关闭（对齐 _stop_browser_pool：不中止
+// 在途求解），由最后一个归还者回收；否则立即摘除。上一轮 retired 若至今无人回收
+// （inFlight 一直没归零过），这里一并交出去关闭，避免旧池越堆越多。
+func (s *BrowserSolver) retireCurrentLocked() (stopNow *Pool) {
+	if s.pool == nil {
+		return nil
 	}
-
-	s.pool = pool
-	s.poolKey = key
-	web.Ok("captcha", fmt.Sprintf("真实浏览器验证码池已就绪（%d 个 worker）", config.CaptchaBrowserWorkers))
-	return pool, nil
+	if s.inFlight > 0 {
+		stopNow = s.retired
+		s.retired = s.pool
+	} else {
+		stopNow = s.pool
+	}
+	s.pool = nil
+	s.poolKey = ""
+	return stopNow
 }
 
 // Close 关闭浏览器池（Manager.Close 转发）。
@@ -168,6 +239,9 @@ func (s *BrowserSolver) Close() error {
 	s.pool = nil
 	s.poolKey = ""
 	s.retired = nil
+	// 置位后，正在锁外启动的池会在提交前看到它并自行关闭，不会挂到一个已关闭的
+	// 求解器上；后续 Solve 也直接短路，不再拉起新浏览器。
+	s.closed = true
 	s.mu.Unlock()
 
 	if pool != nil {
