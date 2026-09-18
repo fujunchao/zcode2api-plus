@@ -413,9 +413,9 @@ func (p *Pool) attemptUpstream(
 			return false, err
 		}
 		if rateAttempt >= gateway.MaxRateLimitRetries {
-			secs := gateway.MarkRateLimited(p.Store, acc, "上游限流 HTTP 429", time.Now())
+			secs, streak := gateway.MarkRateLimited(p.Store, acc.Provider, acc.ID, "上游限流 HTTP 429", time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次被限流，冷却 %d s 后切换下一个",
-				acc.Name, acc.RateLimitStreak, secs))
+				acc.Name, streak, secs))
 			return false, errNetwork{rl.body}
 		}
 		delay := gateway.JitteredDelay(p.RateLimitRetryDelay)
@@ -475,7 +475,7 @@ func (p *Pool) attemptUpstreamOnce(
 
 		// 401/403 → 账号失效，换号
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			gateway.MarkAccount(p.Store, acc, model.StatusInvalid,
+			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid,
 				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
 			return false, errNetwork{bodyText}
@@ -483,7 +483,7 @@ func (p *Pool) attemptUpstreamOnce(
 
 		// 402 → 该模型额度用完
 		if resp.StatusCode == http.StatusPaymentRequired {
-			gateway.MarkModelExhausted(p.Store, acc, modelName,
+			gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
 			return false, errNetwork{bodyText}
@@ -498,7 +498,7 @@ func (p *Pool) attemptUpstreamOnce(
 		// 429：额度上限码族 → 该模型耗尽
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if gateway.IsQuotaExhaustedCode(bodyText) {
-				gateway.MarkModelExhausted(p.Store, acc, modelName,
+				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
 				return false, errNetwork{bodyText}
@@ -510,7 +510,7 @@ func (p *Pool) attemptUpstreamOnce(
 		// 503 → 冷却换号
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			acc.FailCount++
-			gateway.MarkAccount(p.Store, acc, model.StatusCooling,
+			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling,
 				"上游服務不可用 HTTP 503", time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
 			return false, errNetwork{bodyText}
@@ -555,7 +555,7 @@ func (p *Pool) handleUpstreamJSON(
 	switch code := gateway.UpstreamBusinessCode(text); {
 	case code == "1005":
 		// 每日额度耗尽：标该模型耗尽后换号（与 sync 同）。
-		gateway.MarkModelExhausted(p.Store, acc, modelName,
+		gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
 		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
 		return false, errNetwork{text}

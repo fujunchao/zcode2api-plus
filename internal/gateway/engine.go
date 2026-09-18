@@ -478,8 +478,11 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 	}
 	usage.Finish()
 	got := usage.AsDict()
-	acc.AccumulateTokens(got)
-	_ = e.Store.UpdateAccount(acc)
+	// 用量累加必须在 store 锁内对「当前」对象做：acc 是 Select 交出的账号副本，
+	// 改副本不落库，也会与并发的额度刷新/领取回写相撞。
+	_, _ = e.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		live.AccumulateTokens(got)
+	})
 	web.ReqOk(reqID, got.Output)
 	return attemptResult{final: runResult{Delivered: true}}
 }
@@ -490,14 +493,18 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 // 两条请求路径对同一账号必须标出相同状态（曾因 asyncpool 自行实现而分歧）。
 
 // MarkAccount 设置账号状态；status 为 cooling 时按配置写入冷却截止时间。
-func MarkAccount(st *store.Store, acc *model.Account, status, errMsg string, now time.Time) {
-	acc.Status = status
-	acc.LastError = &errMsg
-	if status == model.StatusCooling {
-		until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
-		acc.CoolingUntil = &until
-	}
-	_ = st.UpdateAccount(acc)
+//
+// 按 provider + ID 在 store 锁内改「当前」对象：调用方持有的是账号副本，直接改它
+// 既不落库、也会与并发读写相撞；账号已不存在时静默跳过（可能刚被后台删除）。
+func MarkAccount(st *store.Store, provider, idOrName, status, errMsg string, now time.Time) {
+	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+		acc.Status = status
+		acc.LastError = &errMsg
+		if status == model.StatusCooling {
+			until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
+			acc.CoolingUntil = &until
+		}
+	})
 }
 
 // isStrongStatus 判断账号状态是否强于「额度信号」能改写的范围。
@@ -522,77 +529,87 @@ func isCanceled(err error) bool {
 
 // MarkModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
 // 账号已处于强状态时只更新模型耗尽清单，不动账号状态与冷却窗口。
-func MarkModelExhausted(st *store.Store, acc *model.Account, modelName any, errMsg string) {
-	// 先记额度事实（与账号状态无关，任何情况下都要落库）。
-	marked := acc.MarkModelExhausted(modelName)
-	strong := isStrongStatus(acc.Status)
-	if !marked {
+//
+// 整段读改写都在 store 锁内完成——包括 isStrongStatus 守卫与对 Quota 的遍历。
+// 这两处都需要读「当下」的值：守卫若在锁外判定，判定与写入之间仍有一个窗口，
+// 另一路请求足以把刚判 invalid 的账号刷回可用。
+func MarkModelExhausted(st *store.Store, provider, idOrName string, modelName any, errMsg string) {
+	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+		// 先记额度事实（与账号状态无关，任何情况下都要落库）。
+		marked := acc.MarkModelExhausted(modelName)
+		strong := isStrongStatus(acc.Status)
+		if !marked {
+			if !strong {
+				acc.Status = model.StatusExhausted
+			}
+			acc.LastError = &errMsg
+			return
+		}
+		anyState := false
+		allExhausted := true
+		for name, quota := range acc.Quota {
+			entryModel, _ := quota["model"].(string)
+			if entryModel == "" {
+				entryModel = name
+			}
+			anyState = true
+			if acc.ModelAvailability(entryModel) != "exhausted" {
+				allExhausted = false
+				break
+			}
+		}
 		if !strong {
-			acc.Status = model.StatusExhausted
+			if anyState && allExhausted {
+				acc.Status = model.StatusExhausted
+			} else {
+				acc.Status = model.StatusActive
+			}
+			acc.CoolingUntil = nil
 		}
 		acc.LastError = &errMsg
-		_ = st.UpdateAccount(acc)
-		return
-	}
-	anyState := false
-	allExhausted := true
-	for name, quota := range acc.Quota {
-		entryModel, _ := quota["model"].(string)
-		if entryModel == "" {
-			entryModel = name
-		}
-		anyState = true
-		if acc.ModelAvailability(entryModel) != "exhausted" {
-			allExhausted = false
-			break
-		}
-	}
-	if !strong {
-		if anyState && allExhausted {
-			acc.Status = model.StatusExhausted
-		} else {
-			acc.Status = model.StatusActive
-		}
-		acc.CoolingUntil = nil
-	}
-	acc.LastError = &errMsg
-	_ = st.UpdateAccount(acc)
+	})
 }
 
 func (e *Engine) mark(acc *model.Account, status, errMsg string) {
-	MarkAccount(e.Store, acc, status, errMsg, e.now())
+	MarkAccount(e.Store, acc.Provider, acc.ID, status, errMsg, e.now())
 }
 
 func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
-	MarkModelExhausted(e.Store, acc, modelName, errMsg)
+	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg)
 }
 
 // markRateLimited 瞬时限流的递进冷却，返回本次写入的冷却秒数（见 MarkRateLimited）。
 func (e *Engine) markRateLimited(acc *model.Account, errMsg string) int {
-	return MarkRateLimited(e.Store, acc, errMsg, e.now())
+	secs, _ := MarkRateLimited(e.Store, acc.Provider, acc.ID, errMsg, e.now())
+	return secs
 }
 
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
 // （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
-	acc.UseCount++
 	ts := float64(e.now().UnixNano()) / 1e9
-	acc.LastUsedAt = &ts
-	// 成功即认为限流窗口已过：清零连续计数，下一次再被限流从最短档重新起算。
-	ResetRateLimitStreak(acc)
-	if acc.Status == model.StatusCooling || acc.Status == model.StatusExhausted {
-		acc.Status = model.StatusActive
-	}
-	_ = e.Store.UpdateAccount(acc)
+	_, _ = e.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		live.UseCount++
+		live.LastUsedAt = &ts
+		// 成功即认为限流窗口已过：清零连续计数，下一次再被限流从最短档重新起算。
+		// 必须对 live 调用——对副本清零不会落库，会出现「一边归零、一边继续递增」。
+		ResetRateLimitStreak(live)
+		if live.Status == model.StatusCooling || live.Status == model.StatusExhausted {
+			live.Status = model.StatusActive
+		}
+	})
 	e.fireRefresh(acc)
 }
 
 func (e *Engine) bumpFail(acc *model.Account) {
-	acc.FailCount++
-	_ = e.Store.UpdateAccount(acc)
+	_, _ = e.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		live.FailCount++
+	})
 }
 
 // fireRefresh 触发额度刷新（M3 接入 quota 包；仅 JWT 账号，对齐 _safe_refresh）。
+// 只读账号上的两个不变量字段（provider / mode）；quota 内部会按 ID 重新取快照，
+// 因此这里传副本是安全的。
 func (e *Engine) fireRefresh(acc *model.Account) {
 	if e.OnQuotaRefresh == nil {
 		return

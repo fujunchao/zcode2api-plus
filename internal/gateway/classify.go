@@ -53,23 +53,36 @@ func transientCoolingSeconds(streak int) int {
 }
 
 // MarkRateLimited 记录一次瞬时限流（非额度码族的 429）并按连续次数递进冷却。
-// 返回本次实际写入的冷却秒数，供日志展示。
+// 返回本次实际写入的冷却秒数与累加后的连续次数，供日志展示。
 // 与 MarkAccount(cooling) 的区别：那条用于连接失败/503 等硬故障，时长固定为
 // config.CoolingSeconds；瞬时 429 的窗口可能只有数秒，用固定 300s 惩罚过重。
-func MarkRateLimited(st *store.Store, acc *model.Account, errMsg string, now time.Time) int {
-	acc.RateLimitStreak++
-	secs := transientCoolingSeconds(acc.RateLimitStreak)
-	until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
-	acc.Status = model.StatusCooling
-	acc.CoolingUntil = &until
-	acc.LastError = &errMsg
-	_ = st.UpdateAccount(acc)
-	return secs
+//
+// 按 ID 定位并在 store 锁内改「当前」对象：调用方持有的是账号副本（Select 返回
+// 深拷贝），直接改它既不会落库、也会与并发读写相撞。连续次数的自增也必须在锁内，
+// 否则两路并发限流会各自基于旧值算出同一个档位。
+func MarkRateLimited(st *store.Store, provider, idOrName, errMsg string, now time.Time) (secs, streak int) {
+	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+		acc.RateLimitStreak++
+		streak = acc.RateLimitStreak
+		secs = transientCoolingSeconds(streak)
+		until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
+		acc.Status = model.StatusCooling
+		acc.CoolingUntil = &until
+		acc.LastError = &errMsg
+	})
+	if streak == 0 {
+		// 账号已被删除（并发删除）：不落库，但仍给日志一个可用的秒数。
+		secs = transientCoolingSeconds(1)
+	}
+	return secs, streak
 }
 
 // ResetRateLimitStreak 成功调用后清零「连续被限流」计数。
 // sync 与 async 两条请求路径都必须调用，否则同一账号会出现「一边归零、一边继续
 // 递增」的分歧——这正是两条路径必须共用状态机的老问题。
+//
+// ⚠️ 它对入参**不做落库**，只改字段，因此必须传 store.Update 回调里的 live 对象
+// （或 store 持锁路径内的对象）。传账号副本只是白改一次，不会生效。
 func ResetRateLimitStreak(acc *model.Account) {
 	acc.RateLimitStreak = 0
 }
