@@ -373,6 +373,186 @@ func TestSetEnabled(t *testing.T) {
 	}
 }
 
+// 字段级写入：只替换补丁点名的字段、其余保持不动，并且一定落库（用 Find 复查）。
+// 这些方法是「锁外改字段 → UpdateAccount」的替代形态，语义必须逐项对齐。
+func TestFieldLevelMutators(t *testing.T) {
+	s := newTestStore(t)
+	lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	acc, err := s.AddAccount(model.ProviderZai, "acc-1", jwtFor("uid-mut-1"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if ok, err := s.AssignProxyProfile(acc.ID, lineA.ID); !ok || err != nil {
+		t.Fatalf("指派失败: %v %v", ok, err)
+	}
+
+	t.Run("EditAccount 换名称与凭据并恢复可用", func(t *testing.T) {
+		if _, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+			a.Status = model.StatusInvalid
+			msg := "旧错误"
+			a.LastError = &msg
+		}); err != nil {
+			t.Fatalf("准备现场失败: %v", err)
+		}
+		name := "改过的名字"
+		ok, err := s.EditAccount(model.ProviderZai, acc.ID, AccountEdit{
+			Name: &name, SetSecret: true, Secret: "x.y.z", SecretMode: "jwt",
+		})
+		if err != nil || !ok {
+			t.Fatalf("编辑失败: %v %v", ok, err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.Name != name || got.Mode != "jwt" || got.JWTToken == nil || *got.JWTToken != "x.y.z" {
+			t.Fatalf("名称/凭据未替换: %+v", got)
+		}
+		if got.APIKey != nil {
+			t.Fatalf("切到 jwt 后应清掉 APIKey: %v", got.APIKey)
+		}
+		if got.Status != model.StatusActive || got.LastError != nil {
+			t.Fatalf("换凭据应恢复 active 并清错误: %s %v", got.Status, got.LastError)
+		}
+		// 补丁未点名的字段必须原样保留。
+		if got.ProxyID == nil || *got.ProxyID != lineA.ID {
+			t.Fatalf("未提及的线路指派不应被动到: %v", got.ProxyID)
+		}
+	})
+
+	t.Run("EditAccount 空补丁不动任何字段", func(t *testing.T) {
+		before := s.Find(model.ProviderZai, acc.ID)
+		beforeName, beforeProxy, beforeMode := before.Name, before.ProxyURL, before.Mode
+		ok, err := s.EditAccount(model.ProviderZai, acc.ID, AccountEdit{})
+		if err != nil || !ok {
+			t.Fatalf("编辑失败: %v %v", ok, err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.Name != beforeName || got.Mode != beforeMode || !sameStringPtr(got.ProxyURL, beforeProxy) {
+			t.Fatalf("空补丁不应改动任何字段: %+v", got)
+		}
+	})
+
+	t.Run("EditAccount 代理地址没变则保留线路指派", func(t *testing.T) {
+		ok, err := s.EditAccount(model.ProviderZai, acc.ID, AccountEdit{SetProxyURL: true, ProxyURL: &lineA.URL})
+		if err != nil || !ok {
+			t.Fatalf("编辑失败: %v %v", ok, err)
+		}
+		if got := s.Find(model.ProviderZai, acc.ID); got.ProxyID == nil {
+			t.Fatal("地址没变时不应解除线路指派")
+		}
+	})
+
+	t.Run("EditAccount 改地址即解除线路指派", func(t *testing.T) {
+		manual := "http://9.9.9.9:9999"
+		ok, err := s.EditAccount(model.ProviderZai, acc.ID, AccountEdit{SetProxyURL: true, ProxyURL: &manual})
+		if err != nil || !ok {
+			t.Fatalf("编辑失败: %v %v", ok, err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.ProxyID != nil {
+			t.Fatalf("改为手工代理应解除指派: %v", got.ProxyID)
+		}
+		if got.ProxyURL == nil || *got.ProxyURL != manual {
+			t.Fatalf("出站地址未替换: %v", got.ProxyURL)
+		}
+	})
+
+	t.Run("SetProxyURL 置地址并解除指派", func(t *testing.T) {
+		if ok, err := s.AssignProxyProfile(acc.ID, lineA.ID); !ok || err != nil {
+			t.Fatalf("重新指派失败: %v %v", ok, err)
+		}
+		manual := "http://8.8.8.8:8080"
+		if ok, err := s.SetProxyURL(model.ProviderZai, acc.ID, &manual); !ok || err != nil {
+			t.Fatalf("写入失败: %v %v", ok, err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.ProxyID != nil || got.ProxyURL == nil || *got.ProxyURL != manual {
+			t.Fatalf("应置地址并解除指派: id=%v url=%v", got.ProxyID, got.ProxyURL)
+		}
+		// nil 表示改为直连。
+		if ok, err := s.SetProxyURL(model.ProviderZai, acc.ID, nil); !ok || err != nil {
+			t.Fatalf("清空失败: %v %v", ok, err)
+		}
+		if got := s.Find(model.ProviderZai, acc.ID); got.ProxyURL != nil {
+			t.Fatalf("nil 应表示直连: %v", got.ProxyURL)
+		}
+	})
+
+	t.Run("SetIdentity 只写传入的字段", func(t *testing.T) {
+		email := "someone@example.com"
+		if ok, err := s.SetIdentity(model.ProviderZai, acc.ID, &email, nil); !ok || err != nil {
+			t.Fatalf("写入失败: %v %v", ok, err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.Email == nil || *got.Email != email {
+			t.Fatalf("邮箱未写入: %v", got.Email)
+		}
+		if got.Name != "改过的名字" {
+			t.Fatalf("未传 name 时不应改名字: %q", got.Name)
+		}
+		name := "oauth-login"
+		if ok, err := s.SetIdentity(model.ProviderZai, acc.ID, nil, &name); !ok || err != nil {
+			t.Fatalf("写入失败: %v %v", ok, err)
+		}
+		got = s.Find(model.ProviderZai, acc.ID)
+		if got.Name != name || got.Email == nil || *got.Email != email {
+			t.Fatalf("未传 email 时不应动邮箱: %q %v", got.Name, got.Email)
+		}
+	})
+
+	t.Run("SetAPIKey 与 SetDisabledModels", func(t *testing.T) {
+		if ok, err := s.SetAPIKey(model.ProviderZai, acc.ID, "sk-secret"); !ok || err != nil {
+			t.Fatalf("写入失败: %v %v", ok, err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.APIKey == nil || *got.APIKey != "sk-secret" {
+			t.Fatalf("APIKey 未写入: %v", got.APIKey)
+		}
+		if ok, err := s.SetDisabledModels(model.ProviderZai, acc.ID, []string{"GLM-5.3", "glm-5.3", ""}); !ok || err != nil {
+			t.Fatalf("写入失败: %v %v", ok, err)
+		}
+		got = s.Find(model.ProviderZai, acc.ID)
+		if len(got.DisabledModels) != 1 || got.DisabledModels[0] != "glm-5.3" {
+			t.Fatalf("应归一化并去重: %v", got.DisabledModels)
+		}
+	})
+
+	t.Run("ResetTokenStats 清零累计用量", func(t *testing.T) {
+		if _, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+			a.TotalInputTokens, a.TotalOutputTokens = 11, 22
+			a.TotalCacheCreationTokens, a.TotalCacheReadTokens = 33, 44
+		}); err != nil {
+			t.Fatalf("准备现场失败: %v", err)
+		}
+		if ok, err := s.ResetTokenStats(model.ProviderZai, acc.ID); !ok || err != nil {
+			t.Fatalf("重置失败: %v %v", ok, err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.TotalInputTokens != 0 || got.TotalOutputTokens != 0 ||
+			got.TotalCacheCreationTokens != 0 || got.TotalCacheReadTokens != 0 {
+			t.Fatalf("累计用量未清零: %+v", got)
+		}
+	})
+
+	t.Run("账号不存在时返回 false 且不报错", func(t *testing.T) {
+		edit := AccountEdit{}
+		for name, call := range map[string]func() (bool, error){
+			"EditAccount":       func() (bool, error) { return s.EditAccount(model.ProviderZai, "no-such", edit) },
+			"SetProxyURL":       func() (bool, error) { return s.SetProxyURL(model.ProviderZai, "no-such", nil) },
+			"SetIdentity":       func() (bool, error) { return s.SetIdentity(model.ProviderZai, "no-such", nil, nil) },
+			"SetAPIKey":         func() (bool, error) { return s.SetAPIKey(model.ProviderZai, "no-such", "k") },
+			"SetDisabledModels": func() (bool, error) { return s.SetDisabledModels(model.ProviderZai, "no-such", nil) },
+			"ResetTokenStats":   func() (bool, error) { return s.ResetTokenStats(model.ProviderZai, "no-such") },
+		} {
+			ok, err := call()
+			if ok || err != nil {
+				t.Fatalf("%s 对不存在的账号应返回 false,nil: %v %v", name, ok, err)
+			}
+		}
+	})
+}
+
 func TestSelectRotationAndModelFilter(t *testing.T) {
 	s := newTestStore(t)
 	a1, _ := s.AddAccount(model.ProviderZai, "a1", "h1.p.s3")

@@ -180,8 +180,7 @@ func cmdLogin(args []string) {
 		}
 		// 命中的既有账号可能还叫 oauth-login，用邮箱正名。
 		if email != "" && acc.Name != email {
-			acc.Name = email
-			_ = st.UpdateAccount(acc)
+			_, _ = st.SetIdentity(acc.Provider, acc.ID, nil, &email)
 		}
 		fmt.Println(web.Green + fmt.Sprintf("\n✔ 已保存 Coding Plan JWT 账号: %s (%s)", acc.Name, acc.ID) + web.Reset)
 		// 入池即激活上报 + 自动领取全部可领活动套餐（失败仅提示，不中断；

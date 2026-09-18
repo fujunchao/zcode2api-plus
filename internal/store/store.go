@@ -972,6 +972,110 @@ func (s *Store) Update(provider, idOrName string, fn func(*model.Account)) (bool
 	return true, s.persistAccountLocked(acc)
 }
 
+// ── 字段级写入 ──────────────────────────────────────────────────────────────
+//
+// 下面这些方法把「按语义改某几个字段」收敛到锁内（都经 Update）。调用方先在
+// 锁外完成解析与校验，再把结果交给这里应用——既不把请求体解析塞进闭包，也不
+// 再走「锁外改字段 → UpdateAccount 落库」那种会让并发读方撞上的旧形态。
+
+// AccountEdit 编辑账号时要替换的字段。用 Set* 布尔位区分「改成空/零值」与
+// 「本次不改这一项」——只靠指针无法表达后者。
+type AccountEdit struct {
+	Name        *string  // 非 nil 时替换名称
+	SetSecret   bool     // true 时按 SecretMode 替换凭据并恢复为 active
+	Secret      string   //
+	SecretMode  string   // "jwt" | "apiKey"
+	SetProxyURL bool     // true 时替换出站地址（必要时解除线路指派）
+	ProxyURL    *string  // nil 表示改为直连
+	SetDisabled bool     // true 时替换停用模型清单
+	Disabled    []string //
+}
+
+// EditAccount 按补丁替换账号字段并落库。
+func (s *Store) EditAccount(provider, idOrName string, edit AccountEdit) (bool, error) {
+	return s.Update(provider, idOrName, func(acc *model.Account) {
+		if edit.Name != nil {
+			acc.Name = *edit.Name
+		}
+		if edit.SetSecret {
+			secret := edit.Secret
+			if edit.SecretMode == "jwt" {
+				acc.Mode = "jwt"
+				acc.JWTToken = &secret
+				acc.APIKey = nil
+			} else {
+				acc.Mode = "apiKey"
+				acc.APIKey = &secret
+				acc.JWTToken = nil
+			}
+			// 换凭据即视为重新可用：清掉旧的失效状态与错误。
+			acc.Status = model.StatusActive
+			acc.LastError = nil
+		}
+		if edit.SetProxyURL {
+			// 地址没变则保留原线路指派；变了说明要改成手工代理，解除指派。
+			if !sameStringPtr(edit.ProxyURL, acc.ProxyURL) {
+				acc.ProxyID = nil
+			}
+			acc.ProxyURL = edit.ProxyURL
+		}
+		if edit.SetDisabled {
+			acc.SetDisabledModels(edit.Disabled)
+		}
+	})
+}
+
+// SetProxyURL 设置账号的手工出站地址并解除线路指派（url 为 nil 表示直连）。
+func (s *Store) SetProxyURL(provider, idOrName string, url *string) (bool, error) {
+	return s.Update(provider, idOrName, func(acc *model.Account) {
+		acc.ProxyID = nil
+		acc.ProxyURL = url
+	})
+}
+
+// SetIdentity 补写账号身份（OAuth 登录后回填邮箱、或把 oauth-login 正名为邮箱）。
+// email / name 传 nil 表示不改该项。
+func (s *Store) SetIdentity(provider, idOrName string, email, name *string) (bool, error) {
+	return s.Update(provider, idOrName, func(acc *model.Account) {
+		if email != nil {
+			acc.Email = email
+		}
+		if name != nil {
+			acc.Name = *name
+		}
+	})
+}
+
+// SetAPIKey 写入兑换得到的 API Key（OAuth 登录链路）。
+func (s *Store) SetAPIKey(provider, idOrName, key string) (bool, error) {
+	return s.Update(provider, idOrName, func(acc *model.Account) {
+		acc.APIKey = &key
+	})
+}
+
+// SetDisabledModels 替换账号的停用模型清单（导入链路）。
+func (s *Store) SetDisabledModels(provider, idOrName string, models []string) (bool, error) {
+	return s.Update(provider, idOrName, func(acc *model.Account) {
+		acc.SetDisabledModels(models)
+	})
+}
+
+// ResetTokenStats 清零账号的累计 token 统计（后台「重置統計」）。
+func (s *Store) ResetTokenStats(provider, idOrName string) (bool, error) {
+	return s.Update(provider, idOrName, func(acc *model.Account) {
+		acc.ResetTokenStats()
+	})
+}
+
+// sameStringPtr 判断两个可空字符串内容相同（都为 nil 视为相同）。
+// 与 adminapi 的同名助手语义一致，各自留在包内避免为一个纯函数建依赖。
+func sameStringPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 // SetEnabled 启用/禁用账号（禁用同时置 DISABLED 状态）。
 func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error) {
 	s.mu.Lock()
@@ -1181,8 +1285,7 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, []string, error) {
 				return count, newIDs, err
 			}
 			if item.DisabledModels != nil {
-				acc.SetDisabledModels(item.DisabledModels)
-				if err := s.UpdateAccount(acc); err != nil {
+				if _, err := s.SetDisabledModels(provider, acc.ID, item.DisabledModels); err != nil {
 					return count, newIDs, err
 				}
 			}

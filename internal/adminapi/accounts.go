@@ -142,8 +142,7 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else if hasProxy {
-			acc.ProxyURL = proxyURL
-			if err := h.Store.UpdateAccount(acc); err != nil {
+			if _, err := h.Store.SetProxyURL(provider, acc.ID, proxyURL); err != nil {
 				writeError500(w, err)
 				return
 			}
@@ -262,22 +261,21 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errBadRequest("代理配置不存在"))
 		return
 	}
+	// 先把请求体解析、校验成一份补丁，再交给 store 在锁内落库——校验失败时
+	// 账号一个字段都不会被改到（旧写法是逐个字段直接改在活对象上）。
+	var edit store.AccountEdit
 	if v, ok := payload["name"]; ok && truthy(v) {
-		acc.Name = strings.TrimSpace(strOf(v))
+		name := strings.TrimSpace(strOf(v))
+		edit.Name = &name
 	}
 	if secret := firstTruthy(payload["token"], payload["secret"]); truthy(secret) {
 		s := strings.TrimSpace(strOf(secret))
+		edit.SetSecret = true
+		edit.Secret = s
+		edit.SecretMode = "apiKey"
 		if strings.Count(s, ".") == 2 && acc.Provider == model.ProviderZai {
-			acc.Mode = "jwt"
-			acc.JWTToken = &s
-			acc.APIKey = nil
-		} else {
-			acc.Mode = "apiKey"
-			acc.APIKey = &s
-			acc.JWTToken = nil
+			edit.SecretMode = "jwt"
 		}
-		acc.Status = model.StatusActive
-		acc.LastError = nil
 	}
 	if v, ok := payload["proxy_url"]; ok && !hasProfile {
 		proxyURL, err := proxy.NormalizeProxyURL(strOf(v))
@@ -285,10 +283,8 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest(err.Error()))
 			return
 		}
-		if !sameStringPtr(proxyURL, acc.ProxyURL) {
-			acc.ProxyID = nil // 改为手工代理时解除线路指派
-		}
-		acc.ProxyURL = proxyURL
+		edit.SetProxyURL = true
+		edit.ProxyURL = proxyURL
 	}
 	if v, ok := payload["disabled_models"]; ok {
 		models, apiErr := parseDisabledModels(v)
@@ -296,9 +292,10 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, apiErr)
 			return
 		}
-		acc.SetDisabledModels(models)
+		edit.SetDisabled = true
+		edit.Disabled = models
 	}
-	if err := h.Store.UpdateAccount(acc); err != nil {
+	if _, err := h.Store.EditAccount(acc.Provider, acc.ID, edit); err != nil {
 		writeError500(w, err)
 		return
 	}
@@ -329,13 +326,6 @@ func parseDisabledModels(raw any) ([]string, *apiError) {
 		models = append(models, s)
 	}
 	return models, nil
-}
-
-func sameStringPtr(a, b *string) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
 }
 
 func (h *Handler) handleSetEnabled(w http.ResponseWriter, r *http.Request) {
@@ -456,8 +446,7 @@ func (h *Handler) handleResetStats(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("账号不存在"))
 		return
 	}
-	acc.ResetTokenStats()
-	if err := h.Store.UpdateAccount(acc); err != nil {
+	if _, err := h.Store.ResetTokenStats(acc.Provider, acc.ID); err != nil {
 		writeError500(w, err)
 		return
 	}

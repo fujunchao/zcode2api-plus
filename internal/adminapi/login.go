@@ -190,18 +190,16 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
 	if email != "" {
-		dirty := false
+		var setEmail, setName *string
 		if account.Email == nil || *account.Email == "" {
 			// 命中的既有账号可能早于本次改造入库，尚无邮箱记录。
-			account.Email = &email
-			dirty = true
+			setEmail = &email
 		}
 		if account.Name == "oauth-login" {
-			account.Name = email
-			dirty = true
+			setName = &email
 		}
-		if dirty {
-			_ = h.Store.UpdateAccount(account)
+		if setEmail != nil || setName != nil {
+			_, _ = h.Store.SetIdentity(account.Provider, account.ID, setEmail, setName)
 		}
 	}
 	// 线路必须在兑换与刷新之前落到账号上：这三步都要出站。
@@ -225,8 +223,7 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 	}
 	if result.AccessToken != "" {
 		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken, accountProxy); err == nil && apiKey != "" {
-			account.APIKey = &apiKey
-			_ = h.Store.UpdateAccount(account)
+			_, _ = h.Store.SetAPIKey(account.Provider, account.ID, apiKey)
 		} else if err != nil {
 			web.Warn("adminapi", fmt.Sprintf("兑换 API Key 失败: %v", err))
 		}
@@ -257,9 +254,7 @@ func (h *Handler) applyLoginProxy(account *model.Account, session *loginSession)
 	}
 	// 直接给地址：与编辑账号同语义，解除线路指派。
 	url := session.proxyURL
-	account.ProxyID = nil
-	account.ProxyURL = &url
-	if err := h.Store.UpdateAccount(account); err != nil {
+	if _, err := h.Store.SetProxyURL(account.Provider, account.ID, &url); err != nil {
 		return errUpstream(fmt.Sprintf("写入代理失败: %v", err))
 	}
 	return nil
