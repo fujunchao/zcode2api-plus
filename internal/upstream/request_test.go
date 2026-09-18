@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"strings"
 	"testing"
 
 	"zcode2api/internal/config"
@@ -23,7 +24,7 @@ func TestBuildRequestJWT(t *testing.T) {
 	if h["Authorization"] != "Bearer header.payload.sig" {
 		t.Fatalf("Authorization 不符: %q", h["Authorization"])
 	}
-	if h["content-type"] != "application/json" || h["anthropic-version"] != "2023-06-01" {
+	if h["Content-Type"] != "application/json" || h["Anthropic-Version"] != "2023-06-01" {
 		t.Fatalf("固定头不符: %v", h)
 	}
 	if h["X-ZCode-App-Version"] != config.ZcodeClientVersion || h["X-ZCode-Agent"] != "glm" {
@@ -46,7 +47,7 @@ func TestBuildRequestAPIKey(t *testing.T) {
 	if req.URL != config.UpstreamZaiFallback {
 		t.Fatalf("API Key 应走回退端点: %s", req.URL)
 	}
-	if req.Headers["x-api-key"] != "sk-secret" {
+	if req.Headers["X-Api-Key"] != "sk-secret" {
 		t.Fatalf("x-api-key 不符: %v", req.Headers)
 	}
 	if _, ok := req.Headers["X-Aliyun-Captcha-Verify-Param"]; ok {
@@ -95,6 +96,9 @@ func TestClientHeadersFiltered(t *testing.T) {
 	if _, ok := h["x-zcode-app-version"]; ok {
 		t.Fatal("x-zcode*（小写）透传应被剔除")
 	}
+	if h["X-ZCode-App-Version"] != config.ZcodeClientVersion {
+		t.Fatalf("x-zcode* 透传不得覆盖版本头: %v", h["X-ZCode-App-Version"])
+	}
 	if h["X-Aliyun-Captcha-Verify-Param"] != "server-token" {
 		t.Fatal("客户端不得覆盖验证码头")
 	}
@@ -122,3 +126,42 @@ func TestZcodeSystemBlocks(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// 客户端送来的设备指纹头必须无效：每账号独立的 X-Device-Mid 是账号隔离的基础，
+// 被客户端指定等于让上游把多个账号看成同一台设备。
+//
+// 同时钉住「只占一个键」——固定头与客户端头若因大小写不同各占一个 map 键，
+// 下游 Header.Set 会把它们归一到同一名字，最终取值便取决于 map 迭代顺序。
+func TestClientCannotOverrideDeviceMid(t *testing.T) {
+	acc := jwtAccount()
+	want := acc.DeviceMidOr(config.DeviceMid())
+
+	incomings := []map[string]string{
+		{"X-Device-Mid": "spoofed"},
+		{"x-device-mid": "spoofed"},
+		{"X-DEVICE-MID": "spoofed"},
+		{"x-device-mid": "spoofed", "Accept": "application/json"},
+	}
+	for _, incoming := range incomings {
+		req, err := BuildRequest(acc, "", "", incoming)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := req.Headers["X-Device-Mid"]
+		if !ok {
+			t.Fatalf("应携带固定的设备标识: %v", req.Headers)
+		}
+		if got != want {
+			t.Fatalf("设备指纹被客户端覆盖: %q（期望 %q）", got, want)
+		}
+		count := 0
+		for key := range req.Headers {
+			if strings.EqualFold(key, "x-device-mid") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("设备指纹头应只占一个键，实际 %d 个: %v", count, req.Headers)
+		}
+	}
+}

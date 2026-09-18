@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/textproto"
 	"strings"
 	"sync"
 
@@ -60,6 +61,9 @@ type Request struct {
 // BuildRequest 对应 Python 版 build_request：
 // JWT 账号走 zcode.z.ai 主端点（Bearer），API Key 账号走 api.z.ai 回退端点（x-api-key）。
 // verifyParam/verifyRegion 为验证码令牌（仅 JWT 账号）；incomingHeaders 为客户端透传头。
+//
+// 头合并的优先级是固定的：**网关固定头恒胜**。客户端透传头先落，固定头最后覆写，
+// 因此客户端既不能改掉鉴权与网关标识，也不能改掉每账号的设备指纹（X-Device-Mid）。
 func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incomingHeaders map[string]string) (Request, error) {
 	var targetURL, authHeader, authValue string
 	if acc.Provider == model.ProviderZai {
@@ -68,7 +72,7 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 			authHeader, authValue = "Authorization", "Bearer "+*acc.JWTToken
 		} else if acc.APIKey != nil {
 			targetURL = config.UpstreamZaiFallback
-			authHeader, authValue = "x-api-key", *acc.APIKey
+			authHeader, authValue = "X-Api-Key", *acc.APIKey
 		} else {
 			return Request{}, errors.New("账号缺少有效凭证")
 		}
@@ -76,10 +80,12 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		return Request{}, fmt.Errorf("未知提供商: %s", acc.Provider)
 	}
 
-	headers := map[string]string{
-		"content-type":        "application/json",
+	// 网关固定头：客户端透传头一律不得改写这些取值，尤其是每账号的设备指纹
+	//（伪造它等于让上游把多个账号看成同一台设备，与账号隔离的目的相反）。
+	fixed := map[string]string{
+		"Content-Type":        "application/json",
 		authHeader:            authValue,
-		"anthropic-version":   "2023-06-01",
+		"Anthropic-Version":   "2023-06-01",
 		"User-Agent":          config.UserAgent,
 		"X-ZCode-App-Version": config.ZcodeClientVersion,
 		"X-ZCode-Agent":       "glm",
@@ -87,17 +93,26 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 		"X-Device-Mid":        acc.DeviceMidOr(config.DeviceMid()),
 	}
 	if verifyParam != "" {
-		headers["X-Aliyun-Captcha-Verify-Param"] = verifyParam
+		fixed["X-Aliyun-Captcha-Verify-Param"] = verifyParam
 		if verifyRegion != "" {
-			headers["X-Aliyun-Captcha-Verify-Region"] = verifyRegion
+			fixed["X-Aliyun-Captcha-Verify-Region"] = verifyRegion
 		}
 	}
 
+	// 透传头先合并，并把键统一为规范形式。不规范化的话，固定头 `X-Device-Mid`
+	// 与客户端送来的 `x-device-mid` 会在 map 里各占一个键；下游 `Header.Set`
+	// 又把两者归一到同一名字，最终取值便取决于 map 的迭代顺序——同名头的结果
+	// 成了随机的，这正是客户端能间接影响指纹的成因。
+	headers := make(map[string]string, len(fixed)+len(incomingHeaders))
 	for key, value := range incomingHeaders {
 		lower := strings.ToLower(key)
 		if dropHeaders[lower] || strings.HasPrefix(lower, "x-zcode") {
 			continue
 		}
+		headers[textproto.CanonicalMIMEHeaderKey(key)] = value
+	}
+	// 固定头最后写回，同名透传头被覆盖——固定头必胜。
+	for key, value := range fixed {
 		headers[key] = value
 	}
 
