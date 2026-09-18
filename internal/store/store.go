@@ -542,10 +542,25 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 	return profiles[target], nil
 }
 
-// DeleteProxyProfile 删除代理线路并解除账号指派；不存在返回 false。
-func (s *Store) DeleteProxyProfile(profileID string) (bool, error) {
+// ProxyReassign 删除线路后对「原本绑定它的账号」的处置结果。
+type ProxyReassign struct {
+	Assigned map[string]string // accountID → 改派到的新线路 ID
+	Direct   []string          // 已无空閒线路可补、退回直连的 accountID
+}
+
+// DeleteProxyProfile 删除代理线路；不存在返回 false。
+//
+// 原本绑定该线路的账号不会被打成直连，而是先摘掉失效指派、再用「此刻仍然空閒」
+// 的线路补位，尽量让这些账号继续有代理可用；只有当确实没有空閒线路时才退回直连
+// ——退回时必须把过期的 ProxyURL 一并清掉，否则账号会继续用一条刚被删掉的线路。
+//
+// 全程在同一把锁内完成：删除、指派与落库之间不存在「账号既没了线路又留着旧地址」
+// 的中间态。
+func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error) {
+	reassign := ProxyReassign{Assigned: map[string]string{}}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	profiles := s.listProxyProfilesLocked()
 	remaining := make([]ProxyProfile, 0, len(profiles))
 	removed := false
@@ -557,21 +572,47 @@ func (s *Store) DeleteProxyProfile(profileID string) (bool, error) {
 		remaining = append(remaining, p)
 	}
 	if !removed {
-		return false, nil
+		return false, reassign, nil
 	}
 	if err := s.saveProxyProfilesLocked(remaining); err != nil {
-		return false, err
+		return false, reassign, err
 	}
+
+	// 第一步：摘掉失效指派。必须先做，补位时看到的才是干净的占用情况。
+	affected := []*model.Account{}
 	for _, acc := range s.allAccountsLocked() {
 		if acc.ProxyID != nil && *acc.ProxyID == profileID {
 			acc.ProxyID = nil
 			acc.ProxyURL = nil
-			if err := s.persistAccountLocked(acc); err != nil {
-				return true, err
-			}
+			affected = append(affected, acc)
 		}
 	}
-	return true, nil
+
+	// 第二步：按序补位；补不上才落回直连（此时 ProxyID/ProxyURL 已清空）。
+	free := s.freeProxyProfilesLocked()
+	for _, acc := range affected {
+		if len(free) == 0 {
+			reassign.Direct = append(reassign.Direct, acc.ID)
+			if err := s.persistAccountLocked(acc); err != nil {
+				return true, reassign, err
+			}
+			continue
+		}
+		p := free[0]
+		free = free[1:]
+		newID, newURL := p.ID, p.URL
+		acc.ProxyID = &newID
+		acc.ProxyURL = &newURL
+		if err := s.persistAccountLocked(acc); err != nil {
+			// 落库失败就退回直连，别把内存里的指针留成没写进去的状态。
+			acc.ProxyID = nil
+			acc.ProxyURL = nil
+			reassign.Direct = append(reassign.Direct, acc.ID)
+			continue
+		}
+		reassign.Assigned[acc.ID] = newID
+	}
+	return true, reassign, nil
 }
 
 // AssignProxyProfile 把账号指派到代理线路；profileID 为空表示直连。

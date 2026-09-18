@@ -89,6 +89,65 @@ func probeStub(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	return srv
 }
 
+// 删除线路时，原绑定账号应被自动改派到空閒线路，接口回报两种处置的计数。
+func TestDeleteProxyReassignsAccounts(t *testing.T) {
+	mux, st, _ := setup(t)
+	lineA, err := st.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	lineB, err := st.AddProxyProfile("line-b", "socks5://2.2.2.2:1080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+
+	// 新增账号时自动分配，按线路顺序拿到 line-a。
+	code, body := do(t, mux, st, http.MethodPost, "/admin/api/accounts",
+		map[string]any{"tokens": []any{jwtTokenFor("u-del-1")}})
+	if code != http.StatusOK {
+		t.Fatalf("应 200: %d %v", code, body)
+	}
+	ids, _ := body["ids"].([]any)
+	if len(ids) != 1 {
+		t.Fatalf("应新增 1 个账号: %v", body)
+	}
+	accID := ids[0].(string)
+	if acc := st.Find(model.ProviderZai, accID); acc == nil || acc.ProxyID == nil || *acc.ProxyID != lineA.ID {
+		t.Fatalf("账号应落在 line-a: %+v", acc)
+	}
+
+	code, body = do(t, mux, st, http.MethodDelete, "/admin/api/proxies/"+lineA.ID, nil)
+	if code != http.StatusOK {
+		t.Fatalf("应 200: %d %v", code, body)
+	}
+	if n, _ := body["reassigned"].(float64); n != 1 {
+		t.Fatalf("应回报改派 1 个账号: %v", body)
+	}
+	if n, _ := body["direct_fallback"].(float64); n != 0 {
+		t.Fatalf("有空閒线路时不应回退直连: %v", body)
+	}
+	acc := st.Find(model.ProviderZai, accID)
+	if acc.ProxyID == nil || *acc.ProxyID != lineB.ID {
+		t.Fatalf("账号应已改派到 line-b: %+v", acc.ProxyID)
+	}
+	if acc.ProxyURL == nil || *acc.ProxyURL != lineB.URL {
+		t.Fatalf("出站地址应同步为 line-b: %v", acc.ProxyURL)
+	}
+
+	// 再删 line-b：已无空閒线路，应退回直连。
+	code, body = do(t, mux, st, http.MethodDelete, "/admin/api/proxies/"+lineB.ID, nil)
+	if code != http.StatusOK {
+		t.Fatalf("应 200: %d %v", code, body)
+	}
+	if n, _ := body["direct_fallback"].(float64); n != 1 {
+		t.Fatalf("应回报 1 个账号回退直连: %v", body)
+	}
+	acc = st.Find(model.ProviderZai, accID)
+	if acc.ProxyID != nil || acc.ProxyURL != nil {
+		t.Fatalf("回退直连后不应残留代理: %+v", acc)
+	}
+}
+
 func TestTestAllProxies(t *testing.T) {
 	mux, st, _ := setup(t)
 	// 探测只关心「能不能拿到响应」，返回什么都不重要。

@@ -580,7 +580,8 @@ func TestProxyProfiles(t *testing.T) {
 		t.Fatalf("线路更新应同步账号: %v", got.ProxyURL)
 	}
 
-	if ok, err := s.DeleteProxyProfile(p.ID); !ok || err != nil {
+	// 此时没有别的空閒线路，删掉唯一一条线后账号只能退回直连。
+	if ok, _, err := s.DeleteProxyProfile(p.ID); !ok || err != nil {
 		t.Fatalf("删除失败: %v %v", ok, err)
 	}
 	got = s.Find(model.ProviderZai, acc.ID)
@@ -594,6 +595,74 @@ func TestProxyProfiles(t *testing.T) {
 	if _, err := s.AssignProxyProfile(acc.ID, "proxy-nope"); err == nil {
 		t.Fatal("指派不存在的线路应报错")
 	}
+}
+
+// 删除线路时，原绑定账号应自动改派到其它空閒线路；确实没有空閒线路才退回直连。
+func TestDeleteProxyReassigns(t *testing.T) {
+	s := newTestStore(t)
+	lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	lineB, err := s.AddProxyProfile("line-b", "socks5://2.2.2.2:1080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	// 停用的线路不能作为补位候选。
+	if _, err := s.AddProxyProfile("line-off", "http://3.3.3.3:8080", false); err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	acc, err := s.AddAccount(model.ProviderZai, "acc-1", jwtFor("uid-del-1"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if ok, err := s.AssignProxyProfile(acc.ID, lineA.ID); !ok || err != nil {
+		t.Fatalf("指派失败: %v %v", ok, err)
+	}
+
+	t.Run("有空閒线路则改派", func(t *testing.T) {
+		ok, reassign, err := s.DeleteProxyProfile(lineA.ID)
+		if err != nil || !ok {
+			t.Fatalf("删除失败: %v %v", ok, err)
+		}
+		if reassign.Assigned[acc.ID] != lineB.ID || len(reassign.Direct) != 0 {
+			t.Fatalf("应改派到空閒的 line-b: %+v", reassign)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.ProxyID == nil || *got.ProxyID != lineB.ID {
+			t.Fatalf("账号应指向新线路: %v", got.ProxyID)
+		}
+		if got.ProxyURL == nil || *got.ProxyURL != lineB.URL {
+			t.Fatalf("出站地址应同步为新线路: %v", got.ProxyURL)
+		}
+		// 被删线路不应残留，否则下次还能被分配。
+		for _, p := range s.ListProxyProfiles() {
+			if p.ID == lineA.ID {
+				t.Fatalf("被删线路仍在线路表里: %+v", p)
+			}
+		}
+	})
+
+	t.Run("无空閒线路则退回直连且清掉旧地址", func(t *testing.T) {
+		// 此刻只剩停用的 line-off，没有可补的线路。
+		ok, reassign, err := s.DeleteProxyProfile(lineB.ID)
+		if err != nil || !ok {
+			t.Fatalf("删除失败: %v %v", ok, err)
+		}
+		if len(reassign.Assigned) != 0 || len(reassign.Direct) != 1 || reassign.Direct[0] != acc.ID {
+			t.Fatalf("应记为退回直连: %+v", reassign)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.ProxyID != nil || got.ProxyURL != nil {
+			t.Fatalf("退回直连后不应残留线路与地址: %+v", got)
+		}
+	})
+
+	t.Run("线路不存在返回 false", func(t *testing.T) {
+		if ok, _, err := s.DeleteProxyProfile("no-such-line"); ok || err != nil {
+			t.Fatalf("应返回 false,nil: %v %v", ok, err)
+		}
+	})
 }
 
 func TestAutoAssignProxies(t *testing.T) {

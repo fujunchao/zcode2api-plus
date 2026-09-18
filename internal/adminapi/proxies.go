@@ -65,8 +65,10 @@ func (h *Handler) handleUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, profile)
 }
 
+// handleDeleteProxy 删除线路。原绑定该线路的账号会被自动改派到其它空閒线路，
+// 确实没有空閒线路时才退回直连；响应回报两种处置各覆盖多少个账号。
 func (h *Handler) handleDeleteProxy(w http.ResponseWriter, r *http.Request) {
-	ok, err := h.Store.DeleteProxyProfile(r.PathValue("profile_id"))
+	ok, reassign, err := h.Store.DeleteProxyProfile(r.PathValue("profile_id"))
 	if err != nil {
 		writeError500(w, err)
 		return
@@ -75,7 +77,11 @@ func (h *Handler) handleDeleteProxy(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("代理配置不存在"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"reassigned":      len(reassign.Assigned),
+		"direct_fallback": len(reassign.Direct),
+	})
 }
 
 func (h *Handler) handleAssignProxy(w http.ResponseWriter, r *http.Request) {

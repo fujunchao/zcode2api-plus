@@ -64,6 +64,16 @@ function describeProbe(d: ProbeResult): RowResult {
   return { state: d.upstream?.blocked ? 'warn' : 'error', text }
 }
 
+/* 刪除線路後的提示：說明原本綁在這條線上的帳號被怎麼處置 */
+function deletedMessage(reassigned: number, direct: number): string {
+  if (reassigned && direct) {
+    return `代理已刪除：${reassigned} 個帳號已改派到空閒線路，${direct} 個無線路可補已改為直連`
+  }
+  if (reassigned) return `代理已刪除：${reassigned} 個帳號已改派到空閒線路`
+  if (direct) return `代理已刪除：${direct} 個帳號無空閒線路可補，已改為直連`
+  return '代理已刪除'
+}
+
 export function ProxiesPage() {
   const qc = useQueryClient()
   const { confirm, element: confirmElement } = useConfirm()
@@ -124,13 +134,17 @@ export function ProxiesPage() {
       danger: true,
       description: (
         <>
-          確認刪除 <code className="rounded bg-muted px-1 py-0.5">{p.name}</code>？使用此線路的帳號將切換為直連。
+          確認刪除 <code className="rounded bg-muted px-1 py-0.5">{p.name}</code>？使用此線路的帳號會自動改派到其它空閒線路，
+          沒有空閒線路時才改為直連。
         </>
       ),
       onConfirm: async () => {
         try {
-          await api('DELETE', '/proxies/' + encodeURIComponent(p.id))
-          toast.success('代理已刪除')
+          const d = await api<{ ok: boolean; reassigned: number; direct_fallback: number }>(
+            'DELETE',
+            '/proxies/' + encodeURIComponent(p.id),
+          )
+          toast.success(deletedMessage(d.reassigned || 0, d.direct_fallback || 0))
           invalidate()
         } catch (e) {
           toast.error('刪除失敗：' + errMsg(e))
