@@ -49,9 +49,11 @@ jobs:
       - name: Test
         run: go test ./...
 
-      # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败
+      # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
+      # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
+      # 「这次真的跑过检测器」。编译缓存仍然生效，代价只是重跑一次测试。
       - name: Test (race)
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
   # 真实客户端只连接 httptest，不读取账号、不访问真实模型；SDK 依赖安装在临时目录。
   sdk-compat:
