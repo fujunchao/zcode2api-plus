@@ -340,3 +340,24 @@ func TestProxyProbeReportsUpstreamUnreachable(t *testing.T) {
 		t.Fatalf("原因应冒泡到条目上供前端展示: %v", first)
 	}
 }
+
+// 直连探测必须与网关真实出站同语义：绝不跟随环境代理变量。
+// 否则在设置了 HTTP_PROXY 的环境里，「测直连」实际测到的是环境代理的出口，
+// 结论与生产直连不符。
+func TestNewProbeClientDirectIgnoresEnvProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	t.Setenv("NO_PROXY", "")
+
+	client, err := newProbeClient("")
+	if err != nil {
+		t.Fatalf("直连构造不应报错: %v", err)
+	}
+	tp, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport 类型不符: %T", client.Transport)
+	}
+	if tp.Proxy != nil {
+		t.Fatalf("直连探测不应跟随环境代理")
+	}
+}

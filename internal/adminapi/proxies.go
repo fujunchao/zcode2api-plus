@@ -369,12 +369,15 @@ func hostOfURL(raw string) string {
 	return parsed.Host
 }
 
-// newProbeClient 构造探测客户端：超时 upstreamProbeTimeout、跟随重定向、
-// 默认透传环境代理。
+// newProbeClient 构造探测客户端：超时 upstreamProbeTimeout、跟随重定向。
+// 直连（未传代理）时显式置 Proxy=nil，与网关真实出站 defaultUpstreamClient
+// 同语义——绝不跟随环境代理变量，否则在设置了 HTTP_PROXY 的环境里「测直连」
+// 实际测到的是环境代理的出口，结论与生产直连不符。
 // Go 标准库支持 http/https/socks5 代理；socks5 拨号即远程解析主机名，
 // 与 socks5h 语义一致；socks4 无标准库支持，直接报错（呈 502 形态）。
 func newProbeClient(proxyURL string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
 	if strings.TrimSpace(proxyURL) != "" {
 		u, err := url.Parse(proxyURL)
 		if err != nil {
