@@ -309,7 +309,11 @@ function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
     <main
       data-slot="sidebar-inset"
       className={cn(
-        "relative flex w-full flex-1 flex-col bg-background",
+        // min-w-0 必须保留：Inset 是 SidebarProvider（row flex）里的 flex item，
+        // 默认 min-width:auto 会让宽内容（例如账号表格）的最小宽度一路传导，
+        // 把整个 Inset 撑宽、逼出整页横向滚动条。加上它，过宽的表格改由卡片
+        // 内部横向捲动消化，而不是撑破页面。
+        "relative flex w-full min-w-0 flex-1 flex-col bg-background",
         "md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:shadow-sm md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
         className
       )}

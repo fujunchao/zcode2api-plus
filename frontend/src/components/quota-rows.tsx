@@ -85,8 +85,9 @@ export function QuotaRows({ account }: { account: Account }) {
         return (
           <div key={k} className="flex items-center gap-2 text-xs" title={`${k} · ${period}配額${reset}`}>
             {/* 固定寬度而非 flex-1：進度條曾撐滿整個儲存格，把右側的呼叫／失敗／
-                Tokens／操作等欄位擠出視窗外。名稱為固定寬度是為了讓各行的條對齊。 */}
-            <span className="flex w-28 shrink-0 flex-col leading-tight">
+                Tokens／操作等欄位擠出視窗外。名稱為固定寬度是為了讓各行的條對齊，
+                寬度取 96px——再寬就會頂大整個表格、把最右的「操作」列擠出去。 */}
+            <span className="flex w-24 shrink-0 flex-col leading-tight">
               <span className="truncate font-medium">{model}</span>
               {planName ? <span className="truncate text-[11px] text-muted-foreground">{planName}</span> : null}
             </span>

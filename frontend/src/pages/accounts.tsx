@@ -597,7 +597,9 @@ export function AccountsPage() {
       {/* 帳號明細表 */}
       <Card>
         <CardContent className="overflow-x-auto px-0">
-          <Table>
+          {/* 九列在 1150px 的卡片裏原本擠不下（最小寬度和 1188px），最右的「操作」
+              會被裁掉。收緊格內留白（每格省 4px）把總寬壓到卡片以內。 */}
+          <Table className="[&_td]:px-1.5 [&_th]:px-1.5">
             <TableHeader>
               <TableRow>
                 <TableHead className="text-center">賬號</TableHead>
@@ -607,7 +609,7 @@ export function AccountsPage() {
                 <TableHead className="w-16 text-center">呼叫</TableHead>
                 <TableHead className="w-16 text-center">失敗</TableHead>
                 <TableHead className="w-24 text-center">Tokens</TableHead>
-                <TableHead className="w-28 text-center">最近使用</TableHead>
+                <TableHead className="w-24 text-center">最近使用</TableHead>
                 <TableHead className="w-44 text-center">操作</TableHead>
               </TableRow>
             </TableHeader>
@@ -937,7 +939,7 @@ function EmailCell({ account, onCopy }: { account: Account; onCopy: () => void }
   const label = account.email || account.name || '未命名帳號'
   return (
     <span className="group/email flex min-w-0 items-center gap-1">
-      <span className="max-w-44 truncate font-medium" title={label}>
+      <span className="max-w-32 truncate font-medium" title={label}>
         {label}
       </span>
       <button
