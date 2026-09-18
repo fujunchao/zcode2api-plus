@@ -665,6 +665,95 @@ func TestDeleteProxyReassigns(t *testing.T) {
 	})
 }
 
+// 后台任务拿到的必须是「副本」，且领取结果回写只改领取状态——
+// 否则用副本整体回写会把派生之后发生的改动（例如删除线路改派的 ProxyURL）覆盖回去。
+func TestSnapshotAccountIsDetachedAndClaimWriteBackKeepsChanges(t *testing.T) {
+	s := newTestStore(t)
+	lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	lineB, err := s.AddProxyProfile("line-b", "socks5://2.2.2.2:1080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	acc, err := s.AddAccount(model.ProviderZai, "acc-1", jwtFor("uid-snap-1"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if ok, err := s.AssignProxyProfile(acc.ID, lineA.ID); !ok || err != nil {
+		t.Fatalf("指派失败: %v %v", ok, err)
+	}
+
+	// 长活后台任务在「派生那一刻」取副本。
+	snap := s.SnapshotAccount(model.ProviderZai, acc.ID)
+	if snap == nil {
+		t.Fatal("应取到副本")
+	}
+	if snap.ProxyURL == nil || *snap.ProxyURL != lineA.URL {
+		t.Fatalf("副本应带上当前出站地址: %v", snap.ProxyURL)
+	}
+	if snap.Quota == nil {
+		t.Fatal("副本的 Quota 应为可用容器")
+	}
+
+	// 副本与 store 解耦：改副本不落回 store。
+	other := "http://9.9.9.9:9999"
+	snap.ProxyURL = &other
+	snap.Status = model.StatusInvalid
+	snap.Quota["glm-5.3"] = map[string]any{"remaining": 1.0}
+	got := s.Find(model.ProviderZai, acc.ID)
+	if got.ProxyURL == nil || *got.ProxyURL != lineA.URL {
+		t.Fatalf("改副本不应影响 store 的出站地址: %v", got.ProxyURL)
+	}
+	if got.Status != model.StatusActive {
+		t.Fatalf("改副本不应影响 store 的状态: %v", got.Status)
+	}
+	if len(got.Quota) != 0 {
+		t.Fatalf("Quota 应为深拷贝: %v", got.Quota)
+	}
+
+	// 派生之后 store 改了该账号：删掉 line-a → 自动改派到 line-b。
+	if _, _, err := s.DeleteProxyProfile(lineA.ID); err != nil {
+		t.Fatalf("删除线路失败: %v", err)
+	}
+
+	// 领取结果回写：只落领取状态，改派结果必须保住。
+	claimed := 1700000000.0
+	ok, err := s.UpdateClaimState(model.ProviderZai, acc.ID, func(cur *model.ClaimState) *model.ClaimState {
+		next := *cur
+		next.ClaimedAt = &claimed
+		return &next
+	})
+	if err != nil || !ok {
+		t.Fatalf("回写领取状态失败: %v %v", ok, err)
+	}
+	got = s.Find(model.ProviderZai, acc.ID)
+	if got.ProxyID == nil || *got.ProxyID != lineB.ID {
+		t.Fatalf("回写不该覆盖改派结果: %v", got.ProxyID)
+	}
+	if got.ProxyURL == nil || *got.ProxyURL != lineB.URL {
+		t.Fatalf("回写不该覆盖改派后的出站地址: %v", got.ProxyURL)
+	}
+	if v := got.ClaimView(); v == nil || v.ClaimedAt == nil || *v.ClaimedAt != claimed {
+		t.Fatalf("领取状态应已写入: %+v", v)
+	}
+}
+
+// 账号不存在时快照返回 nil、回写返回 false 且不报错——领取任务与删除并发属正常情况。
+func TestSnapshotAndClaimWriteBackOnMissingAccount(t *testing.T) {
+	s := newTestStore(t)
+
+	if snap := s.SnapshotAccount(model.ProviderZai, "no-such-account"); snap != nil {
+		t.Fatalf("账号不存在应返回 nil: %+v", snap)
+	}
+	ok, err := s.UpdateClaimState(model.ProviderZai, "no-such-account",
+		func(cur *model.ClaimState) *model.ClaimState { return cur })
+	if ok || err != nil {
+		t.Fatalf("账号不存在应返回 false,nil: %v %v", ok, err)
+	}
+}
+
 func TestAutoAssignProxies(t *testing.T) {
 	// 建 n 个账号并返回它们的 ID（每个用不同 user_id，避免被三级判重合并）。
 	newAccounts := func(t *testing.T, s *Store, names ...string) []string {

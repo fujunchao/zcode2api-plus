@@ -107,14 +107,15 @@ func claimCooldownUntil(outcomes []map[string]any, now time.Time, captchaSec, re
 }
 
 // applyClaimOutcome 把一次领取结果写回账号（含上游给的下次可领时间）并落库。
-// ClaimState 视为不可变：在这里基于快照生成新对象、经 SetClaimState 原子替换
-// （领取在后台 goroutine 写、后台快照在读，CI 的 -race 实测抓到过竞态）。
+//
+// acc 是**领取用的账号副本**，不能拿它整体回写（领取期间 store 可能已改过该账号，
+// 例如删除线路改派了 ProxyURL；整体回写会用副本的旧值把它覆盖回去）。因此只把
+// 领取状态这一个字段经 UpdateClaimState 落到 store 的当前对象上；读取当前状态
+// 与替换也在该方法的锁内完成，避免与另一路领取任务互相覆盖。
+// ClaimState 视为不可变：基于副本生成新对象、整体替换。
 func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]any, now time.Time) {
 	captchaSec, retrySec, _ := h.Store.ClaimCooldowns()
-	next := acc.ClaimView()
-	if next == nil {
-		next = &model.ClaimState{}
-	}
+	nextAt := claimCooldownUntil(outcomes, now, captchaSec, retrySec)
 	succeeded := false
 	for _, o := range outcomes {
 		if ok, _ := o["ok"].(bool); ok {
@@ -122,18 +123,20 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 			break
 		}
 	}
-	next.NextAt = claimCooldownUntil(outcomes, now, captchaSec, retrySec)
-	if succeeded {
-		ts := float64(now.Unix())
-		next.ClaimedAt = &ts
-		next.LastError = nil
-	} else if len(outcomes) > 0 {
-		if msg, _ := outcomes[0]["message"].(string); msg != "" {
-			next.LastError = &msg
+	if _, err := h.Store.UpdateClaimState(acc.Provider, acc.ID, func(cur *model.ClaimState) *model.ClaimState {
+		next := *cur
+		next.NextAt = nextAt
+		if succeeded {
+			ts := float64(now.Unix())
+			next.ClaimedAt = &ts
+			next.LastError = nil
+		} else if len(outcomes) > 0 {
+			if msg, _ := outcomes[0]["message"].(string); msg != "" {
+				next.LastError = &msg
+			}
 		}
-	}
-	acc.SetClaimState(next)
-	if err := h.Store.UpdateAccount(acc); err != nil {
+		return &next
+	}); err != nil {
 		web.Warn("claim", "领取状态落库失败: "+err.Error())
 	}
 }
@@ -175,12 +178,14 @@ func markPreview(id string, now time.Time) {
 // 受后台「入池自動領取」开关约束——刻意只拦自动路径，手动按钮永远可用；
 // 冷却中直接跳过：上游已在响应里给出下次可领时间，到点前重试只是白打一次上游。
 func (h *Handler) scheduleAutoClaim(acc *model.Account) {
+	// 只取走用得到的标量：后台 goroutine 不该再碰 store 的内部对象（见 claimUnderGate）。
+	name := acc.Name
 	if !h.Store.ClaimAutoEnabled() {
-		web.Ok("claim", fmt.Sprintf("账号 %s 已关闭入池自动领取，跳过", acc.Name))
+		web.Ok("claim", fmt.Sprintf("账号 %s 已关闭入池自动领取，跳过", name))
 		return
 	}
 	if claimCooldownActive(acc, time.Now()) {
-		web.Ok("claim", fmt.Sprintf("账号 %s 仍在领取冷却期，跳过自动领取", acc.Name))
+		web.Ok("claim", fmt.Sprintf("账号 %s 仍在领取冷却期，跳过自动领取", name))
 		return
 	}
 	autoClaimTasks.Add(1)
@@ -192,7 +197,7 @@ func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 			}
 		}()
 		if !claimSlot.acquire() {
-			web.Ok("claim", fmt.Sprintf("账号 %s 已有领取任务在跑，本轮跳过", acc.Name))
+			web.Ok("claim", fmt.Sprintf("账号 %s 已有领取任务在跑，本轮跳过", name))
 			return
 		}
 		h.claimUnderGate(acc)
@@ -203,9 +208,18 @@ func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 // 调用方负责抢占闸门，释放由这里的 defer 兜底；返回是否至少领到一个套餐。
 func (h *Handler) claimUnderGate(acc *model.Account) (succeeded bool) {
 	defer claimSlot.release()
+	// 领取可能持续数十秒，期间后台仍在改账号（删除线路会改派 ProxyURL/ProxyID、
+	// 额度刷新会改 Status/Quota）。这里先取一份副本再开工——直接拿 store 的内部
+	// 指针会让整个领取过程与那些写入相撞（CI 的 -race 实测到过）。
+	// 副本上的改动不会进 store，故结果由 applyClaimOutcome 按 ID 回写。
+	snap := h.Store.SnapshotAccount(acc.Provider, acc.ID)
+	if snap == nil {
+		// 账号已被删除：不是错误，本轮无事可做。
+		return false
+	}
 	svc := claim.NewService(h.Captcha)
-	outcomes := svc.AutoClaimAllPlans(acc)
-	h.applyClaimOutcome(acc, outcomes, time.Now())
+	outcomes := svc.AutoClaimAllPlans(snap)
+	h.applyClaimOutcome(snap, outcomes, time.Now())
 	for _, o := range outcomes {
 		if ok, _ := o["ok"].(bool); ok {
 			return true

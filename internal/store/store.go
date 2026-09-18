@@ -751,6 +751,26 @@ func (s *Store) FindAny(idOrName string) *model.Account {
 	return s.findAnyLocked(idOrName)
 }
 
+// SnapshotAccount 返回账号的独立副本（找不到返回 nil）。
+//
+// 给**长活后台任务**用：领取这类操作可能持续数十秒，期间后台仍在改账号
+// （删除线路改派 ProxyURL/ProxyID、额度刷新改 Status/Quota）。直接持有
+// Find/ListAccounts 交出的内部指针，就会与这些写入相撞——CI 的 -race
+// 实测到过（入池自动领取 vs 删除线路）。取副本在锁内完成，故副本内容是
+// 一个内部一致的时点快照。
+//
+// 副作用：副本的改动不会进 store，回写必须走 Store 的方法（按 ID 落到
+// 「当前」对象上），否则会用旧快照整体覆盖并发改动。
+func (s *Store) SnapshotAccount(provider, idOrName string) *model.Account {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := s.findLocked(provider, idOrName)
+	if acc == nil {
+		return nil
+	}
+	return acc.Clone()
+}
+
 func (s *Store) findLocked(provider, idOrName string) *model.Account {
 	for _, a := range s.accounts[provider] {
 		if a.ID == idOrName || a.Name == idOrName {
@@ -901,6 +921,35 @@ func (s *Store) UpdateAccount(acc *model.Account) error {
 		return fmt.Errorf("账号已不存在，拒绝回写: %s", acc.ID)
 	}
 	return s.persistAccountLocked(acc)
+}
+
+// UpdateClaimState 在锁内把领取状态替换到**当前**账号对象上并落库，
+// 返回是否命中账号（已删除返回 false 且不报错——领取任务与删除并发时属正常情况）。
+//
+// 为什么不能拿快照去 UpdateAccount：领取（可能数十秒）跑在账号副本上，期间
+// store 可能已改过该账号（例如删除线路改派了 ProxyURL）。用副本整体回写会把
+// 这些改动一并覆盖回旧值，造成丢失更新，所以回写只针对领取状态这一个字段。
+//
+// fn 收到的是当前状态的副本（ClaimState 视为不可变），返回新状态整体替换；
+// 返回 nil 表示不改。锁序 store.mu → claimMu，与 persistAccountLocked 一致。
+func (s *Store) UpdateClaimState(
+	provider, idOrName string,
+	fn func(cur *model.ClaimState) *model.ClaimState,
+) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := s.findLocked(provider, idOrName)
+	if acc == nil {
+		return false, nil
+	}
+	cur := acc.ClaimView()
+	if cur == nil {
+		cur = &model.ClaimState{}
+	}
+	if next := fn(cur); next != nil {
+		acc.SetClaimState(next)
+	}
+	return true, s.persistAccountLocked(acc)
 }
 
 // SetEnabled 启用/禁用账号（禁用同时置 DISABLED 状态）。

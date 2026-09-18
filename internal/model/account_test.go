@@ -238,6 +238,69 @@ func TestClaimNextAt(t *testing.T) {
 // applyClaimOutcome 与 PublicView 的真实竞态（run 35091374551），本用例把同类
 // 并发固定下来——写入方换快照，读方同时做快照、取值与编码，任何一处漏锁都会在
 // -race 下报出。
+// Clone 必须产出与原件解耦的副本：标量、容器（含内层 map）与领取状态都不能共享，
+// 否则「交给后台任务」这件事就还是共享可变状态。
+func TestCloneIsDetached(t *testing.T) {
+	claimed := 1700000000.0
+	acc := Create(ProviderZai, "acc-1", "a.b.c")
+	acc.Quota["glm-5.3"] = map[string]any{"remaining": 10.0}
+	acc.ExhaustedModels = append(acc.ExhaustedModels, "glm-4.6")
+	acc.SetClaimState(&ClaimState{ClaimedAt: &claimed})
+	acc.RateLimitStreak = 3
+
+	cp := acc.Clone()
+	if cp == nil {
+		t.Fatal("副本不应为 nil")
+	}
+	if cp.ID != acc.ID || cp.Name != acc.Name || cp.Provider != acc.Provider || cp.Mode != acc.Mode {
+		t.Fatalf("副本应复制标识字段: %+v", cp)
+	}
+	if cp.JWTToken == nil || *cp.JWTToken != *acc.JWTToken {
+		t.Fatal("副本应带上凭据")
+	}
+	if cp.RateLimitStreak != 3 {
+		t.Fatalf("运行期退避状态应一并复制: %d", cp.RateLimitStreak)
+	}
+	if v := cp.ClaimView(); v == nil || v.ClaimedAt == nil || *v.ClaimedAt != claimed {
+		t.Fatalf("副本应带上领取状态: %+v", v)
+	}
+
+	// 改原件不影响副本。
+	proxyURL := "http://9.9.9.9:9999"
+	acc.Status = StatusInvalid
+	acc.Quota["glm-5.3"]["remaining"] = 0.0
+	acc.ExhaustedModels = append(acc.ExhaustedModels, "glm-5.2")
+	acc.ProxyURL = &proxyURL
+	acc.SetClaimState(&ClaimState{})
+
+	if cp.Status == StatusInvalid {
+		t.Fatal("副本不应跟随原件的状态改动")
+	}
+	if rem := cp.Quota["glm-5.3"]["remaining"]; rem != 10.0 {
+		t.Fatalf("Quota 应深拷贝到内层 map: %v", rem)
+	}
+	if len(cp.ExhaustedModels) != 1 {
+		t.Fatalf("模型清单应独立: %v", cp.ExhaustedModels)
+	}
+	if cp.ProxyURL != nil {
+		t.Fatal("副本不应跟随原件的代理改动")
+	}
+	if v := cp.ClaimView(); v == nil || v.ClaimedAt == nil {
+		t.Fatal("副本的领取状态不应跟随原件的替换")
+	}
+
+	// 反向也要成立：改副本不影响原件。
+	cp.Status = StatusDisabled
+	if acc.Status == StatusDisabled {
+		t.Fatal("改副本不应影响原件")
+	}
+
+	var nilAcc *Account
+	if nilAcc.Clone() != nil {
+		t.Fatal("nil 接收者应返回 nil")
+	}
+}
+
 func TestClaimStateConcurrentAccess(t *testing.T) {
 	acc := Create(ProviderZai, "race", "sk-race")
 	var wg sync.WaitGroup

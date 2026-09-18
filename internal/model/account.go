@@ -227,6 +227,109 @@ func (a *Account) ClaimView() *ClaimState {
 	return &c
 }
 
+// Clone 生成账号的独立副本：字段逐一复制、内部锁不复制（锁只属于原对象），
+// 容器字段（Quota/Plan/Plans/Usage/模型清单）递归深拷贝，Claim 经 ClaimView 取快照。
+//
+// 用途：把账号交给**长活后台任务**时必须用副本。store 的内部对象会被并发原地修改
+// （删除线路改派时的 ProxyURL/ProxyID、额度刷新时的 Status/Quota），后台任务直接
+// 持有 store 的指针就会与这些写入相撞——CI 的 -race 实测到过（入池自动领取读
+// ProxyURL vs 删除线路写 ProxyURL）。副本固定的是「派生那一刻」的值，此后与 store
+// 的后续改动完全解耦。
+//
+// ⚠️ Account 新增字段时必须同步补进本方法，否则后台任务会静默读不到该字段。
+func (a *Account) Clone() *Account {
+	if a == nil {
+		return nil
+	}
+	return &Account{
+		ID: a.ID, Name: a.Name, Provider: a.Provider, Mode: a.Mode,
+		Email: a.Email, JWTToken: a.JWTToken, APIKey: a.APIKey,
+		Enabled: a.Enabled, Status: a.Status,
+
+		Quota:           cloneQuotaMap(a.Quota),
+		ExhaustedModels: append([]string(nil), a.ExhaustedModels...),
+		DisabledModels:  append([]string(nil), a.DisabledModels...),
+		Plan:            cloneJSONMap(a.Plan),
+		Plans:           cloneJSONMaps(a.Plans),
+		Usage:           cloneJSONMap(a.Usage),
+
+		UseCount:                 a.UseCount,
+		FailCount:                a.FailCount,
+		TotalInputTokens:         a.TotalInputTokens,
+		TotalOutputTokens:        a.TotalOutputTokens,
+		TotalCacheCreationTokens: a.TotalCacheCreationTokens,
+		TotalCacheReadTokens:     a.TotalCacheReadTokens,
+		LastUsedAt:               a.LastUsedAt,
+		LastCheckedAt:            a.LastCheckedAt,
+		CoolingUntil:             a.CoolingUntil,
+		LastError:                a.LastError,
+		ProxyURL:                 a.ProxyURL,
+		ProxyID:                  a.ProxyID,
+		CreatedAt:                a.CreatedAt,
+		ArchivedAt:               a.ArchivedAt,
+
+		UserID:           a.UserID,
+		VirtualDeviceMid: a.VirtualDeviceMid,
+		Claim:            a.ClaimView(),
+
+		RateLimitStreak: a.RateLimitStreak,
+	}
+}
+
+// cloneJSONish 递归复制 JSON 形态的值。标量本身不可变、直接共享；只有容器需要
+// 复制，否则副本会与原件共享同一张 map，接不上「解耦」这个目的。
+func cloneJSONish(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, item := range x {
+			out[k] = cloneJSONish(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = cloneJSONish(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func cloneJSONMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = cloneJSONish(v)
+	}
+	return out
+}
+
+func cloneJSONMaps(list []map[string]any) []map[string]any {
+	if list == nil {
+		return nil
+	}
+	out := make([]map[string]any, len(list))
+	for i, m := range list {
+		out[i] = cloneJSONMap(m)
+	}
+	return out
+}
+
+func cloneQuotaMap(m map[string]map[string]any) map[string]map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]map[string]any, len(m))
+	for k, inner := range m {
+		out[k] = cloneJSONMap(inner)
+	}
+	return out
+}
+
 // MarshalJSON 在锁内完成整个账号的编码。Claim 的读取方除了后台快照还有序列化
 // （落库走 persistAccountLocked 的 json 编码），后者不经过 ClaimView；若不在
 // 这里上锁，后台领取 goroutine 的替换写入仍会与编码读取相撞。
