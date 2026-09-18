@@ -430,7 +430,7 @@ func (e *Engine) handleUpstreamJSON(
 		return attemptResult{final: runResult{
 			Status: http.StatusBadGateway,
 			Body: map[string]any{"error": map[string]any{
-				"message": messageFromJSON(text, buffered),
+				"message": MessageFromJSON(text, buffered),
 				"type":    "upstream_error",
 				"code":    code,
 			}},
@@ -681,8 +681,9 @@ func passthroughBodyWithType(text, fallbackType string) any {
 	}}
 }
 
-// messageFromJSON 取业务错误的 msg/message 字段，回退到正文预览。
-func messageFromJSON(text string, raw []byte) string {
+// MessageFromJSON 取业务错误的 msg/message 字段，回退到正文预览。
+// 导出给 asyncpool 复用：两条路径对同一份上游错误体必须给出同样的文案。
+func MessageFromJSON(text string, raw []byte) string {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err == nil {
 		for _, key := range []string{"msg", "message"} {

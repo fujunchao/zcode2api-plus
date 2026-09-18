@@ -526,8 +526,71 @@ func (p *Pool) attemptUpstreamOnce(
 		return false, errDelivered
 	}
 
+	// 200 未必是成功：上游会用 200 包装额度耗尽一类的业务错误（如 code=1005）。
+	// 真正的流式响应是 text/event-stream，命中 JSON 说明这不是流——此时若直接
+	// 转发 SSE，客户端拿到的是空流，账号也不会被标任何状态、下次仍会被选中。
+	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		return p.handleUpstreamJSON(ctx, ticketID, acc, modelName, resp)
+	}
+
 	// 200：转发 SSE；转发开始后中断按 chunk 计数区分两种出路
 	return p.forwardSSE(ctx, ticketID, resp, acc)
+}
+
+// handleUpstreamJSON 处理「200 + JSON」的上游响应。分类口径与同步路径
+//（gateway.handleUpstreamJSON）逐条对齐——同一账号在两条路径下必须标出相同状态，
+// 否则同一次额度耗尽在 sync 侧被记为「模型耗尽」、在 async 侧却被当成成功。
+func (p *Pool) handleUpstreamJSON(
+	ctx context.Context,
+	ticketID string,
+	acc *model.Account,
+	modelName string,
+	resp *http.Response,
+) (bool, error) {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, errNetwork{err.Error()}
+	}
+	text := string(raw)
+	switch code := gateway.UpstreamBusinessCode(text); {
+	case code == "1005":
+		// 每日额度耗尽：标该模型耗尽后换号（与 sync 同）。
+		gateway.MarkModelExhausted(p.Store, acc, modelName,
+			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
+		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		return false, errNetwork{text}
+
+	case code == "3007":
+		// 验证码失效：令牌作废，由调用方换令牌重试（不换号）。
+		p.Captcha.Invalidate()
+		return false, errCaptchaRejected
+
+	case code != "" && code != "0":
+		acc.FailCount++
+		_ = p.Store.UpdateAccount(acc)
+		p.emit(ctx, ticketID, ticketEvent{
+			Type: "error",
+			Data: map[string]any{"error": map[string]any{
+				"message": gateway.MessageFromJSON(text, raw),
+				"type":    "upstream_error",
+				"code":    code,
+			}},
+		})
+		return false, errDelivered
+	}
+
+	// 业务码缺失 / 为 0：本票据承诺的是 SSE 流，上游却回了 JSON 正文。
+	// 当作成功转发会破坏 chunk 契约（同步路径同样判为无效流），故投递错误后终止。
+	acc.FailCount++
+	_ = p.Store.UpdateAccount(acc)
+	p.emit(ctx, ticketID, ticketEvent{
+		Type: "error",
+		Data: map[string]any{"error": map[string]any{
+			"message": "上游未返回有效的 SSE 串流",
+			"type":    "invalid_upstream_response",
+		}},
+	})
+	return false, errDelivered
 }
 
 // errCaptchaRejected 上游拒绝验证码：调用方在内层循环内换令牌重试（不换号）。

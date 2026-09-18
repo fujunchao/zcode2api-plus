@@ -769,6 +769,77 @@ func TestQuotaExhaustedCodeMarksModelNotCooling(t *testing.T) {
 	}
 }
 
+// 200 包业务错误（code=1005 每日额度耗尽）：异步路径必须与同步路径一样标记该模型
+// 耗尽并换号。此前 200 会直接进 forwardSSE——客户端拿到空流，账号也不被标任何状态，
+// 下一次选号还会选中它。
+func TestBusinessCode1005In200MarksModelExhausted(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "daily-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, body: `{"code":1005,"msg":"exceed quota limit"}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-1005", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-1005")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status == model.StatusCooling {
+		t.Fatalf("额度耗尽不应记为冷却（应与 engine 一致）: %s", acc.Status)
+	}
+	if !containsStr(acc.ExhaustedModels, "glm-5.3") {
+		t.Fatalf("200+1005 应标记该模型耗尽: %v", acc.ExhaustedModels)
+	}
+
+	var sawError, sawDone bool
+	for _, ev := range drainEvents(tk) {
+		switch ev.Type {
+		case "error":
+			sawError = true
+		case "done":
+			sawDone = true
+		}
+	}
+	if !sawError {
+		t.Fatal("应立即换号并最终投递 error 事件")
+	}
+	if sawDone {
+		t.Fatal("额度耗尽不得投递 done——那等于告诉客户端流已正常结束")
+	}
+}
+
+// 200 + JSON 但没有业务码：本票据承诺的是 SSE 流，上游却回了普通 JSON 正文。
+// 这种情况不能当成功转发（那会破坏 chunk 契约），但也不能据此改写账号状态。
+func TestPlainJSON200IsNotForwardedAsStream(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "plain-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, body: `{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":2}}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-plain", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-plain")
+
+	var sawError, sawDone bool
+	for _, ev := range drainEvents(tk) {
+		switch ev.Type {
+		case "error":
+			sawError = true
+		case "done":
+			sawDone = true
+		}
+	}
+	if !sawError || sawDone {
+		t.Fatalf("无业务码的 JSON 应报错而非当成功流（error=%v done=%v）", sawError, sawDone)
+	}
+	if acc := st.ListAccounts(model.ProviderZai)[0]; acc.Status != model.StatusActive {
+		t.Fatalf("上游返回体形态异常不应改写账号状态: %s", acc.Status)
+	}
+}
+
 // 401 应标 invalid（账号失效），不得落入冷却分支。
 func TestUnauthorizedMarksInvalid(t *testing.T) {
 	p, st, _, _ := newTestPool(t)
