@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -589,6 +591,48 @@ func TestClientCancelDoesNotCoolAccount(t *testing.T) {
 	}
 	if got := f.st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusActive || got.CoolingUntil != nil {
 		t.Fatalf("取消不应改变账号状态: status=%s cooling=%v", got.Status, got.CoolingUntil)
+	}
+}
+
+// 拨号超时（错误链携带 DeadlineExceeded，但请求 ctx 未结束）是线路故障：
+// 必须冷却该账号并换号重试。修复前它被「错误值像取消」的旧判据误判成客户端
+// 取消——不冷却、不换号，客户端还会收到误导性的 502「请求已取消」。
+func TestDialTimeoutCoolsAccountAndSwitches(t *testing.T) {
+	f := newFixture(t)
+	f.respond = jsonResp(200, okUpstreamJSON)
+
+	// 模拟 net.Dialer.Timeout：Go 把 Timeout 实现为 context deadline，超时错误
+	// 链携带 context.DeadlineExceeded（本机实测；线上代理超时即此形态）。
+	// 首次拨号失败，之后放行走真实拨号。
+	var firstDial atomic.Bool
+	firstDial.Store(true)
+	f.eng.Client = &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if firstDial.Swap(false) {
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded}
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}}
+
+	bad, err := f.st.AddAccount(model.ProviderZai, "bad", "sk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.AddAccount(model.ProviderZai, "good", "sk-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 200 {
+		t.Fatalf("拨号超时应换号后成功: %d %s", status, raw)
+	}
+	got := f.st.Find(model.ProviderZai, bad.ID)
+	if got.Status != model.StatusCooling {
+		t.Fatalf("拨号超时应冷却账号，实际 status=%s err=%v", got.Status, got.LastError)
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "连接失败") {
+		t.Fatalf("冷却原因应记为连接失败: %v", got.LastError)
 	}
 }
 

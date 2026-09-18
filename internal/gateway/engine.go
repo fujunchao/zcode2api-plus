@@ -8,7 +8,6 @@ import (
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -226,7 +225,7 @@ func (e *Engine) tryAccount(
 
 		resp, err := e.clientFor(acc).Do(httpReq)
 		if err != nil {
-			if isCanceled(err) {
+			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
 				// ——换号只会白烧另一个账号的额度。
 				web.Warn(reqID, fmt.Sprintf("请求已取消（账号 %s）：%v", acc.Name, err))
@@ -290,7 +289,7 @@ func (e *Engine) handleUpstreamError(
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
-		if isCanceled(err) {
+		if isClientGone(ctx) {
 			// 同上的取消语义：读错误体被取消不代表账号有问题。
 			web.Warn(reqID, fmt.Sprintf("读上游错误体时请求已取消（账号 %s）：%v", acc.Name, err))
 			return attemptResult{final: errResult(http.StatusBadGateway, "request_canceled", "请求已取消")}
@@ -369,9 +368,9 @@ func (e *Engine) handleUpstreamError(
 			}
 			return attemptResult{retrySame: true}
 		}
-		secs := e.markRateLimited(acc, "上游限流 HTTP 429")
+		secs, streak := e.markRateLimited(acc, "上游限流 HTTP 429")
 		web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次被限流，冷却 %d s 后切换下一个",
-			acc.Name, acc.RateLimitStreak, secs))
+			acc.Name, streak, secs))
 		return attemptResult{switchAccount: true}
 	}
 
@@ -520,11 +519,21 @@ func isStrongStatus(status string) bool {
 	return false
 }
 
-// isCanceled 判断错误是否来自调用方主动取消（客户端断开连接、服务停机）。
+// isClientGone 判断本次失败是否源于客户端侧（客户端断开、客户端自己的 deadline
+// 到期、服务停机）——判据是「请求 ctx 是否已经结束」，而不是错误链里出现了哪个
+// 错误值。
+//
 // 这与账号健康无关：据此冷却账号会把一个完好的账号踢出池子整整一轮冷却时长，
 // 而一次客户端中断最多可连锁影响 MaxAccountAttempts 个账号。
-func isCanceled(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+//
+// ⚠️ 不要改回 errors.Is(err, context.DeadlineExceeded)：Go 的 net.Dialer 把
+// Timeout 实现为 context deadline，Transport 的响应头超时同样携带该错误值
+// （本机 Go 1.25 实测），于是「拨号 30s 超时」「120s 等不到响应头」这类
+// 线路/上游故障也会命中——账号不冷却、坏线路不被标记，且客户端收到误导性的
+// 502「请求已取消」（线上日志：代理连接超时 13 次全部被误判）。这些场景属于
+// 连接失败，必须落入冷却换号分支；只有 ctx 真的结束才算客户端侧取消。
+func isClientGone(ctx context.Context) bool {
+	return ctx.Err() != nil
 }
 
 // MarkModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
@@ -578,10 +587,13 @@ func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg st
 	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg)
 }
 
-// markRateLimited 瞬时限流的递进冷却，返回本次写入的冷却秒数（见 MarkRateLimited）。
-func (e *Engine) markRateLimited(acc *model.Account, errMsg string) int {
-	secs, _ := MarkRateLimited(e.Store, acc.Provider, acc.ID, errMsg, e.now())
-	return secs
+// markRateLimited 瞬时限流的递进冷却，返回（本次冷却秒数, 累加后的连续次数）。
+//
+// 连续次数必须取返回值：acc 是 Select 交出的账号副本，MarkRateLimited 更新的是
+// store 内的 live 对象，读 acc.RateLimitStreak 只会拿到旧值（线上曾把「第 1 次」
+// 打成「第 0 次」；asyncpool 侧一直用的就是返回值）。
+func (e *Engine) markRateLimited(acc *model.Account, errMsg string) (int, int) {
+	return MarkRateLimited(e.Store, acc.Provider, acc.ID, errMsg, e.now())
 }
 
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
