@@ -952,6 +952,26 @@ func (s *Store) UpdateClaimState(
 	return true, s.persistAccountLocked(acc)
 }
 
+// Update 在锁内对**当前**账号对象应用 fn（可读可写），随后落库，返回是否命中。
+//
+// 这是账号状态变更唯一安全的形态：读到的值与写出的值都由同一把锁保护，因此与
+// 其它写入方（删除线路改派、另一路额度刷新、后台领取回写）天然串行。相对的
+// 「锁外改字段 → 再 UpdateAccount 落库」会让并发读方（后台领取取快照、后台
+// 列表序列化、另一路写入方）撞上——CI 的 -race 实测抓到过（quota 后台刷新
+// 写 Plans/Quota/Status vs 领取任务读账号）。
+//
+// fn 内**不要**再调用 Store 的其它方法（本方法已持锁，会自锁）。
+func (s *Store) Update(provider, idOrName string, fn func(*model.Account)) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := s.findLocked(provider, idOrName)
+	if acc == nil {
+		return false, nil
+	}
+	fn(acc)
+	return true, s.persistAccountLocked(acc)
+}
+
 // SetEnabled 启用/禁用账号（禁用同时置 DISABLED 状态）。
 func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error) {
 	s.mu.Lock()

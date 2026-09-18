@@ -176,9 +176,19 @@ func mergeQuotaEntry(current map[string]any, incoming map[string]any) map[string
 
 // fetchQuotaOnce 拉取官方客户端使用的套餐与模型余额，写回账号状态并持久化。
 // 返回结构与 Python 版一致：成功 {"balance": payload}；失败 {"error": ...}。
+//
+// 并发约定（2026-09-18 修竞态）：本查询跑在独立 goroutine 里，与后台其它路径
+// （删除线路改派、网关标记、后台领取）并行；因此**出站请求所需字段一律从副本读**
+// （凭据 / 设备指纹 / 代理都不是本次查询的权威来源），而**所有对账号的改动都经
+// s.apply 在 store 锁内落到「当前」对象上**。此前是"锁外改字段 → UpdateAccount"，
+// 读方（后台领取取快照）会与这里的写入相撞，CI 的 -race 实测抓到过。
 func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 	checkedAt := float64(s.now().UnixNano()) / 1e9
-	acc.LastCheckedAt = &checkedAt
+	snap := s.Store.SnapshotAccount(acc.Provider, acc.ID)
+	if snap == nil {
+		// 账号已被删除：不是错误，直接不查。
+		return map[string]any{"error": "账号已不存在"}
+	}
 
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeClientVersion)
@@ -186,19 +196,35 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		strings.TrimRight(config.ZcodeBillingBase, "/")+"/billing/balance?"+query.Encode(), nil)
 	if err == nil {
-		for k, v := range authHeaders(acc) {
+		for k, v := range authHeaders(snap) {
 			req.Header.Set(k, v)
 		}
 		var resp *http.Response
-		resp, err = s.clientFor(acc).Do(req)
+		resp, err = s.clientFor(snap).Do(req)
 		if err == nil {
-			return s.handleBillingResponse(acc, resp)
+			return s.handleBillingResponse(snap, checkedAt, resp)
 		}
 	}
 	msg := "额度查询网络错误: " + err.Error()
-	acc.LastError = &msg
-	_ = s.Store.UpdateAccount(acc)
+	s.fail(snap, checkedAt, msg, "")
 	return map[string]any{"error": msg}
+}
+
+// apply 在 store 锁内修改账号并落库。Service 对账号的**任何**改动都必须走这里，
+// 否则会与并发读方相撞（见 fetchQuotaOnce 的说明）。fn 内别调 Store 的其它方法。
+func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
+	_, _ = s.Store.Update(acc.Provider, acc.ID, fn)
+}
+
+// fail 记录一次查询失败：刷新检查时间、写失败原因，status 非空时同时改状态。
+func (s *Service) fail(acc *model.Account, checkedAt float64, msg, status string) {
+	s.apply(acc, func(live *model.Account) {
+		live.LastCheckedAt = &checkedAt
+		if status != "" {
+			live.Status = status
+		}
+		live.LastError = &msg
+	})
 }
 
 // clientFor 返回账号出站客户端；配置了代理时走代理传输（20s 超时，短请求）。
@@ -218,41 +244,50 @@ func (s *Service) clientFor(acc *model.Account) HTTPClient {
 }
 
 // handleBillingResponse 处理计费端点响应：错误分类、快照解析与状态回写。
-func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response) map[string]any {
+//
+// acc 是查询开始时取的**副本**，这里只用它的身份字段（Provider/ID）；账号状态的
+// 读取与写入一律在 s.apply 的锁内对「当前」对象进行，避免与其它写入方交错
+// （例如冷却标记、失效标记、另一路刷新）。checkedAt 与本次结果一并写入。
+func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, resp *http.Response) map[string]any {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		msg := fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode)
-		acc.Status = model.StatusInvalid
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.fail(acc, checkedAt, msg, model.StatusInvalid)
 		return map[string]any{"error": msg}
 	}
 	if resp.StatusCode != http.StatusOK {
-		// 上游对重复查询返回 405：已有快照时视为幂等成功（清错误、不重建状态）
-		if resp.StatusCode == http.StatusMethodNotAllowed && len(acc.Quota) > 0 {
-			acc.LastError = nil
-			_ = s.Store.UpdateAccount(acc)
-			return map[string]any{"cached": true, "reason": "上游额度接口拒绝了重复查询（HTTP 405）"}
+		// 上游对重复查询返回 405：已有快照时视为幂等成功（清错误、不重建状态）。
+		// 「是否已有快照」必须在锁内判断，否则与并发写入方交错。
+		if resp.StatusCode == http.StatusMethodNotAllowed {
+			hasSnapshot := false
+			s.apply(acc, func(live *model.Account) {
+				if len(live.Quota) == 0 {
+					return
+				}
+				hasSnapshot = true
+				live.LastCheckedAt = &checkedAt
+				live.LastError = nil
+			})
+			if hasSnapshot {
+				return map[string]any{"cached": true, "reason": "上游额度接口拒绝了重复查询（HTTP 405）"}
+			}
 		}
 		msg := fmt.Sprintf("额度查询失败 HTTP %d", resp.StatusCode)
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.fail(acc, checkedAt, msg, "")
 		return map[string]any{"error": msg}
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		msg := "额度查询网络错误: " + err.Error()
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.fail(acc, checkedAt, msg, "")
 		return map[string]any{"error": msg}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		msg := "额度查询返回了无效 JSON"
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.fail(acc, checkedAt, msg, "")
 		return map[string]any{"error": msg}
 	}
 	if code := payload["code"]; code != nil && !isZeroNumber(code) {
@@ -261,8 +296,7 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 			msg = fmt.Sprintf("额度查询失败 code=%s", fmt.Sprint(code))
 		}
 		msg = strings.TrimSpace(msg)
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
+		s.fail(acc, checkedAt, msg, "")
 		return map[string]any{"balance": payload, "error": msg}
 	}
 
@@ -279,17 +313,11 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 			plans = append(plans, p)
 		}
 	}
-	acc.Plans = plans
-	if len(plans) > 0 {
-		acc.Plan = plans[0]
-	} else {
-		acc.Plan = map[string]any{}
-	}
 
 	// balance 仅提供当期数值；周期与所属方案需由 entitlement 对应回来
 	entitlements := map[any]map[string]any{}
 	entitlementPlans := map[any]map[string]any{}
-	for _, plan := range acc.Plans {
+	for _, plan := range plans {
 		rawEnts, _ := plan["entitlements"].([]any)
 		for _, raw := range rawEnts {
 			ent, ok := raw.(map[string]any)
@@ -303,7 +331,7 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 
 	// 同名模型在多个订阅各自独立一列（每日刷新的体验套餐与限时活动套餐不得混合）；
 	// 仅同一订阅内的重复项目才合并加总。
-	multiPlan := len(acc.Plans) > 1
+	multiPlan := len(plans) > 1
 	rawBalances, _ := data["balances"].([]any)
 	quotaMap := map[string]map[string]any{}
 	for _, raw := range rawBalances {
@@ -340,17 +368,6 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 		quotaMap[key] = mergeQuotaEntry(quotaMap[key], entry)
 	}
 
-	if len(quotaMap) == 0 {
-		acc.Quota = map[string]map[string]any{}
-		msg := "账号未返回可用套餐额度"
-		acc.LastError = &msg
-		_ = s.Store.UpdateAccount(acc)
-		return map[string]any{"balance": payload, "error": msg}
-	}
-
-	acc.Quota = quotaMap
-	acc.SyncExhaustedModels()
-
 	// 任一列 remaining 缺失时跳过该列；全部已列 remaining <= 0 才判耗尽
 	var remainings []float64
 	for _, q := range quotaMap {
@@ -369,26 +386,50 @@ func (s *Service) handleBillingResponse(acc *model.Account, resp *http.Response)
 		}
 	}
 
-	if allEmpty {
-		acc.Status = model.StatusExhausted
-		msg := "額度已用完"
-		acc.LastError = &msg
-	} else {
-		switch acc.Status {
+	// 快照写入与状态判定必须在同一把锁内：判据取自 live.Status / live.CoolingUntil，
+	// 若锁外先读再写，就会把两次读之间发生的冷却/失效标记覆盖掉。
+	emptyQuota := false
+	s.apply(acc, func(live *model.Account) {
+		live.LastCheckedAt = &checkedAt
+		live.Plans = plans
+		if len(plans) > 0 {
+			live.Plan = plans[0]
+		} else {
+			live.Plan = map[string]any{}
+		}
+		if len(quotaMap) == 0 {
+			emptyQuota = true
+			live.Quota = map[string]map[string]any{}
+			msg := "账号未返回可用套餐额度"
+			live.LastError = &msg
+			return
+		}
+		live.Quota = quotaMap
+		live.SyncExhaustedModels()
+		if allEmpty {
+			live.Status = model.StatusExhausted
+			msg := "額度已用完"
+			live.LastError = &msg
+			return
+		}
+		switch live.Status {
 		case model.StatusExhausted, model.StatusInvalid:
-			acc.Status = model.StatusActive
-			acc.CoolingUntil = nil
+			live.Status = model.StatusActive
+			live.CoolingUntil = nil
 		case model.StatusCooling:
-			if acc.CoolingUntil != nil && *acc.CoolingUntil <= float64(s.now().UnixNano())/1e9 {
-				acc.Status = model.StatusActive
-				acc.CoolingUntil = nil
+			if live.CoolingUntil != nil && *live.CoolingUntil <= float64(s.now().UnixNano())/1e9 {
+				live.Status = model.StatusActive
+				live.CoolingUntil = nil
 			}
 		}
-		if acc.Status != model.StatusCooling {
-			acc.LastError = nil
+		if live.Status != model.StatusCooling {
+			live.LastError = nil
 		}
+	})
+	if emptyQuota {
+		msg := "账号未返回可用套餐额度"
+		return map[string]any{"balance": payload, "error": msg}
 	}
-	_ = s.Store.UpdateAccount(acc)
 	return map[string]any{"balance": payload}
 }
 
