@@ -605,7 +605,10 @@ export function AccountsPage() {
                 <TableHead className="text-center">賬號</TableHead>
                 <TableHead className="w-20 text-center">狀態</TableHead>
                 <TableHead className="w-28 text-center">出口線路</TableHead>
-                <TableHead className="min-w-56 text-center">額度</TableHead>
+                {/* 額度列改為定寬（原本只有 min-w-56=224px 的下限）：內容實寬約 296px，
+                    定寬後這一列不再隨表格剩餘寬度被撐大，標題也就不會飄在內容之外。
+                    多出來的寬度由未定寬的「賬號」列吸收（該列本就截斷，伸縮無副作用）。 */}
+                <TableHead className="w-[308px] text-center">額度</TableHead>
                 <TableHead className="w-16 text-center">呼叫</TableHead>
                 <TableHead className="w-16 text-center">失敗</TableHead>
                 <TableHead className="w-24 text-center">Tokens</TableHead>
@@ -644,8 +647,12 @@ export function AccountsPage() {
                         </span>
                       ) : (
                         <span className="flex items-center gap-1.5 text-xs">
-                          <span className="size-1.5 rounded-full bg-emerald-500/70" />
-                          {proxies.find((p) => p.id === a.proxy_id)?.name || '舊版自訂代理'}
+                          <span className="size-1.5 shrink-0 rounded-full bg-emerald-500/70" />
+                          {/* 代理名由用戶自填，長度不可控；不截斷會把本列的最小寬度頂開
+                              （與額度列的 ClaimHint 同一類問題），故限寬並保留全文於 title。 */}
+                          <span className="max-w-[88px] truncate" title={proxyLabel(a, proxies)}>
+                            {proxyLabel(a, proxies)}
+                          </span>
                         </span>
                       )}
                     </TableCell>
@@ -1024,6 +1031,11 @@ function humanizeGap(seconds: number): string {
   return `約 ${Math.ceil(seconds / 86400)} 天後`
 }
 
+/* proxyLabel 出口線路列的顯示名：線路已刪除／手工填地址時的佔位文案。 */
+function proxyLabel(a: Account, proxies: ProxyProfile[]): string {
+  return proxies.find((p) => p.id === a.proxy_id)?.name || '舊版自訂代理'
+}
+
 /* claimStateText 領取狀態的一行說明（無可顯示資訊時返回空串）。 */
 function claimStateText(a: Account): string {
   const claim = a.claim
@@ -1040,7 +1052,15 @@ function claimStateText(a: Account): string {
 function ClaimHint({ account }: { account: Account }) {
   const text = claimStateText(account)
   if (!text) return null
-  return <p className="mt-1 text-[11px] leading-tight text-muted-foreground">{text}</p>
+  /* 必須限寬並截斷：這段文字來自上游錯誤體，長度完全不可控；而 TableCell 繼承了
+     whitespace-nowrap，不截斷就會把「額度」列的最小寬度頂開——列寬取全體行的最大值，
+     而那一行往往不在首屏，於是表現為「進度條後面莫名其妙一大片空白、表頭比例失衡、
+     右側欄位被裁」。寬度取額度列的內容寬（308 − 12 內距）。 */
+  return (
+    <p className="mt-1 max-w-[296px] truncate text-[11px] leading-tight text-muted-foreground" title={text}>
+      {text}
+    </p>
+  )
 }
 
 function TokensCell({ account }: { account: Account }) {

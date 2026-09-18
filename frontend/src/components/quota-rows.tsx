@@ -94,7 +94,9 @@ export function QuotaRows({ account }: { account: Account }) {
             <span className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-muted">
               <span className="block h-full rounded-full" style={{ width: `${pct}%`, background: color }} />
             </span>
-            <span className="ml-auto shrink-0 tabular-nums text-muted-foreground">
+            {/* 緊跟進度條，不用 ml-auto 推到格子右緣：格子只要比內容寬（例如整表被撐開
+                或視窗較寬），ml-auto 就會在條與數字之間留出一大片空白，看著像內容沒跟上。 */}
+            <span className="shrink-0 tabular-nums text-muted-foreground">
               {period} {fmtCompact(rem)} / {fmtCompact(tot)}
             </span>
           </div>
