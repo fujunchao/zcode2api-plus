@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -225,6 +226,12 @@ func (e *Engine) tryAccount(
 
 		resp, err := e.clientFor(acc).Do(httpReq)
 		if err != nil {
+			if isCanceled(err) {
+				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
+				// ——换号只会白烧另一个账号的额度。
+				web.Warn(reqID, fmt.Sprintf("请求已取消（账号 %s）：%v", acc.Name, err))
+				return attemptResult{final: errResult(http.StatusBadGateway, "request_canceled", "请求已取消")}
+			}
 			e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
@@ -283,6 +290,11 @@ func (e *Engine) handleUpstreamError(
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
+		if isCanceled(err) {
+			// 同上的取消语义：读错误体被取消不代表账号有问题。
+			web.Warn(reqID, fmt.Sprintf("读上游错误体时请求已取消（账号 %s）：%v", acc.Name, err))
+			return attemptResult{final: errResult(http.StatusBadGateway, "request_canceled", "请求已取消")}
+		}
 		// 读不出错误体：按连接失败处理
 		e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
 		return attemptResult{switchAccount: true}
@@ -488,10 +500,36 @@ func MarkAccount(st *store.Store, acc *model.Account, status, errMsg string, now
 	_ = st.UpdateAccount(acc)
 }
 
+// isStrongStatus 判断账号状态是否强于「额度信号」能改写的范围。
+//
+// invalid 需要人工介入、cooling 处于冷却窗口、disabled 是管理员主动停用：三者都与
+// 「当前额度用没用完」无关。配额信号（402 / 200+1005 / 429 上限码族）不得把它们
+// 刷回 active —— 否则并发下刚被判失效的账号会被另一条请求放回轮询。
+func isStrongStatus(status string) bool {
+	switch status {
+	case model.StatusInvalid, model.StatusCooling, model.StatusDisabled:
+		return true
+	}
+	return false
+}
+
+// isCanceled 判断错误是否来自调用方主动取消（客户端断开连接、服务停机）。
+// 这与账号健康无关：据此冷却账号会把一个完好的账号踢出池子整整一轮冷却时长，
+// 而一次客户端中断最多可连锁影响 MaxAccountAttempts 个账号。
+func isCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // MarkModelExhausted 只停用已耗尽的请求模型；所有已知模型皆耗尽时才停用整号。
+// 账号已处于强状态时只更新模型耗尽清单，不动账号状态与冷却窗口。
 func MarkModelExhausted(st *store.Store, acc *model.Account, modelName any, errMsg string) {
-	if !acc.MarkModelExhausted(modelName) {
-		acc.Status = model.StatusExhausted
+	// 先记额度事实（与账号状态无关，任何情况下都要落库）。
+	marked := acc.MarkModelExhausted(modelName)
+	strong := isStrongStatus(acc.Status)
+	if !marked {
+		if !strong {
+			acc.Status = model.StatusExhausted
+		}
 		acc.LastError = &errMsg
 		_ = st.UpdateAccount(acc)
 		return
@@ -509,12 +547,14 @@ func MarkModelExhausted(st *store.Store, acc *model.Account, modelName any, errM
 			break
 		}
 	}
-	if anyState && allExhausted {
-		acc.Status = model.StatusExhausted
-	} else {
-		acc.Status = model.StatusActive
+	if !strong {
+		if anyState && allExhausted {
+			acc.Status = model.StatusExhausted
+		} else {
+			acc.Status = model.StatusActive
+		}
+		acc.CoolingUntil = nil
 	}
-	acc.CoolingUntil = nil
 	acc.LastError = &errMsg
 	_ = st.UpdateAccount(acc)
 }

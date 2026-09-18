@@ -489,6 +489,103 @@ func TestBusinessCode1005ExhaustsDailyQuota(t *testing.T) {
 	}
 }
 
+// 额度信号不得把更强的账号状态刷回 active：invalid 需人工介入、cooling 在冷却窗口内、
+// disabled 是管理员主动停用——三者都与「额度用没用完」无关。并发下若不设防，一条 402
+// 就能把刚被判失效的账号放回轮询。
+func TestQuotaSignalKeepsStrongStatus(t *testing.T) {
+	for _, strong := range []string{model.StatusInvalid, model.StatusCooling, model.StatusDisabled} {
+		t.Run(strong, func(t *testing.T) {
+			st := openStore(t)
+			acc, err := st.AddAccount(model.ProviderZai, "a", "sk-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			until := float64(time.Now().Add(time.Hour).UnixNano()) / 1e9
+			acc.Status = strong
+			acc.CoolingUntil = &until
+			if err := st.UpdateAccount(acc); err != nil {
+				t.Fatal(err)
+			}
+
+			// 账号没有额度快照 → anyState=false，正是原先会落到 else 分支
+			// 把状态写成 active 的那条路径。
+			MarkModelExhausted(st, acc, "glm-5.3", "GLM-5.3 額度已用完")
+
+			got := st.Find(model.ProviderZai, acc.ID)
+			if got.Status != strong {
+				t.Fatalf("状态被额度信号改写: %q → %q", strong, got.Status)
+			}
+			if got.CoolingUntil == nil {
+				t.Fatal("冷却截止时间不应被清空")
+			}
+			// 额度事实仍要照常记录：模型耗尽清单与账号状态是两件事。
+			if len(got.ExhaustedModels) != 1 {
+				t.Fatalf("模型耗尽清单应照常更新: %v", got.ExhaustedModels)
+			}
+		})
+	}
+}
+
+// 客户端断连（context 取消）与账号健康无关：既不该冷却账号，也不该换号白烧下一个。
+func TestClientCancelDoesNotCoolAccount(t *testing.T) {
+	f := newFixture(t)
+	called := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	// 上游收到请求后挂住，直到测试放行——保证取消发生在 Do 进行期间。
+	f.respond = func(int, *http.Request) (int, http.Header, string) {
+		once.Do(func() { close(called) })
+		<-release
+		return http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+	}
+	// Cleanup 逆序执行：本行晚于 newFixture 内的 up.Close 注册，因此先跑——
+	// 先解开上游阻塞，再关服务，避免 Close 等待未完成的请求。
+	t.Cleanup(func() { close(release) })
+
+	acc, err := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	data, err := json.Marshal(msgBody())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.srv.URL+"/v1/messages", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", "sk-test")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := f.srv.Client().Do(req)
+		if err != nil {
+			return // 取消后客户端拿到的正是这个错误，也就是被测场景
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	<-called // 上游已收到请求 → 网关已经进入 Do
+	cancel() // 模拟客户端断开连接
+	<-done
+
+	// 给网关留出走完取消分支的时间；期间只要出现冷却即判定回归。
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := f.st.Find(model.ProviderZai, acc.ID); got.Status == model.StatusCooling {
+			t.Fatalf("客户端断连把账号冷却了: %v", got.LastError)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusActive || got.CoolingUntil != nil {
+		t.Fatalf("取消不应改变账号状态: status=%s cooling=%v", got.Status, got.CoolingUntil)
+	}
+}
+
 func TestJWTInjectsSystemAndCaptcha(t *testing.T) {
 	f := newFixture(t)
 	oldBrowser := config.CaptchaBrowserEnabled
