@@ -112,15 +112,38 @@ export interface SettingsResponse {
   claim_preview_cooldown: number
 }
 
+/* z.ai 側的單個探測目標（主站 / 備援站） */
+export interface UpstreamTarget {
+  url: string
+  host: string
+  ok: boolean
+  status?: number
+  ms?: number
+  blocked?: boolean
+  error?: string
+}
+
+/* z.ai 側可達性：探測上游真實入口，回答「這條線路能不能真的用來跑 z.ai」。
+   與 ip/asn 那組欄位互相獨立——出口查詢站通了不代表 z.ai 認這個出口。 */
+export interface UpstreamProbe {
+  ok: boolean
+  blocked: boolean
+  ms?: number
+  error?: string
+  targets?: UpstreamTarget[]
+}
+
 export interface EgressInfo {
-  ip: string
-  asn: string
-  operator: string
-  country: string
-  country_code: string
+  ip?: string
+  asn?: string
+  operator?: string
+  country?: string
+  country_code?: string
+  /* 後端給出的最終判據：線路是否可用（含 z.ai 可達）。*/
   ok?: boolean
   source?: string
   latency_ms?: number
+  upstream?: UpstreamProbe
 }
 
 /* 一鍵測試全部線路的單條結果：出口資訊 + 該線路的標識與成敗。 */

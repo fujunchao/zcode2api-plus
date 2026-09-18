@@ -8,6 +8,7 @@ package adminapi
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"zcode2api/internal/model"
@@ -74,18 +75,31 @@ func TestAddAccountsAutoAssignsProxy(t *testing.T) {
 	})
 }
 
-// probeStub 启动一个既当出口服务、又当代理的本地服务器（测试结束时自动还原配置）。
+// probeStub 启动一个既当出口服务、又当代理、还当 z.ai 侧入口的本地服务器
+// （测试结束时自动还原包级配置）。
+//
+// 两处覆写缺一不可：漏掉 upstreamProbeTargets 就会让 z.ai 可达性探测真的去打
+// z.ai，测试便不再是离线的。判据用 Host 区分两类请求——经 HTTP 代理发出的绝对
+// URI 请求会带上原目标域名，出口查询的目标恒为 probe.invalid。
 func probeStub(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(handler)
-	old := ipProbeProviders
+	oldProviders := ipProbeProviders
+	oldTargets := upstreamProbeTargets
 	// 端点域名不会被真正解析：请求经由 profile 的代理地址发出。
 	ipProbeProviders = []struct{ name, endpoint string }{{"local", "http://probe.invalid/"}}
+	upstreamProbeTargets = []string{srv.URL + "/"}
 	t.Cleanup(func() {
-		ipProbeProviders = old
+		ipProbeProviders = oldProviders
+		upstreamProbeTargets = oldTargets
 		srv.Close()
 	})
 	return srv
+}
+
+// isEgressQuery 判断是不是发往出口查询服务的请求（其余即 z.ai 侧入口探测）。
+func isEgressQuery(r *http.Request) bool {
+	return strings.Contains(r.Host, "probe.invalid")
 }
 
 func TestTestAllProxies(t *testing.T) {
@@ -160,5 +174,128 @@ func TestTestAllProxiesReportsFailure(t *testing.T) {
 	summary, _ := body["summary"].(map[string]any)
 	if summary["ok"] != float64(0) || summary["fail"] != float64(1) {
 		t.Fatalf("汇总应记 1 条失败: %v", summary)
+	}
+}
+
+// firstResult 取批量检测结果里的唯一一条。
+func firstResult(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	results, _ := body["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("应有 1 条结果: %v", body)
+	}
+	first, _ := results[0].(map[string]any)
+	if first == nil {
+		t.Fatalf("结果条目格式不符: %v", results)
+	}
+	return first
+}
+
+// 线路能连上 z.ai 时，结果应带 upstream 明细并把线路判为可用。
+func TestProxyProbeReportsUpstreamReachable(t *testing.T) {
+	mux, st, _ := setup(t)
+	srv := probeStub(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ip":"1.2.3.4","asn":"AS1234","asn_organization":"Test ISP"}`))
+	})
+	line, err := st.AddProxyProfile("line-ok", srv.URL, true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+
+	code, body := do(t, mux, st, http.MethodPost, "/admin/api/proxies/test-all", nil)
+	if code != http.StatusOK {
+		t.Fatalf("应 200: %d %v", code, body)
+	}
+	first := firstResult(t, body)
+	if first["id"] != line.ID {
+		t.Fatalf("线路 ID 不符: %v", first)
+	}
+	upstream, _ := first["upstream"].(map[string]any)
+	if upstream == nil {
+		t.Fatalf("结果应带 upstream 明细: %v", first)
+	}
+	if upstream["ok"] != true || upstream["blocked"] == true {
+		t.Fatalf("z.ai 侧应可达: %v", upstream)
+	}
+	if first["ok"] != true {
+		t.Fatalf("线路应判为可用: %v", first)
+	}
+}
+
+// z.ai 边缘返回拦截页时，即便出口查询一切正常，线路也必须判为不可用——
+// 这正是「拿 ip.sb 当基准」测不出来的那一类。
+func TestProxyProbeDetectsUpstreamBlock(t *testing.T) {
+	mux, st, _ := setup(t)
+	srv := probeStub(t, func(w http.ResponseWriter, r *http.Request) {
+		if isEgressQuery(r) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ip":"1.2.3.4","asn":"AS1234"}`))
+			return
+		}
+		w.Header().Set("Cf-Mitigated", "challenge")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<html><title>Just a moment...</title></html>`))
+	})
+	if _, err := st.AddProxyProfile("line-blocked", srv.URL, true); err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+
+	code, body := do(t, mux, st, http.MethodPost, "/admin/api/proxies/test-all", nil)
+	if code != http.StatusOK {
+		t.Fatalf("应 200: %d %v", code, body)
+	}
+	first := firstResult(t, body)
+	upstream, _ := first["upstream"].(map[string]any)
+	if upstream["blocked"] != true || upstream["ok"] != false {
+		t.Fatalf("应识别为被边缘拦截: %v", upstream)
+	}
+	if first["ip"] != "1.2.3.4" {
+		t.Fatalf("出口信息仍应照常返回: %v", first)
+	}
+	if first["ok"] != false {
+		t.Fatalf("连不上 z.ai 的线路不应判为可用: %v", first)
+	}
+	summary, _ := body["summary"].(map[string]any)
+	if summary["fail"] != float64(1) {
+		t.Fatalf("汇总应记为不可用: %v", summary)
+	}
+}
+
+// z.ai 侧完全拿不到响应（连接被掐）时，两路结果仍应各自独立汇报。
+func TestProxyProbeReportsUpstreamUnreachable(t *testing.T) {
+	mux, st, _ := setup(t)
+	srv := probeStub(t, func(w http.ResponseWriter, r *http.Request) {
+		if isEgressQuery(r) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ip":"1.2.3.4","asn":"AS1234"}`))
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	})
+	if _, err := st.AddProxyProfile("line-half", srv.URL, true); err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+
+	code, body := do(t, mux, st, http.MethodPost, "/admin/api/proxies/test-all", nil)
+	if code != http.StatusOK {
+		t.Fatalf("应 200: %d %v", code, body)
+	}
+	first := firstResult(t, body)
+	upstream, _ := first["upstream"].(map[string]any)
+	if upstream["ok"] != false || upstream["blocked"] != false {
+		t.Fatalf("应报「不通」而不是「被拦截」: %v", upstream)
+	}
+	if msg, _ := upstream["error"].(string); msg == "" {
+		t.Fatalf("不通时应带 error: %v", upstream)
+	}
+	if first["ip"] != "1.2.3.4" {
+		t.Fatalf("出口查询成功仍应保留: %v", first)
+	}
+	if first["ok"] != false {
+		t.Fatalf("z.ai 不通则线路不可用: %v", first)
 	}
 }

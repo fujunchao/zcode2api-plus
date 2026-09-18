@@ -18,7 +18,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { api, errMsg } from '@/lib/api'
 import { proxyScheme } from '@/lib/format'
-import type { EgressInfo, ProxyProfile, TestAllResponse } from '@/lib/types'
+import type { EgressInfo, ProxyProfile, TestAllResponse, UpstreamProbe } from '@/lib/types'
 
 interface ProxiesResponse {
   profiles: ProxyProfile[]
@@ -31,9 +31,9 @@ type CurrentResult =
   | { state: 'ok'; main: string; sub: string }
   | { state: 'error'; text: string }
 
-/* 單線路測試結果 */
+/* 單線路測試結果；warn 用於「線路通、但 z.ai 不通」這種半可用狀態 */
 interface RowResult {
-  state: 'testing' | 'ok' | 'error'
+  state: 'testing' | 'ok' | 'warn' | 'error'
   text: string
 }
 
@@ -43,6 +43,22 @@ function maskUrl(url: string): string {
 
 function formatProbe(d: EgressInfo): string {
   return [d.ip, d.asn, d.operator, d.latency_ms != null ? d.latency_ms + ' ms' : ''].filter(Boolean).join(' · ')
+}
+
+/* z.ai 側可達性文案：可達 / 被邊緣攔截 / 不通 三態。出口查詢通不代表 z.ai 認這個出口。 */
+function formatUpstream(u?: UpstreamProbe): string {
+  if (!u) return ''
+  if (u.ok) return 'z.ai 可達' + (u.ms != null ? ` ${u.ms} ms` : '')
+  if (u.blocked) return 'z.ai 被邊緣攔截'
+  return 'z.ai 不可達'
+}
+
+/* 探測結果 → 行狀態。只有連出口資訊都沒拿到才算 error；其餘「線路通但 z.ai 不通」
+   降級為 warn——這正是 IP 查詢站測不出來的那一類。 */
+function describeProbe(d: EgressInfo): RowResult {
+  const text = [formatProbe(d), formatUpstream(d.upstream)].filter(Boolean).join(' · ')
+  if (d.ok !== false) return { state: 'ok', text }
+  return { state: d.ip ? 'warn' : 'error', text }
 }
 
 function countryLabel(d: EgressInfo): string {
@@ -128,8 +144,10 @@ export function ProxiesPage() {
     setRowResults((m) => ({ ...m, [p.id]: { state: 'testing', text: '正在測試線路…' } }))
     try {
       const d = await api<EgressInfo>('POST', '/proxies/' + encodeURIComponent(p.id) + '/test')
-      setRowResults((m) => ({ ...m, [p.id]: { state: 'ok', text: formatProbe(d) } }))
-      toast.success('代理線路正常')
+      const result = describeProbe(d)
+      setRowResults((m) => ({ ...m, [p.id]: result }))
+      if (result.state === 'warn') toast.warning('線路可用，但連不上 z.ai')
+      else toast.success('代理線路正常')
     } catch (e) {
       setRowResults((m) => ({ ...m, [p.id]: { state: 'error', text: errMsg(e) } }))
       toast.error('代理測試失敗：' + errMsg(e))
@@ -143,12 +161,18 @@ export function ProxiesPage() {
       const d = await api<EgressInfo>('POST', '/proxies/test-current')
       setCurrent({
         state: 'ok',
-        main: [d.ip, d.asn, d.operator].filter(Boolean).join(' · '),
-        sub: [countryLabel(d), d.latency_ms != null ? d.latency_ms + ' ms' : '', d.source ? '來源 ' + d.source : '']
+        main: [d.ip, d.asn, d.operator].filter(Boolean).join(' · ') || '已取得回應',
+        sub: [
+          countryLabel(d),
+          d.latency_ms != null ? d.latency_ms + ' ms' : '',
+          d.source ? '來源 ' + d.source : '',
+          formatUpstream(d.upstream),
+        ]
           .filter(Boolean)
           .join(' · '),
       })
-      toast.success('目前線路查詢完成')
+      if (d.ok === false) toast.warning('目前線路連不上 z.ai')
+      else toast.success('目前線路查詢完成')
     } catch (e) {
       setCurrent({ state: 'error', text: errMsg(e) })
       toast.error('目前線路測試失敗：' + errMsg(e))
@@ -158,7 +182,7 @@ export function ProxiesPage() {
   }
 
   /* 一鍵測試全部「啟用」線路：後端併發探測（8 路），返回後逐行回填結果。
-     單條最壞 36s（三個出口服務依次 12s 逾時），故測試期間按鈕禁用。 */
+     後端同時併發查出口資訊與 z.ai 側可達性，單條最壞仍是 36s，故測試期間按鈕禁用。 */
   async function testAll() {
     const targets = profiles.filter((p) => p.enabled)
     if (!targets.length) {
@@ -176,16 +200,16 @@ export function ProxiesPage() {
       setRowResults((m) => {
         const next = { ...m }
         for (const r of d.results) {
-          next[r.id] = r.ok
-            ? { state: 'ok', text: formatProbe(r) }
-            : { state: 'error', text: r.error || '測試失敗' }
+          const result = describeProbe(r)
+          // 完全沒有出口資訊時才回退到後端給的錯誤文案
+          next[r.id] = result.state === 'error' && !result.text ? { state: 'error', text: r.error || '測試失敗' } : result
         }
         return next
       })
       if (d.summary.fail > 0) {
-        toast.warning(`線路測試完成：成功 ${d.summary.ok}／失敗 ${d.summary.fail}`)
+        toast.warning(`線路測試完成：可用 ${d.summary.ok}／有問題 ${d.summary.fail}`)
       } else {
-        toast.success(`線路測試完成：${d.summary.total} 條全部正常`)
+        toast.success(`線路測試完成：${d.summary.total} 條全部可用`)
       }
     } catch (e) {
       toast.error('批量測試失敗：' + errMsg(e))
@@ -255,17 +279,22 @@ export function ProxiesPage() {
             {current.state === 'ok'
               ? current.sub
               : current.state === 'testing'
-                ? '正在連線至 IP 查詢服務'
+                ? '正在查詢出口並探測 z.ai'
                 : current.state === 'error'
                   ? current.text
-                  : '透過 ip.sb 等服務查詢公網 IP 與 ASN'}
+                  : '先查公網 IP 與 ASN，再探測 z.ai 側入口是否可達'}
           </small>
         </div>
       </div>
 
       {/* 線路清單＋連線格式說明 */}
       <div className="grid gap-4 lg:grid-cols-5">
-        <PanelCard title="代理線路" subtitle="建立後可在帳號設定中選用" badge={`${profiles.length} 條線路`} className="lg:col-span-3">
+        <PanelCard
+          title="代理線路"
+          subtitle="測試會同時查出口 IP 與 z.ai 側可達性"
+          badge={`${profiles.length} 條線路`}
+          className="lg:col-span-3"
+        >
           {profiles.length ? (
             <div className="flex flex-col divide-y">
               {profiles.map((p) => {
@@ -284,9 +313,11 @@ export function ProxiesPage() {
                             'mt-0.5 block truncate text-xs not-italic ' +
                             (result.state === 'ok'
                               ? 'text-emerald-600'
-                              : result.state === 'error'
-                                ? 'text-destructive'
-                                : 'text-muted-foreground')
+                              : result.state === 'warn'
+                                ? 'text-amber-600'
+                                : result.state === 'error'
+                                  ? 'text-destructive'
+                                  : 'text-muted-foreground')
                           }
                         >
                           {result.text}
