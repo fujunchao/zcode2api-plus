@@ -133,25 +133,19 @@ export interface UpstreamProbe {
   targets?: UpstreamTarget[]
 }
 
-export interface EgressInfo {
-  ip?: string
-  asn?: string
-  operator?: string
-  country?: string
-  country_code?: string
-  /* 後端給出的最終判據：線路是否可用（含 z.ai 可達）。*/
+/* 探測結果：只回答一個問題——經這條線路能不能連上 z.ai。
+   出口 IP / ASN 不再查詢，它們證明不了 z.ai 認不認這個出口。 */
+export interface ProbeResult {
   ok?: boolean
-  source?: string
-  latency_ms?: number
+  error?: string
   upstream?: UpstreamProbe
 }
 
-/* 一鍵測試全部線路的單條結果：出口資訊 + 該線路的標識與成敗。 */
-export interface ProxyTestResult extends EgressInfo {
+/* 一鍵測試全部線路的單條結果：探測結論 + 該線路的標識。 */
+export interface ProxyTestResult extends ProbeResult {
   id: string
   name: string
   ok: boolean
-  error?: string
 }
 
 export interface TestAllResponse {

@@ -18,20 +18,20 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { api, errMsg } from '@/lib/api'
 import { proxyScheme } from '@/lib/format'
-import type { EgressInfo, ProxyProfile, TestAllResponse, UpstreamProbe } from '@/lib/types'
+import type { ProbeResult, ProxyProfile, TestAllResponse, UpstreamProbe } from '@/lib/types'
 
 interface ProxiesResponse {
   profiles: ProxyProfile[]
 }
 
-/* 目前出口測試狀態 */
+/* 伺服器直連探測狀態 */
 type CurrentResult =
   | { state: 'idle' }
   | { state: 'testing' }
   | { state: 'ok'; main: string; sub: string }
   | { state: 'error'; text: string }
 
-/* 單線路測試結果；warn 用於「線路通、但 z.ai 不通」這種半可用狀態 */
+/* 單線路探測結果；warn 用於「拿到了回應、但那是邊緣攔截頁」 */
 interface RowResult {
   state: 'testing' | 'ok' | 'warn' | 'error'
   text: string
@@ -41,11 +41,7 @@ function maskUrl(url: string): string {
   return String(url || '').replace(/\/\/([^@/]+)@/, '//***@')
 }
 
-function formatProbe(d: EgressInfo): string {
-  return [d.ip, d.asn, d.operator, d.latency_ms != null ? d.latency_ms + ' ms' : ''].filter(Boolean).join(' · ')
-}
-
-/* z.ai 側可達性文案：可達 / 被邊緣攔截 / 不通 三態。出口查詢通不代表 z.ai 認這個出口。 */
+/* z.ai 側可達性的主文案：可達 / 被邊緣攔截 / 不可達 三態。 */
 function formatUpstream(u?: UpstreamProbe): string {
   if (!u) return ''
   if (u.ok) return 'z.ai 可達' + (u.ms != null ? ` ${u.ms} ms` : '')
@@ -53,16 +49,19 @@ function formatUpstream(u?: UpstreamProbe): string {
   return 'z.ai 不可達'
 }
 
-/* 探測結果 → 行狀態。只有連出口資訊都沒拿到才算 error；其餘「線路通但 z.ai 不通」
-   降級為 warn——這正是 IP 查詢站測不出來的那一類。 */
-function describeProbe(d: EgressInfo): RowResult {
-  const text = [formatProbe(d), formatUpstream(d.upstream)].filter(Boolean).join(' · ')
-  if (d.ok !== false) return { state: 'ok', text }
-  return { state: d.ip ? 'warn' : 'error', text }
+/* 逐入口明細压成一行：zcode.z.ai 200 · api.z.ai 401 */
+function upstreamDetail(u?: UpstreamProbe): string {
+  return (u?.targets || [])
+    .map((t) => (t.ok ? `${t.host} ${t.status ?? '-'}${t.blocked ? '（攔截頁）' : ''}` : `${t.host} 無回應`))
+    .join(' · ')
 }
 
-function countryLabel(d: EgressInfo): string {
-  return [d.country_code, d.country].filter(Boolean).join(' ')
+/* 探測結果 → 行狀態。唯一結論是「能不能連上 z.ai」：拿到非攔截回應算可用，
+   拿到攔截頁單獨標示（琥珀色），其餘算不通。 */
+function describeProbe(d: ProbeResult): RowResult {
+  const text = formatUpstream(d.upstream) || d.error || ''
+  if (d.ok !== false) return { state: 'ok', text }
+  return { state: d.upstream?.blocked ? 'warn' : 'error', text }
 }
 
 export function ProxiesPage() {
@@ -141,48 +140,48 @@ export function ProxiesPage() {
   }
 
   async function testProxy(p: ProxyProfile) {
-    setRowResults((m) => ({ ...m, [p.id]: { state: 'testing', text: '正在測試線路…' } }))
+    setRowResults((m) => ({ ...m, [p.id]: { state: 'testing', text: '正在探測 z.ai…' } }))
     try {
-      const d = await api<EgressInfo>('POST', '/proxies/' + encodeURIComponent(p.id) + '/test')
+      const d = await api<ProbeResult>('POST', '/proxies/' + encodeURIComponent(p.id) + '/test')
       const result = describeProbe(d)
       setRowResults((m) => ({ ...m, [p.id]: result }))
-      if (result.state === 'warn') toast.warning('線路可用，但連不上 z.ai')
-      else toast.success('代理線路正常')
+      if (result.state === 'ok') toast.success('線路可用：z.ai 可達')
+      else if (result.state === 'warn') toast.warning('線路被 z.ai 邊緣攔截')
+      else toast.error('線路無法連上 z.ai')
     } catch (e) {
       setRowResults((m) => ({ ...m, [p.id]: { state: 'error', text: errMsg(e) } }))
       toast.error('代理測試失敗：' + errMsg(e))
     }
   }
 
+  /* 伺服器自身（不走代理）到 z.ai 的可達性——外網斷了或 z.ai 掛了，所有線路
+     看起來都會「不通」，先排除這一層。 */
   async function testCurrentLine() {
     setTestingCurrent(true)
     setCurrent({ state: 'testing' })
     try {
-      const d = await api<EgressInfo>('POST', '/proxies/test-current')
+      const d = await api<ProbeResult>('POST', '/proxies/test-current')
+      if (d.ok === false) {
+        setCurrent({ state: 'error', text: formatUpstream(d.upstream) || d.error || '無法連上 z.ai' })
+        toast.warning('伺服器直連無法連上 z.ai')
+        return
+      }
       setCurrent({
         state: 'ok',
-        main: [d.ip, d.asn, d.operator].filter(Boolean).join(' · ') || '已取得回應',
-        sub: [
-          countryLabel(d),
-          d.latency_ms != null ? d.latency_ms + ' ms' : '',
-          d.source ? '來源 ' + d.source : '',
-          formatUpstream(d.upstream),
-        ]
-          .filter(Boolean)
-          .join(' · '),
+        main: formatUpstream(d.upstream) || '探測完成',
+        sub: upstreamDetail(d.upstream),
       })
-      if (d.ok === false) toast.warning('目前線路連不上 z.ai')
-      else toast.success('目前線路查詢完成')
+      toast.success('伺服器直連正常')
     } catch (e) {
       setCurrent({ state: 'error', text: errMsg(e) })
-      toast.error('目前線路測試失敗：' + errMsg(e))
+      toast.error('直連測試失敗：' + errMsg(e))
     } finally {
       setTestingCurrent(false)
     }
   }
 
   /* 一鍵測試全部「啟用」線路：後端併發探測（8 路），返回後逐行回填結果。
-     後端同時併發查出口資訊與 z.ai 側可達性，單條最壞仍是 36s，故測試期間按鈕禁用。 */
+     單條最壞 12s（兩個 z.ai 入口依次 6s 逾時），故測試期間按鈕禁用。 */
   async function testAll() {
     const targets = profiles.filter((p) => p.enabled)
     if (!targets.length) {
@@ -192,7 +191,7 @@ export function ProxiesPage() {
     setTestingAll(true)
     setRowResults((m) => {
       const next = { ...m }
-      for (const p of targets) next[p.id] = { state: 'testing', text: '正在測試線路…' }
+      for (const p of targets) next[p.id] = { state: 'testing', text: '正在探測 z.ai…' }
       return next
     })
     try {
@@ -228,7 +227,7 @@ export function ProxiesPage() {
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => void testCurrentLine()} disabled={testingCurrent}>
-            <Activity /> 測試目前線路
+            <Activity /> 測試直連
           </Button>
           <Button
             variant="outline"
@@ -265,24 +264,24 @@ export function ProxiesPage() {
           }
         />
         <div className="min-w-0 flex-1 leading-tight">
-          <span className="block text-xs text-muted-foreground">伺服器目前出口</span>
+          <span className="block text-xs text-muted-foreground">伺服器直連 z.ai</span>
           <strong className="block truncate text-sm">
             {current.state === 'ok'
               ? current.main
               : current.state === 'testing'
-                ? '正在查詢出口…'
+                ? '正在探測 z.ai…'
                 : current.state === 'error'
-                  ? '出口查詢失敗'
+                  ? '無法連上 z.ai'
                   : '尚未測試'}
           </strong>
           <small className="block truncate text-xs text-muted-foreground">
             {current.state === 'ok'
               ? current.sub
               : current.state === 'testing'
-                ? '正在查詢出口並探測 z.ai'
+                ? '正在連線至 z.ai 側入口'
                 : current.state === 'error'
                   ? current.text
-                  : '先查公網 IP 與 ASN，再探測 z.ai 側入口是否可達'}
+                  : '經伺服器自身網路（不使用代理）探測 z.ai 側入口'}
           </small>
         </div>
       </div>
@@ -291,7 +290,7 @@ export function ProxiesPage() {
       <div className="grid gap-4 lg:grid-cols-5">
         <PanelCard
           title="代理線路"
-          subtitle="測試會同時查出口 IP 與 z.ai 側可達性"
+          subtitle="測試只驗證一件事：這條線路能不能連上 z.ai"
           badge={`${profiles.length} 條線路`}
           className="lg:col-span-3"
         >
