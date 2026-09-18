@@ -75,13 +75,20 @@ CI 推 `v*` tag 時會構建 `linux/amd64` + `linux/arm64` 多架構鏡像並發
 數據持久化在命名卷 `zcode-data`，內含 `accounts.db`、`device_mid.txt` 與補丁 Chromium 緩存；
 **首次求解驗證碼時**自動下載約 200MB 補丁 Chromium（僅一次，走卷持久化）。
 
-兩個容易踩的坑：
+收到 `SIGTERM`（`docker stop` / `docker compose down`）時會先停止接受新連接、等待在途請求
+收尾（上限 10 秒）再退出，存儲與瀏覽器池都會正常關閉，不會被拖到容器超時強殺。
+
+三個容易踩的坑：
 
 - 應用**不讀 `.env` 文件**（只認進程環境變量）。同目錄的 `.env` 之所以生效，是因為 compose
   讀它來做 `${VAR}` 插值——所以變量必須在 `docker-compose.yml` 的 `environment:` 裡顯式引用，
   寫進 `.env` 卻沒被引用的不會進容器；把 `.env` 放進 `/data` 更是完全無效。
 - 想沿用宿主機既有的 `./data` 目錄時，bind mount 前先 `sudo chown -R 10001:10001 ./data`
   （鏡像以 uid 10001 非 root 運行），或改用命名卷。
+- **前面掛了反向代理（Nginx / Caddy 等）時，把端口改成只綁回環**
+  （`- "127.0.0.1:${ZCODE_PORT:-3000}:${ZCODE_PORT:-3000}"`）。反代轉發後 `RemoteAddr`
+  恆為代理地址，後台登入的「單 IP 10 次失敗」限速會退化成**全局限速**——任何人的十次
+  失敗都能鎖死整個後台。只綁回環可確保外部只能經反代進來，同時讓這個桶不再對外部流量生效。
 
 ### 方式二：裸二進制 + systemd
 

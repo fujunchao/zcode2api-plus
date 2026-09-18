@@ -8,11 +8,14 @@
 #   2) docker compose up -d
 #   3) docker compose logs zcode2api | grep -E '初始后台密码|网关 API Key'
 #
-# ⚠️ 两个容易踩的坑：
+# ⚠️ 三个容易踩的坑：
 #   a) 应用本身**不读 .env 文件**（只认进程环境变量，见 internal/config）。
 #      同目录的 .env 之所以生效，是因为 compose 读它来做 ${VAR} 插值——因此下面每个
 #      变量都必须在 environment: 里显式引用；写进 .env 却没被引用的不会进容器。
 #   b) 别把 .env 放进数据卷（/data）里，应用不会读它。
+#   c) 走反向代理时，把端口只映射到回环（见下方 ports 处的注释）。
+#      否则所有请求的 RemoteAddr 都是代理地址，后台登录的「单 IP 失败次数」
+#      会共用一个桶——任何人的十次失败都能锁死整个后台。
 
 services:
   zcode2api:
@@ -27,6 +30,12 @@ services:
     # 容器内会拉起 Chromium 子进程，用 init 收尸，避免僵尸进程堆积
     init: true
     ports:
+      # 直连访问（浏览器直接开 http://<主机>:3000）就保持原样。
+      # 若前面挂了 Nginx / Caddy 等反向代理，请改成只绑回环：
+      #   - "127.0.0.1:${ZCODE_PORT:-3000}:${ZCODE_PORT:-3000}"
+      # 原因：反代转发后 RemoteAddr 恒为代理地址，后台登录的「单 IP 10 次失败」
+      # 限速会变成全局限速，任何人的失败都能锁死整个后台；只绑回环可确保
+      # 外部只能经反代进来，同时让限速桶不再对外部流量生效。
       - "${ZCODE_PORT:-3000}:${ZCODE_PORT:-3000}"
     environment:
       ZCODE_PORT: ${ZCODE_PORT:-3000}
