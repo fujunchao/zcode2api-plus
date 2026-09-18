@@ -117,6 +117,33 @@ func TestUsageMappingSumsCacheIntoPrompt(t *testing.T) {
 	}
 }
 
+// 两段流式 usage 合并时数值取 max：message_delta 常把 input_tokens 补发为 0，
+// 若按后者覆盖，客户端看到的用量会被清零。
+func TestMergeUsageTakesMaxAcrossSegments(t *testing.T) {
+	merged := mergeUsage(
+		map[string]any{"input_tokens": float64(100), "cache_read_input_tokens": float64(20)},
+		map[string]any{"input_tokens": float64(0), "output_tokens": float64(7)},
+	)
+	if merged["prompt_tokens"] != float64(120) {
+		t.Fatalf("input 不该被后续的 0 覆盖: %v", merged)
+	}
+	if merged["completion_tokens"] != float64(7) {
+		t.Fatalf("output 应照常带入: %v", merged)
+	}
+	if merged["total_tokens"] != float64(127) {
+		t.Fatalf("total_tokens 应为 120+7: %v", merged)
+	}
+
+	// 反向：后面的值更大时应当采用（上游可能分段补报）
+	grown := mergeUsage(
+		map[string]any{"input_tokens": float64(10)},
+		map[string]any{"input_tokens": float64(30)},
+	)
+	if grown["prompt_tokens"] != float64(30) {
+		t.Fatalf("更大的数值应被采用: %v", grown)
+	}
+}
+
 // streamEvents 上游 Anthropic SSE 流夹具：文本 + 一次工具调用 + usage。
 const streamEvents = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_1","model":"GLM-5.3","usage":{"input_tokens":10,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}}

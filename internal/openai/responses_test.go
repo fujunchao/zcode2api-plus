@@ -403,3 +403,80 @@ func TestResponsesStreamEmitsReasoningEvents(t *testing.T) {
 		t.Fatalf("思考签名不应出现在响应中: %s", last)
 	}
 }
+
+// function_call_output 的 output 允许是内容块数组——Codex 在工具返回结构化内容时
+// 就会发数组。只做字符串断言会把整段工具输出静默变成空串。
+func TestFunctionCallOutputAcceptsContentArray(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  any
+		want string
+	}{
+		{"字符串", "plain", "plain"},
+		{"单元素数组", []any{map[string]any{"type": "input_text", "text": "from-array"}}, "from-array"},
+		{"多元素数组", []any{
+			map[string]any{"type": "input_text", "text": "a"},
+			map[string]any{"type": "text", "text": "b"},
+		}, "a\nb"},
+		{"单个内容块", map[string]any{"type": "input_text", "text": "one"}, "one"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := functionCallOutputText(c.raw); got != c.want {
+				t.Fatalf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+	// 非文本内容块没有 text 字段：退化为紧凑 JSON，而不是丢掉。
+	if got := functionCallOutputText([]any{map[string]any{"type": "input_image", "image_url": "u"}}); !strings.Contains(got, "input_image") {
+		t.Fatalf("无 text 的内容块不应被丢弃: %q", got)
+	}
+}
+
+// 数组形态必须真的穿过转换链路进到 tool_result，而不只是辅助函数能解析。
+func TestFunctionCallOutputArrayReachesToolResult(t *testing.T) {
+	msgs, err := convertResponsesInput([]any{
+		map[string]any{"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "call_1",
+			"output": []any{map[string]any{"type": "input_text", "text": "tool-said-hi"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "tool-said-hi") {
+		t.Fatalf("数组形态的工具输出丢失: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), "tool_result") {
+		t.Fatalf("应转换为 tool_result: %s", encoded)
+	}
+}
+
+// Responses 的 input_tokens 必须并入缓存两系，并暴露 input_tokens_details：
+// Codex 正是按 cached_tokens 判断上下文压缩时机的。
+func TestResponsesUsageIncludesCacheTokens(t *testing.T) {
+	usage := responsesUsage(map[string]any{
+		"input_tokens":                float64(10),
+		"output_tokens":               float64(5),
+		"cache_read_input_tokens":     float64(3),
+		"cache_creation_input_tokens": float64(2),
+	})
+	if usage["input_tokens"] != float64(15) || usage["total_tokens"] != float64(20) {
+		t.Fatalf("input 应含缓存两系: %v", usage)
+	}
+	details, _ := usage["input_tokens_details"].(map[string]any)
+	if details == nil || details["cached_tokens"] != float64(3) {
+		t.Fatalf("应暴露 cached_tokens: %v", details)
+	}
+	if details["cache_write_tokens"] != float64(2) {
+		t.Fatalf("应暴露 cache_write_tokens: %v", details)
+	}
+	// 无缓存时也要给出 details，保持字段形态稳定
+	plain := responsesUsage(map[string]any{"input_tokens": float64(1), "output_tokens": float64(1)})
+	if plain["input_tokens"] != float64(1) {
+		t.Fatalf("无缓存时 input 不应被改动: %v", plain)
+	}
+}

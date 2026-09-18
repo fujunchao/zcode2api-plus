@@ -278,14 +278,43 @@ func (e *sseEncoder) emit(payload map[string]any) error {
 
 // mergeUsage 合并 message_start（input 系）与 message_delta（output）的 usage。
 func mergeUsage(input, output map[string]any) map[string]any {
-	merged := map[string]any{}
+	return mapUsage(mergeRawUsage(input, output))
+}
+
+// mergeRawUsage 逐键合并两段原始 usage，**数值键取较大者**而非后者覆盖前者。
+//
+// Anthropic 的流式 usage 分两处到达：message_start 带完整 input（含缓存两系），
+// message_delta 只带 output——但它常把 input_tokens 一并补发为 0。按后者覆盖会把
+// 已有用量清零，客户端据此算出的计费与上下文占用都会错。
+func mergeRawUsage(input, output map[string]any) map[string]any {
+	merged := make(map[string]any, len(input)+len(output))
 	for k, v := range input {
 		merged[k] = v
 	}
 	for k, v := range output {
+		if current, ok := merged[k]; ok {
+			if a, aok := usageNumber(current); aok {
+				if b, bok := usageNumber(v); bok && b < a {
+					continue // 已有更大的数值，保留它
+				}
+			}
+		}
 		merged[k] = v
 	}
-	return mapUsage(merged)
+	return merged
+}
+
+// usageNumber 把 usage 里的数值归一成 float64；非数值返回 false。
+func usageNumber(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
 }
 
 // stringOr 取字符串值，nil 或空时回退。

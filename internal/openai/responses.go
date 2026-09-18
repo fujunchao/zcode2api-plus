@@ -117,10 +117,9 @@ func convertResponsesInput(input any) ([]any, error) {
 					}},
 				})
 			case "function_call_output":
-				output, _ := item["output"].(string)
 				pendingBlocks = append(pendingBlocks, map[string]any{
 					"type": "tool_result", "tool_use_id": item["call_id"],
-					"content": []any{map[string]any{"type": "text", "text": output}},
+					"content": []any{map[string]any{"type": "text", "text": functionCallOutputText(item["output"])}},
 				})
 			default:
 				// reasoning 等 item 忽略
@@ -284,7 +283,45 @@ func messageToResponsesOutput(message map[string]any) ([]any, bool) {
 	return output, true
 }
 
+// functionCallOutputText 把 function_call_output 的 output 归一成文本。
+//
+// OpenAI Responses 允许 output 是字符串，也允许是内容块数组——Codex 在工具返回
+// 结构化内容时就会发数组。只做字符串断言会把整段工具输出静默变成空串，多轮工具
+// 上下文随之丢失（表现为模型「忘了」刚拿到的工具结果）。
+func functionCallOutputText(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := functionCallOutputText(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		if text, ok := v["text"].(string); ok && text != "" {
+			return text
+		}
+		// 非文本内容块（图片等）没有 text 字段：退化为紧凑 JSON。
+		// 宁可让模型看到原始形态，也不要静默丢内容。
+		if len(v) > 0 {
+			if encoded, err := marshalCompact(v); err == nil {
+				return encoded
+			}
+		}
+	}
+	return ""
+}
+
 // responsesUsage Anthropic usage → Responses usage（直接 token 计数）。
+//
+// input_tokens 必须并入缓存读写：Anthropic 把缓存命中/写入的 token 单列在
+// cache_read_input_tokens / cache_creation_input_tokens 里，**不计入** input_tokens。
+// 只报原始 input_tokens 会让用量严重低估——而 Codex 一类客户端正是按
+// input_tokens_details.cached_tokens 判断上下文压缩时机的，恒为 0 会让它一直以为
+// 没有缓存命中，从而做出错误的压缩决策。
 func responsesUsage(raw any) map[string]any {
 	u, _ := raw.(map[string]any)
 	num := func(key string) float64 {
@@ -297,12 +334,18 @@ func responsesUsage(raw any) map[string]any {
 			return 0
 		}
 	}
-	input := num("input_tokens")
+	cacheRead := num("cache_read_input_tokens")
+	cacheCreation := num("cache_creation_input_tokens")
+	input := num("input_tokens") + cacheRead + cacheCreation
 	output := num("output_tokens")
 	return map[string]any{
 		"input_tokens":  input,
 		"output_tokens": output,
 		"total_tokens":  input + output,
+		"input_tokens_details": map[string]any{
+			"cached_tokens":      cacheRead,
+			"cache_write_tokens": cacheCreation,
+		},
 	}
 }
 

@@ -384,13 +384,5 @@ func (e *responsesEncoder) responseEnvelope(status string) map[string]any {
 }
 
 // 合并 message_start（input 系）与 message_delta（output）的 Anthropic usage。
-func mergeRawUsage(input, output map[string]any) map[string]any {
-	merged := map[string]any{}
-	for k, v := range input {
-		merged[k] = v
-	}
-	for k, v := range output {
-		merged[k] = v
-	}
-	return merged
-}
+// mergeRawUsage 见 stream.go：两段 usage 的数值键取 max，避免 message_delta
+// 补发的 input_tokens: 0 把已统计的用量清零。
