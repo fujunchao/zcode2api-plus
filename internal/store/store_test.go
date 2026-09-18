@@ -920,6 +920,156 @@ func TestDeleteProxyReassigns(t *testing.T) {
 	})
 }
 
+// 批量清理：先把整批线路摘除、再统一改派；改派优先空閒线路，没有空閒则选
+// 绑定账号数最少的（并列取线路表顺序），连候选都没有才退回直连。
+func TestPurgeProxyProfiles(t *testing.T) {
+	// mustAssign 建号并绑到指定线路（store 顺序即入池顺序，改派结果依赖它）。
+	mustAssign := func(s *Store, name, uid, profileID string) string {
+		t.Helper()
+		acc, err := s.AddAccount(model.ProviderZai, name, jwtFor(uid))
+		if err != nil {
+			t.Fatalf("入池失败: %v", err)
+		}
+		if ok, err := s.AssignProxyProfile(acc.ID, profileID); !ok || err != nil {
+			t.Fatalf("指派失败: %v %v", ok, err)
+		}
+		return acc.ID
+	}
+
+	t.Run("同批待删线路不会被补位、优先空閒线路", func(t *testing.T) {
+		s := newTestStore(t)
+		lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		// line-b 空閒但同批待删——如果实现是「逐条删除」，line-a 的账号会被
+		// 补位到这条马上也要消失的线路上。
+		lineB, err := s.AddProxyProfile("line-b", "http://2.2.2.2:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		lineC, err := s.AddProxyProfile("line-c", "http://3.3.3.3:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		accID := mustAssign(s, "acc-1", "uid-purge-1", lineA.ID)
+
+		purged, reassign, err := s.PurgeProxyProfiles([]string{lineA.ID, lineB.ID})
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if len(purged) != 2 {
+			t.Fatalf("应移除 2 条: %v", purged)
+		}
+		if reassign.Assigned[accID] != lineC.ID || len(reassign.Direct) != 0 {
+			t.Fatalf("应改派到幸存的 line-c（而不是同批待删的 line-b）: %+v", reassign)
+		}
+		got := s.Find(model.ProviderZai, accID)
+		if got.ProxyID == nil || *got.ProxyID != lineC.ID || *got.ProxyURL != lineC.URL {
+			t.Fatalf("账号应指向 line-c: %v %v", got.ProxyID, got.ProxyURL)
+		}
+		if profiles := s.ListProxyProfiles(); len(profiles) != 1 || profiles[0].ID != lineC.ID {
+			t.Fatalf("线路表应只剩 line-c: %+v", profiles)
+		}
+	})
+
+	t.Run("无空閒时摊薄到绑定数最少的线路", func(t *testing.T) {
+		s := newTestStore(t)
+		lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		lineB, err := s.AddProxyProfile("line-b", "http://2.2.2.2:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		lineC, err := s.AddProxyProfile("line-c", "http://3.3.3.3:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		// 预置负载：line-a 2 个、line-b 1 个；line-c 上 3 个账号待改派。
+		mustAssign(s, "acc-a1", "uid-pa1", lineA.ID)
+		mustAssign(s, "acc-a2", "uid-pa2", lineA.ID)
+		mustAssign(s, "acc-b1", "uid-pb1", lineB.ID)
+		c0 := mustAssign(s, "acc-c0", "uid-pc0", lineC.ID)
+		c1 := mustAssign(s, "acc-c1", "uid-pc1", lineC.ID)
+		c2 := mustAssign(s, "acc-c2", "uid-pc2", lineC.ID)
+
+		purged, reassign, err := s.PurgeProxyProfiles([]string{lineC.ID})
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if len(purged) != 1 || len(reassign.Direct) != 0 {
+			t.Fatalf("应只移除 line-c 且无人退直连: %v %+v", purged, reassign)
+		}
+		// 摊薄过程（贪心、逐个更新计数）：a=2,b=1 → c0→b(2)；
+		// c1→并列(2,2)取表序→a(3)；c2→b(3)。最终 a=3、b=3。
+		expect := map[string]string{c0: lineB.ID, c1: lineA.ID, c2: lineB.ID}
+		for id, want := range expect {
+			if reassign.Assigned[id] != want {
+				t.Fatalf("改派结果与摊薄预期不符: %s → %v（期望 %s）全量: %+v", id, reassign.Assigned[id], want, reassign.Assigned)
+			}
+		}
+	})
+
+	t.Run("无可用候选则退回直连且清掉旧地址", func(t *testing.T) {
+		s := newTestStore(t)
+		lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		// 幸存线路停用 → 不作候选。
+		if _, err := s.AddProxyProfile("line-off", "http://2.2.2.2:8080", false); err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		accID := mustAssign(s, "acc-1", "uid-purge-direct", lineA.ID)
+
+		purged, reassign, err := s.PurgeProxyProfiles([]string{lineA.ID})
+		if err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		if len(purged) != 1 || len(reassign.Direct) != 1 || reassign.Direct[0] != accID {
+			t.Fatalf("应移除 line-a 并把账号退回直连: %v %+v", purged, reassign)
+		}
+		got := s.Find(model.ProviderZai, accID)
+		if got.ProxyID != nil || got.ProxyURL != nil {
+			t.Fatalf("退回直连后不应残留线路与地址: %+v", got)
+		}
+	})
+
+	t.Run("不存在的 ID 静默跳过", func(t *testing.T) {
+		s := newTestStore(t)
+		purged, reassign, err := s.PurgeProxyProfiles([]string{"no-such-line", ""})
+		if err != nil || purged != nil || len(reassign.Assigned) != 0 || len(reassign.Direct) != 0 {
+			t.Fatalf("应空手而归: %v %+v %v", purged, reassign, err)
+		}
+	})
+
+	t.Run("手工填地址的账号不受影响", func(t *testing.T) {
+		s := newTestStore(t)
+		lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
+		if err != nil {
+			t.Fatalf("建线路失败: %v", err)
+		}
+		acc, err := s.AddAccount(model.ProviderZai, "acc-manual", jwtFor("uid-purge-manual"))
+		if err != nil {
+			t.Fatalf("入池失败: %v", err)
+		}
+		manual := "http://9.9.9.9:8080"
+		if ok, err := s.SetProxyURL(model.ProviderZai, acc.ID, &manual); !ok || err != nil {
+			t.Fatalf("手工填地址失败: %v %v", ok, err)
+		}
+
+		if _, _, err := s.PurgeProxyProfiles([]string{lineA.ID}); err != nil {
+			t.Fatalf("清理失败: %v", err)
+		}
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.ProxyID != nil || got.ProxyURL == nil || *got.ProxyURL != manual {
+			t.Fatalf("手工出站地址不应被清理触碰: %+v", got)
+		}
+	})
+}
+
 // 后台任务拿到的必须是「副本」，且领取结果回写只改领取状态——
 // 否则用副本整体回写会把派生之后发生的改动（例如删除线路改派的 ProxyURL）覆盖回去。
 func TestSnapshotAccountIsDetachedAndClaimWriteBackKeepsChanges(t *testing.T) {

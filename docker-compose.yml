@@ -52,6 +52,9 @@ services:
       ZCODE_QUOTA_REFRESH_INTERVAL: ${ZCODE_QUOTA_REFRESH_INTERVAL:-60}
       # 限流冷却时长（秒）
       ZCODE_COOLING_SECONDS: ${ZCODE_COOLING_SECONDS:-300}
+      # 代理线路自动巡检：检测不通过的线路自动移除并改派绑定账号（分钟间隔）
+      ZCODE_PROXY_HEALTH_ENABLED: ${ZCODE_PROXY_HEALTH_ENABLED:-true}
+      ZCODE_PROXY_HEALTH_INTERVAL: ${ZCODE_PROXY_HEALTH_INTERVAL:-30}
     volumes:
       # 必须持久化：accounts.db + device_mid.txt + 补丁 Chromium 都在这里。
       # device_mid 每次重建都变会被上游当成新设备（风控）。

@@ -114,6 +114,12 @@ func serve() int {
 	sched.Start()
 	defer sched.Stop()
 
+	// 代理线路自动巡检：周期检测可用性，自动移除不可用线路并改派绑定账号
+	//（全部线路不可用且直连也不可达时跳过该轮，防本机网络故障清空线路池）
+	proxyHealth := adminapi.NewProxyHealthScheduler(st)
+	proxyHealth.Start()
+	defer proxyHealth.Stop()
+
 	printBanner(st)
 
 	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)

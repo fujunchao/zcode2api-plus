@@ -162,7 +162,7 @@ func (h *Handler) handleTestAllProxies(w http.ResponseWriter, r *http.Request) {
 			defer func() { <-sem }()
 
 			entry := map[string]any{"id": p.ID, "name": p.Name}
-			info, err := h.probe(p.URL)
+			info, err := probeProxy(p.URL)
 			if err != nil {
 				entry["ok"] = false
 				entry["error"] = err.Error()
@@ -203,7 +203,7 @@ func payloadEnabled(payload map[string]any) bool {
 // 探测要报告的结论，所以仍返回 200 + ok=false，让后台按线路不可用展示；只有
 // 代理地址本身不可用（协议不支持等）才报 502。
 func (h *Handler) writeProbe(w http.ResponseWriter, proxyURL string) {
-	result, err := h.probe(proxyURL)
+	result, err := probeProxy(proxyURL)
 	if err != nil {
 		writeAPIError(w, &apiError{
 			status:  http.StatusBadGateway,
@@ -250,7 +250,7 @@ func defaultUpstreamProbeTargets() []string {
 	return targets
 }
 
-// probe 经指定出口验证 z.ai 侧入口是否可达，返回：
+// probeProxy 经指定出口验证 z.ai 侧入口是否可达（手动检测与自动巡检共用），返回：
 //
 //	ok       线路可用于 z.ai（至少一个入口拿到非拦截响应）
 //	error    不可用时的原因，直接给后台展示
@@ -258,7 +258,7 @@ func defaultUpstreamProbeTargets() []string {
 //
 // 只有「连不上 z.ai」这一种结论。出口 IP 与 ASN 对判断可用性没有帮助，所以
 // 不再查询；线路本身活没活，由请求能不能拿到响应体现。
-func (h *Handler) probe(proxyURL string) (map[string]any, error) {
+func probeProxy(proxyURL string) (map[string]any, error) {
 	client, err := newProbeClient(proxyURL)
 	if err != nil {
 		return nil, err

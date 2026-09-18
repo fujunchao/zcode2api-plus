@@ -615,6 +615,111 @@ func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error
 	return true, reassign, nil
 }
 
+// PurgeProxyProfiles 批量删除代理线路，并把「原本绑定它们的账号」统一改派。
+//
+// 与单条 DeleteProxyProfile 的两点差别：
+//   - 先把整批线路一次性摘除、再统一改派——逐条删除会把 A 线路的账号补位到
+//     同样待删的 B 线路上，紧接着又被二次改派，白白产生抖动；
+//   - 补位规则多一层：没有空閒线路时改派到「当前绑定账号数最少」的线路
+//     （并列取线路表顺序，先创建者优先），让存活线路摊薄负载；只有连候选
+//     都没有（无启用线路）才退回直连，退回时同步清掉过期 ProxyURL。
+//
+// 多个账号同时待改派时按 store 内顺序（即账号入池顺序）逐个分配，每分配一个
+// 就更新占用计数，批内也保持摊薄。不存在于线路表的 ID 静默跳过，不报错。
+func (s *Store) PurgeProxyProfiles(ids []string) ([]string, ProxyReassign, error) {
+	reassign := ProxyReassign{Assigned: map[string]string{}}
+	purgeSet := map[string]bool{}
+	for _, id := range ids {
+		if id != "" {
+			purgeSet[id] = true
+		}
+	}
+	if len(purgeSet) == 0 {
+		return nil, reassign, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	profiles := s.listProxyProfilesLocked()
+	remaining := make([]ProxyProfile, 0, len(profiles))
+	purged := []string{}
+	for _, p := range profiles {
+		if purgeSet[p.ID] {
+			purged = append(purged, p.ID)
+			continue
+		}
+		remaining = append(remaining, p)
+	}
+	if len(purged) == 0 {
+		return nil, reassign, nil
+	}
+	if err := s.saveProxyProfilesLocked(remaining); err != nil {
+		return nil, reassign, err
+	}
+
+	// 第一步：摘掉全部失效指派。必须先做，占用计数看到的才是干净状态
+	//（这一步同时保证了改派绝不会落到同批待删的线路上）。
+	accounts := s.allAccountsLocked()
+	affected := []*model.Account{}
+	for _, acc := range accounts {
+		if acc.ProxyID != nil && purgeSet[*acc.ProxyID] {
+			acc.ProxyID = nil
+			acc.ProxyURL = nil
+			affected = append(affected, acc)
+		}
+	}
+
+	// 第二步：统计存活启用线路的占用数；「占用最少」天然涵盖空閒优先
+	//（空閒 = 占用 0 ≤ 任何其它线路），并列时取线路表顺序。
+	occupancy := map[string]int{}
+	candidates := []ProxyProfile{}
+	for _, p := range remaining {
+		if !p.Enabled {
+			continue
+		}
+		candidates = append(candidates, p)
+		occupancy[p.ID] = 0
+	}
+	for _, acc := range accounts {
+		if id := derefStr(acc.ProxyID); id != "" {
+			if _, ok := occupancy[id]; ok {
+				occupancy[id]++
+			}
+		}
+	}
+
+	// 第三步：逐个改派；没有候选才退回直连（此时 ProxyID/ProxyURL 已清空）。
+	for _, acc := range affected {
+		best := -1
+		for i, p := range candidates {
+			if best < 0 || occupancy[p.ID] < occupancy[candidates[best].ID] {
+				best = i
+			}
+		}
+		if best < 0 {
+			reassign.Direct = append(reassign.Direct, acc.ID)
+			if err := s.persistAccountLocked(acc); err != nil {
+				return purged, reassign, err
+			}
+			continue
+		}
+		p := candidates[best]
+		newID, newURL := p.ID, p.URL
+		acc.ProxyID = &newID
+		acc.ProxyURL = &newURL
+		if err := s.persistAccountLocked(acc); err != nil {
+			// 落库失败就退回直连，别把内存里的指针留成没写进去的状态。
+			acc.ProxyID = nil
+			acc.ProxyURL = nil
+			reassign.Direct = append(reassign.Direct, acc.ID)
+			continue
+		}
+		occupancy[p.ID]++
+		reassign.Assigned[acc.ID] = newID
+	}
+	return purged, reassign, nil
+}
+
 // AssignProxyProfile 把账号指派到代理线路；profileID 为空表示直连。
 func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 	s.mu.Lock()

@@ -124,6 +124,16 @@ var (
 	ClaimPreviewCooldownSeconds = max(0, envInt("ZCODE_CLAIM_PREVIEW_COOLDOWN", 60))
 )
 
+// ── 代理线路自动巡检 ────────────────────────────────────────────────────────
+// 开启后周期性对全部「启用」线路做 z.ai 可达性检测：不通过的线路自动移除，
+// 其绑定账号按「空閒优先、其次绑定账号数最少」改派（全部线路不可用且直连
+// 也不可达时视为本机网络故障，跳过该轮移除，防止把整个线路池清空）。
+var (
+	ProxyHealthEnabled = envBool("ZCODE_PROXY_HEALTH_ENABLED", true)
+	// 巡检间隔（分钟）。
+	ProxyHealthIntervalMinutes = max(1, envInt("ZCODE_PROXY_HEALTH_INTERVAL", 30))
+)
+
 // ── 上游端点 ────────────────────────────────────────────────────────────────
 var (
 	UpstreamZai         = env("ZAI_UPSTREAM_URL", "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")
