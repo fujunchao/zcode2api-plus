@@ -3,10 +3,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"zcode2api" // 嵌入的前端构建产物（仓库根包，受 go:embed 目录约束）
 
@@ -27,15 +32,44 @@ func main() {
 	if len(os.Args) > 1 {
 		os.Exit(runCLI(os.Args[1], os.Args[2:], serve))
 	}
-	serve()
+	// serve 内部靠 defer 收尾，所以等它返回之后再决定退出码：
+	// 在其内部 os.Exit 会跳过全部 defer（存储、验证码池、额度监控、领取调度器）。
+	if code := serve(); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// 服务端超时与停机预算。
+const (
+	// readHeaderTimeout 读取请求头的上限（防御慢速头攻击）。
+	readHeaderTimeout = 30 * time.Second
+	// idleTimeout 空闲 keep-alive 连接的最长保持时间。
+	idleTimeout = 120 * time.Second
+	// gracefulShutdownTimeout 收到停机信号后等待在途请求收尾的上限。
+	gracefulShutdownTimeout = 10 * time.Second
+)
+
+// newServer 构造 HTTP 服务端。
+//
+// 刻意不设 WriteTimeout：SSE 是长连接，写超时会把正常的长流掐断。
+// 零值 http.Server 则连读头超时与空闲超时都没有，既不防御慢速攻击，
+// 也让空闲连接一直占着不放。
+func newServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 }
 
 // serve 启动网关 + 后台管理 + SPA（对应 Python 版 main.py serve）。
-func serve() {
+// 返回进程退出码：0 为正常退出（含收到停机信号），1 为启动或运行失败。
+func serve() int {
 	st, err := store.New()
 	if err != nil {
 		web.Err("main", "存储初始化失败: "+err.Error())
-		os.Exit(1)
+		return 1
 	}
 	defer func() { _ = st.Close() }()
 
@@ -83,11 +117,29 @@ func serve() {
 	printBanner(st)
 
 	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	srv := newServer(addr, mux)
+
+	// 停机信号：容器里对应 docker stop 发的 SIGTERM。收到后停止接受新连接、
+	// 等待在途请求收尾，ListenAndServe 随之返回 ErrServerClosed，defer 依次执行。
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	go func() {
+		<-stop
+		web.Ok("main", "收到退出信号，开始优雅停机…")
+		ctx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			web.Warn("main", "优雅停机未在限时内完成: "+err.Error())
+		}
+	}()
+
 	web.Ok("main", "服务运行中 "+addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		web.Err("main", "服务退出: "+err.Error())
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // distSub 从嵌入根提取 frontend/dist 子树；缺失时返回 nil（页面路由 404 提示）。
