@@ -538,7 +538,7 @@ func (p *Pool) attemptUpstreamOnce(
 }
 
 // handleUpstreamJSON 处理「200 + JSON」的上游响应。分类口径与同步路径
-//（gateway.handleUpstreamJSON）逐条对齐——同一账号在两条路径下必须标出相同状态，
+// （gateway.handleUpstreamJSON）逐条对齐——同一账号在两条路径下必须标出相同状态，
 // 否则同一次额度耗尽在 sync 侧被记为「模型耗尽」、在 async 侧却被当成成功。
 func (p *Pool) handleUpstreamJSON(
 	ctx context.Context,
