@@ -924,22 +924,10 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 	return true, nil
 }
 
-// UpdateAccount 持久化某个账号的当前状态。
-func (s *Store) UpdateAccount(acc *model.Account) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// 防御已删除账号复活：后台流/额度刷新可能长期持有旧对象，
-	// 若删除后完成回写，INSERT OR REPLACE 会把账号重新插回 SQLite。
-	if s.findLocked(acc.Provider, acc.ID) == nil {
-		return fmt.Errorf("账号已不存在，拒绝回写: %s", acc.ID)
-	}
-	return s.persistAccountLocked(acc)
-}
-
 // UpdateClaimState 在锁内把领取状态替换到**当前**账号对象上并落库，
 // 返回是否命中账号（已删除返回 false 且不报错——领取任务与删除并发时属正常情况）。
 //
-// 为什么不能拿快照去 UpdateAccount：领取（可能数十秒）跑在账号副本上，期间
+// 为什么不能拿账号副本整体回写：领取（可能数十秒）跑在账号副本上，期间
 // store 可能已改过该账号（例如删除线路改派了 ProxyURL）。用副本整体回写会把
 // 这些改动一并覆盖回旧值，造成丢失更新，所以回写只针对领取状态这一个字段。
 //

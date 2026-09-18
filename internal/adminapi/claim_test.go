@@ -198,8 +198,9 @@ func TestRunScheduledClaimsSkipsCooling(t *testing.T) {
 		t.Fatalf("入池失败: %v", err)
 	}
 	future := float64(time.Now().Add(time.Hour).Unix())
-	acc.Claim = &model.ClaimState{NextAt: &future}
-	if err := st.UpdateAccount(acc); err != nil {
+	if _, err := st.UpdateClaimState(model.ProviderZai, acc.ID, func(*model.ClaimState) *model.ClaimState {
+		return &model.ClaimState{NextAt: &future}
+	}); err != nil {
 		t.Fatalf("落盘失败: %v", err)
 	}
 

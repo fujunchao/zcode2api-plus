@@ -715,10 +715,11 @@ func TestUpdateDeletedAccountRejected(t *testing.T) {
 	if ok, _ := s.RemoveAccount(model.ProviderZai, acc.ID); !ok {
 		t.Fatal("删除失败")
 	}
-	// 模拟后台流长期持有旧对象、删除后回写：必须被拒绝而非复活
-	acc.UseCount = 999
-	if err := s.UpdateAccount(acc); err == nil {
-		t.Fatal("已删除账号的回写应报错")
+	// 模拟后台流长期持有旧对象、删除后回写：必须被拒绝（不命中）而非复活
+	if ok, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.UseCount = 999
+	}); ok || err != nil {
+		t.Fatalf("已删除账号的写入应不命中且不报错: %v %v", ok, err)
 	}
 	if s.Find(model.ProviderZai, acc.ID) != nil {
 		t.Fatal("已删除账号不得复活")
@@ -762,8 +763,7 @@ func TestExportImportRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	acc.SetDisabledModels([]string{"glm-4.7"})
-	if err := s1.UpdateAccount(acc); err != nil {
+	if _, err := s1.SetDisabledModels(model.ProviderZai, acc.ID, []string{"glm-4.7"}); err != nil {
 		t.Fatal(err)
 	}
 	payload := s1.Export()
