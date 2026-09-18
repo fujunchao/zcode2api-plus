@@ -494,6 +494,8 @@ func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"claim_captcha_cooldown": captchaSec,
 		"claim_retry_cooldown":   retrySec,
 		"claim_preview_cooldown": previewSec,
+		"proxy_health_enabled":   h.Store.ProxyHealthEnabled(),
+		"proxy_health_interval":  h.Store.ProxyHealthIntervalMinutes(),
 	})
 }
 
@@ -592,6 +594,29 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.Store.SetSetting(item.key, strconv.Itoa(max(item.min, n))); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	// ── 線路自動巡檢 ── 同樣即時生效：調度器每輪重新讀設置。
+	if v, ok := payload["proxy_health_enabled"]; ok {
+		b, valid := pyBool(v)
+		if !valid {
+			writeAPIError(w, errBadRequest("线路自动巡检开关需为布尔值"))
+			return
+		}
+		if err := h.Store.SetSetting("proxy_health_enabled", boolText(b)); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	if v, ok := payload["proxy_health_interval"]; ok {
+		n, valid := pyInt(v)
+		if !valid || n < 1 {
+			writeAPIError(w, errBadRequest("巡检间隔必须是 ≥1 的整数（分钟）"))
+			return
+		}
+		if err := h.Store.SetSetting("proxy_health_interval", strconv.Itoa(n)); err != nil {
 			writeError500(w, err)
 			return
 		}

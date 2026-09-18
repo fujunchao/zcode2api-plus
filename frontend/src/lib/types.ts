@@ -110,6 +110,8 @@ export interface SettingsResponse {
   claim_captcha_cooldown: number
   claim_retry_cooldown: number
   claim_preview_cooldown: number
+  proxy_health_enabled: boolean
+  proxy_health_interval: number
 }
 
 /* z.ai 側的單個探測目標（主站 / 備援站） */

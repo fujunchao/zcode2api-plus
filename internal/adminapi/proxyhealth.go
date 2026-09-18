@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"zcode2api/internal/config"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/web"
@@ -46,8 +45,8 @@ func (s *ProxyHealthScheduler) Stop() {
 	<-s.done
 }
 
-// loop 调度循环：每 ProxyHealthIntervalMinutes 一轮，开关每轮实时读
-// （关掉即空转，重新开启无需重启进程）。
+// loop 调度循环：开关与间隔每轮实时读后台设置（缺省回退环境变量），
+// 关掉即空转、调间隔下一轮生效，均无需重启进程。
 func (s *ProxyHealthScheduler) loop() {
 	defer close(s.done)
 	// 启动先避让，与领取调度器/额度监控一致，让监听与账号加载先跑完。
@@ -56,14 +55,14 @@ func (s *ProxyHealthScheduler) loop() {
 		return
 	case <-time.After(5 * time.Second):
 	}
-	interval := time.Duration(config.ProxyHealthIntervalMinutes) * time.Minute
 	for {
+		interval := time.Duration(s.store.ProxyHealthIntervalMinutes()) * time.Minute
 		select {
 		case <-s.stop:
 			return
 		case <-time.After(interval):
 		}
-		if !config.ProxyHealthEnabled {
+		if !s.store.ProxyHealthEnabled() {
 			continue
 		}
 		// 单轮异常不该终结调度循环。

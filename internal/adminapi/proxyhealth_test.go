@@ -155,3 +155,50 @@ func TestProxyHealthSchedulerStartStop(t *testing.T) {
 	// Start 内部是 sync.Once，Stop 后再 Start 不会重启循环；这里不进一步断言，
 	// 只保证生命周期不挂起、不 panic。
 }
+
+// TestProxyHealthSettingsFlow 巡检开关与间隔的设置读写与校验（即改即生效）。
+func TestProxyHealthSettingsFlow(t *testing.T) {
+	mux, st, _ := setup(t)
+
+	// 默认值：开、30 分钟（跟随环境变量默认）。
+	code, body := do(t, mux, st, http.MethodGet, "/admin/api/settings", nil)
+	if code != http.StatusOK {
+		t.Fatalf("读取设置应 200: %d", code)
+	}
+	if b, _ := body["proxy_health_enabled"].(bool); !b {
+		t.Fatalf("自动巡检默认应开: %v", body)
+	}
+	if num(t, body["proxy_health_interval"]) != 30 {
+		t.Fatalf("巡检间隔默认应 30: %v", body)
+	}
+
+	// 写入并回读。
+	code, _ = do(t, mux, st, http.MethodPut, "/admin/api/settings", map[string]any{
+		"proxy_health_enabled":  false,
+		"proxy_health_interval": 15,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("保存设置应 200: %d", code)
+	}
+	_, body = do(t, mux, st, http.MethodGet, "/admin/api/settings", nil)
+	if b, _ := body["proxy_health_enabled"].(bool); b {
+		t.Fatalf("开关应已关: %v", body)
+	}
+	if num(t, body["proxy_health_interval"]) != 15 {
+		t.Fatalf("间隔应 15: %v", body)
+	}
+
+	// 校验：非布尔 400；间隔 <1 或非数字 400。
+	code, _ = do(t, mux, st, http.MethodPut, "/admin/api/settings", map[string]any{"proxy_health_enabled": "maybe"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("非布尔多值应 400: %d", code)
+	}
+	code, _ = do(t, mux, st, http.MethodPut, "/admin/api/settings", map[string]any{"proxy_health_interval": 0})
+	if code != http.StatusBadRequest {
+		t.Fatalf("间隔 0 应 400: %d", code)
+	}
+	code, _ = do(t, mux, st, http.MethodPut, "/admin/api/settings", map[string]any{"proxy_health_interval": "abc"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("非数字间隔应 400: %d", code)
+	}
+}

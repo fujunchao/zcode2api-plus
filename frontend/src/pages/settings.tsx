@@ -34,6 +34,11 @@ export function SettingsPage() {
   const [claimPreviewCooldown, setClaimPreviewCooldown] = useState('60')
   const [savingClaim, setSavingClaim] = useState(false)
 
+  /* ── 線路自動巡檢 ── */
+  const [proxyHealth, setProxyHealth] = useState(true)
+  const [proxyHealthInterval, setProxyHealthInterval] = useState('30')
+  const [savingProxyHealth, setSavingProxyHealth] = useState(false)
+
   /* 載入完成後填入表單（僅在尚未編輯時同步） */
   useEffect(() => {
     if (!data) return
@@ -46,6 +51,8 @@ export function SettingsPage() {
     setClaimCaptchaCooldown(String(data.claim_captcha_cooldown ?? 3600))
     setClaimRetryCooldown(String(data.claim_retry_cooldown ?? 600))
     setClaimPreviewCooldown(String(data.claim_preview_cooldown ?? 60))
+    setProxyHealth(data.proxy_health_enabled)
+    setProxyHealthInterval(String(data.proxy_health_interval ?? 30))
   }, [data])
 
   async function save(e: FormEvent) {
@@ -114,6 +121,29 @@ export function SettingsPage() {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
       setSavingClaim(false)
+    }
+  }
+
+  /* 線路自動巡檢：独立表单，只提交巡检相关字段 */
+  async function saveProxyHealth(e: FormEvent) {
+    e.preventDefault()
+    const interval = parseInt(proxyHealthInterval, 10)
+    if (isNaN(interval) || interval < 1) {
+      toast.error('巡檢間隔必須是 ≥1 的整數（分鐘）')
+      return
+    }
+    setSavingProxyHealth(true)
+    try {
+      await api('PUT', '/settings', {
+        proxy_health_enabled: proxyHealth,
+        proxy_health_interval: interval,
+      })
+      toast.success('已儲存')
+      void qc.invalidateQueries({ queryKey: ['settings'] })
+    } catch (err) {
+      toast.error('儲存失敗：' + errMsg(err))
+    } finally {
+      setSavingProxyHealth(false)
     }
   }
 
@@ -261,6 +291,50 @@ export function SettingsPage() {
             <div className="flex justify-end">
               <Button type="submit" disabled={savingClaim}>
                 {savingClaim ? <Loader2 className="animate-spin" /> : null}
+                儲存
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      {/* 線路自動巡檢 */}
+      <Card>
+        <CardContent className="flex flex-col gap-5">
+          <div className="text-sm font-semibold">線路自動巡檢</div>
+          <form className="flex flex-col gap-5" onSubmit={saveProxyHealth}>
+            <label className="flex cursor-pointer items-start gap-2 text-sm">
+              <Checkbox checked={proxyHealth} onCheckedChange={(v) => setProxyHealth(v === true)} />
+              <span>
+                自動巡檢代理線路
+                <span className="block text-xs text-muted-foreground">
+                  每隔一段時間對全部已啟用線路做 z.ai 可達性檢測（與手動「全部測試」同口徑）。
+                  檢測不通過的線路會被<strong>自動移除</strong>，其綁定帳號按「空閒線路優先 →
+                  綁定數最少 → 直連兜底」自動改派。關閉後線路只由人工管理。
+                </span>
+              </span>
+            </label>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-proxy-health-interval">巡檢間隔（分鐘）</Label>
+              <div className="text-xs text-muted-foreground">
+                最小 1 分鐘。若某一輪全部線路失敗且直連也不可达，會判定為本機網路故障而跳過移除，
+                不會清空線路池；停用線路不參與巡檢。
+              </div>
+              <Input
+                id="set-proxy-health-interval"
+                type="number"
+                min={1}
+                className="w-40"
+                value={proxyHealthInterval}
+                onChange={(e) => setProxyHealthInterval(e.target.value)}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              改動即時生效（間隔從下一輪起按新值計）；每輪的移除與改派都會寫入日誌（前綴 proxy-health）。
+            </p>
+            <div className="flex justify-end">
+              <Button type="submit" disabled={savingProxyHealth}>
+                {savingProxyHealth ? <Loader2 className="animate-spin" /> : null}
                 儲存
               </Button>
             </div>

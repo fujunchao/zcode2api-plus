@@ -1297,3 +1297,49 @@ func TestPickFreeProxyProfile(t *testing.T) {
 		t.Fatalf("Pick 不应改动账号: %v / %v", acc.ProxyID, acc.ProxyURL)
 	}
 }
+
+// 巡检设置：默认跟随环境变量（开、30 分钟），落库后以设置为准，非法值回退默认。
+func TestProxyHealthSettings(t *testing.T) {
+	s := newTestStore(t)
+
+	if !s.ProxyHealthEnabled() {
+		t.Fatal("默认应开（环境变量默认 true）")
+	}
+	if got := s.ProxyHealthIntervalMinutes(); got != 30 {
+		t.Fatalf("默认间隔应 30 分钟: %d", got)
+	}
+
+	// 落库覆盖。
+	if err := s.SetSetting("proxy_health_enabled", "false"); err != nil {
+		t.Fatalf("写设置失败: %v", err)
+	}
+	if err := s.SetSetting("proxy_health_interval", "15"); err != nil {
+		t.Fatalf("写设置失败: %v", err)
+	}
+	if s.ProxyHealthEnabled() {
+		t.Fatal("落库 false 后应关")
+	}
+	if got := s.ProxyHealthIntervalMinutes(); got != 15 {
+		t.Fatalf("落库后间隔应 15: %d", got)
+	}
+
+	// 非法值回退默认；越界钳到下限 1。
+	if err := s.SetSetting("proxy_health_enabled", "maybe"); err != nil {
+		t.Fatalf("写设置失败: %v", err)
+	}
+	if !s.ProxyHealthEnabled() {
+		t.Fatal("非法布尔应回退默认（开）")
+	}
+	if err := s.SetSetting("proxy_health_interval", "abc"); err != nil {
+		t.Fatalf("写设置失败: %v", err)
+	}
+	if got := s.ProxyHealthIntervalMinutes(); got != 30 {
+		t.Fatalf("非法间隔应回退默认 30: %d", got)
+	}
+	if err := s.SetSetting("proxy_health_interval", "0"); err != nil {
+		t.Fatalf("写设置失败: %v", err)
+	}
+	if got := s.ProxyHealthIntervalMinutes(); got != 1 {
+		t.Fatalf("间隔 0 应钳到下限 1: %d", got)
+	}
+}

@@ -424,6 +424,21 @@ func (s *Store) claimInt(key string, def, min int) int {
 	return max(min, n)
 }
 
+// ── 線路自動巡檢設定 ────────────────────────────────────────────────────────
+//
+// 与领取设置同一约定：环境变量（ZCODE_PROXY_HEALTH_*）只是**默认值**，落库后
+// 以后台设置页为准；调度器每轮重新读取，改完下一轮生效。
+
+// ProxyHealthEnabled 自动巡检开关（缺失或非法回退环境变量值）。
+func (s *Store) ProxyHealthEnabled() bool {
+	return s.claimBool("proxy_health_enabled", config.ProxyHealthEnabled)
+}
+
+// ProxyHealthIntervalMinutes 巡检间隔（分钟，≥1；缺失或非法回退环境变量值）。
+func (s *Store) ProxyHealthIntervalMinutes() int {
+	return s.claimInt("proxy_health_interval", config.ProxyHealthIntervalMinutes, 1)
+}
+
 // ── 代理設定 ────────────────────────────────────────────────────────────────
 
 // ProxyProfile 命名代理出口（設定以 JSON 儲存在 meta 表中）。
