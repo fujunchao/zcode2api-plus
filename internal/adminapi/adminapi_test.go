@@ -519,10 +519,11 @@ func TestMonitorAndUsage(t *testing.T) {
 	})
 	ids := added["ids"].([]any)
 
-	// 预置用量与状态供快照/排行断言
-	acc := st.FindAny(str(t, ids[0]))
-	acc.UseCount, acc.FailCount, acc.TotalInputTokens, acc.TotalOutputTokens = 8, 2, 100, 40
-	if err := st.UpdateAccount(acc); err != nil {
+	// 预置用量与状态供快照/排行断言（读 API 返副本，必须经 Update 落到「当前」对象）
+	accID := str(t, ids[0])
+	if _, err := st.Update(model.ProviderZai, accID, func(a *model.Account) {
+		a.UseCount, a.FailCount, a.TotalInputTokens, a.TotalOutputTokens = 8, 2, 100, 40
+	}); err != nil {
 		t.Fatal(err)
 	}
 

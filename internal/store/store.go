@@ -721,34 +721,42 @@ func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]stri
 // ── 账号读取 ────────────────────────────────────────────────────────────────
 
 // ListAccounts 列出账号；provider 为空表示全部。
+//
+// 返回的是**副本**：调用方改它不会影响 store（要改账号一律走 Update 或字段级方法）。
+// 这样账号对象就不会被多个 goroutine 无锁共享——此前返回内部指针，调用方习惯
+// 「锁外改字段 → UpdateAccount 落库」，与后台刷新/领取等路径相撞（CI 的 -race 抓到过）。
 func (s *Store) ListAccounts(provider string) []*model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if provider != "" {
 		src := s.accounts[provider]
 		out := make([]*model.Account, len(src))
-		copy(out, src)
+		for i, a := range src {
+			out[i] = a.Clone()
+		}
 		return out
 	}
 	var out []*model.Account
 	for _, p := range Providers {
-		out = append(out, s.accounts[p]...)
+		for _, a := range s.accounts[p] {
+			out = append(out, a.Clone())
+		}
 	}
 	return out
 }
 
-// Find 按 provider + id/名称 查找账号。
+// Find 按 provider + id/名称 查找账号；找不到返回 nil。返回副本（见 ListAccounts）。
 func (s *Store) Find(provider, idOrName string) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.findLocked(provider, idOrName)
+	return s.findLocked(provider, idOrName).Clone()
 }
 
-// FindAny 按 id 在全部提供商中查找账号。
+// FindAny 按 id 在全部提供商中查找账号；找不到返回 nil。返回副本（见 ListAccounts）。
 func (s *Store) FindAny(idOrName string) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.findAnyLocked(idOrName)
+	return s.findAnyLocked(idOrName).Clone()
 }
 
 // SnapshotAccount 返回账号的独立副本（找不到返回 nil）。
@@ -816,6 +824,11 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 //
 // 第二个返回值 isNew 区分「本次新建」与「命中既有记录」：调用方（OAuth 重登、
 // 自动分配代理线路）需要据此决定是否施加只对新号生效的默认值。
+//
+// ⚠️ 返回的是 **store 内部对象本身**（不是副本），刻意如此：登录链路依赖「后续
+// AutoAssignProxies 改的就是同一个对象，读 account.ProxyURL 立刻能看到新线路」。
+// 因此调用方**不得把它交给长活后台任务**，也不要长期持有——需要副本请用
+// SnapshotAccount。读 API（Find/FindAny/ListAccounts/Select）返回的才是副本。
 func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*model.Account, bool, error) {
 	if _, ok := s.providersSet()[provider]; !ok {
 		return nil, false, fmt.Errorf("不支持的 provider: %s", provider)
@@ -1172,7 +1185,9 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	idx := s.rotation[key] % len(pool)
 	acc := pool[idx]
 	s.rotation[key] = (idx + 1) % len(pool)
-	return acc
+	// 返回副本：网关/异步工单会跨整个请求（乃至数十秒的流式转发）持有它，
+	// 期间后台仍在改这个账号。改动一律经 Update 按 ID 落到「当前」对象上。
+	return acc.Clone()
 }
 
 func orStar(modelName string) string {

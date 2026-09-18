@@ -553,6 +553,81 @@ func TestFieldLevelMutators(t *testing.T) {
 	})
 }
 
+// 读 API 必须交出**副本**：账号对象不再被多个 goroutine 无锁共享，改副本
+// （含内层 map）都不得影响 store。这是「无锁读 vs 加锁写仍是竞态」的正面防线。
+func TestReadAPIsReturnDetachedCopies(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "acc-1", jwtFor("uid-copy-1"))
+	if err != nil {
+		t.Fatalf("入池失败: %v", err)
+	}
+	if _, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.Quota["glm-5.3"] = map[string]any{"remaining": 10.0}
+	}); err != nil {
+		t.Fatalf("准备现场失败: %v", err)
+	}
+
+	t.Run("Find 返回副本", func(t *testing.T) {
+		got := s.Find(model.ProviderZai, acc.ID)
+		got.Name = "改过的名字"
+		got.Status = model.StatusInvalid
+		got.Quota["glm-5.3"]["remaining"] = 0.0
+		got.Quota["新模型"] = map[string]any{"remaining": 1.0}
+
+		again := s.Find(model.ProviderZai, acc.ID)
+		if again.Name != "acc-1" || again.Status != model.StatusActive {
+			t.Fatalf("改副本不应影响 store: %+v", again)
+		}
+		if v := again.Quota["glm-5.3"]["remaining"]; v != 10.0 {
+			t.Fatalf("内层 map 应深拷贝: %v", v)
+		}
+		if _, ok := again.Quota["新模型"]; ok {
+			t.Fatal("给副本加键不应影响 store")
+		}
+	})
+
+	t.Run("ListAccounts 返回副本", func(t *testing.T) {
+		list := s.ListAccounts(model.ProviderZai)
+		if len(list) != 1 {
+			t.Fatalf("应有 1 个账号: %d", len(list))
+		}
+		list[0].Name = "列表改的名字"
+		if got := s.Find(model.ProviderZai, acc.ID); got.Name != "acc-1" {
+			t.Fatalf("改列表元素不应影响 store: %q", got.Name)
+		}
+	})
+
+	t.Run("Select 返回副本", func(t *testing.T) {
+		sel := s.Select(model.ProviderZai, map[string]bool{}, "")
+		if sel == nil {
+			t.Fatal("应选中账号")
+		}
+		sel.Name = "选择改的名字"
+		sel.FailCount = 99
+		got := s.Find(model.ProviderZai, acc.ID)
+		if got.Name != "acc-1" || got.FailCount != 0 {
+			t.Fatalf("改 Select 结果不应影响 store: %q %d", got.Name, got.FailCount)
+		}
+	})
+
+	// AddAccount* 刻意仍返回内部对象：登录链路依赖「AutoAssignProxies 改的就是
+	// 同一个对象，读 account.ProxyURL 立刻看到新线路」。这条不对称必须钉住，
+	// 否则将来有人"顺手统一成副本"会静默破坏登录选线路。
+	t.Run("AddAccount 仍返回内部对象", func(t *testing.T) {
+		fresh, err := s.AddAccount(model.ProviderZai, "acc-2", jwtFor("uid-copy-2"))
+		if err != nil {
+			t.Fatalf("入池失败: %v", err)
+		}
+		manual := "http://7.7.7.7:8080"
+		if _, err := s.SetProxyURL(model.ProviderZai, fresh.ID, &manual); err != nil {
+			t.Fatalf("写入失败: %v", err)
+		}
+		if fresh.ProxyURL == nil || *fresh.ProxyURL != manual {
+			t.Fatalf("AddAccount 返回的应是 store 内部对象: %v", fresh.ProxyURL)
+		}
+	})
+}
+
 func TestSelectRotationAndModelFilter(t *testing.T) {
 	s := newTestStore(t)
 	a1, _ := s.AddAccount(model.ProviderZai, "a1", "h1.p.s3")
