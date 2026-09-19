@@ -234,6 +234,55 @@ type clientFunc func(req *http.Request) (*http.Response, error)
 
 func (f clientFunc) Do(req *http.Request) (*http.Response, error) { return f(req) }
 
+// 上游把 entitlement_id 回成数组或对象时，先前会拿它当 map[any] 的键而 panic
+// （hash of unhashable type）；该 panic 发生在无 recover 的自建 goroutine 里，
+// 会带走整个进程。非字符串一律跳过，退化为「对应不到周期信息」而不是崩溃。
+func TestNonStringEntitlementIDDoesNotPanic(t *testing.T) {
+	svc, st, billing := setup(t)
+	acc, err := st.AddAccount(model.ProviderZai, "weird", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	billing.body = `{"code":0,"data":{
+		"plans":[{"plan_id":"p1","name":"Weird Plan","entitlements":[
+			{"entitlement_id":["not","hashable"],"show_name":"GLM-5.3-Flash","period":"daily"}]}],
+		"balances":[{"entitlement_id":"ent-flash","show_name":"GLM-5.3-Flash",
+			"total_units":100,"used_units":10,"remaining_units":90,"available_units":90}]}}`
+
+	result := svc.FetchQuota(acc) // 不得 panic
+	if _, hasErr := result["error"]; hasErr {
+		t.Fatalf("非字符串 entitlement_id 不应让整次查询失败: %v", result)
+	}
+	row := st.FindAny(acc.ID).Quota["GLM-5.3-Flash"]
+	if row == nil {
+		t.Fatalf("余额仍应成列: %v", st.FindAny(acc.ID).Quota)
+	}
+	if row["period"] != nil {
+		t.Fatalf("对应不到 entitlement 时应无周期信息: %v", row["period"])
+	}
+}
+
+// 正常的字符串 entitlement_id 必须仍能对应回周期与所属方案——别为了防 panic
+// 把正常路径一起丢掉。
+func TestStringEntitlementIDStillResolvesPeriod(t *testing.T) {
+	svc, st, billing := setup(t)
+	acc, err := st.AddAccount(model.ProviderZai, "normal", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	billing.body = balancePayload(2500000)
+
+	svc.FetchQuota(acc)
+
+	row := st.FindAny(acc.ID).Quota["GLM-5.3-Flash"]
+	if row == nil {
+		t.Fatalf("应有 GLM-5.3-Flash 额度列")
+	}
+	if row["period"] != "daily" {
+		t.Fatalf("字符串 entitlement_id 应仍能对应周期: %v", row["period"])
+	}
+}
+
 func TestFetchQuotaCacheAndInflightDedup(t *testing.T) {
 	// 并发查询共享同一次请求；成功结果 15s 内复用并带 cached 标记。
 	svc, st, _ := setup(t)
