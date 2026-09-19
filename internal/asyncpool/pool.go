@@ -459,7 +459,9 @@ func (p *Pool) attemptUpstreamOnce(
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		text, readErr := io.ReadAll(resp.Body)
+		// 限长：错误体要整段读进内存做分类，上游或代理异常时可能回一个任意大的
+		// body。正常路径是流式转发，不受此限。
+		text, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		if readErr != nil {
 			return false, readErr
 		}
@@ -546,7 +548,8 @@ func (p *Pool) handleUpstreamJSON(
 	modelName string,
 	resp *http.Response,
 ) (bool, error) {
-	raw, err := io.ReadAll(resp.Body)
+	// 同样限长：这是「200 但为 JSON」的异常分支，不是正常流式响应。
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	if err != nil {
 		return false, errNetwork{err.Error()}
 	}
@@ -622,6 +625,13 @@ func (p *Pool) bumpFail(acc *model.Account) {
 		live.FailCount++
 	})
 }
+
+// maxErrorBodyBytes 异常响应的读取上限。
+//
+// 正常路径是流式转发（边读边发），只有错误分支与「200 但为 JSON」的异常分支要整段
+// 读进内存做分类，而上游或代理异常时可能回一个任意大的 body。64KB 足够容纳业务码
+// 与错误消息。
+const maxErrorBodyBytes = 64 << 10
 
 // forwardSSE 把上游 SSE 行转成 ticket chunk 事件，并累计账号 token 用量。
 // 完整结束时投递 done 并返回 (false, nil)；转发开始后中断时返回

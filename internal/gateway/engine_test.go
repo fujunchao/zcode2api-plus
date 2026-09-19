@@ -531,6 +531,38 @@ func TestBusinessCode1005ExhaustsDailyQuota(t *testing.T) {
 	}
 }
 
+// 错误/异常响应的读取限长 64KB：限内照常分类，限外不再参与分类。上游或账号级
+// 代理异常时可能回一个任意大的 body，不限长会直接吃光内存（正常流式路径边读边发，
+// 不受影响）。
+func TestOversizedErrorBodyIsBounded(t *testing.T) {
+	t.Run("限内仍能分类", func(t *testing.T) {
+		f := newFixture(t)
+		f.respond = jsonResp(200, `{"code":1005,"msg":"exceed quota limit","pad":"`+strings.Repeat(" ", 8<<10)+`"}`)
+		acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+		if status, _ := f.post(t, msgBody(), "sk-test"); status != 503 {
+			t.Fatalf("业务码在限内应照常换号并 503: %d", status)
+		}
+		if got := f.st.Find(model.ProviderZai, acc.ID); len(got.ExhaustedModels) != 1 {
+			t.Fatalf("应标记该模型耗尽: %v", got.ExhaustedModels)
+		}
+	})
+
+	t.Run("限外不再参与分类", func(t *testing.T) {
+		f := newFixture(t)
+		// 业务码排在 64KB 之后：读取被截断后应看不到它，而不是把整个 body 读进内存
+		f.respond = jsonResp(200, `{"pad":"`+strings.Repeat(" ", 100<<10)+`","code":1005}`)
+		acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+		if status, _ := f.post(t, msgBody(), "sk-test"); status != 200 {
+			t.Fatalf("限外的业务码不参与分类，应按无业务码处理: %d", status)
+		}
+		if got := f.st.Find(model.ProviderZai, acc.ID); len(got.ExhaustedModels) != 0 {
+			t.Fatalf("限外的业务码不应标记耗尽: %v", got.ExhaustedModels)
+		}
+	})
+}
+
 // 额度信号不得把更强的账号状态刷回 active：invalid 需人工介入、cooling 在冷却窗口内、
 // disabled 是管理员主动停用——三者都与「额度用没用完」无关。并发下若不设防，一条 402
 // 就能把刚被判失效的账号放回轮询。

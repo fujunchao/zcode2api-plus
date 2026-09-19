@@ -251,7 +251,7 @@ func (e *Engine) tryAccount(
 
 		// HTTP 200 且为 JSON：先缓冲，处理 HTTP 200 包装的业务错误
 		if strings.Contains(contentType, "application/json") {
-			buffered, err := io.ReadAll(resp.Body)
+			buffered, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 			_ = resp.Body.Close()
 			if err != nil {
 				e.bumpFail(acc)
@@ -276,6 +276,13 @@ func (e *Engine) tryAccount(
 	return attemptResult{switchAccount: true}
 }
 
+// maxErrorBodyBytes 错误响应体的读取上限。
+//
+// 正常响应走流式转发（边读边发）不受影响；只有错误分支要整段读进内存做分类，
+// 而上游或账号级代理异常时可能回一个任意大的 body，无上限会直接吃光内存。
+// 64KB 足以容纳业务码与错误消息。
+const maxErrorBodyBytes = 64 << 10
+
 // handleUpstreamError 处理上游 >=400 的响应（分类链顺序对齐 PLAN §5.2，不可变）。
 func (e *Engine) handleUpstreamError(
 	ctx context.Context,
@@ -286,7 +293,7 @@ func (e *Engine) handleUpstreamError(
 	resp *http.Response,
 	b *attemptBudget,
 ) attemptResult {
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	_ = resp.Body.Close()
 	if err != nil {
 		if isClientGone(ctx) {
