@@ -216,21 +216,28 @@ func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string
 	if _, err := readFull(conn, head); err != nil {
 		return fmt.Errorf("socks5 CONNECT 回复读取失败: %v", err)
 	}
+	if head[0] != 0x05 {
+		return fmt.Errorf("socks5 回复版本非法: %d", head[0])
+	}
 	if head[1] != 0x00 {
 		return fmt.Errorf("socks5 代理连接失败，回复码 %d", head[1])
 	}
+	// head 已读满 5 字节：对 0x01/0x04 而言第 5 字节是地址首字节，对 0x03 而言
+	// 它是域名长度、域名本体尚未读取。故 extra 统一表示「还需读多少字节」＝
+	// 剩余地址字节 + 2 字节端口。域名分支若写成 (len-1)+2 会少读 1 字节，
+	// 该字节留在 socket 里污染后续应用层数据（表现为 TLS 握手失败、请求行被吃掉）。
 	var extra int
 	switch head[3] {
 	case 0x01:
-		extra = 4
+		extra = 4 - 1 + 2
 	case 0x04:
-		extra = 16
+		extra = 16 - 1 + 2
 	case 0x03:
-		extra = int(head[4])
+		extra = int(head[4]) + 2
 	default:
 		return fmt.Errorf("socks5 回复地址类型非法: %d", head[3])
 	}
-	trailer := make([]byte, extra-1+2) // 剩余地址字节 + 2 字节端口
+	trailer := make([]byte, extra)
 	if _, err := readFull(conn, trailer); err != nil {
 		return fmt.Errorf("socks5 回复尾部读取失败: %v", err)
 	}

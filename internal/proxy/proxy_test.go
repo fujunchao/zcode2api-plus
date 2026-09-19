@@ -292,6 +292,100 @@ func TestSocks5LocalResolveFallsBackToIPv6(t *testing.T) {
 	}
 }
 
+// startSocks5Replier 起一个假 socks5：完成协商与 CONNECT 读取后，用 reply 回应。
+func startSocks5Replier(t *testing.T, reply []byte) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				head := make([]byte, 2)
+				if _, e := readFull(c, head); e != nil {
+					return
+				}
+				methods := make([]byte, head[1])
+				if _, e := readFull(c, methods); e != nil {
+					return
+				}
+				if _, e := c.Write([]byte{0x05, 0x00}); e != nil {
+					return
+				}
+				req := make([]byte, 4)
+				if _, e := readFull(c, req); e != nil {
+					return
+				}
+				n := make([]byte, 1)
+				if _, e := readFull(c, n); e != nil {
+					return
+				}
+				rest := make([]byte, int(n[0])+2)
+				if _, e := readFull(c, rest); e != nil {
+					return
+				}
+				_, _ = c.Write(reply)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// CONNECT 回复用 ATYP=0x03（域名型 BND.ADDR）时必须把「长度+域名+端口」读干净。
+// 曾按 (len-1)+2 计算剩余字节，少读 1 字节——那一字节留在 socket 里被后续应用层
+// 当成数据首字节（表现为 TLS 握手失败、请求行被吃掉）。ATYP 由代理决定，所以任何
+// socks5 线路只要回域名型地址就会中招，不只是 socks5h。
+func TestSocks5HandshakeConsumesDomainReply(t *testing.T) {
+	const bndDomain = "proxy.local"
+	marker := []byte("HELLO")
+	reply := append([]byte{0x05, 0x00, 0x00, 0x03, byte(len(bndDomain))}, []byte(bndDomain)...)
+	reply = append(reply, 0x1f, 0x90) // 端口 8080
+	// 回复后面紧跟应用层数据：握手若少读，首字节就会被这条回复的尾巴污染。
+	proxyAddr := startSocks5Replier(t, append(reply, marker...))
+
+	u, _ := url.Parse("socks5://" + proxyAddr)
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := socks5Handshake(ctx, conn, u, "example.com:80", true); err != nil {
+		t.Fatalf("域名型回复握手失败: %v", err)
+	}
+	got := make([]byte, len(marker))
+	if _, err := readFull(conn, got); err != nil {
+		t.Fatalf("读应用层数据失败: %v", err)
+	}
+	if string(got) != string(marker) {
+		t.Fatalf("握手读多了或读少了回复字节，应用层首字节被污染: got %q want %q", got, marker)
+	}
+}
+
+func TestSocks5HandshakeRejectsBadVersion(t *testing.T) {
+	// 非 0x05 的回复版本说明对端不是 socks5，不能当成成功握手继续使用隧道。
+	proxyAddr := startSocks5Replier(t, []byte{0x04, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	u, _ := url.Parse("socks5://" + proxyAddr)
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := socks5Handshake(ctx, conn, u, "example.com:80", true); err == nil {
+		t.Fatal("回复版本非 0x05 应报错")
+	}
+}
+
 func TestMaskURL(t *testing.T) {
 	// 代理凭据不该出现在面向使用者的报错里。
 	cases := []struct {
