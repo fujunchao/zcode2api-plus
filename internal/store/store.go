@@ -970,10 +970,12 @@ func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*m
 	// 每账号独立设备指纹：全局共用一份会让同机多账号被上游按设备关联。
 	mid := config.NewDeviceMid()
 	acc.VirtualDeviceMid = &mid
-	s.accounts[provider] = append(s.accounts[provider], acc)
+	// 先落库再改内存：落库失败时内存不能留下一个不存在的账号。反过来会让账号在本次
+	// 进程里可用、重启后消失，而调用方收到错误以为没建成。
 	if err := s.persistAccountLocked(acc); err != nil {
 		return nil, false, err
 	}
+	s.accounts[provider] = append(s.accounts[provider], acc)
 	return acc, true, nil
 }
 

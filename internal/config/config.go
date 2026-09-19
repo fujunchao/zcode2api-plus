@@ -183,8 +183,15 @@ func DeviceMid() string {
 			}
 		}
 		mid := newUUID()
-		_ = os.MkdirAll(DataDir, 0o755)
-		_ = os.WriteFile(path, []byte(mid), 0o644)
+		// 写盘失败必须留下痕迹：该值随每个上游请求送出并用于激活上报，落不了盘时
+		// 每次重启都会换一个（上游视为新装置），管理员只会看到「账号莫名被风控」，
+		// 没有任何线索指向 DataDir 不可写。用 stderr 而非 internal/web：web 包依赖
+		// 本包，反向引用会成环。
+		if err := os.MkdirAll(DataDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "[!] 设备指纹目录不可建（%s），本次使用临时指纹，重启后会变化: %v\n", DataDir, err)
+		} else if err := os.WriteFile(path, []byte(mid), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "[!] 设备指纹写入失败（%s），本次使用临时指纹，重启后会变化: %v\n", path, err)
+		}
 		deviceMid = mid
 	})
 	return deviceMid

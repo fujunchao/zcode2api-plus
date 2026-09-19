@@ -1319,6 +1319,26 @@ func TestRemoveAccountKeepsMemoryWhenPersistFails(t *testing.T) {
 	}
 }
 
+// 与删除同理：新建也必须先落库再改内存。反过来时落库失败会让账号在本次进程里可用、
+// 重启后消失，而调用方收到错误以为没建成。
+func TestAddAccountKeepsMemoryWhenPersistFails(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Close(); err != nil {
+		t.Fatalf("关闭存储失败: %v", err)
+	}
+
+	acc, isNew, err := s.AddAccountWithIdentity(model.ProviderZai, "late", "sk-1", "")
+	if err == nil {
+		t.Fatal("落库失败应报错")
+	}
+	if acc != nil || isNew {
+		t.Fatalf("落库失败不应返回账号: acc=%v isNew=%v", acc, isNew)
+	}
+	if got := s.ListAccounts(model.ProviderZai); len(got) != 0 {
+		t.Fatalf("落库失败时内存里不得留下账号: %d 个", len(got))
+	}
+}
+
 // 巡检设置：默认跟随环境变量（开、30 分钟），落库后以设置为准，非法值回退默认。
 func TestProxyHealthSettings(t *testing.T) {
 	s := newTestStore(t)
