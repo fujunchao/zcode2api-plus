@@ -360,6 +360,46 @@ func TestFetchQuotaCacheAndInflightDedup(t *testing.T) {
 	}
 }
 
+// 额度解析 panic 必须被隔离：这条 goroutine 是本包自己开的，不在 net/http 的
+// recover 范围内，逃逸出去就是进程死亡（在途串流一并陪葬）。兜住之后还必须唤醒
+// 等待者并清理 inflight，否则调用方永久阻塞在 <-call.done（比 panic 更隐蔽）。
+func TestFetchQuotaIsolatesPanic(t *testing.T) {
+	svc, st, _ := setup(t)
+	acc, err := st.AddAccount(model.ProviderZai, "panicky", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Client = clientFunc(func(*http.Request) (*http.Response, error) {
+		panic("boom") // 模拟解析上游 JSON 时未预见的类型/结构
+	})
+
+	result := svc.FetchQuota(acc) // 不得 panic、不得永久阻塞
+	if result == nil {
+		t.Fatal("panic 应转化为错误结果而不是 nil")
+	}
+	if _, hasErr := result["error"]; !hasErr {
+		t.Fatalf("panic 应转化为错误结果: %v", result)
+	}
+
+	svc.mu.Lock()
+	_, stillInflight := svc.inflight[acc.ID]
+	svc.mu.Unlock()
+	if stillInflight {
+		t.Fatal("panic 后 inflight 未清理，后续同账号查询会永久阻塞")
+	}
+
+	// 出错结果不进缓存：换掉 client 后应能立刻重新查询
+	svc.Client = clientFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(balancePayload(1000))),
+		}, nil
+	})
+	if res := svc.FetchQuota(acc); res["error"] != nil {
+		t.Fatalf("panic 之后额度查询应能恢复正常: %v", res)
+	}
+}
+
 func TestFetchQuotaErrorNotCached(t *testing.T) {
 	// 失败结果不写缓存：连续失败每次都真实请求。
 	svc, st, billing := setup(t)
