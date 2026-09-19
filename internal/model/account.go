@@ -835,8 +835,11 @@ func newAccountID(name string) string {
 		}
 	}
 	safe := strings.Trim(b.String(), "-")
-	if len(safe) > 32 {
-		safe = strings.Trim(safe[:32], "-")
+	// 按 rune 而非 byte 截断：Python 的 name[:32] 对 str 是 32 个字符，按字节切会
+	// 切断多字节字符产生非法 UTF-8（如 11 个汉字 = 33 bytes），落库后 ID 变成含
+	// 替换字符的版本，重启再载入时主键改变、同账号被插成第二行。
+	if runes := []rune(safe); len(runes) > 32 {
+		safe = strings.Trim(string(runes[:32]), "-")
 	}
 	if safe == "" {
 		safe = "account"

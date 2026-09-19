@@ -1298,6 +1298,27 @@ func TestPickFreeProxyProfile(t *testing.T) {
 	}
 }
 
+// 删除必须「先落库再改内存」。反过来时落库失败会让内存与 DB 分叉——本次进程里账号
+// 已消失、重启后又从 DB 载入回来。删除常用来撤销可疑或外泄的凭证，这种「显示已删除、
+// 实际还在」属于安全相关的静默失败。这里用「关掉底层 DB 让落库必失败」来复现。
+func TestRemoveAccountKeepsMemoryWhenPersistFails(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "victim", "sk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("关闭存储失败: %v", err)
+	}
+
+	if ok, err := s.RemoveAccount(model.ProviderZai, acc.ID); err == nil || ok {
+		t.Fatalf("落库失败应报错且不算删除成功: ok=%v err=%v", ok, err)
+	}
+	if s.Find(model.ProviderZai, acc.ID) == nil {
+		t.Fatal("落库失败时内存里的账号不得被移除（否则重启后它会复活，而调用方以为已删除）")
+	}
+}
+
 // 巡检设置：默认跟随环境变量（开、30 分钟），落库后以设置为准，非法值回退默认。
 func TestProxyHealthSettings(t *testing.T) {
 	s := newTestStore(t)

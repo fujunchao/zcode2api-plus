@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -583,3 +584,19 @@ func TestAccumulateAndPublicView(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// 账号 ID 的名称前缀必须按 rune 截断。40 个汉字 = 120 字节，按字节切会切断多字节
+// 字符、产生非法 UTF-8 的 ID；落库后主键与内存里的不一致，重启载入时同一账号会被
+// 插成第二行。Python 的 name[:32] 对 str 是 32 个字符，这里对齐该语义。
+func TestNewAccountIDTruncatesByRune(t *testing.T) {
+	id := newAccountID(strings.Repeat("汉", 40))
+	if !strings.HasPrefix(id, strings.Repeat("汉", 32)+"-") {
+		t.Fatalf("名称前缀应按 rune 截到 32 个字符，实际 %q", id)
+	}
+	if got := len([]rune(id)); got != 32+1+8 {
+		t.Fatalf("ID 应为 32 字符 + 短横 + 8 位十六进制，实际 %d 个字符: %q", got, id)
+	}
+	if short := newAccountID("abc"); !strings.HasPrefix(short, "abc-") {
+		t.Fatalf("短名不应被改写: %q", short)
+	}
+}

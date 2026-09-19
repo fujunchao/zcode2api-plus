@@ -1031,6 +1031,12 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 	if target == nil {
 		return false, nil
 	}
+	// 先落库再改内存：反过来时落库失败会让内存与 DB 分叉——本次进程里账号已消失，
+	// 重启后又从 DB 载入回来。删除常被用来撤销可疑或外泄的凭证，这种「显示已删除、
+	// 实际还在」属于安全相关的静默失败。
+	if err := s.deleteAccountLocked(target.ID); err != nil {
+		return false, err
+	}
 	remaining := items[:0:0]
 	for _, a := range items {
 		if a.ID != target.ID {
@@ -1038,9 +1044,6 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 		}
 	}
 	s.accounts[provider] = remaining
-	if err := s.deleteAccountLocked(target.ID); err != nil {
-		return false, err
-	}
 	return true, nil
 }
 
