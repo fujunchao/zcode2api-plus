@@ -1364,6 +1364,25 @@ func TestGetSettingSeesWritesImmediately(t *testing.T) {
 	}
 }
 
+// 设置也必须先落库再改内存：落库失败时内存里不能留下未持久化的值，否则本次进程按
+// 新值运行、重启后回滚，而调用方收到错误以为没生效（改密码场景会让人拿旧密码重试）。
+func TestSetSettingKeepsMemoryWhenPersistFails(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetSetting("admin_key", "before"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("关闭存储失败: %v", err)
+	}
+
+	if err := s.SetSetting("admin_key", "after"); err == nil {
+		t.Fatal("落库失败应报错")
+	}
+	if got, _ := s.GetSetting("admin_key"); got != "before" {
+		t.Fatalf("落库失败时内存值不应改变: %q", got)
+	}
+}
+
 // 巡检设置：默认跟随环境变量（开、30 分钟），落库后以设置为准，非法值回退默认。
 func TestProxyHealthSettings(t *testing.T) {
 	s := newTestStore(t)

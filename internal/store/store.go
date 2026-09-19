@@ -29,6 +29,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/web"
 )
 
 const (
@@ -348,13 +349,55 @@ func (s *Store) publishSettings() {
 	s.settingsSnapshot.Store(&cp)
 }
 
+// logPersistFailure 记录一次落库失败。
+//
+// 统计路径（网关计 token、异步池计状态、额度刷新）刻意忽略 Update 的错误——不该因为
+// 统计写不进去就让用户的对话请求失败。但完全静默会让「磁盘满导致状态全部不落库」没有
+// 任何线索可查：后台数字与实际持久化状态脱节、重启后回滚，而日志里什么都没有。这里
+// 集中记一次，涵盖所有调用方。
+//
+// 节流到每分钟一条：持续失败时每个请求都会走到这里，不节流会把日志刷爆并掩盖其他信息。
+//
+// 调用方都持有 s.mu，故本函数必须自行确保「不在锁内做 I/O」——web.Warn 是同步的
+// stdout 写，stdout 阻塞（管道满、终端卡住）时会把整个 Store 锁住。做法是只在锁内
+// 做判断，把实际输出交给独立 goroutine。
+func logPersistFailure(scope, detail string, err error) {
+	if err == nil {
+		return
+	}
+	persistLogMu.Lock()
+	now := time.Now()
+	allow := now.Sub(persistLogLast) >= persistLogInterval
+	if allow {
+		persistLogLast = now
+	}
+	persistLogMu.Unlock()
+	if !allow {
+		return
+	}
+	msg := fmt.Sprintf("落库失败（%s，%s）: %v；该改动可能只存在于内存，重启后会回滚", scope, detail, err)
+	go web.Warn("store", msg)
+}
+
+var (
+	persistLogMu       sync.Mutex
+	persistLogLast     time.Time
+	persistLogInterval = time.Minute
+)
+
 // SetSetting 更新设置并落库。
 func (s *Store) SetSetting(key, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 先落库再改内存，与 AddAccount / RemoveAccount 同一原则：落库失败时内存不能留下
+	// 一个未持久化的值，否则本次进程按新值运行、重启后回滚，而调用方收到错误以为没生效。
+	if err := s.setMeta(key, value); err != nil {
+		logPersistFailure("setting", key, err)
+		return err
+	}
 	s.settings[key] = value
 	s.publishSettings()
-	return s.setMeta(key, value)
+	return nil
 }
 
 func (s *Store) AdminKey() string {
@@ -1002,6 +1045,7 @@ func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*m
 	// 先落库再改内存：落库失败时内存不能留下一个不存在的账号。反过来会让账号在本次
 	// 进程里可用、重启后消失，而调用方收到错误以为没建成。
 	if err := s.persistAccountLocked(acc); err != nil {
+		logPersistFailure("add", provider+"/"+acc.ID, err)
 		return nil, false, err
 	}
 	s.accounts[provider] = append(s.accounts[provider], acc)
@@ -1066,6 +1110,7 @@ func (s *Store) RemoveAccount(provider, idOrName string) (bool, error) {
 	// 重启后又从 DB 载入回来。删除常被用来撤销可疑或外泄的凭证，这种「显示已删除、
 	// 实际还在」属于安全相关的静默失败。
 	if err := s.deleteAccountLocked(target.ID); err != nil {
+		logPersistFailure("delete", provider+"/"+target.ID, err)
 		return false, err
 	}
 	remaining := items[:0:0]
@@ -1124,7 +1169,9 @@ func (s *Store) Update(provider, idOrName string, fn func(*model.Account)) (bool
 		return false, nil
 	}
 	fn(acc)
-	return true, s.persistAccountLocked(acc)
+	failed := s.persistAccountLocked(acc)
+	logPersistFailure("update", provider+"/"+idOrName, failed)
+	return true, failed
 }
 
 // ── 字段级写入 ──────────────────────────────────────────────────────────────
