@@ -1339,6 +1339,31 @@ func TestAddAccountKeepsMemoryWhenPersistFails(t *testing.T) {
 	}
 }
 
+// 设置读路径走原子快照：写入后必须立刻可见——发布点漏一个就会读到旧值，比不加
+// 快照更糟。读不再依赖 store 锁，并发正确性由 CI 的 -race 覆盖。
+func TestGetSettingSeesWritesImmediately(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetSetting("admin_key", "k1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.GetSetting("admin_key"); !ok || got != "k1" {
+		t.Fatalf("写入后应立刻可见: %q ok=%v", got, ok)
+	}
+	if err := s.SetSetting("admin_key", "k2"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetSetting("admin_key"); got != "k2" {
+		t.Fatalf("覆盖写后应看到新值: %q", got)
+	}
+	// 线路落库走另一条发布路径（saveProxyProfilesLocked），同样要立刻可见
+	if _, err := s.AddProxyProfile("prx", "http://1.2.3.4:8080", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.GetSetting("proxy_profiles"); !ok {
+		t.Fatal("线路写入后 proxy_profiles 应立刻可见")
+	}
+}
+
 // 巡检设置：默认跟随环境变量（开、30 分钟），落库后以设置为准，非法值回退默认。
 func TestProxyHealthSettings(t *testing.T) {
 	s := newTestStore(t)
