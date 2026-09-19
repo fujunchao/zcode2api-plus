@@ -39,7 +39,7 @@ func main() {
 	}
 }
 
-// 服务端超时与停机预算。
+// 服务端超时与体积预算。
 const (
 	// readHeaderTimeout 读取请求头的上限（防御慢速头攻击）。
 	readHeaderTimeout = 30 * time.Second
@@ -47,7 +47,32 @@ const (
 	idleTimeout = 120 * time.Second
 	// gracefulShutdownTimeout 收到停机信号后等待在途请求收尾的上限。
 	gracefulShutdownTimeout = 10 * time.Second
+	// maxBodyBytes 请求体大小上限。
+	//
+	// 八个对外入口都把 r.Body 直接交给 json.NewDecoder 解进 map[string]any，
+	// 解出来的内存远大于线上字节数；网关还会为每个候选账号再序列化一次。
+	// 不设上限时一个超大 JSON 就能把进程撑爆，连带杀掉所有在途 SSE 串流。
+	// 16 MiB：足以容纳任何合理请求（含长上下文的多模态输入），同时把
+	// 「单个请求吃光内存」变成一次明确的拒绝。
+	maxBodyBytes = 16 << 20
+	// maxHeaderBytes 请求头体积上限：默认 1 MiB 对 Cookie/Authorization 足够，
+	// 显式写小以缩小单连接可占用的内存。
+	maxHeaderBytes = 64 << 10
 )
+
+// limitBody 给请求体套上大小上限。
+//
+// 放在服务端而非各 handler：入口有八个，逐个加容易漏，且新入口默认没有防护；
+// 包在 mux 外层则新增端点自动受保护。超限时响应体不会被整段读进内存——读取
+// 直接失败，handler 的解码随之报错并回 4xx。
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // newServer 构造 HTTP 服务端。
 //
@@ -57,9 +82,10 @@ const (
 func newServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           limitBody(handler),
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 }
 
