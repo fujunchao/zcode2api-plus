@@ -255,6 +255,12 @@ meta(key TEXT PK, value TEXT)
   `signature_delta` 与 `redacted_thinking` 不外泄（签名属内部凭据）。
   多轮历史中的 `reasoning_content` **不回灌**为 thinking 块（缺签名，上游会拒），见 §8 风险表。
 - UsageCollector 在重编码旁路照常解析 Anthropic 事件——账号调度统计不受转换影响。
+- **账号用量的计入判据是「上游是否交出终值」，不是「客户端有没有把流读完」**：
+  收到带非空 `stop_reason` 且含 `output_tokens` 的 `message_delta`（或非流式 JSON 解析出
+  `usage`）即认定为终值；此后交付即便因客户端提前断开而失败（编辑器类客户端收到
+  `finish_reason` 就立刻关流，是常态而非故障），这笔用量仍要累计。没有终值的半截流
+  （缺少 `message_stop` 且未见终值）仍旧不计入——这正是上一行「不累计为完整交付」的本意。
+  判据实现见 `gateway.UsageCollector.UsageComplete`，同步与 async 两条路径同口径。
 
 ### 5.8 `/v1/responses`（无状态兼容层）
 

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -240,6 +241,40 @@ func TestStreamPassthroughAndUsage(t *testing.T) {
 	got := f.st.Find(model.ProviderZai, acc.ID)
 	if got.TotalInputTokens != 9 || got.TotalOutputTokens != 42 {
 		t.Fatalf("流式 usage 统计不符: %+v", got)
+	}
+}
+
+// 交付中断时「这笔用量还能不能计入」的判据是上游有没有交出终值，不是客户端有没有读完。
+// zcode 编辑器收到 finish_reason 就立刻关流是常态，此时 message_delta 的终值已经到手，
+// 整笔丢掉就会系统性少算（线上曾漏计一次 57,352 output token 的生成，见
+// docs/analysis-flash-30min-stream-cut.md §5）；没有终值的半截流仍不能计。
+func TestAbortedDeliveryStillCountsFinalUsage(t *testing.T) {
+	f := newFixture(t)
+	acc, err := f.st.AddAccount(model.ProviderZai, "k", "sk-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	complete := NewUsageCollector(true)
+	complete.FeedLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}`)
+	complete.FeedLine(`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}`)
+	res := f.eng.finishDelivery("t1", acc, complete, errors.New("write tcp: 客户端已断开"))
+	if !res.final.Delivered {
+		t.Fatal("交付中断仍应记为 Delivered（200 已发出，不得再写响应）")
+	}
+	if got := f.st.Find(model.ProviderZai, acc.ID); got.TotalInputTokens != 9 || got.TotalOutputTokens != 42 {
+		t.Fatalf("上游终值已到齐，应计入: %+v", got)
+	}
+
+	// 反例：流在半途断掉（只有中途的 usage 更新、没有 stop_reason）时不得记半截数字。
+	partial := NewUsageCollector(true)
+	partial.FeedLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}`)
+	partial.FeedLine(`data: {"type":"message_delta","usage":{"output_tokens":17}}`)
+	if res := f.eng.finishDelivery("t2", acc, partial, errors.New("上游串流在 message_stop 之前结束: unexpected EOF")); !res.final.Delivered {
+		t.Fatal("交付中断仍应记为 Delivered")
+	}
+	if got := f.st.Find(model.ProviderZai, acc.ID); got.TotalOutputTokens != 42 {
+		t.Fatalf("usage 不完整不应计入: %+v", got)
 	}
 }
 

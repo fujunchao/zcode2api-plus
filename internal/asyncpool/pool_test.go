@@ -606,6 +606,33 @@ func TestMidStreamFailureTerminatesWithoutRetry(t *testing.T) {
 	}
 }
 
+// 上游已交出终值（message_delta 带 stop_reason + usage）之后才断流：用量是准的，必须计入。
+// 计入判据是「上游有没有交出终值」而不是「客户端有没有读完」，与同步路径同口径
+// （见 gateway.UsageCollector.UsageComplete）。
+func TestMidStreamFailureAfterFinalUsageStillCounts(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "finalusage")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, lines: []string{
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}`,
+		}, abort: true},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-finalusage", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-finalusage")
+	_ = drainEvents(tk)
+
+	if got := st.Find(model.ProviderZai, acc.ID); got.TotalInputTokens != 9 || got.TotalOutputTokens != 42 {
+		t.Fatalf("上游终值已到齐，中断后仍应计入: %+v", got)
+	}
+	if up.callCount() != 1 {
+		t.Fatalf("已发出 chunk 后不得换号重发: %d", up.callCount())
+	}
+}
+
 func TestFailureBeforeFirstChunkStillRetries(t *testing.T) {
 	// 一個 chunk 都沒發出時中斷：仍按網絡錯誤走換號重試路徑。
 	p, st, _, _ := newTestPool(t)

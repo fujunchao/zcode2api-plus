@@ -469,21 +469,38 @@ func (e *Engine) deliverStream(reqID string, acc *model.Account, contentType str
 	return e.finishDelivery(reqID, acc, usage, err)
 }
 
-// finishDelivery 交付收尾：完整交付 → 累计 usage；客户端中断 → 只记日志不累计。
+// finishDelivery 交付收尾：累计 usage 并写日志。
+//
+// 「能不能计入」的判据是上游有没有交出终值（UsageComplete），不是客户端有没有把流读完。
+// zcode 编辑器这类客户端收到 finish_reason 就立刻关流是常态，此时 message_delta 的终值
+// 已经到手，用量是准的；若沿用旧的「客户端没读完就不计入」，账号用量会系统性少算
+// （线上曾漏计一次 57,352 output token 的生成，详见
+// docs/analysis-flash-30min-stream-cut.md §5）。usage 不完整时仍旧不计入。
 func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCollector, err error) attemptResult {
 	if err != nil {
-		web.ReqErr(reqID, fmt.Sprintf("流传输中断: %v", err))
+		if usage.UsageComplete() {
+			got := e.accumulateUsage(acc, usage)
+			web.ReqErr(reqID, fmt.Sprintf("流传输中断，上游 usage 已完整，仍计入 %d tok: %v", got.Output, err))
+		} else {
+			web.ReqErr(reqID, fmt.Sprintf("流传输中断: %v", err))
+		}
 		return attemptResult{final: runResult{Delivered: true}}
 	}
 	usage.Finish()
+	web.ReqOk(reqID, e.accumulateUsage(acc, usage).Output)
+	return attemptResult{final: runResult{Delivered: true}}
+}
+
+// accumulateUsage 把一次交付的 token 用量累加到账号上，返回本次用量。
+//
+// 用量累加必须在 store 锁内对「当前」对象做：acc 是 Select 交出的账号副本，
+// 改副本不落库，也会与并发的额度刷新/领取回写相撞。
+func (e *Engine) accumulateUsage(acc *model.Account, usage *UsageCollector) model.Usage {
 	got := usage.AsDict()
-	// 用量累加必须在 store 锁内对「当前」对象做：acc 是 Select 交出的账号副本，
-	// 改副本不落库，也会与并发的额度刷新/领取回写相撞。
 	_, _ = e.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
 		live.AccumulateTokens(got)
 	})
-	web.ReqOk(reqID, got.Output)
-	return attemptResult{final: runResult{Delivered: true}}
+	return got
 }
 
 // ── 账号状态标记（对齐 Python 版 _mark / _mark_model_exhausted）──────────────

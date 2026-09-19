@@ -626,6 +626,7 @@ func (p *Pool) bumpFail(acc *model.Account) {
 // forwardSSE 把上游 SSE 行转成 ticket chunk 事件，并累计账号 token 用量。
 // 完整结束时投递 done 并返回 (false, nil)；转发开始后中断时返回
 // (true, err)，零 chunk 时返回 (false, err) 由调用方换号重试。
+// 中断时若上游已交出终值，用量仍由 accumulateFinalUsage 补记。
 func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Response, acc *model.Account) (bool, error) {
 	usage := gateway.NewUsageCollector(true)
 	chunksSent := 0
@@ -646,11 +647,14 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 			continue
 		}
 		if !p.emit(ctx, ticketID, ticketEvent{Type: "chunk", Data: payload}) {
+			// 消费者提前断开（票务被释放）：上游若已交出终值，这笔用量仍要计入
+			p.accumulateFinalUsage(ticketID, acc, usage)
 			return false, ctx.Err()
 		}
 		chunksSent++
 	}
 	if err := scanner.Err(); err != nil {
+		p.accumulateFinalUsage(ticketID, acc, usage)
 		if chunksSent > 0 {
 			return true, err
 		}
@@ -669,6 +673,28 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	}
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
+}
+
+// accumulateFinalUsage 在「上游已交出最终 usage」时补记这笔用量。
+//
+// 转发被中断（消费者断开、或上游在 message_delta 之后才断）时，原本直接返回，
+// 一笔已经确定的用量就被丢掉了；同步路径的 gateway.finishDelivery 有同样的问题，
+// 两处判据一致（gateway.UsageCollector.UsageComplete）。usage 不完整时保持原样
+// 不计入，避免记半截数字。
+//
+// 不会重复计数：两个中断出口都走向终止（消费者断开由调用方按 ctx.Err 直接 return；
+// needChunks 场景返回 midStream=true 后不换号重发），不存在「记一次又重试成功再记一次」。
+func (p *Pool) accumulateFinalUsage(ticketID string, acc *model.Account, usage *gateway.UsageCollector) {
+	if !usage.UsageComplete() {
+		return
+	}
+	usage.Finish()
+	got := usage.AsDict()
+	if _, err := p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		live.AccumulateTokens(got)
+	}); err != nil {
+		web.Warn(ticketID, "用量统计落库失败: "+err.Error())
+	}
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
