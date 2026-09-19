@@ -166,6 +166,60 @@ func newTestPool(t *testing.T, f WorkerFactory, size int) *Pool {
 
 // ── 基本往返 ─────────────────────────────────────────────────────────────────
 
+// 派发的两条失败出路（调用方取消 / 池关闭）都必须把槽位放回 idle。槽位是从 idle
+// 取出的、此刻正阻塞在 reqCh 接收上；若直接返回，它既没收到请求也不会再入队
+// （serveLoop 只在循环顶端归还，错过一次就永不执行），池容量永久少一格——size=1
+// 时整池失效，而 IsStarted 仍为 true 不会被重建。
+//
+// 这两条出路都与「发送就绪」在 select 里同时成立、随机取胜，用真实 Solve 去撞是
+// 撞不稳的（实测把归还去掉用例照样绿）。所以这里直接驱动 handoff，并让 reqCh 无人
+// 接收使发送必然不就绪，从而确定性走到这两条路。不启动 worker、只验证这条不变量。
+func TestHandoffReturnsSlotOnCancelAndClose(t *testing.T) {
+	p := NewPool(func(context.Context) (Worker, error) { return &scriptWorker{}, nil }, 1)
+	newReq := func(ctx context.Context) (*solveReq, *slot) {
+		return &solveReq{ctx: ctx, done: make(chan solveResult, 1)},
+			&slot{id: 1, reqCh: make(chan *solveReq)}
+	}
+	assertReturned := func(t *testing.T, g *generation, want *slot) {
+		t.Helper()
+		select {
+		case got := <-g.idle:
+			if got != want {
+				t.Fatalf("归还的槽位不对: %v", got)
+			}
+		default:
+			t.Fatal("槽位未归还 idle，池容量永久少一格")
+		}
+	}
+
+	t.Run("调用方取消", func(t *testing.T) {
+		g := &generation{done: make(chan struct{}), idle: make(chan *slot, 1)}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req, s := newReq(ctx)
+		if err := p.handoff(g, s, req, ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("应返回 context.Canceled: %v", err)
+		}
+		if !req.abandoned.Load() {
+			t.Fatal("取消的请求应标记为已放弃（迟到的结果必须丢弃）")
+		}
+		assertReturned(t, g, s)
+	})
+
+	t.Run("池关闭", func(t *testing.T) {
+		g := &generation{done: make(chan struct{}), idle: make(chan *slot, 1)}
+		close(g.done)
+		req, s := newReq(context.Background())
+		if err := p.handoff(g, s, req, context.Background()); !errors.Is(err, ErrPoolClosed) {
+			t.Fatalf("应返回 ErrPoolClosed: %v", err)
+		}
+		if !req.abandoned.Load() {
+			t.Fatal("池关闭时请求应标记为已放弃")
+		}
+		assertReturned(t, g, s)
+	})
+}
+
 func TestPoolSolveRoundtrip(t *testing.T) {
 	f := &scriptFactory{}
 	p := newTestPool(t, f.create, 2)

@@ -323,14 +323,8 @@ func (p *Pool) Solve(ctx context.Context) (string, error) {
 	solveCtx, cancel := context.WithTimeout(ctx, p.requestTimeout)
 	defer cancel()
 	req := &solveReq{ctx: solveCtx, done: make(chan solveResult, 1)}
-	select {
-	case s.reqCh <- req:
-	case <-ctx.Done():
-		p.abandon(req)
-		return "", ctx.Err()
-	case <-g.done:
-		p.abandon(req)
-		return "", ErrPoolClosed
+	if err := p.handoff(g, s, req, ctx); err != nil {
+		return "", err
 	}
 
 	// 等待结果；请求超时即判死槽位（对齐 Python：超时杀进程，杜绝响应错位）
@@ -377,6 +371,31 @@ func (p *Pool) Solve(ctx context.Context) (string, error) {
 		}
 		p.abandon(req)
 		return "", ErrPoolClosed
+	}
+}
+
+// handoff 把请求交给已取得的槽位；发送成功即完成交接。
+//
+// 两条失败出路都必须把槽位放回 idle。槽位此刻正阻塞在 reqCh 接收上，放回即恢复
+// 空闲；若直接返回，它既没收到请求、也不会再入队（serveLoop 只在循环顶端归还，
+// 错过一次就永不执行），池容量永久少一格——默认 size=1 时整个池就此失效，而
+// IsStarted 仍为 true 不会被重建。idle 缓冲容量等于池容量，且本槽位是从 idle
+// 取出的，故归还的发送不会阻塞。
+//
+// 单独成函数是为了让这两条竞态出路可被确定性测试覆盖（调用方取消与池关闭都是
+// 与「发送就绪」同时成立的 select 分支，随机取胜）。
+func (p *Pool) handoff(g *generation, s *slot, req *solveReq, ctx context.Context) error {
+	select {
+	case s.reqCh <- req:
+		return nil
+	case <-ctx.Done():
+		p.abandon(req)
+		g.idle <- s
+		return ctx.Err()
+	case <-g.done:
+		p.abandon(req)
+		g.idle <- s
+		return ErrPoolClosed
 	}
 }
 
