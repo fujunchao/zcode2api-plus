@@ -39,6 +39,10 @@ export function SettingsPage() {
   const [proxyHealthInterval, setProxyHealthInterval] = useState('30')
   const [savingProxyHealth, setSavingProxyHealth] = useState(false)
 
+  /* ── 風控冷卻（上游 405 + 風控文案） ── */
+  const [riskCoolingSteps, setRiskCoolingSteps] = useState('300,900,3600')
+  const [savingRiskCooling, setSavingRiskCooling] = useState(false)
+
   /* 載入完成後填入表單（僅在尚未編輯時同步） */
   useEffect(() => {
     if (!data) return
@@ -53,6 +57,7 @@ export function SettingsPage() {
     setClaimPreviewCooldown(String(data.claim_preview_cooldown ?? 60))
     setProxyHealth(data.proxy_health_enabled)
     setProxyHealthInterval(String(data.proxy_health_interval ?? 30))
+    setRiskCoolingSteps(data.risk_cooling_steps || '300,900,3600')
   }, [data])
 
   async function save(e: FormEvent) {
@@ -144,6 +149,31 @@ export function SettingsPage() {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
       setSavingProxyHealth(false)
+    }
+  }
+
+  /* 風控冷卻階梯：独立表单，只提交这一个字段。
+     校验必须严格（整串都是 ≥1 的整数）——档位数同时是升级点，静默丢一档会给出一个
+     管理员自己都不知道有几档的阶梯。 */
+  async function saveRiskCooling(e: FormEvent) {
+    e.preventDefault()
+    const steps = riskCoolingSteps
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== '')
+    if (steps.length === 0 || steps.some((s) => !/^\d+$/.test(s) || parseInt(s, 10) < 1)) {
+      toast.error('階梯需為逗號分隔的正整數秒，如 300,900,3600')
+      return
+    }
+    setSavingRiskCooling(true)
+    try {
+      await api('PUT', '/settings', { risk_cooling_steps: steps.join(',') })
+      toast.success('已儲存')
+      void qc.invalidateQueries({ queryKey: ['settings'] })
+    } catch (err) {
+      toast.error('儲存失敗：' + errMsg(err))
+    } finally {
+      setSavingRiskCooling(false)
     }
   }
 
@@ -335,6 +365,43 @@ export function SettingsPage() {
             <div className="flex justify-end">
               <Button type="submit" disabled={savingProxyHealth}>
                 {savingProxyHealth ? <Loader2 className="animate-spin" /> : null}
+                儲存
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      {/* 風控冷卻 */}
+      <Card>
+        <CardContent className="flex flex-col gap-5">
+          <div className="text-sm font-semibold">風控冷卻</div>
+          <form className="flex flex-col gap-5" onSubmit={saveRiskCooling}>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-risk-cooling-steps">冷卻階梯（秒，逗號分隔）</Label>
+              <div className="text-xs text-muted-foreground">
+                上游用 HTTP 405 + <code>unusual activity</code> 表示風控攔截。它看的是身分維度
+                （帳號、裝置指紋、出口 IP、請求標頭），與請求的哪個模型無關，所以處置是
+                <strong>停整個帳號</strong>——換模型照樣被攔。連續第 N 次命中取第 N 檔；
+                <strong>連續次數超過檔位數</strong>則帳號直接置為失效，需人工介入。
+              </div>
+              <Input
+                id="set-risk-cooling-steps"
+                className="w-64"
+                placeholder="300,900,3600"
+                value={riskCoolingSteps}
+                onChange={(e) => setRiskCoolingSteps(e.target.value)}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              預設 <span className="tabular-nums">300,900,3600</span>（5／15／60 分鐘）。
+              <strong>檔位數就是升級點</strong>：想多給帳號一次自證機會就多加一檔，想更早封禁就減一檔。
+              冷卻期內該帳號不參與調度、也不做套餐領取；冷卻到期後成功調用一次即回到最低檔。
+              單檔上限 7 天。判定同時看 body，因此「缺少 system 注入」這類我方請求缺陷不會被誤判成風控。
+            </p>
+            <div className="flex justify-end">
+              <Button type="submit" disabled={savingRiskCooling}>
+                {savingRiskCooling ? <Loader2 className="animate-spin" /> : null}
                 儲存
               </Button>
             </div>

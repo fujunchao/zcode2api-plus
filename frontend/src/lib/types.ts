@@ -116,6 +116,8 @@ export interface SettingsResponse {
   claim_preview_cooldown: number
   proxy_health_enabled: boolean
   proxy_health_interval: number
+  /* 風控冷卻階梯：逗號分隔的秒數。檔位數同時是升級點——連續命中超過檔位數則帳號失效 */
+  risk_cooling_steps: string
 }
 
 /* z.ai 側的單個探測目標（主站 / 備援站） */
@@ -222,6 +224,7 @@ export type AccountErrorKind =
   | 'client_canceled'
   | 'upstream_error'
   | 'quota_query_failed'
+  | 'risk_control'
 
 /** 錯誤類型標籤（繁體）。改文案只動這裡，不動上面的取值。 */
 export const ERROR_KIND_LABEL: Record<AccountErrorKind, string> = {
@@ -237,6 +240,7 @@ export const ERROR_KIND_LABEL: Record<AccountErrorKind, string> = {
   client_canceled: '用戶端取消',
   upstream_error: '上游錯誤',
   quota_query_failed: '額度查詢失敗',
+  risk_control: '風控攔截',
 }
 
 /**
@@ -256,6 +260,7 @@ export const ERROR_KIND_BADGE: Record<AccountErrorKind, string> = {
   client_canceled: 'bg-muted text-muted-foreground',
   upstream_error: 'bg-red-100 text-red-700',
   quota_query_failed: 'bg-muted text-muted-foreground',
+  risk_control: 'bg-red-100 text-red-700',
 }
 
 /**
@@ -278,6 +283,7 @@ export const ERROR_KIND_IS_FAULT: Record<AccountErrorKind, boolean> = {
   client_canceled: false,
   upstream_error: true,
   quota_query_failed: false,
+  risk_control: true,
 }
 
 /** 全部錯誤類型，順序與後端 `model.ErrorKindAll` 一致（下拉選單用）。 */
@@ -294,6 +300,7 @@ export const ERROR_KIND_ALL: AccountErrorKind[] = [
   'client_canceled',
   'upstream_error',
   'quota_query_failed',
+  'risk_control',
 ]
 
 /* 儀表板用的完整狀態標籤與配色 */
