@@ -709,6 +709,137 @@ func TestSelectPromoAccountsFirst(t *testing.T) {
 	}
 }
 
+// 额度优先调度：剩余可用额度最多的账号先服务，额度并列时才轮询。
+func TestSelectPrefersMostRemainingQuota(t *testing.T) {
+	s := newTestStore(t)
+	small, _ := s.AddAccount(model.ProviderZai, "small", "h1.p.s3")
+	mid, _ := s.AddAccount(model.ProviderZai, "mid", "h2.p.s3")
+	big, _ := s.AddAccount(model.ProviderZai, "big", "h3.p.s3")
+	setRemaining := func(a *model.Account, v float64) {
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": v},
+		}
+	}
+	setRemaining(small, 100)
+	setRemaining(mid, 5_000)
+	setRemaining(big, 1_000_000)
+
+	// big 的额度严格最多 → 一直选它，不轮询到额度更少的账号。
+	for i := range 5 {
+		acc := s.Select("zai", nil, "GLM-5.3")
+		if acc == nil || acc.ID != big.ID {
+			t.Fatalf("第 %d 次应优先选中额度最多的账号: %v", i, acc)
+		}
+	}
+
+	// big 降到与 mid 并列 → 两者轮询交替；small 仍靠后。
+	setRemaining(big, 5_000)
+	seen := map[string]bool{}
+	for range 6 {
+		acc := s.Select("zai", nil, "GLM-5.3")
+		if acc == nil {
+			t.Fatal("应选到账号")
+		}
+		if acc.ID == small.ID {
+			t.Fatal("并列组未耗尽时不应选中额度更少的账号")
+		}
+		seen[acc.ID] = true
+	}
+	if !seen[big.ID] || !seen[mid.ID] {
+		t.Fatalf("额度并列时应轮询交替: %v", seen)
+	}
+
+	// big 继续降到低于 mid → 最大值转移到 mid。
+	setRemaining(big, 4_000)
+	if acc := s.Select("zai", nil, "GLM-5.3"); acc == nil || acc.ID != mid.ID {
+		t.Fatalf("应跟随额度排序转移到 mid: %v", acc)
+	}
+}
+
+// 同规格账号（额度完全相同）是最常见的生产形态，行为必须与原来的纯轮询一致：
+// 并列组就是全池，游标逐个轮转。
+func TestSelectEqualQuotaStillRotates(t *testing.T) {
+	s := newTestStore(t)
+	ids := map[string]bool{}
+	for _, name := range []string{"a1", "a2", "a3"} {
+		a, _ := s.AddAccount(model.ProviderZai, name, "h"+name+".p.s3")
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(5_000_000)},
+		}
+		ids[a.ID] = true
+	}
+	seen := map[string]bool{}
+	for range 3 {
+		acc := s.Select("zai", nil, "GLM-5.3")
+		if acc == nil || !ids[acc.ID] {
+			t.Fatalf("应选中池内账号: %v", acc)
+		}
+		seen[acc.ID] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("额度完全相同的三个账号应各被选中一次: %v", seen)
+	}
+}
+
+// 有额度数值的账号优先于「尚无快照」的账号；后者彼此之间仍轮询。
+// 「没有数值」不能被当成「额度 0」——0 会被 ModelAvailability 判成耗尽而排除，
+// 两者在排序里必须落在不同位置。
+func TestSelectQuotaNumbersRankAboveUnknown(t *testing.T) {
+	s := newTestStore(t)
+	unknownIDs := []string{}
+	for _, name := range []string{"u1", "u2"} {
+		a, _ := s.AddAccount(model.ProviderZai, name, "h"+name+".p.s3")
+		unknownIDs = append(unknownIDs, a.ID)
+	}
+	known, _ := s.AddAccount(model.ProviderZai, "known", "hk.p.s3")
+	known.Quota = map[string]map[string]any{
+		"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(7)},
+	}
+
+	for range 3 {
+		if acc := s.Select("zai", nil, "GLM-5.3"); acc == nil || acc.ID != known.ID {
+			t.Fatalf("有额度数值的账号应优先于无数值者: %v", acc)
+		}
+	}
+	seen := map[string]bool{}
+	for range 2 {
+		acc := s.Select("zai", map[string]bool{known.ID: true}, "GLM-5.3")
+		if acc == nil {
+			t.Fatal("有数值者被跳过后应回退到无数值账号")
+		}
+		seen[acc.ID] = true
+	}
+	for _, id := range unknownIDs {
+		if !seen[id] {
+			t.Fatalf("无数值账号之间应轮询: %v", seen)
+		}
+	}
+}
+
+// 不指定模型时没有额度可比较，全池并列 → 退化为纯轮询（"*" 游标键的既有语义）。
+func TestSelectWithoutModelRotates(t *testing.T) {
+	s := newTestStore(t)
+	ids := map[string]bool{}
+	for _, name := range []string{"a1", "a2"} {
+		a, _ := s.AddAccount(model.ProviderZai, name, "h"+name+".p.s3")
+		a.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(100)},
+		}
+		ids[a.ID] = true
+	}
+	seen := map[string]bool{}
+	for range 2 {
+		acc := s.Select("zai", nil, "")
+		if acc == nil || !ids[acc.ID] {
+			t.Fatalf("不指定模型时应轮询全池: %v", acc)
+		}
+		seen[acc.ID] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("应轮询到两个账号: %v", seen)
+	}
+}
+
 func TestUpdateDeletedAccountRejected(t *testing.T) {
 	s := newTestStore(t)
 	acc, _ := s.AddAccount(model.ProviderZai, "ghost", "h.p.s3")

@@ -334,6 +334,77 @@ func TestCloneCopiesErrorFields(t *testing.T) {
 	}
 }
 
+// UsableQuotaForModel 是调度的排序依据，必须把三种情况分开：
+// 有数值（可比较）、无数值（还不知道）、以及 available 与 remaining 的优先级。
+func TestUsableQuotaForModel(t *testing.T) {
+	acc := Create(ProviderZai, "a", "a.b.c")
+
+	t.Run("无快照返回 false", func(t *testing.T) {
+		if v, ok := acc.UsableQuotaForModel("GLM-5.3"); ok || v != 0 {
+			t.Fatalf("无快照不应给出数值: %v %v", v, ok)
+		}
+	})
+
+	t.Run("available 优先于 remaining", func(t *testing.T) {
+		acc.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(500), "available": float64(120)},
+		}
+		if v, ok := acc.UsableQuotaForModel("GLM-5.3"); !ok || v != 120 {
+			t.Fatalf("应取 available: %v %v", v, ok)
+		}
+	})
+
+	t.Run("只有 remaining 时回落", func(t *testing.T) {
+		acc.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(500)},
+		}
+		if v, ok := acc.UsableQuotaForModel("GLM-5.3"); !ok || v != 500 {
+			t.Fatalf("应回落到 remaining: %v %v", v, ok)
+		}
+	})
+
+	t.Run("同模型多订阅相加且不串到别的模型", func(t *testing.T) {
+		acc.Quota = map[string]map[string]any{
+			"GLM-5.3 · pro":   {"model": "GLM-5.3", "remaining": float64(100)},
+			"GLM-5.3 · trial": {"model": "GLM-5.3", "remaining": float64(40)},
+			"GLM-5.3-Flash":   {"model": "GLM-5.3-Flash", "remaining": float64(9999)},
+		}
+		if v, ok := acc.UsableQuotaForModel("GLM-5.3"); !ok || v != 140 {
+			t.Fatalf("同模型各订阅应相加: %v %v", v, ok)
+		}
+		if v, ok := acc.UsableQuotaForModel("glm_5.3_flash"); !ok || v != 9999 {
+			t.Fatalf("模型名应归一化后匹配: %v %v", v, ok)
+		}
+	})
+
+	t.Run("额度列无数值返回 false 而不是 0", func(t *testing.T) {
+		acc.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": nil, "available": nil},
+		}
+		if v, ok := acc.UsableQuotaForModel("GLM-5.3"); ok {
+			t.Fatalf("「还不知道」不能被当成「已用完（0）」: %v %v", v, ok)
+		}
+	})
+
+	t.Run("数值为 0 时是有效数值", func(t *testing.T) {
+		acc.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": float64(0)},
+		}
+		if v, ok := acc.UsableQuotaForModel("GLM-5.3"); !ok || v != 0 {
+			t.Fatalf("0 应被视为有效数值: %v %v", v, ok)
+		}
+	})
+
+	t.Run("字符串数值也能解析", func(t *testing.T) {
+		acc.Quota = map[string]map[string]any{
+			"GLM-5.3": {"model": "GLM-5.3", "remaining": "1234"},
+		}
+		if v, ok := acc.UsableQuotaForModel("GLM-5.3"); !ok || v != 1234 {
+			t.Fatalf("字符串数值应可解析: %v %v", v, ok)
+		}
+	})
+}
+
 func TestClaimStateConcurrentAccess(t *testing.T) {
 	acc := Create(ProviderZai, "race", "sk-race")
 	var wg sync.WaitGroup

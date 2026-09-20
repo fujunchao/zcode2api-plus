@@ -1324,11 +1324,18 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 	return true, nil
 }
 
-// ── 轮询选择 ────────────────────────────────────────────────────────────────
+// ── 额度优先选择 ────────────────────────────────────────────────────────────
 
-// Select 按模型额度与 round-robin 选择账号。
-// 有该模型余额的账号优先；尚无快照无法判断者仅作后备；
-// 快照中未提供此模型（absent）的账号一律排除。
+// Select 按模型额度优先、并列时轮询的方式选择账号。
+//
+// 选号分五层，前一层筛出的池子决定后一层的作用范围：
+//  1. 可选：状态可调度（IsSelectable）且未被本次请求跳过（skipIDs）；
+//  2. 模型分档：该模型 available 者优先，其次 unknown；absent/exhausted 一律排除；
+//  3. 优惠优先：持有未耗尽的一次性优惠额度（one_time）者优先——这类额度不用就过期，
+//     与「谁剩得多」是两回事，故独立成层；
+//  4. 额度优先：剩余可用额度（token）最多者优先；
+//  5. 轮询：在第 4 层并列的账号之间按 round-robin 游标轮转。
+//
 // skipIDs 保证同一次请求不会重复尝试已失败的账号。
 func (s *Store) Select(provider string, skipIDs map[string]bool, modelName string) *model.Account {
 	s.mu.Lock()
@@ -1372,7 +1379,34 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	}
 	if len(promo) > 0 {
 		pool = promo
+	} else {
+		pool = regular
 	}
+	// 额度优先：只保留剩余额度最多的那一组，再由下面的游标在组内轮转。
+	//
+	// 为什么是「并列组 + 组内轮转」而不是「永远取最大的那一个」：额度快照是按账号
+	// 缓存的（quota.QuotaCacheTTL，15 秒）且只在账号被使用时才刷新，所以同一份数值会
+	// 在一段时间里保持不变。取并列组既保住了「额度多的先用」这个方向，又不会把全部
+	// 流量压在一个账号上；同规格账号（同一套餐、剩余量相同）会整体并列，行为与纯轮询
+	// 一致。
+	//
+	// 没有额度数值的账号记 -1：排在任何有数值者之后，但彼此之间照样并列。这与第 2 层
+	// 「unknown 作后备」同向，也不会把「还不知道」误当成「已经用完（0）」。
+	best := 0.0
+	var top []*model.Account
+	for i, a := range pool {
+		v, ok := a.UsableQuotaForModel(modelName)
+		if !ok {
+			v = -1
+		}
+		switch {
+		case i == 0 || v > best:
+			best, top = v, []*model.Account{a}
+		case v == best:
+			top = append(top, a)
+		}
+	}
+	pool = top
 	key := provider + ":" + orStar(modelName)
 	idx := s.rotation[key] % len(pool)
 	acc := pool[idx]

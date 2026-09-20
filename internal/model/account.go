@@ -498,6 +498,48 @@ func (a *Account) IsModelSelectable(model any, now time.Time) bool {
 	return false
 }
 
+// UsableQuotaForModel 汇总请求模型当前可用的剩余额度（token 单位），供调度排序使用。
+//
+// 每个额度列优先取 available（上游的 available_units，即「现在还能用多少」），缺省
+// 回落到 remaining（total − used）。逐列回落而不是整体二选一：老快照往往只有
+// remaining，新快照两个都有，混在一起时也要算出可比的数。
+//
+// 同一个模型出现在多个订阅时各列相加——它们是该模型的不同额度池，本次请求可能落到
+// 其中任意一个，对调度而言可用量就是它们的和。
+//
+// 第二个返回值为 false 表示「没有可用数值」：尚无快照，或额度列里没有数值（与
+// ModelAvailability 的 unknown 同源）。调用方必须把它和 0 区分开——0 的含义是
+// 「额度已用完」，而「没有数值」只是「还不知道」。两者在排序里必须落在不同位置。
+func (a *Account) UsableQuotaForModel(model any) (float64, bool) {
+	total := 0.0
+	found := false
+	for _, quota := range a.QuotaEntriesForModel(model) {
+		for _, key := range []string{"available", "remaining"} {
+			v, ok := quotaNumber(quota, key)
+			if !ok {
+				continue
+			}
+			total += v
+			found = true
+			break
+		}
+	}
+	return total, found
+}
+
+// quotaNumber 取额度列里的数值字段；缺失、nil、非数值都算「没有」。
+func quotaNumber(quota map[string]any, key string) (float64, bool) {
+	raw, ok := quota[key]
+	if !ok || raw == nil {
+		return 0, false
+	}
+	v, err := toFloat(raw)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
 // SetDisabledModels 保存手动停用模型：正規化、去除空值与重复项。
 func (a *Account) SetDisabledModels(models []string) {
 	seen := map[string]bool{}

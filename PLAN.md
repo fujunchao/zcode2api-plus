@@ -388,6 +388,46 @@ meta(key TEXT PK, value TEXT)
 - 后端 `test` 覆盖：真发 CONNECT 到假代理（证明请求确实经代理）、非法代理提前报错、
   脱敏不泄密码、`resolveLoginProxy` 三条分支。
 
+### 5.12 账号选择：额度优先调度（Go 版增量，2026-09-20 新增）
+
+`store.Select(provider, skipIDs, modelName)` 是唯一的选号入口（网关与 async 池共用），
+分五层，**前一层筛出的池子决定后一层的作用范围**（层与层之间是「替换」而不是「加权」）：
+
+| 层 | 规则 | 被排除者 |
+|---|---|---|
+| 1 可选 | `IsSelectable(now)` 且不在 `skipIDs` | 停用/归档/冷却中，以及本次请求已试过的 |
+| 2 模型分档 | 该模型 `available` 者优先；无 available 时用 `unknown` | `absent`（快照里没这个模型）、`exhausted`、`disabled` |
+| 3 优惠优先 | 持有未耗尽的一次性额度（`period` 含 `one_time` 且 `remaining>0`）者优先 | —（不排除，仅降级） |
+| 4 **额度优先** | 该模型**剩余可用额度最多**者优先 | —（仅降级） |
+| 5 轮询 | 在第 4 层并列的账号之间按 `rotation[provider:model]` 游标轮转 | — |
+
+**「剩余可用额度」的定义**（`model.Account.UsableQuotaForModel`）：
+
+- 逐额度列**优先取 `available`**（上游的 `available_units`，「现在还能用多少」），缺省回落
+  `remaining`（`total − used`）。逐列回落而不是整体二选一——老快照往往只有 `remaining`。
+- 同一模型出现在多个订阅时**各列相加**：它们是同一个模型的不同额度池，本次请求可能落到
+  其中任意一个，对调度而言可用量就是它们的和。
+- 返回 `(0, false)` 表示「没有可用数值」（尚无快照 / 额度列无数值），调用方必须把它与
+  **真正的 0 区分开**：0 的含义是「已用完」，而「没有数值」只是「还不知道」。排序里前者
+  记 `-1`，落在任何有数值者之后，但彼此之间照样并列轮转。
+
+**为什么是「最大值并列组 + 组内轮转」，而不是「永远取最大的那一个」**：
+
+额度快照是**按账号缓存**的（`quota.QuotaCacheTTL = 15s`），且只在账号被使用时才异步刷新
+（`Engine.success → fireRefresh`）。因此同一份数值会在一段时间里保持不变，若严格取唯一最大值，
+这段时间内全部流量都会压在那一个账号上。取「最大值并列组 + 组内轮转」保住了「额度多的先用」
+的方向，又不会把流量压在一个号上；**同规格账号（同一套餐、剩余量相同）会整体并列，行为与
+原来的纯轮询完全一致**——这也是最常见的生产形态，所以这次改动对它的净值是零。
+
+**已知取舍（未采纳的方案）**：按剩余量加权的平滑加权轮询（weight = remaining）能让大号按比例
+多服务、小号永不饿死，且对快照陈旧不敏感；但它不满足「优先使用剩余更多的账号」这一字面要求
+（小号会在有大号可用时仍被选中）。当前按用户要求实现额度优先，若在线观察到「同一个号被连打」
+再评估切换。
+
+**不参与排序的因素**（有意为之）：额度过期时间、线路/代理、`RateLimitStreak`、最近使用时间。
+其中**过期时间**值得注意——`ModelAvailability` 与本次排序都不看 `expires_at`/`period_end`，
+所以一个「计划已过期但快照仍显示有余额」的账号会被正常选中（是否要改是独立议题，不在本次范围）。
+
 ## 6. 里程碑
 
 ### M0 骨架 + 数据层
@@ -506,16 +546,6 @@ meta(key TEXT PK, value TEXT)
   既不换号也不冷却账号。实测 z.ai 在 Anthropic 兼容面用 HTTP 529 承载 1305，
   因此判据是 `IsUpstreamOverload`（状态码 529 **或**业务码 1305），不是 `== 429`。
 
-### M14 平台过载分支与账号错误归类（v2.2.0-go）
-- [x] 529 / `code=1305` 平台过载分支：排在 429 之前（否则官方表里的 429+1305 会误入限流冷却），
-  退避档位 `OverloadRetryDelays`（1s/3s，±20% 抖动）、独立预算 `attemptBudget.overload`。
-- [x] 账号「最近错误」归类：`last_error_kind` / `last_error_at`（`model.ErrorKind*` 共 12 项），
-  `MarkAccount` / `MarkModelExhausted` / `bumpFail` 全部强制传 kind，漏传编译失败。
-- [x] 上游错误日志补业务码与截断预览（`gateway.ErrorPreview`，200 字符、按 rune 截断）——
-  此前只记状态码，1305 与风控 405 这类「关键信息在 body 里」的失败在日志里完全不可见。
-- [x] 后台账号页新增「最近錯誤」列与错误类型筛選（前端本地过滤，含「帳號故障」聚合项）。
-- [x] 顺手修 `quota.go` 的 405 判定：原来只看状态码，风控 405 被当成「重复查询」静默吞掉。
-
 ### M13 账户身份、设备指纹与领取状态（v2.0.6-go）
 - [x] 借鉴 zcode-switch（`pjpv/zcode-switch`，Tauri 桌面多账号切换器）的 autoClaim 设计，
   补齐领取状态落盘、冷却分档与单槽串行闸门；契约见 §5.9.1。
@@ -555,6 +585,28 @@ meta(key TEXT PK, value TEXT)
 - [x] 修掉 CI `-race` 抓到的领取状态竞态（`Claim` 的读写与序列化统一走 `claimMu`，
   见 §5.9.1）；回归 `TestClaimStateConcurrentAccess`。
 - [ ] 在线观察定时批量的上游节奏（账号较多时 1s 间隔是否合适）。
+
+### M16 平台过载分支与账号错误归类（v2.2.0-go）
+- [x] 529 / `code=1305` 平台过载分支：排在 429 之前（否则官方表里的 429+1305 会误入限流冷却），
+  退避档位 `OverloadRetryDelays`（1s/3s，±20% 抖动）、独立预算 `attemptBudget.overload`。
+- [x] 账号「最近错误」归类：`last_error_kind` / `last_error_at`（`model.ErrorKind*` 共 12 项），
+  `MarkAccount` / `MarkModelExhausted` / `bumpFail` 全部强制传 kind，漏传编译失败。
+- [x] 上游错误日志补业务码与截断预览（`gateway.ErrorPreview`，200 字符、按 rune 截断）——
+  此前只记状态码，1305 与风控 405 这类「关键信息在 body 里」的失败在日志里完全不可见。
+- [x] 后台账号页新增「最近錯誤」列与错误类型筛選（前端本地过滤，含「帳號故障」聚合项）。
+- [x] 顺手修 `quota.go` 的 405 判定：原来只看状态码，风控 405 被当成「重复查询」静默吞掉。
+
+### M17 额度优先调度（未发版）
+- [x] `model.Account.UsableQuotaForModel`：汇总请求模型当前可用额度（逐列优先取 `available`，
+  回落 `remaining`；同模型多订阅相加），并把「没有数值」与「额度为 0」严格区分开。
+- [x] `store.Select` 增至五层：可选 → 模型分档 → 优惠额度优先 → **额度优先** → 并列组内轮询；
+  契约见 §5.12。
+- [x] 回归：`TestUsableQuotaForModel`、`TestSelectPrefersMostRemainingQuota`、
+  `TestSelectEqualQuotaStillRotates`、`TestSelectQuotaNumbersRankAboveUnknown`、
+  `TestSelectWithoutModelRotates`；原有 `TestSelectRotationAndModelFilter`、
+  `TestSelectPromoAccountsFirst` 不改而动（它们本来就是额度并列）。
+- [ ] 在线观察：额度快照 15s TTL 下的实际分摊是否均匀。若出现「同一个号被连打到下一次
+  刷新」，改评估按剩余量加权的平滑加权轮询（见 §5.12 的取舍说明）。
 
 ## 7. 测试策略
 
