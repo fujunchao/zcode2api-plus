@@ -840,6 +840,115 @@ func TestSelectWithoutModelRotates(t *testing.T) {
 	}
 }
 
+// 风控冷却阶梯设定的读取与规范化：合法值生效、非法值回退默认、超大值钳制。
+// 回退而不报错是刻意的——这是调度热路径每次选档都会读的值，不能因为一条脏设定就
+// 让请求失败；非法输入由 PUT 层的 NormalizeRiskCoolingSteps 挡在库外。
+func TestRiskCoolingStepsSetting(t *testing.T) {
+	s := newTestStore(t)
+
+	assertSteps := func(want []int, ctx string) {
+		t.Helper()
+		got := s.RiskCoolingSteps()
+		if len(got) != len(want) {
+			t.Fatalf("%s: 档位数 got %v want %v", ctx, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: got %v want %v", ctx, got, want)
+			}
+		}
+	}
+
+	// 未设置 → 回退环境变量默认（config 层默认 300,900,3600）。
+	assertSteps([]int{300, 900, 3600}, "未设置")
+	if got := s.RiskCoolingStepsString(); got != config.RiskCoolingSteps {
+		t.Fatalf("未设置应回退 config 默认: %q", got)
+	}
+
+	// 合法覆盖；档位数可多可少（档位数就是升级点）。
+	if err := s.SetSetting(RiskCoolingStepsKey, "60,120"); err != nil {
+		t.Fatal(err)
+	}
+	assertSteps([]int{60, 120}, "两档")
+	if err := s.SetSetting(RiskCoolingStepsKey, "10,20,30,40,50"); err != nil {
+		t.Fatal(err)
+	}
+	assertSteps([]int{10, 20, 30, 40, 50}, "五档")
+
+	// 非法 → 回退默认（不是空切片：空切片会让「第 1 次命中」直接判失效）。
+	for _, bad := range []string{"", " ", "0", "-5", "abc", "300,,900", "300,abc,900", ",", "300,"} {
+		if err := s.SetSetting(RiskCoolingStepsKey, bad); err != nil {
+			t.Fatal(err)
+		}
+		assertSteps([]int{300, 900, 3600}, "非法 "+bad)
+	}
+
+	// 超大值钳到上限，避免把账号锁死到「看不出问题」。
+	if err := s.SetSetting(RiskCoolingStepsKey, "99999999999"); err != nil {
+		t.Fatal(err)
+	}
+	assertSteps([]int{riskCoolingStepMax}, "超大值钳制")
+
+	// NormalizeRiskCoolingSteps：PUT 层用它做校验 + 规范化。
+	norm := []struct {
+		in     string
+		want   string
+		wantOk bool
+	}{
+		{"300,900,3600", "300,900,3600", true},
+		{" 60, 120 ,180 ", "60,120,180", true}, // 去空白 + 统一逗号
+		{"7", "7", true},
+		{"", "", false},
+		{"0", "", false},
+		{"-1", "", false},
+		{"abc", "", false},
+		{"300,,900", "", false}, // 空项不算合法档位
+		{"300,abc,900", "", false},
+		{"99999999999", "604800", true}, // 规范化时一并钳制
+	}
+	for _, tc := range norm {
+		got, ok := NormalizeRiskCoolingSteps(tc.in)
+		if ok != tc.wantOk || got != tc.want {
+			t.Fatalf("NormalizeRiskCoolingSteps(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOk)
+		}
+	}
+}
+
+// 换凭据（人工恢复动作）必须清零风控连续计数。
+// 不清的话，一个被升到失效的账号被救回来之后，下一次风控命中就是老 streak + 1，
+// 会立刻又判失效——等于人工修复无效。
+func TestEditSecretResetsRiskControlStreak(t *testing.T) {
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "banned", "h.p.s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind := model.ErrorKindRiskControl
+	if _, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.Status = model.StatusInvalid
+		a.RiskControlStreak = 4 // 已经超过三档阶梯
+		a.LastErrorKind = &kind
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, err := s.EditAccount(model.ProviderZai, acc.ID, AccountEdit{
+		SetSecret: true, Secret: "x.y.z", SecretMode: "jwt",
+	}); err != nil || !ok {
+		t.Fatalf("换凭据失败: %v %v", ok, err)
+	}
+	got := s.Find(model.ProviderZai, acc.ID)
+	if got.RiskControlStreak != 0 {
+		t.Fatalf("换凭据应清零风控连续计数: %d", got.RiskControlStreak)
+	}
+	if got.Status != model.StatusActive {
+		t.Fatalf("换凭据应恢复 active: %s", got.Status)
+	}
+	if got.LastErrorKind != nil {
+		t.Fatalf("换凭据应清掉错误归类: %v", *got.LastErrorKind)
+	}
+}
+
 func TestUpdateDeletedAccountRejected(t *testing.T) {
 	s := newTestStore(t)
 	acc, _ := s.AddAccount(model.ProviderZai, "ghost", "h.p.s3")

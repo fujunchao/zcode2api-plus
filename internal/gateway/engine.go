@@ -440,7 +440,27 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 
-	// 8) 其余错误：非已知信号，不做账号状态推断，直接原样继承上游响应
+	// 8) 405 + 风控文案：上游风控拦截，冷却整个账号（按连续命中次数递进），
+	// 连续次数超过阶梯长度则置为失效、交人工处理。
+	//
+	// 先看 body 再看状态码：405 在本项目里有三种完全不同的含义——风控拦截、计费接口
+	// 的重复查询、以及 JWT 账号缺顶层 system 注入时上游回的 405。最后一种是**我方构造
+	// 请求的缺陷**（见 body.go / upstream/request.go 的说明），换号与冷却都没用，每个
+	// 账号都会一样地失败；只看状态码冷却会把它变成对账号的集体惩罚。
+	//
+	// 风控看身份维度（账号/设备指纹/出口 IP/请求头），与模型无关，所以这里不换模型、
+	// 直接停整个账号；冷却期间该号 IsSelectable 为 false，本请求自然换下一个。
+	if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(text) {
+		secs, streak, invalid := e.markRiskControl(acc, "上游风控拦截 HTTP 405: "+ErrorPreview(text))
+		if invalid {
+			web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控，已置為失效待人工處理", acc.Name, streak))
+		} else {
+			web.Warn(reqID, fmt.Sprintf("账号 %s 第 %d 次命中风控，冷却 %d s 后切换下一个", acc.Name, streak, secs))
+		}
+		return attemptResult{switchAccount: true}
+	}
+
+	// 9) 其余错误：非已知信号，不做账号状态推断，直接原样继承上游响应
 	e.bumpFail(acc, model.ErrorKindUpstreamError)
 	// 日志带上业务码与截断预览：只记状态码时，1305 / 风控这类「关键信息在 body 里」
 	// 的失败在日志里完全不可见。
@@ -688,6 +708,13 @@ func (e *Engine) markRateLimited(acc *model.Account, errMsg string) (int, int) {
 	return MarkRateLimited(e.Store, acc.Provider, acc.ID, errMsg, e.now())
 }
 
+// markRiskControl 上游风控的递进冷却，返回（本次冷却秒数, 累加后的连续次数, 是否已失效）。
+// 与 markRateLimited 同理：连续次数只能取返回值，acc 是副本，读 acc.RiskControlStreak
+// 拿到的是旧值。
+func (e *Engine) markRiskControl(acc *model.Account, errMsg string) (int, int, bool) {
+	return MarkRiskControl(e.Store, acc.Provider, acc.ID, errMsg, e.now())
+}
+
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
 // （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
@@ -697,7 +724,9 @@ func (e *Engine) success(acc *model.Account) {
 		live.LastUsedAt = &ts
 		// 成功即认为限流窗口已过：清零连续计数，下一次再被限流从最短档重新起算。
 		// 必须对 live 调用——对副本清零不会落库，会出现「一边归零、一边继续递增」。
+		// 风控计数同理：冷却到期后能真正打通一次，说明这次拦截是偶发的，回到最低档。
 		ResetRateLimitStreak(live)
+		ResetRiskControlStreak(live)
 		if live.Status == model.StatusCooling || live.Status == model.StatusExhausted {
 			live.Status = model.StatusActive
 		}

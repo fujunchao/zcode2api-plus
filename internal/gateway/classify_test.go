@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"zcode2api/internal/model"
+	"zcode2api/internal/store"
 )
 
 // 日志预览要能一眼看出「是哪一类失败」：业务码/类型 + 可读文案，单行、截断。
@@ -117,6 +118,151 @@ func TestStampAccountErrorKeepsTextWhenDetailEmpty(t *testing.T) {
 	StampAccountError(acc, model.ErrorKindUpstreamOverload, "新文案", at)
 	if acc.LastError == nil || *acc.LastError != "新文案" {
 		t.Fatalf("非空 detail 应覆盖文案: %v", acc.LastError)
+	}
+}
+
+// 风控判定必须靠 body：405 在本项目里有三种含义（风控拦截 / 计费重复查询 /
+// 缺 system 注入），只看状态码会把第三种——我方请求构造缺陷——当成风控惩罚账号。
+func TestIsRiskControlBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"实测原文", "request has been blocked due to unusual activity.", true},
+		{"大小写无关", "Request has been BLOCKED due to UNUSUAL ACTIVITY.", true},
+		{"blocked 同族", `{"error":{"message":"Request blocked."}}`, true},
+		{"risk 兜底", `{"msg":"risk detected"}`, true},
+		{"空 body", "", false},
+		{"缺 system 注入的普通 405", `{"error":{"message":"method not allowed"}}`, false},
+		{"其它 405 文案", "405 Method Not Allowed", false},
+		{"非 JSON 且无风控词", "upstream refused", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := model.IsRiskControlBody(tc.body); got != tc.want {
+				t.Fatalf("IsRiskControlBody(%q) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// 风控阶梯：连续第 N 次命中取第 N 档；连续次数超过档位数则置失效。
+// 默认 3 档 ⇒ 前 3 次冷却（5/15/60 分钟），第 4 次升 invalid。
+func TestMarkRiskControlLadder(t *testing.T) {
+	st := openStore(t)
+	acc, err := st.AddAccount(model.ProviderZai, "risk", "sk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1700000000, 0)
+
+	// 前三档冷却，第四档升失效。
+	want := []struct {
+		secs    int
+		invalid bool
+	}{{300, false}, {900, false}, {3600, false}, {0, true}}
+	for i, w := range want {
+		secs, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "风控拦截", now)
+		if streak != i+1 || secs != w.secs || invalid != w.invalid {
+			t.Fatalf("第 %d 次: got (secs=%d streak=%d invalid=%v) want (secs=%d streak=%d invalid=%v)",
+				i+1, secs, streak, invalid, w.secs, i+1, w.invalid)
+		}
+		got := st.Find(model.ProviderZai, acc.ID)
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
+			t.Fatalf("第 %d 次应归类为 risk_control: %v", i+1, got.LastErrorKind)
+		}
+		if got.LastError == nil || *got.LastError != "风控拦截" {
+			t.Fatalf("第 %d 次应写入错误文案: %v", i+1, got.LastError)
+		}
+		if w.invalid {
+			if got.Status != model.StatusInvalid {
+				t.Fatalf("超限应置 invalid: %s", got.Status)
+			}
+			// 失效没有等待窗口，必须清掉冷却截止时间，否则前台会把它显示成一个
+			// 到点就会自己好的冷却。
+			if got.CoolingUntil != nil {
+				t.Fatalf("超限应清掉 CoolingUntil: %v", got.CoolingUntil)
+			}
+			continue
+		}
+		if got.Status != model.StatusCooling {
+			t.Fatalf("第 %d 次应 cooling: %s", i+1, got.Status)
+		}
+		if got.CoolingUntil == nil {
+			t.Fatalf("第 %d 次应写入 CoolingUntil", i+1)
+		}
+		inWant := float64(now.Add(time.Duration(w.secs)*time.Second).UnixNano()) / 1e9
+		if diff := *got.CoolingUntil - inWant; diff > 1 || diff < -1 {
+			t.Fatalf("第 %d 次冷却截止应约 %d 秒后: got=%v want=%v", i+1, w.secs, *got.CoolingUntil, inWant)
+		}
+	}
+}
+
+// 成功调用（冷却到期后真正打通一次）把连续计数清零，回到最低档——
+// 否则一次偶发拦截会永久抬高该账号的档位。
+func TestResetRiskControlStreakReturnsToFirstRung(t *testing.T) {
+	st := openStore(t)
+	acc, _ := st.AddAccount(model.ProviderZai, "risk-reset", "sk-1")
+	now := time.Unix(1700000000, 0)
+
+	MarkRiskControl(st, model.ProviderZai, acc.ID, "第一次", now)
+	if _, streak, _ := MarkRiskControl(st, model.ProviderZai, acc.ID, "第二次", now); streak != 2 {
+		t.Fatalf("连续计数应为 2: %d", streak)
+	}
+	if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		ResetRiskControlStreak(a)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secs, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "清零后再来", now)
+	if streak != 1 || secs != 300 || invalid {
+		t.Fatalf("清零后应从最低档重来: secs=%d streak=%d invalid=%v", secs, streak, invalid)
+	}
+}
+
+// 阶梯设定驱动档位与升级点：档位数就是升级点，管理员改设定即可改「第几次封禁」。
+func TestRiskCoolingStepsDriveEscalationPoint(t *testing.T) {
+	st := openStore(t)
+	acc, _ := st.AddAccount(model.ProviderZai, "risk-steps", "sk-1")
+	now := time.Unix(1700000000, 0)
+
+	if err := st.SetSetting(store.RiskCoolingStepsKey, "60,120"); err != nil {
+		t.Fatal(err)
+	}
+	if secs, _, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "1", now); secs != 60 || invalid {
+		t.Fatalf("第 1 档应为 60: %d %v", secs, invalid)
+	}
+	if secs, _, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "2", now); secs != 120 || invalid {
+		t.Fatalf("第 2 档应为 120: %d %v", secs, invalid)
+	}
+	// 只有两档 ⇒ 第 3 次即失效（默认三档时是第 4 次）。
+	if _, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "3", now); !invalid || streak != 3 {
+		t.Fatalf("两档设定下第 3 次应失效: streak=%d invalid=%v", streak, invalid)
+	}
+	if got := st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusInvalid {
+		t.Fatalf("应置 invalid: %s", got.Status)
+	}
+}
+
+// 设定缺失或非法时回退默认，绝不返回空切片（空切片会让「第 1 次命中」直接越界成失效）。
+func TestRiskCoolingStepsFallback(t *testing.T) {
+	st := openStore(t)
+	acc, _ := st.AddAccount(model.ProviderZai, "risk-fallback", "sk-1")
+	now := time.Unix(1700000000, 0)
+
+	for _, bad := range []string{"", "0", "-5", "abc", "300,,900", "300,abc,900", "   "} {
+		if err := st.SetSetting(store.RiskCoolingStepsKey, bad); err != nil {
+			t.Fatal(err)
+		}
+		steps := st.RiskCoolingSteps()
+		if len(steps) != 3 || steps[0] != 300 || steps[1] != 900 || steps[2] != 3600 {
+			t.Fatalf("非法设定 %q 应回退默认三档: %v", bad, steps)
+		}
+	}
+	// 默认设定下第 1 次命中仍是 300s（证明回退真的生效，而不是空阶梯直接判失效）。
+	if secs, _, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "x", now); secs != 300 || invalid {
+		t.Fatalf("回退后应取默认首档: secs=%d invalid=%v", secs, invalid)
 	}
 }
 

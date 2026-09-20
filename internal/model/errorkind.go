@@ -40,6 +40,11 @@ const (
 	// ErrorKindQuotaQueryFailed 额度轮询失败（非鉴权类）。它是旁路观测的失败，
 	// 不影响该账号能否转发请求，因此不算账号故障。
 	ErrorKindQuotaQueryFailed = "quota_query_failed"
+	// ErrorKindRiskControl 上游风控拦截（HTTP 405 + 风控文案，见 IsRiskControlBody）。
+	// 风控看的是身份维度——JWT 账号、X-Device-Mid 设备指纹、出口 IP、请求头与 UA——
+	// 模型只是 body 里的一个字段，所以按模型冷却毫无意义：换个模型照样被拦。
+	// 因此它触发整号冷却，并计入「账号故障」（换个账号/换条线路确实可能成功）。
+	ErrorKindRiskControl = "risk_control"
 )
 
 // ErrorKindAll 全部错误类型，供遍历与一致性测试使用。
@@ -57,6 +62,7 @@ var ErrorKindAll = []string{
 	ErrorKindClientCanceled,
 	ErrorKindUpstreamError,
 	ErrorKindQuotaQueryFailed,
+	ErrorKindRiskControl,
 }
 
 // accountFaultKinds 归因于账号自身、因而值得按「账号故障」聚合筛选的错误类型。
@@ -76,6 +82,7 @@ var accountFaultKinds = map[string]bool{
 	ErrorKindUpstreamUnavailable: true,
 	ErrorKindInvalidResponse:     true,
 	ErrorKindUpstreamError:       true,
+	ErrorKindRiskControl:         true,
 }
 
 // ErrorKindAccountFault 判断某类错误是否归因于账号自身。

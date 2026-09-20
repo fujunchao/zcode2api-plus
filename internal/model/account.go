@@ -125,6 +125,15 @@ type Account struct {
 	// 进程重启后归零（下次按最低档冷却）没有正确性影响。
 	// 进程内 sync（engine）与 async（asyncpool）共享同一个 *Account 对象。
 	RateLimitStreak int `json:"-"`
+
+	// RiskControlStreak 连续命中上游风控（HTTP 405 + 风控文案）的次数，成功调用后
+	// 归零，用于选择递进冷却档位；连续次数超过阶梯长度则把账号置为 invalid。
+	//
+	// 与 RateLimitStreak 刻意分开：两者失败模式不同（限流等一会儿真的会好，风控
+	// 往往要换身份），共用计数会互相清零干扰。同样 json:"-"：纯运行期状态，
+	// 不新增 accounts.data 的键。人工换凭据（见 store.EditAccount）时会一并清零，
+	// 否则救回来的账号下一次命中就是老 streak，会立刻又被判失效。
+	RiskControlStreak int `json:"-"`
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -282,7 +291,8 @@ func (a *Account) Clone() *Account {
 		VirtualDeviceMid: a.VirtualDeviceMid,
 		Claim:            a.ClaimView(),
 
-		RateLimitStreak: a.RateLimitStreak,
+		RateLimitStreak:   a.RateLimitStreak,
+		RiskControlStreak: a.RiskControlStreak,
 	}
 }
 

@@ -134,6 +134,19 @@ var (
 	ProxyHealthIntervalMinutes = max(1, envInt("ZCODE_PROXY_HEALTH_INTERVAL", 30))
 )
 
+// ── 上游风控冷却 ────────────────────────────────────────────────────────────
+// 上游用 HTTP 405 + "unusual activity" 表达风控拦截。它看的是身份维度（账号、
+// 设备指纹、出口 IP、请求头），与请求的模型无关，所以处置是停整个账号。
+//
+// 冷却时长按连续命中次数递进：第 N 次命中取第 N 档；连续次数**超过档位数**则把
+// 账号置为 invalid（需人工介入）。也就是说档位数同时就是升级点——想给账号多一次
+// 自证机会就多加一档。默认 3 档 = 5 / 15 / 60 分钟。
+//
+// 与领取冷却同一约定：环境变量只是默认值，后台写入后以落库值为准。
+var (
+	RiskCoolingSteps = env("ZCODE_RISK_COOLING_STEPS", "300,900,3600")
+)
+
 // ── 上游端点 ────────────────────────────────────────────────────────────────
 var (
 	UpstreamZai         = env("ZAI_UPSTREAM_URL", "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")

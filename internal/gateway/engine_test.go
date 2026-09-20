@@ -569,6 +569,65 @@ func Test529OverloadRetriesThenPassesThrough(t *testing.T) {
 
 // 分类链的每个出口都必须写出对应的错误归类——这是前端「按错误类型筛选账号」的数据
 // 基础，也是「同步与异步两条路径对同一账号标出相同状态」这条不变式的延伸。
+// 405 + 风控文案：冷却整个账号（不是只灰一个模型）并按阶梯选档。
+// 风控看身份维度（账号/设备指纹/出口 IP/请求头），与模型无关，所以处置是停账号。
+func Test405RiskControlCoolsAndSwitches(t *testing.T) {
+	f := newFixture(t)
+	f.respond = jsonResp(405, `{"error":{"message":"Request has been blocked due to unusual activity."}}`)
+	acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+	// 唯一账号被冷却后无号可用。
+	status, _ := f.post(t, msgBody(), "sk-test")
+	if status != 503 {
+		t.Fatalf("唯一账号被冷却后应 503: %d", status)
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusCooling {
+		t.Fatalf("风控 405 应冷却整个账号: %s", got.Status)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
+		t.Fatalf("应归类为 risk_control: %v", got.LastErrorKind)
+	}
+	if got.RiskControlStreak != 1 {
+		t.Fatalf("连续命中计数应为 1: %d", got.RiskControlStreak)
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "风控") {
+		t.Fatalf("last_error 应说明是风控: %v", got.LastError)
+	}
+	// 首档应约 300s（默认阶梯第一档）。
+	want := float64(time.Now().Add(300*time.Second).UnixNano()) / 1e9
+	if got.CoolingUntil == nil || *got.CoolingUntil-want > 5 || *got.CoolingUntil-want < -5 {
+		t.Fatalf("首档应约 300s: %v", got.CoolingUntil)
+	}
+}
+
+// 非风控 405 不得冷却：那多半是 JWT 缺顶层 system 注入时上游回的错（body.go 有说明），
+// 属我方请求构造缺陷，每个账号都会一样地失败——冷却账号等于把代码 bug 变成集体惩罚。
+func Test405WithoutRiskBodyDoesNotCool(t *testing.T) {
+	f := newFixture(t)
+	upstreamBody := `{"error":{"message":"method not allowed"}}`
+	f.respond = jsonResp(405, upstreamBody)
+	acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 405 || raw != upstreamBody {
+		t.Fatalf("非风控 405 应原样透传: %d %q", status, raw)
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive || got.CoolingUntil != nil {
+		t.Fatalf("非风控 405 不该冷却账号: status=%s until=%v", got.Status, got.CoolingUntil)
+	}
+	if got.RiskControlStreak != 0 {
+		t.Fatalf("非风控 405 不该推进风控阶梯: %d", got.RiskControlStreak)
+	}
+	if got.FailCount != 1 {
+		t.Fatalf("失败计数应 +1: %d", got.FailCount)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindUpstreamError {
+		t.Fatalf("非风控 405 应归类为 upstream_error: %v", got.LastErrorKind)
+	}
+}
+
 func TestErrorKindRecordedPerBranch(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -589,6 +648,8 @@ func TestErrorKindRecordedPerBranch(t *testing.T) {
 		{"200+1005 每日额度", jsonResp(200, `{"code":1005,"msg":"exceed quota limit"}`), false, model.ErrorKindQuotaExhausted},
 		{"200+未知业务码", jsonResp(200, `{"code":9999,"msg":"weird"}`), false, model.ErrorKindUpstreamError},
 		{"200 非 SSE JSON", jsonResp(200, `{"unexpected":"json"}`), true, model.ErrorKindInvalidResponse},
+		{"405+风控文案", jsonResp(405, `{"error":{"message":"Request has been blocked due to unusual activity."}}`), false, model.ErrorKindRiskControl},
+		{"405 无风控文案", jsonResp(405, `{"error":{"message":"method not allowed"}}`), false, model.ErrorKindUpstreamError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

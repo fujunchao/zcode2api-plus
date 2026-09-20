@@ -130,6 +130,70 @@ func RecordAccountError(st *store.Store, provider, idOrName, kind, detail string
 	})
 }
 
+// ── 上游风控冷却（405 + unusual activity） ───────────────────────────────────
+
+// riskControlCoolingSeconds 取「连续第 streak 次命中风控」对应的冷却秒数。
+//
+// 连续次数**超过阶梯长度**时返回 (0, true)：由调用方把账号置为 invalid。也就是说
+// 阶梯的档位数同时就是升级点——管理员想给账号多一次自证机会就多加一档，想更早
+// 封禁就减一档，不需要第二个参数。
+func riskControlCoolingSeconds(st *store.Store, streak int) (secs int, invalid bool) {
+	if streak < 1 {
+		streak = 1
+	}
+	steps := st.RiskCoolingSteps()
+	if streak > len(steps) {
+		return 0, true
+	}
+	return steps[streak-1], false
+}
+
+// MarkRiskControl 记录一次上游风控拦截并按连续命中次数递进冷却，超限则置 invalid。
+// 返回本次实际写入的冷却秒数、累加后的连续次数、以及是否已升级为失效，供日志展示。
+//
+// 形状与 MarkRateLimited 一致（锁内自增 → 选档 → 写状态 → StampAccountError），
+// 但刻意不复用 MarkAccount：那条的契约是「cooling 即固定 config.CoolingSeconds」，
+// 供 503 / 连接失败等硬故障共用；风控需要「递进阶梯 + 超限置 invalid」两种语义，
+// 往 MarkAccount 里塞参数会把 503 路径也拖进这套复杂度。
+//
+// 为什么不按模型冷却：风控看的是身份维度——JWT 账号、X-Device-Mid 设备指纹、出口
+// IP、请求头与 UA——模型只是 body 里的一个字段。同一个身份换个模型照样被拦，按模型
+// 冷却只会把失败摊到别的模型上、把暴露时间拖长。这条分支必须排在「其余错误」兜底
+// 之前，否则 405 会被当成未识别错误原样透传、账号状态一点不变（线上曾如此）。
+func MarkRiskControl(st *store.Store, provider, idOrName, errMsg string, now time.Time) (secs, streak int, invalid bool) {
+	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+		acc.RiskControlStreak++
+		streak = acc.RiskControlStreak
+		secs, invalid = riskControlCoolingSeconds(st, streak)
+		if invalid {
+			// 失效是「需人工介入」的终态，没有等待窗口可言，故清掉冷却截止时间，
+			// 避免前台把它显示成一个到点就会自己好的冷却。
+			acc.Status = model.StatusInvalid
+			acc.CoolingUntil = nil
+			StampAccountError(acc, model.ErrorKindRiskControl, errMsg, now)
+			return
+		}
+		until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
+		acc.Status = model.StatusCooling
+		acc.CoolingUntil = &until
+		StampAccountError(acc, model.ErrorKindRiskControl, errMsg, now)
+	})
+	if streak == 0 {
+		// 账号已被删除（并发删除）：不落库，但仍给日志一个可用的档位。
+		secs, invalid = riskControlCoolingSeconds(st, 1)
+	}
+	return secs, streak, invalid
+}
+
+// ResetRiskControlStreak 成功调用后清零「连续命中风控」计数。
+// 与 ResetRateLimitStreak 同语义、同样必须对 store.Update 回调里的 live 对象调用。
+//
+// 清零点是「冷却到期后的首次成功调用」——风控封禁期间账号根本不会被选中，所以只有
+// 冷却窗口过去、真正打通一次，才说明这次拦截是偶发的；否则连续命中会一路升到失效。
+func ResetRiskControlStreak(acc *model.Account) {
+	acc.RiskControlStreak = 0
+}
+
 // ResetRateLimitStreak 成功调用后清零「连续被限流」计数。
 // sync 与 async 两条请求路径都必须调用，否则同一账号会出现「一边归零、一边继续
 // 递增」的分歧——这正是两条路径必须共用状态机的老问题。

@@ -118,7 +118,8 @@
 | 429 额度上限码族 | 1113、1308-1311、1313、1316-1321 → 标记该模型 exhausted；其余 429（瞬时限流）→ 原地重试 1 次后按阶梯冷却 |
 | 平台过载（529 / `code=1305`） | 判据 `IsUpstreamOverload`：状态码 529 **或**业务码 1305（官方表把它标成 429，只看 429 会整类漏掉）。原地退避 1s、3s（±20% 抖动），**不换号、不标状态、不计 fail_count**；用尽后原样透传上游响应 |
 | 业务码语义 | `1005`(HTTP 200)=当日额度用完；`3007`=验证码失效；`3010`=并发准入；`1305`=**平台服务过载**（与账号无关）；`1302`=账户维度速率限制；F001=风控指纹拒绝 |
-| 最近错误归类 | `last_error_kind` / `last_error_at` 两键记录「最近一次失败」；取值见 `model.ErrorKind*`（12 项，稳定字符串，**上线后不可改名**）。写入必须显式传 kind（编译期强制），且 `last_error_kind` 与 `last_error` 应描述同一次失败 |
+| 最近错误归类 | `last_error_kind` / `last_error_at` 两键记录「最近一次失败」；取值见 `model.ErrorKind*`（13 项，稳定字符串，**上线后不可改名**）。写入必须显式传 kind（编译期强制），且 `last_error_kind` 与 `last_error` 应描述同一次失败 |
+| 风控冷却（405） | 判据 `model.IsRiskControlBody(text)` **必须看 body**：405 在本项目有风控拦截 / 计费重复查询 / 缺 system 注入三种含义，只看状态码会把第三种（我方缺陷）变成账号惩罚。风控命中即**整号冷却**，档位取 `RISK_COOLING_STEPS`（默认 `300,900,3600` 秒），**连续次数超过档位数则置 invalid**；成功调用后计数归零。契约见 §5.13 |
 | 冷却 / 刷新 | `COOLING_SECONDS=300`（连接失败与 503 的固定值，同时是瞬时限流阶梯的封顶）、`QUOTA_REFRESH_INTERVAL=60`（0=关闭，运行中可改） |
 | 瞬时限流冷却阶梯 | 同一账号连续被限流 30s → 60s → 120s → `COOLING_SECONDS`；任意一次成功调用后归零 |
 | 领取冷却（仅自动路径） | 优先用上游 `data.plan.ends_at`；缺失时按成因分档：验证码类与 1005/1003 取 `CLAIM_CAPTCHA_COOLDOWN=3600`，其余取 `CLAIM_RETRY_COOLDOWN=600`（秒） |
@@ -428,6 +429,57 @@ meta(key TEXT PK, value TEXT)
 其中**过期时间**值得注意——`ModelAvailability` 与本次排序都不看 `expires_at`/`period_end`，
 所以一个「计划已过期但快照仍显示有余额」的账号会被正常选中（是否要改是独立议题，不在本次范围）。
 
+### 5.13 风控 405 冷却契约（Go 版增量，2026-09-20 新增）
+
+上游用 **HTTP 405 + `unusual activity`** 表达风控拦截。它看的是**身份维度**——JWT 账号、
+`X-Device-Mid` 设备指纹、出口 IP、请求头与 UA——**模型只是 body 里的一个字段**。因此
+处置是**停整个账号**：换个模型照样被拦，按模型冷却只会把失败摊到别的模型上、把暴露时间拖长。
+
+**触发判定（必须看 body，不能只看状态码）**
+
+| 405 形态 | 含义 | 处置 |
+|---|---|---|
+| body 含 `unusual activity` / `blocked` / `risk` | 上游风控拦截 | **整号冷却**（本节） |
+| 计费接口的重复查询（无风控文案） | 幂等，可安全忽略 | 忽略（`quota.go` 的幂等分支） |
+| body 为空 / 无风控文案 | JWT 账号缺顶层 `system` 注入时上游就回 405（见 `body.go`、`upstream/request.go`）——**我方构造请求的缺陷** | 落「其余错误」兜底，**不冷却**（每个账号都会一样地失败） |
+
+判定收口在 `model.IsRiskControlBody`（唯一权威实现，网关请求路径与 quota 计费路径共用）。
+
+**冷却阶梯与升级点**
+
+- 档位取自在线设定 `risk_cooling_steps`（逗号分隔秒数，默认 `300,900,3600`，环境变量
+  `ZCODE_RISK_COOLING_STEPS` 只是默认值）。**第 N 次连续命中取第 N 档**。
+- **连续次数超过档位数 → 置 `StatusInvalid` 且清空 `CoolingUntil`**：失效是「需人工介入」
+  的终态，没有等待窗口。也就是说**档位数本身就是升级点**——默认三档 ⇒ 前三次冷却、第四次失效；
+  想多给账号一次自证机会就多加一档，想更早封禁就减一档。
+- **首次命中即冷却**，不要求连续两次确认：风控是明确的策略拒绝，且误判一次的代价（一个号闲
+  几分钟）远低于漏判的代价（被标记的身份持续打上游，可能把拦截级别升上去，而共享这条 IP 的
+  其它账号会一起遭殃）。
+- 阶梯与限流阶梯**完全独立**（`RiskControlStreak` vs `RateLimitStreak`）：两者失败模式不同
+  （限流等一会儿真的会好，风控往往要换身份），共用计数会互相清零干扰。字段用 `json:"-"`，
+  不新增 `accounts.data` 的键。
+
+**生效范围**：`IsSelectable` 为 false（全部模型不可选）+ 领取调度自动跳过（既有行为）。
+不覆盖手动 `disabled`（管理员意图优先）。
+
+**恢复出口（三条，缺一不可）**
+
+1. **到期自动可再选**：`CoolingUntil` 过去后 `IsSelectable` 直接为真，无需显式清除。
+2. **成功即归零**：冷却到期后成功调用一次 ⇒ `Status → active` 且 `RiskControlStreak → 0`
+   （回到最低档）。所以只有「冷却一到期立刻又被拦」才会继续升级。
+3. **人工恢复**：换凭据（`store.EditAccount` 的 `SetSecret` 分支）会清 `Status`/`LastError*`
+   **并清零 `RiskControlStreak`**——不清的话，救回来的账号下一次命中就是老计数 + 1，会立刻
+   又判失效，等于人工修复无效。失效后真正要做的是换线路 / 换设备指纹 / 换凭据。
+
+**⚠️ 额度探测不得撤销风控封禁**：`quota.handleBillingResponse` 在探测成功时会把
+`exhausted`/`invalid` 刷回 `active`（既有语义）。但额度接口与消息接口是**不同端点**，风控未必
+同时命中——只探测通了额度就复活账号，一次轮询（15–60s）就把刚升上去的封禁悄悄抹掉。因此该处
+加了窄守卫：`invalid` 且 `last_error_kind == risk_control` 时**早退、不复活**；其它成因的
+`invalid`（如凭据失效）保持「额度通了即视为恢复」的既有行为。这条守卫**不让计费路径驱动阶梯**
+（不递增计数、不冷却），只阻止它**覆盖**请求路径的判决。
+
+**不做模型级冷却**：已论证无效（见本节开头）。**不让额度轮询驱动阶梯**：计费路径只记归类。
+
 ## 6. 里程碑
 
 ### M0 骨架 + 数据层
@@ -607,6 +659,26 @@ meta(key TEXT PK, value TEXT)
   `TestSelectPromoAccountsFirst` 不改而动（它们本来就是额度并列）。
 - [ ] 在线观察：额度快照 15s TTL 下的实际分摊是否均匀。若出现「同一个号被连打到下一次
   刷新」，改评估按剩余量加权的平滑加权轮询（见 §5.12 的取舍说明）。
+
+### M18 风控 405 递进冷却（未发版）
+- [x] 判定收口：新建 `model.IsRiskControlBody`（唯一权威实现），`quota` 私有的
+  `isRiskControlBody` 改为调用它；契约见 §5.13。
+- [x] 同步与异步两条请求路径各加一条 405 风控分支（插在 503 与「其余错误」之间，405 与
+  所有既有分支条件互斥）：`MarkRiskControl` 递进冷却，超限置 invalid。
+- [x] 阶梯做成在线设定 `risk_cooling_steps`（逗号分隔秒数）+ 后台「風控冷卻」卡片；
+  非法值 PUT 层 400、超大值钳到 7 天、存储损坏回退默认。
+- [x] ⚠️ 修掉一个会让本特性失效的漏洞：`quota` 的额度探测成功会把 `invalid` 刷回 `active`，
+  一次轮询就能悄悄撤销风控封禁。加窄守卫（只对 `last_error_kind=risk_control` 的失效早退）。
+- [x] 新错误归类 `risk_control`（第 13 项，算账号故障）；`RiskControlStreak` 用 `json:"-"`，
+  不新增 `accounts.data` 的键；换凭据时一并清零。
+- [x] 回归：`TestIsRiskControlBody`、`TestMarkRiskControlLadder`、
+  `TestRiskCoolingStepsDriveEscalationPoint`、`TestRiskCoolingStepsFallback`、
+  `Test405RiskControlCoolsAndSwitches`、`Test405WithoutRiskBodyDoesNotCool`、
+  `Test405RiskControlInAsyncPool`、`Test405WithoutRiskBodyInAsyncPool`、
+  `TestRiskCoolingStepsSetting`、`TestEditSecretResetsRiskControlStreak`、
+  `TestBillingSuccessKeepsRiskControlInvalid`、`TestRiskCoolingStepsAPI`；
+  扩 `TestErrorKindRecordedPerBranch` 两行（405 风控 / 405 非风控）。
+- [ ] 在线观察：风控文案是否只有 `unusual activity` 一族；升级阈值（= 档位数）默认三档是否合适。
 
 ## 7. 测试策略
 

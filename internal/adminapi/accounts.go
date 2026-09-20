@@ -509,6 +509,7 @@ func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"claim_preview_cooldown": previewSec,
 		"proxy_health_enabled":   h.Store.ProxyHealthEnabled(),
 		"proxy_health_interval":  h.Store.ProxyHealthIntervalMinutes(),
+		"risk_cooling_steps":     h.Store.RiskCoolingStepsString(),
 	})
 }
 
@@ -630,6 +631,20 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.Store.SetSetting("proxy_health_interval", strconv.Itoa(n)); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	// ── 風控冷卻階梯 ── 逗號分隔的秒數；檔位數同時是升級點（連續命中超過檔位數
+	// 就把帳號置為失效），所以非法值一律 400 拒收，不做「跳過壞項」的寬容解析：
+	// 靜默少一檔會讓管理員拿到一個他不知道有幾檔的階梯。
+	if v, ok := payload[store.RiskCoolingStepsKey]; ok {
+		raw, valid := store.NormalizeRiskCoolingSteps(strOf(v))
+		if !valid {
+			writeAPIError(w, errBadRequest("風控冷卻階梯需為逗號分隔的正整數秒，如 300,900,3600"))
+			return
+		}
+		if err := h.Store.SetSetting(store.RiskCoolingStepsKey, raw); err != nil {
 			writeError500(w, err)
 			return
 		}

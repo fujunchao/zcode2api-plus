@@ -239,16 +239,13 @@ func (s *Service) fail(acc *model.Account, checkedAt float64, msg, kind, status 
 // 而上游异常时可能回一个任意大的 body——不限长会直接吃光内存。
 const maxBillingBodyBytes = 8 << 10
 
-// isRiskControlBody 判断计费接口的错误体是不是风控拦截。
+// isRiskControlInvalid 账号是否因上游风控被置为失效。
 //
-// 这条判定存在的唯一理由：上游对「重复查询」回 405（幂等，可安全忽略），风控也用
-// 405 回 "request has been blocked due to unusual activity."（真实故障，必须报出来）。
-// 只看状态码会把风控静默当成幂等成功，还顺手清掉 last_error，账号看起来一片健康。
-func isRiskControlBody(text string) bool {
-	low := strings.ToLower(text)
-	return strings.Contains(low, "unusual activity") ||
-		strings.Contains(low, "blocked") ||
-		strings.Contains(low, "risk")
+// 用「失效 + 末次错误归类」两件事共同判定，而不是只看状态：失效还有别的成因
+// （凭据失效也置 invalid），那些成因下额度探测通了就该按既有语义放行。
+func isRiskControlInvalid(acc *model.Account) bool {
+	return acc.Status == model.StatusInvalid &&
+		acc.LastErrorKind != nil && *acc.LastErrorKind == model.ErrorKindRiskControl
 }
 
 // textPreview 取错误体预览：单行化 + 截断。last_error 会出现在后台界面上，
@@ -298,7 +295,7 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 		//
 		// ⚠️ 405 不是「重复查询」的专属信号：风控也用 405（unusual activity），
 		// 因此必须看 body 才能确认。否则一次风控会被静默吞掉，还顺手清掉 last_error。
-		if resp.StatusCode == http.StatusMethodNotAllowed && !isRiskControlBody(text) {
+		if resp.StatusCode == http.StatusMethodNotAllowed && !model.IsRiskControlBody(text) {
 			hasSnapshot := false
 			s.apply(acc, func(live *model.Account) {
 				if len(live.Quota) == 0 {
@@ -468,6 +465,15 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 		}
 		switch live.Status {
 		case model.StatusExhausted, model.StatusInvalid:
+			// ⚠️ 风控失效是「需人工介入」的终态，额度探测成功不得把它撤销。
+			//
+			// 额度接口与消息接口是**不同端点**，风控未必同时命中：只探测通了额度就
+			// 复活账号，等于一次轮询就把刚升上去的封禁悄悄抹掉，账号立刻重新进入调度
+			// 再被拦——升级机制形同不存在。所以这里只放行「非风控成因」的失效
+			//（如凭据失效）保持既有语义：额度通了即视为恢复。
+			if isRiskControlInvalid(live) {
+				return
+			}
 			live.Status = model.StatusActive
 			live.CoolingUntil = nil
 		case model.StatusCooling:

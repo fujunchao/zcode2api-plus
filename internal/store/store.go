@@ -495,6 +495,80 @@ func (s *Store) claimInt(key string, def, min int) int {
 	return max(min, n)
 }
 
+// ── 上游风控冷却阶梯 ────────────────────────────────────────────────────────
+//
+// 键名导出：它同时出现在 store 的访问器与 adminapi 的 GET/PUT 三处，写成字面量
+// 迟早会漂移（改一处忘一处会静默失效——GET 少字段前端走兜底、PUT 未知键被忽略）。
+
+// RiskCoolingStepsKey 风控冷却阶梯的设定键（逗号分隔的秒数）。
+const RiskCoolingStepsKey = "risk_cooling_steps"
+
+// riskCoolingStepMax 单档上限（7 天）。防写入异常大的值把账号锁死到「看不出问题」。
+const riskCoolingStepMax = 7 * 24 * 3600
+
+// RiskCoolingStepsString 返回设定原始串；缺失或为空回退环境变量默认值。
+func (s *Store) RiskCoolingStepsString() string {
+	if v, ok := s.GetSetting(RiskCoolingStepsKey); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return config.RiskCoolingSteps
+}
+
+// NormalizeRiskCoolingSteps 校验并规范化阶梯：去空白、统一逗号、钳超大值。
+// 非法（空串 / 含 0 / 负数 / 非数字）返回 ok=false，由调用方决定是否 400。
+//
+// 落库前先规范化，GET 才能总是回读到同一个规范形态：否则管理员填 " 60, 120 "
+// 会原样存进去，回读时前端显示一堆空格，看起来像没保存对。
+func NormalizeRiskCoolingSteps(raw string) (string, bool) {
+	steps, err := parseRiskCoolingSteps(raw)
+	if err != nil {
+		return "", false
+	}
+	parts := make([]string, len(steps))
+	for i, n := range steps {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ","), true
+}
+
+// RiskCoolingSteps 解析并钳制风控冷却阶梯；解析失败回退默认值。
+//
+// 回退而不是报错：这是被调度热路径调用的读取（每次命中风控都要选档），不能因为
+// 一条脏设定就拒绝服务。PUT 层已经用 ValidRiskCoolingSteps 把非法输入挡在库外。
+func (s *Store) RiskCoolingSteps() []int {
+	if steps, err := parseRiskCoolingSteps(s.RiskCoolingStepsString()); err == nil {
+		return steps
+	}
+	if steps, err := parseRiskCoolingSteps(config.RiskCoolingSteps); err == nil {
+		return steps
+	}
+	// 编译期常量再坏也不该发生；兜个底避免返回 nil 切片让调用方 len()==0 误判
+	// 成「阶梯为空 ⇒ 第一次命中就置 invalid」。
+	return []int{300, 900, 3600}
+}
+
+// parseRiskCoolingSteps 解析逗号分隔的秒数；任何一项非法即整串作废。
+//
+// 刻意不做「跳过坏项、保留好项」：管理员填 "300,abc,3600" 时静默丢一项，会得到
+// 一个他不知道有几档的阶梯（而档位数决定升级点），比直接报错危险得多。
+func parseRiskCoolingSteps(raw string) ([]int, error) {
+	parts := strings.Split(raw, ",")
+	steps := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("冷却档位必须是正整数秒: %q", p)
+		}
+		steps = append(steps, min(n, riskCoolingStepMax))
+	}
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("冷却阶梯不能为空")
+	}
+	return steps, nil
+}
+
 // ── 線路自動巡檢設定 ────────────────────────────────────────────────────────
 //
 // 与领取设置同一约定：环境变量（ZCODE_PROXY_HEALTH_*）只是**默认值**，落库后
@@ -1216,6 +1290,10 @@ func (s *Store) EditAccount(provider, idOrName string, edit AccountEdit) (bool, 
 			acc.LastError = nil
 			acc.LastErrorKind = nil
 			acc.LastErrorAt = nil
+			// 风控连续计数也要清零：它是「这个身份被拦了几次」的计数，而换凭据就是
+			// 换身份。不清的话，一个被升到 invalid 的账号人工救回来之后，下一次风控
+			// 命中就是老 streak + 1，会立刻又判失效——等于人工修复无效。
+			acc.RiskControlStreak = 0
 		}
 		if edit.SetProxyURL {
 			// 地址没变则保留原线路指派；变了说明要改成手工代理，解除指派。

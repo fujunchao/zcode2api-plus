@@ -36,6 +36,7 @@ func TestErrorKindAccountFault(t *testing.T) {
 		ErrorKindUpstreamUnavailable: true,
 		ErrorKindInvalidResponse:     true,
 		ErrorKindUpstreamError:       true,
+		ErrorKindRiskControl:         true,
 
 		ErrorKindUpstreamOverload: false,
 		ErrorKindQuotaExhausted:   false,

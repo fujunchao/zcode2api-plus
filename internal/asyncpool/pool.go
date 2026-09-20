@@ -566,6 +566,21 @@ func (p *Pool) attemptUpstreamOnce(
 			return false, errNetwork{bodyText}
 		}
 
+		// 405 + 风控文案：与 sync 路径同语义——整号冷却（按连续命中递进，超限置失效）
+		// 并换号。判定必须先看 body：405 也可能是计费接口的重复查询，或者我方缺
+		// system 注入时上游回的错（那种情况每个账号都会一样失败，冷却账号等于把
+		// 代码缺陷变成账号惩罚）。
+		if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(bodyText) {
+			_, streak, invalid := gateway.MarkRiskControl(p.Store, acc.Provider, acc.ID,
+				"上游风控拦截 HTTP 405: "+gateway.ErrorPreview(bodyText), time.Now())
+			if invalid {
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控，已置為失效待人工處理", acc.Name, streak))
+			} else {
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 第 %d 次命中风控，進入冷卻並切換下一個", acc.Name, streak))
+			}
+			return false, errNetwork{bodyText}
+		}
+
 		// 其余错误：原样回传上游错误体，终止本票
 		p.bumpFail(acc, model.ErrorKindUpstreamError)
 		// 日志带上业务码与截断预览（与 sync 路径同）：只记状态码时，关键信息在 body
@@ -744,7 +759,9 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	if _, err := p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
 		live.AccumulateTokens(got)
 		// 与 engine.success 对齐：成功即认为限流窗口已过，清零连续计数。
+		// 风控计数同理：冷却到期后能真正打通一次，说明这次拦截是偶发的。
 		gateway.ResetRateLimitStreak(live)
+		gateway.ResetRiskControlStreak(live)
 	}); err != nil {
 		web.Warn("async", "用量统计落库失败: "+err.Error())
 	}

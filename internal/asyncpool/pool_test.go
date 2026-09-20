@@ -831,6 +831,63 @@ func Test529OverloadRecoversInAsyncPool(t *testing.T) {
 	}
 }
 
+// 405 + 风控文案：异步路径与 sync 同语义——冷却整个账号并按阶梯选档，然后换号。
+// 两条路径对同一账号必须标出相同状态（项目硬不变式）。
+func Test405RiskControlInAsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "risk-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusMethodNotAllowed,
+			body: `{"error":{"message":"Request has been blocked due to unusual activity."}}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-risk", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-risk")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusCooling {
+		t.Fatalf("风控 405 应冷却整个账号: %s", acc.Status)
+	}
+	if acc.RiskControlStreak != 1 {
+		t.Fatalf("连续命中计数应为 1: %d", acc.RiskControlStreak)
+	}
+	if acc.CoolingUntil == nil {
+		t.Fatal("应写入冷却截止时间")
+	}
+	wantErrorKind(t, acc, model.ErrorKindRiskControl)
+}
+
+// 非风控 405 在异步路径同样不冷却（与 sync 一致），落「其余错误」投递事件。
+func Test405WithoutRiskBodyInAsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "plain-405-acc")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusMethodNotAllowed, body: `{"error":{"message":"method not allowed"}}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-405", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-405")
+
+	events := drainEvents(tk)
+	last := events[len(events)-1]
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "upstream_error" {
+		t.Fatalf("非风控 405 应投递 upstream_error: %v", events)
+	}
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
+		t.Fatalf("非风控 405 不该冷却账号: status=%s until=%v", acc.Status, acc.CoolingUntil)
+	}
+	if acc.RiskControlStreak != 0 {
+		t.Fatalf("非风控 405 不该推进风控阶梯: %d", acc.RiskControlStreak)
+	}
+	wantErrorKind(t, acc, model.ErrorKindUpstreamError)
+}
+
 func TestSSEJSONEscapesNonASCII(t *testing.T) {
 	// sseJSON 对齐 Python json.dumps 默认 ensure_ascii=True。
 	got := sseJSON(map[string]any{"id": "中文", "n": float64(3)})

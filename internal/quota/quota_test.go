@@ -556,6 +556,66 @@ func TestBillingFailureRecordsErrorKind(t *testing.T) {
 	})
 }
 
+// 风控失效是「需人工介入」的终态：一次成功的额度探测不得把它撤销。
+//
+// 额度接口与消息接口是不同端点，风控未必同时命中——只探测通了额度就复活账号，
+// 等于一次轮询（15–60s）就把刚升上去的封禁悄悄抹掉，账号立刻重新进入调度再被拦。
+func TestBillingSuccessKeepsRiskControlInvalid(t *testing.T) {
+	t.Run("风控失效→保持 invalid", func(t *testing.T) {
+		svc, st, billing := setup(t)
+		acc, err := st.AddAccount(model.ProviderZai, "banned", "header.payload.signature")
+		if err != nil {
+			t.Fatal(err)
+		}
+		kind := model.ErrorKindRiskControl
+		if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+			a.Status = model.StatusInvalid
+			a.LastErrorKind = &kind
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		billing.body = balancePayload(2500000)
+		result := svc.FetchQuota(acc)
+		if _, hasErr := result["error"]; hasErr {
+			t.Fatalf("额度探测本应成功: %v", result)
+		}
+
+		got := st.FindAny(acc.ID)
+		if got.Status != model.StatusInvalid {
+			t.Fatalf("额度探测成功不该撤销风控封禁: %s", got.Status)
+		}
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
+			t.Fatalf("风控归类不该被额度成功路径清掉: %v", got.LastErrorKind)
+		}
+	})
+
+	// 对照组：守卫只针对风控成因的失效，不得扩大化——凭据失效的账号额度探测通了
+	// 就该按既有语义恢复，否则等于悄悄改了 v2.2.0 已发布的行为。
+	t.Run("凭据失效→照旧恢复 active", func(t *testing.T) {
+		svc, st, billing := setup(t)
+		acc, err := st.AddAccount(model.ProviderZai, "authfail", "header.payload.signature")
+		if err != nil {
+			t.Fatal(err)
+		}
+		kind := model.ErrorKindAuthFailed
+		if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+			a.Status = model.StatusInvalid
+			a.LastErrorKind = &kind
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		billing.body = balancePayload(2500000)
+		svc.FetchQuota(acc)
+
+		got := st.FindAny(acc.ID)
+		if got.Status != model.StatusActive {
+			t.Fatalf("凭据失效的账号在额度探测成功后应恢复 active: %s", got.Status)
+		}
+	})
+}
+
 func TestMergeQuotaEntryCombinesSubscriptions(t *testing.T) {
 	// 同一订阅内重复条目：数值相加、时间取最早、period 去重排序拼接。
 	merged := mergeQuotaEntry(
