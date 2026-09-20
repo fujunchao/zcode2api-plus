@@ -46,6 +46,10 @@ export interface Account {
   last_checked_at: number | null
   cooling_until: number | null
   last_error: string | null
+  /** 最近一次失敗的歸類（後端 model.ErrorKind* 的穩定字串）。 */
+  last_error_kind: AccountErrorKind | null
+  /** 最近一次失敗的時間（Unix 秒）。 */
+  last_error_at: number | null
   proxy_url: string | null
   proxy_id: string | null
   created_at: number
@@ -200,6 +204,97 @@ export const STATUS_LABEL: Record<AccountStatus, string> = {
   invalid: '異常',
   disabled: '停用',
 }
+
+/**
+ * 帳號最近一次錯誤的歸類。取值是後端 `model.ErrorKind*` 的穩定字串，
+ * 一字不可改（會落進 accounts.data，並成為篩選值）。
+ */
+export type AccountErrorKind =
+  | 'upstream_overload'
+  | 'rate_limited'
+  | 'quota_exhausted'
+  | 'model_busy'
+  | 'auth_failed'
+  | 'connection_failed'
+  | 'upstream_unavailable'
+  | 'captcha_failed'
+  | 'invalid_response'
+  | 'client_canceled'
+  | 'upstream_error'
+  | 'quota_query_failed'
+
+/** 錯誤類型標籤（繁體）。改文案只動這裡，不動上面的取值。 */
+export const ERROR_KIND_LABEL: Record<AccountErrorKind, string> = {
+  upstream_overload: '上游過載',
+  rate_limited: '上游限流',
+  quota_exhausted: '額度耗盡',
+  model_busy: '併發受限',
+  auth_failed: '憑證異常',
+  connection_failed: '連線失敗',
+  upstream_unavailable: '上游不可用',
+  captcha_failed: '驗證碼失敗',
+  invalid_response: '回應無效',
+  client_canceled: '用戶端取消',
+  upstream_error: '上游錯誤',
+  quota_query_failed: '額度查詢失敗',
+}
+
+/**
+ * 錯誤類型配色。與 STATUS_BADGE 同一套語義：
+ * 紅＝疑似帳號自身問題，琥珀＝暫時受限，灰＝與帳號健康無關。
+ */
+export const ERROR_KIND_BADGE: Record<AccountErrorKind, string> = {
+  upstream_overload: 'bg-muted text-muted-foreground',
+  rate_limited: 'bg-amber-100 text-amber-700',
+  quota_exhausted: 'bg-purple-100 text-purple-700',
+  model_busy: 'bg-muted text-muted-foreground',
+  auth_failed: 'bg-red-100 text-red-700',
+  connection_failed: 'bg-red-100 text-red-700',
+  upstream_unavailable: 'bg-red-100 text-red-700',
+  captcha_failed: 'bg-amber-100 text-amber-700',
+  invalid_response: 'bg-red-100 text-red-700',
+  client_canceled: 'bg-muted text-muted-foreground',
+  upstream_error: 'bg-red-100 text-red-700',
+  quota_query_failed: 'bg-muted text-muted-foreground',
+}
+
+/**
+ * 是否歸因於帳號自身（後端 `model.ErrorKindAccountFault` 的前端鏡像）。
+ *
+ * 判據是「換個帳號是否可能成功」：憑證異常／連不上／上游 503／回應無效算故障；
+ * 平台過載、額度耗盡、併發受限、驗證碼、用戶端取消、額度輪詢失敗都不算——
+ * 否則平台一過載，「帳號故障」視圖會被整池帳號刷滿。
+ */
+export const ERROR_KIND_IS_FAULT: Record<AccountErrorKind, boolean> = {
+  upstream_overload: false,
+  rate_limited: true,
+  quota_exhausted: false,
+  model_busy: false,
+  auth_failed: true,
+  connection_failed: true,
+  upstream_unavailable: true,
+  captcha_failed: false,
+  invalid_response: true,
+  client_canceled: false,
+  upstream_error: true,
+  quota_query_failed: false,
+}
+
+/** 全部錯誤類型，順序與後端 `model.ErrorKindAll` 一致（下拉選單用）。 */
+export const ERROR_KIND_ALL: AccountErrorKind[] = [
+  'upstream_overload',
+  'rate_limited',
+  'quota_exhausted',
+  'model_busy',
+  'auth_failed',
+  'connection_failed',
+  'upstream_unavailable',
+  'captcha_failed',
+  'invalid_response',
+  'client_canceled',
+  'upstream_error',
+  'quota_query_failed',
+]
 
 /* 儀表板用的完整狀態標籤與配色 */
 export const STATUS_LABEL_LONG: Record<AccountStatus, string> = {

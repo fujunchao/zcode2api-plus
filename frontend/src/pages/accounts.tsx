@@ -39,8 +39,19 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { api, errMsg } from '@/lib/api'
-import { fmt, fmtCompact, fmtDate, normalizeModel, proxyScheme } from '@/lib/format'
-import { STATUS_LABEL, type Account, type AccountStatus, type AccountsResponse, type ProxyProfile } from '@/lib/types'
+import { fmt, fmtCompact, fmtDate, normalizeModel, proxyScheme, relativeTime } from '@/lib/format'
+import {
+  ERROR_KIND_ALL,
+  ERROR_KIND_BADGE,
+  ERROR_KIND_IS_FAULT,
+  ERROR_KIND_LABEL,
+  STATUS_LABEL,
+  type Account,
+  type AccountErrorKind,
+  type AccountStatus,
+  type AccountsResponse,
+  type ProxyProfile,
+} from '@/lib/types'
 
 /* 頂層「直連」的 Select 哨兵值：Radix Select 不允許空字串 value */
 const PROXY_DIRECT = '__direct__'
@@ -57,6 +68,41 @@ const STATUS_BADGE: Record<AccountStatus, string> = {
 }
 
 type FilterKey = 'all' | AccountStatus
+
+/* 錯誤類型篩選：'fault' 是按「是否歸因於帳號自身」聚合，其餘是具體類型。
+   聚合項讓「一鍵找出有問題的號」成立，而不必在下拉裡逐個類型點一遍。 */
+type ErrFilterKey = 'all' | 'fault' | AccountErrorKind
+
+/* 錯誤類型標籤的兜底：後端新增類型而前端尚未同步時，退化成原字串而不是顯示空白。 */
+function errorKindLabel(kind: string): string {
+  return ERROR_KIND_LABEL[kind as AccountErrorKind] ?? kind
+}
+
+function errorKindBadge(kind: string): string {
+  return ERROR_KIND_BADGE[kind as AccountErrorKind] ?? 'bg-muted text-muted-foreground'
+}
+
+/* 「最近錯誤」列：小徽章 + 相對時間；完整錯誤文案放 title（欄寬只有 104px）。 */
+function LastErrorCell({ account }: { account: Account }) {
+  const kind = account.last_error_kind
+  if (!kind) {
+    return <span className="text-xs text-muted-foreground">—</span>
+  }
+  const label = errorKindLabel(kind)
+  const tip = account.last_error ? `${label} · ${account.last_error}` : label
+  return (
+    <div className="flex flex-col items-center gap-0.5">
+      {/* 限寬 + truncate 是硬約定：欄位從 TableCell 繼承 whitespace-nowrap，
+          不截斷會把整張表頂寬（歷史 bug 20c8bf0）。 */}
+      <Badge className={`${errorKindBadge(kind)} max-w-[92px] text-[11px] font-normal`} title={tip}>
+        <span className="truncate">{label}</span>
+      </Badge>
+      <span className="text-[11px] text-muted-foreground" title={fmtDate(account.last_error_at)}>
+        {relativeTime(account.last_error_at)}
+      </span>
+    </div>
+  )
+}
 
 export function AccountsPage() {
   const qc = useQueryClient()
@@ -83,6 +129,7 @@ export function AccountsPage() {
   const freeProxyCount = proxies.filter((p) => p.enabled && !usedProxyIds.has(p.id)).length
 
   const [filter, setFilter] = useState<FilterKey>('all')
+  const [errFilter, setErrFilter] = useState<ErrFilterKey>('all')
   const [showArchived, setShowArchived] = useState(false)
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set())
 
@@ -131,10 +178,29 @@ export function AccountsPage() {
 
   /* ── 篩選（歸檔帳號不參與） ── */
   const counts: Record<string, number> = { all: liveAccounts.length, exhausted: 0, disabled: 0 }
+  /* 錯誤類型計數：只統計最近一次錯誤的歸類；無錯誤的帳號不進任何一項。 */
+  const errCounts: Record<string, number> = {}
+  let faultCount = 0
   liveAccounts.forEach((a) => {
     counts[a.status] = (counts[a.status] || 0) + 1
+    const kind = a.last_error_kind
+    if (!kind) return
+    errCounts[kind] = (errCounts[kind] || 0) + 1
+    if (ERROR_KIND_IS_FAULT[kind as AccountErrorKind]) faultCount++
   })
-  const filtered = filter === 'all' ? liveAccounts : liveAccounts.filter((a) => a.status === filter)
+  /* 狀態與錯誤類型兩級串聯：先按狀態收窄，再按錯誤歸類收窄。
+     'fault' 用歸因布林值過濾，因此 client_canceled（用戶端取消，不計為帳號故障）
+     不會混進「帳號故障」視圖——但它仍可從下拉單獨選出。 */
+  const filtered = liveAccounts
+    .filter((a) => filter === 'all' || a.status === filter)
+    .filter((a) => {
+      if (errFilter === 'all') return true
+      const kind = a.last_error_kind
+      if (!kind) return false
+      return errFilter === 'fault'
+        ? Boolean(ERROR_KIND_IS_FAULT[kind as AccountErrorKind])
+        : kind === errFilter
+    })
 
   /* ── 新增 ── */
   function openAdd() {
@@ -592,34 +658,55 @@ export function AccountsPage() {
             <span className="tabular-nums opacity-70">{counts[k] || 0}</span>
           </Button>
         ))}
+        {/* 錯誤類型篩選：只列當前真的有帳號命中的類型，避免下拉被 12 個選項塞滿；
+            計數為 0 的類型選了也看不到東西。 */}
+        <Select value={errFilter} onValueChange={(v) => setErrFilter(v as ErrFilterKey)}>
+          <SelectTrigger className="h-8 w-[176px] rounded-full" aria-label="依錯誤類型篩選">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部錯誤類型</SelectItem>
+            {faultCount > 0 && <SelectItem value="fault">帳號故障（{faultCount}）</SelectItem>}
+            {ERROR_KIND_ALL.filter((k) => errCounts[k]).map((k) => (
+              <SelectItem key={k} value={k}>
+                {ERROR_KIND_LABEL[k]}（{errCounts[k]}）
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
       {/* 帳號明細表 */}
       <Card>
         <CardContent className="overflow-x-auto px-0">
-          {/* 九列在 1150px 的卡片裏原本擠不下（最小寬度和 1188px），最右的「操作」
-              會被裁掉。收緊格內留白（每格省 4px）把總寬壓到卡片以內。 */}
-          <Table className="[&_td]:px-1.5 [&_th]:px-1.5">
+          {/* 十列在 1150px 的卡片裏原本擠不下（九列時最小寬度和 1188px），最右的
+              「操作」會被裁掉。收緊格內留白（每格省 4px）把總寬壓到卡片以內；
+              新增「最近錯誤」列（104px）時又從呼叫／失敗／Tokens／最近使用／操作／
+              出口線路各讓出 16px，淨增 24px 由未定寬的「賬號」列吸收。
+              改動前後都要用 .workbuddy/measure-ui-layout.js 量一次：這一列的壞法
+              是「表格被頂寬、右側被裁」，短數據看不出來。 */}
+          <Table className="[&_td]:px-1 [&_th]:px-1">
             <TableHeader>
               <TableRow>
-                <TableHead className="text-center">賬號</TableHead>
+                <TableHead className="w-32 text-center">賬號</TableHead>
                 <TableHead className="w-20 text-center">狀態</TableHead>
-                <TableHead className="w-28 text-center">出口線路</TableHead>
+                <TableHead className="w-24 text-center">出口線路</TableHead>
                 {/* 額度列改為定寬（原本只有 min-w-56=224px 的下限）：內容實寬約 296px，
                     定寬後這一列不再隨表格剩餘寬度被撐大，標題也就不會飄在內容之外。
                     多出來的寬度由未定寬的「賬號」列吸收（該列本就截斷，伸縮無副作用）。 */}
                 <TableHead className="w-[308px] text-center">額度</TableHead>
-                <TableHead className="w-16 text-center">呼叫</TableHead>
-                <TableHead className="w-16 text-center">失敗</TableHead>
-                <TableHead className="w-24 text-center">Tokens</TableHead>
-                <TableHead className="w-24 text-center">最近使用</TableHead>
-                <TableHead className="w-44 text-center">操作</TableHead>
+                <TableHead className="w-12 text-center">呼叫</TableHead>
+                <TableHead className="w-12 text-center">失敗</TableHead>
+                <TableHead className="w-[76px] text-center">最近錯誤</TableHead>
+                <TableHead className="w-20 text-center">Tokens</TableHead>
+                <TableHead className="w-16 text-center">最近使用</TableHead>
+                <TableHead className="w-40 text-center">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {!filtered.length ? (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-10 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={10} className="py-10 text-center text-sm text-muted-foreground">
                     尚無帳號，請點擊右上角「新增」
                   </TableCell>
                 </TableRow>
@@ -630,7 +717,7 @@ export function AccountsPage() {
                       <div className="flex items-center gap-1">
                         <EmailCell account={a} onCopy={() => void copyEmail(a)} />
                         {(a.disabled_models || []).length > 0 && (
-                          <Badge variant="outline" className="shrink-0 text-[11px] font-normal" title={(a.disabled_models || []).join('、')}>
+                          <Badge variant="outline" className="max-w-[68px] shrink-0 text-[11px] font-normal" title={(a.disabled_models || []).join('、')}>
                             停用 {a.disabled_models.length} 模型
                           </Badge>
                         )}
@@ -650,7 +737,7 @@ export function AccountsPage() {
                           <span className="size-1.5 shrink-0 rounded-full bg-emerald-500/70" />
                           {/* 代理名由用戶自填，長度不可控；不截斷會把本列的最小寬度頂開
                               （與額度列的 ClaimHint 同一類問題），故限寬並保留全文於 title。 */}
-                          <span className="max-w-[88px] truncate" title={proxyLabel(a, proxies)}>
+                          <span className="max-w-[64px] truncate" title={proxyLabel(a, proxies)}>
                             {proxyLabel(a, proxies)}
                           </span>
                         </span>
@@ -672,12 +759,15 @@ export function AccountsPage() {
                     </TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.use_count || 0}</TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.fail_count || 0}</TableCell>
+                    <TableCell className="text-center">
+                      <LastErrorCell account={a} />
+                    </TableCell>
                     <TableCell>
                       <TokensCell account={a} />
                     </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{fmtDate(a.last_used_at)}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground" title={fmtDate(a.last_used_at)}>{relativeTime(a.last_used_at)}</TableCell>
                     <TableCell>
-                      <div className="flex justify-end gap-0.5">
+                      <div className="flex justify-end gap-0">
                         {a.mode === 'jwt' && (
                           <Button variant="ghost" size="icon-sm" title="重新整理額度" onClick={() => void refreshOne(a)}>
                             {refreshing.has(a.id) ? <Loader2 className="animate-spin" /> : <RefreshCw />}
@@ -946,7 +1036,7 @@ function EmailCell({ account, onCopy }: { account: Account; onCopy: () => void }
   const label = account.email || account.name || '未命名帳號'
   return (
     <span className="group/email flex min-w-0 items-center gap-1">
-      <span className="max-w-32 truncate font-medium" title={label}>
+      <span className="max-w-24 truncate font-medium" title={label}>
         {label}
       </span>
       <button
