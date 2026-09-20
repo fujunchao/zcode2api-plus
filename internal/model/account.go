@@ -90,10 +90,18 @@ type Account struct {
 	LastCheckedAt            *float64 `json:"last_checked_at"`
 	CoolingUntil             *float64 `json:"cooling_until"`
 	LastError                *string  `json:"last_error"`
-	ProxyURL                 *string  `json:"proxy_url"`
-	ProxyID                  *string  `json:"proxy_id"`
-	CreatedAt                float64  `json:"created_at"`
-	ArchivedAt               *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
+
+	// LastErrorKind 最近一次请求失败的归类（取值见 ErrorKind* 常量）。与 LastError
+	// 成对出现但语义不同：LastError 是给人看的文案，会随分支调整而变；Kind 是稳定
+	// 字符串，供后台按类型筛选。可空、不带 omitempty——键集只增不减。
+	LastErrorKind *string `json:"last_error_kind"`
+	// LastErrorAt 最近一次失败的时间（Unix 秒，与其它时间字段同口径）。
+	LastErrorAt *float64 `json:"last_error_at"`
+
+	ProxyURL   *string  `json:"proxy_url"`
+	ProxyID    *string  `json:"proxy_id"`
+	CreatedAt  float64  `json:"created_at"`
+	ArchivedAt *float64 `json:"archived_at"` // 非空表示已归档：只保留记录，不参与调度/领取/刷新
 
 	// UserID 上游用户标识（JWT payload 的 user_id，sub 兜底）。身份判据，优先级最高：
 	// 同一个号的 token 会刷新，只比凭据字节会让它变成"另一条记录"。
@@ -263,6 +271,8 @@ func (a *Account) Clone() *Account {
 		LastCheckedAt:            a.LastCheckedAt,
 		CoolingUntil:             a.CoolingUntil,
 		LastError:                a.LastError,
+		LastErrorKind:            a.LastErrorKind,
+		LastErrorAt:              a.LastErrorAt,
 		ProxyURL:                 a.ProxyURL,
 		ProxyID:                  a.ProxyID,
 		CreatedAt:                a.CreatedAt,
@@ -619,6 +629,8 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		"last_checked_at": a.LastCheckedAt,
 		"cooling_until":   a.CoolingUntil,
 		"last_error":      a.LastError,
+		"last_error_kind": a.LastErrorKind,
+		"last_error_at":   a.LastErrorAt,
 		"proxy_url":       a.ProxyURL,
 		"proxy_id":        a.ProxyID,
 		"created_at":      a.CreatedAt,

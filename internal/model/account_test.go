@@ -11,7 +11,7 @@ import (
 )
 
 // pythonAccountJSON 模拟 Python 版 json.dumps(asdict(account)) 的输出形态：
-// 全部 32 个键都在（含 null），Account 的 json tag 必须与之完全对齐。
+// 全部 34 个键都在（含 null），Account 的 json tag 必须与之完全对齐。
 const pythonAccountJSON = `{
   "id": "glm-acc-1a2b3c4d",
   "name": "test",
@@ -45,6 +45,8 @@ const pythonAccountJSON = `{
   "last_checked_at": 1700000000.5,
   "cooling_until": null,
   "last_error": null,
+  "last_error_kind": null,
+  "last_error_at": null,
   "proxy_url": null,
   "proxy_id": null,
   "created_at": 1700000001.5,
@@ -55,17 +57,19 @@ const pythonAccountJSON = `{
 }`
 
 // pythonAccountKeys 序列化契约的全部键。
-// 前四个 Go 增量字段：archived_at（归档）、user_id（身份判据）、
-// virtual_device_mid（每账号设备指纹）、claim（领取状态）——Python 侧已退休，
+// Go 增量字段：archived_at（归档）、user_id（身份判据）、
+// virtual_device_mid（每账号设备指纹）、claim（领取状态）、
+// last_error_kind / last_error_at（最近一次错误的归类与时间）——Python 侧已退休，
 // 旧版 json.loads 对多出的键会原样保留在 dict 中，不影响旧数据互读；
-// 本测试现在保护的是 Go 自身的往返一致性。
+// 本测试现在保护的是 Go 自身的往返一致性。键集只增不减。
 var pythonAccountKeys = []string{
 	"id", "name", "provider", "mode", "email", "jwt_token", "api_key",
 	"enabled", "status", "quota", "exhausted_models", "disabled_models",
 	"plan", "plans", "usage", "use_count", "fail_count",
 	"total_input_tokens", "total_output_tokens", "total_cache_creation_tokens",
 	"total_cache_read_tokens", "last_used_at", "last_checked_at", "cooling_until",
-	"last_error", "proxy_url", "proxy_id", "created_at", "archived_at",
+	"last_error", "last_error_kind", "last_error_at",
+	"proxy_url", "proxy_id", "created_at", "archived_at",
 	"user_id", "virtual_device_mid", "claim",
 }
 
@@ -302,6 +306,34 @@ func TestCloneIsDetached(t *testing.T) {
 	}
 }
 
+// TestCloneCopiesErrorFields 单独钉「最近错误」两个字段必须被 Clone 复制。
+//
+// 不能指望 TestCloneIsDetached 兜住：它只检查自己关心的字段，而 Clone() 是逐字段
+// 字面量列举——漏拷新字段时那条测试照样是绿的，症状是调用方（后台领取、异步池快照）
+// 拿到的副本里错误归类莫名消失。
+func TestCloneCopiesErrorFields(t *testing.T) {
+	kind := ErrorKindUpstreamOverload
+	at := 1700000000.25
+	acc := Create(ProviderZai, "acc-err", "a.b.c")
+	acc.LastErrorKind = &kind
+	acc.LastErrorAt = &at
+
+	cp := acc.Clone()
+	if cp.LastErrorKind == nil || *cp.LastErrorKind != kind {
+		t.Fatalf("副本应带上错误归类: %v", cp.LastErrorKind)
+	}
+	if cp.LastErrorAt == nil || *cp.LastErrorAt != at {
+		t.Fatalf("副本应带上错误时间: %v", cp.LastErrorAt)
+	}
+
+	// 两个字段都按「整体替换指针」写入（不就地改值），因此副本持有旧指针即已解耦。
+	other := ErrorKindRateLimited
+	acc.LastErrorKind = &other
+	if cp.LastErrorKind == nil || *cp.LastErrorKind != kind {
+		t.Fatalf("副本不应跟随原件的替换: %v", cp.LastErrorKind)
+	}
+}
+
 func TestClaimStateConcurrentAccess(t *testing.T) {
 	acc := Create(ProviderZai, "race", "sk-race")
 	var wg sync.WaitGroup
@@ -371,7 +403,10 @@ func TestNewFieldsSerializedAsNull(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("回读失败: %v", err)
 	}
-	for _, k := range []string{"user_id", "virtual_device_mid", "claim"} {
+	for _, k := range []string{
+		"user_id", "virtual_device_mid", "claim",
+		"last_error_kind", "last_error_at",
+	} {
 		v, ok := got[k]
 		if !ok {
 			t.Fatalf("缺少键 %s", k)
