@@ -439,8 +439,12 @@ func TestBilling405WithSnapshotIsIdempotent(t *testing.T) {
 
 	// 人为制造 last_error，验证 405 幂等路径将其清除
 	msg := "上游服務暫時不可用 HTTP 503"
+	kind := model.ErrorKindUpstreamUnavailable
+	at := 1700000000.0
 	if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
 		a.LastError = &msg
+		a.LastErrorKind = &kind
+		a.LastErrorAt = &at
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -459,6 +463,97 @@ func TestBilling405WithSnapshotIsIdempotent(t *testing.T) {
 	if got.LastError != nil {
 		t.Fatalf("405 幂等路径应清除 last_error: %v", got.LastError)
 	}
+	// 错误归类与时间同样要清：否则前台会留下「已恢复健康但仍带着旧错误类型」的脏标记。
+	if got.LastErrorKind != nil || got.LastErrorAt != nil {
+		t.Fatalf("405 幂等路径应清除错误归类与时间: kind=%v at=%v", got.LastErrorKind, got.LastErrorAt)
+	}
+}
+
+// 405 不是「重复查询」的专属信号：上游风控也用 405。只看状态码会把风控当成幂等成功
+// 静默吞掉，还顺手清掉 last_error——账号看起来一片健康，实际已经被拦。
+func TestBilling405RiskControlIsNotIdempotent(t *testing.T) {
+	svc, st, billing := setup(t)
+	acc, err := st.AddAccount(model.ProviderZai, "risk", "header.payload.signature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	billing.body = balancePayload(2500000)
+	svc.FetchQuota(acc) // 建立快照：确保「有快照」这个前提成立，风控仍不能被当成幂等
+
+	base := time.Now()
+	now := base
+	svc.SetNow(func() time.Time { return now })
+
+	now = base.Add(QuotaCacheTTL + time.Second)
+	billing.setStatus(http.StatusMethodNotAllowed, "request has been blocked due to unusual activity.")
+	result := svc.FetchQuota(acc)
+
+	if result["cached"] == true {
+		t.Fatalf("风控 405 不该被当成幂等成功: %v", result)
+	}
+	if _, ok := result["error"]; !ok {
+		t.Fatalf("风控 405 应报错: %v", result)
+	}
+	got := st.FindAny(acc.ID)
+	if got.LastError == nil || !strings.Contains(*got.LastError, "405") {
+		t.Fatalf("风控 405 应写入 last_error: %v", got.LastError)
+	}
+	if !strings.Contains(*got.LastError, "unusual activity") {
+		t.Fatalf("last_error 应带上上游原文以便定位: %v", *got.LastError)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindQuotaQueryFailed {
+		t.Fatalf("额度查询失败应归类为 quota_query_failed: %v", got.LastErrorKind)
+	}
+	if got.Status == model.StatusInvalid {
+		t.Fatalf("风控 405 不该把账号判为 invalid: %s", got.Status)
+	}
+}
+
+// 额度查询失败的归类：凭据失效走 auth_failed（账号真的坏了），其余走
+// quota_query_failed（旁路观测失败，账号仍可转发请求，不算「账号故障」）。
+func TestBillingFailureRecordsErrorKind(t *testing.T) {
+	t.Run("401 鉴权失败→auth_failed 且置 invalid", func(t *testing.T) {
+		svc, st, billing := setup(t)
+		acc, _ := st.AddAccount(model.ProviderZai, "bad", "header.payload.signature")
+
+		billing.setStatus(http.StatusUnauthorized, "")
+		result := svc.FetchQuota(acc)
+		if _, ok := result["error"]; !ok {
+			t.Fatalf("401 应报错: %v", result)
+		}
+		got := st.FindAny(acc.ID)
+		if got.Status != model.StatusInvalid {
+			t.Fatalf("401 应置 invalid: %s", got.Status)
+		}
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindAuthFailed {
+			t.Fatalf("401 应归类为 auth_failed: %v", got.LastErrorKind)
+		}
+	})
+
+	t.Run("500→quota_query_failed 且不动状态", func(t *testing.T) {
+		svc, st, billing := setup(t)
+		acc, _ := st.AddAccount(model.ProviderZai, "boom", "header.payload.signature")
+
+		billing.setStatus(http.StatusInternalServerError, `{"error":"boom"}`)
+		result := svc.FetchQuota(acc)
+		if _, ok := result["error"]; !ok {
+			t.Fatalf("500 应报错: %v", result)
+		}
+		got := st.FindAny(acc.ID)
+		if got.Status != model.StatusActive {
+			t.Fatalf("额度查询失败不该改账号状态: %s", got.Status)
+		}
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindQuotaQueryFailed {
+			t.Fatalf("应归类为 quota_query_failed: %v", got.LastErrorKind)
+		}
+		if got.LastErrorAt == nil {
+			t.Fatal("应记录失败时间")
+		}
+		// 旁路观测的失败不该算「账号故障」——它不影响该账号能否转发请求。
+		if model.ErrorKindAccountFault(*got.LastErrorKind) {
+			t.Fatal("quota_query_failed 不应算作账号故障")
+		}
+	})
 }
 
 func TestMergeQuotaEntryCombinesSubscriptions(t *testing.T) {

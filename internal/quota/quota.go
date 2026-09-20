@@ -206,7 +206,7 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 		}
 	}
 	msg := "额度查询网络错误: " + err.Error()
-	s.fail(snap, checkedAt, msg, "")
+	s.fail(snap, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
 	return map[string]any{"error": msg}
 }
 
@@ -216,15 +216,49 @@ func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
 	_, _ = s.Store.Update(acc.Provider, acc.ID, fn)
 }
 
-// fail 记录一次查询失败：刷新检查时间、写失败原因，status 非空时同时改状态。
-func (s *Service) fail(acc *model.Account, checkedAt float64, msg, status string) {
+// fail 记录一次查询失败：刷新检查时间、写失败原因与归类，status 非空时同时改状态。
+//
+// kind 必填（见 model.ErrorKind*）：额度轮询是旁路观测，它的失败大多不影响该账号能否
+// 转发请求，所以归类通常是 quota_query_failed、不算「账号故障」；但凭据失效是例外，
+// 它走 auth_failed——那与查询路径无关，账号本身确实坏了。
+func (s *Service) fail(acc *model.Account, checkedAt float64, msg, kind, status string) {
 	s.apply(acc, func(live *model.Account) {
 		live.LastCheckedAt = &checkedAt
 		if status != "" {
 			live.Status = status
 		}
 		live.LastError = &msg
+		live.LastErrorKind = &kind
+		at := float64(time.Unix(0, int64(checkedAt*1e9)).UnixNano()) / 1e9
+		live.LastErrorAt = &at
 	})
+}
+
+// maxBillingBodyBytes 计费接口错误体的读取上限。
+// 错误体要整段读进来判形态（405 尤其需要看 body 才能区分风控与重复查询），
+// 而上游异常时可能回一个任意大的 body——不限长会直接吃光内存。
+const maxBillingBodyBytes = 8 << 10
+
+// isRiskControlBody 判断计费接口的错误体是不是风控拦截。
+//
+// 这条判定存在的唯一理由：上游对「重复查询」回 405（幂等，可安全忽略），风控也用
+// 405 回 "request has been blocked due to unusual activity."（真实故障，必须报出来）。
+// 只看状态码会把风控静默当成幂等成功，还顺手清掉 last_error，账号看起来一片健康。
+func isRiskControlBody(text string) bool {
+	low := strings.ToLower(text)
+	return strings.Contains(low, "unusual activity") ||
+		strings.Contains(low, "blocked") ||
+		strings.Contains(low, "risk")
+}
+
+// textPreview 取错误体预览：单行化 + 截断。last_error 会出现在后台界面上，
+// 整段 body 既没必要也撑不住（上游可能回 HTML 错误页）。
+func textPreview(text string) string {
+	text = strings.TrimSpace(strings.Join(strings.Fields(text), " "))
+	if len(text) > 200 {
+		return text[:200] + "…"
+	}
+	return text
 }
 
 // clientFor 返回账号出站客户端；配置了代理时走代理传输（20s 超时，短请求）。
@@ -253,13 +287,18 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		msg := fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode)
-		s.fail(acc, checkedAt, msg, model.StatusInvalid)
+		s.fail(acc, checkedAt, msg, model.ErrorKindAuthFailed, model.StatusInvalid)
 		return map[string]any{"error": msg}
 	}
 	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBillingBodyBytes))
+		text := string(body)
 		// 上游对重复查询返回 405：已有快照时视为幂等成功（清错误、不重建状态）。
 		// 「是否已有快照」必须在锁内判断，否则与并发写入方交错。
-		if resp.StatusCode == http.StatusMethodNotAllowed {
+		//
+		// ⚠️ 405 不是「重复查询」的专属信号：风控也用 405（unusual activity），
+		// 因此必须看 body 才能确认。否则一次风控会被静默吞掉，还顺手清掉 last_error。
+		if resp.StatusCode == http.StatusMethodNotAllowed && !isRiskControlBody(text) {
 			hasSnapshot := false
 			s.apply(acc, func(live *model.Account) {
 				if len(live.Quota) == 0 {
@@ -268,26 +307,31 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 				hasSnapshot = true
 				live.LastCheckedAt = &checkedAt
 				live.LastError = nil
+				live.LastErrorKind = nil
+				live.LastErrorAt = nil
 			})
 			if hasSnapshot {
 				return map[string]any{"cached": true, "reason": "上游额度接口拒绝了重复查询（HTTP 405）"}
 			}
 		}
 		msg := fmt.Sprintf("额度查询失败 HTTP %d", resp.StatusCode)
-		s.fail(acc, checkedAt, msg, "")
+		if detail := strings.TrimSpace(textPreview(text)); detail != "" {
+			msg += ": " + detail
+		}
+		s.fail(acc, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
 		return map[string]any{"error": msg}
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		msg := "额度查询网络错误: " + err.Error()
-		s.fail(acc, checkedAt, msg, "")
+		s.fail(acc, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
 		return map[string]any{"error": msg}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		msg := "额度查询返回了无效 JSON"
-		s.fail(acc, checkedAt, msg, "")
+		s.fail(acc, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
 		return map[string]any{"error": msg}
 	}
 	if code := payload["code"]; code != nil && !isZeroNumber(code) {
@@ -296,7 +340,7 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 			msg = fmt.Sprintf("额度查询失败 code=%s", fmt.Sprint(code))
 		}
 		msg = strings.TrimSpace(msg)
-		s.fail(acc, checkedAt, msg, "")
+		s.fail(acc, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
 		return map[string]any{"balance": payload, "error": msg}
 	}
 

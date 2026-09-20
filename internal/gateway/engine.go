@@ -49,6 +49,10 @@ type Engine struct {
 	// 与 BusyRetryDelays 分开配置，两者语义不同：3010 是模型级准入、换号无用，
 	// 瞬时限流只值一次对冲。
 	RateLimitRetryDelay time.Duration
+	// OverloadRetryDelays 平台过载（529 / 业务码 1305）的原地退避档位，默认 1s/3s。
+	// 同样与 BusyRetryDelays 分开：过载是平台侧拥塞，与账号无关，既不改账号状态
+	// 也不换号，只按自己的档位退避重试。
+	OverloadRetryDelays []time.Duration
 	// OnQuotaRefresh 成功/耗尽后触发的额度刷新（M3 接入 quota 包；nil 跳过）。
 	OnQuotaRefresh func(acc *model.Account)
 
@@ -66,6 +70,7 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		Client:              client,
 		BusyRetryDelays:     defaultBusyRetryDelays,
 		RateLimitRetryDelay: RateLimitRetryDelay,
+		OverloadRetryDelays: OverloadRetryDelays,
 		now:                 time.Now,
 	}
 }
@@ -122,9 +127,10 @@ type attemptResult struct {
 // 等待预算，且 BusyRetryDelays 会按验证码次数取到错误下标——语义完全不同的两件事
 // 共用一个数，扩展时会咬人。
 type attemptBudget struct {
-	captcha int // 验证码刷新（含首次尝试，上限 MaxCaptchaRetries）
-	busy    int // 3010 并发准入等待（上限 len(BusyRetryDelays)）
-	rate    int // 瞬时限流原地重试（上限 MaxRateLimitRetries）
+	captcha  int // 验证码刷新（含首次尝试，上限 MaxCaptchaRetries）
+	busy     int // 3010 并发准入等待（上限 len(BusyRetryDelays)）
+	rate     int // 瞬时限流原地重试（上限 MaxRateLimitRetries）
+	overload int // 平台过载退避重试（上限 len(OverloadRetryDelays)）
 }
 
 // RunMessages 执行完整循环。body 是入口 NormalizeBody 后的请求体；
@@ -178,7 +184,7 @@ func (e *Engine) tryAccount(
 	needsCaptcha := acc.Mode == "jwt"
 
 	var b attemptBudget
-	budget := 1 + MaxCaptchaRetries + len(e.BusyRetryDelays) + MaxRateLimitRetries
+	budget := 1 + MaxCaptchaRetries + len(e.BusyRetryDelays) + MaxRateLimitRetries + len(e.OverloadRetryDelays)
 
 	for range budget {
 		var verifyParam, verifyRegion string
@@ -187,6 +193,7 @@ func (e *Engine) tryAccount(
 			if err != nil {
 				e.Captcha.Invalidate()
 				b.captcha++
+				e.recordError(acc, model.ErrorKindCaptchaFailed, "验证码自动求解失败: "+err.Error())
 				if b.captcha < MaxCaptchaRetries {
 					web.Warn(reqID, fmt.Sprintf("验证码自动求解失败，刷新令牌重试（第 %d 次）", b.captcha))
 					continue
@@ -209,14 +216,14 @@ func (e *Engine) tryAccount(
 
 		req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, incomingHeaders)
 		if err != nil {
-			e.mark(acc, model.StatusInvalid, err.Error())
+			e.mark(acc, model.StatusInvalid, model.ErrorKindAuthFailed, err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 凭证无效，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
 		}
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(payload))
 		if err != nil {
-			e.mark(acc, model.StatusInvalid, err.Error())
+			e.mark(acc, model.StatusInvalid, model.ErrorKindAuthFailed, err.Error())
 			return attemptResult{switchAccount: true}
 		}
 		for k, v := range req.Headers {
@@ -228,10 +235,13 @@ func (e *Engine) tryAccount(
 			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
 				// ——换号只会白烧另一个账号的额度。
+				// 只记「归类 + 时间」而**不覆盖 last_error 文案**：用户按一下 ESC 不该
+				// 把上一次真实故障的文案冲掉，但「这个号最近发生过什么」仍值得留痕。
+				e.recordError(acc, model.ErrorKindClientCanceled, "")
 				web.Warn(reqID, fmt.Sprintf("请求已取消（账号 %s）：%v", acc.Name, err))
 				return attemptResult{final: errResult(http.StatusBadGateway, "request_canceled", "请求已取消")}
 			}
-			e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
+			e.mark(acc, model.StatusCooling, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
 		}
@@ -254,7 +264,7 @@ func (e *Engine) tryAccount(
 			buffered, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 			_ = resp.Body.Close()
 			if err != nil {
-				e.bumpFail(acc)
+				e.bumpFail(acc, model.ErrorKindConnectionFailed)
 				web.ReqErr(reqID, fmt.Sprintf("上游错误体读取失败（账号 %s）", acc.Name))
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_error", textPreview(err.Error()))}
 			}
@@ -298,11 +308,12 @@ func (e *Engine) handleUpstreamError(
 	if err != nil {
 		if isClientGone(ctx) {
 			// 同上的取消语义：读错误体被取消不代表账号有问题。
+			e.recordError(acc, model.ErrorKindClientCanceled, "")
 			web.Warn(reqID, fmt.Sprintf("读上游错误体时请求已取消（账号 %s）：%v", acc.Name, err))
 			return attemptResult{final: errResult(http.StatusBadGateway, "request_canceled", "请求已取消")}
 		}
 		// 读不出错误体：按连接失败处理
-		e.mark(acc, model.StatusCooling, "连接失败: "+err.Error())
+		e.mark(acc, model.StatusCooling, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
 		return attemptResult{switchAccount: true}
 	}
 	text := string(body)
@@ -311,6 +322,7 @@ func (e *Engine) handleUpstreamError(
 	if needsCaptcha && IsCaptchaError(text, resp.StatusCode, resp.Header) {
 		e.Captcha.Invalidate()
 		b.captcha++
+		e.recordError(acc, model.ErrorKindCaptchaFailed, "上游拒绝验证码 HTTP "+fmt.Sprint(resp.StatusCode))
 		web.Warn(reqID, fmt.Sprintf("账号 %s 验证码失效，刷新重试（第 %d 次）", acc.Name, b.captcha))
 		if b.captcha >= MaxCaptchaRetries {
 			detail := "上游连续拒绝验证码"
@@ -324,7 +336,8 @@ func (e *Engine) handleUpstreamError(
 
 	// 2) 鉴权失败是强信号（JWT 上游为裸 401 空 body；api.z.ai 为 type=1000/1001/1003）
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		e.mark(acc, model.StatusInvalid, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
+		e.mark(acc, model.StatusInvalid, model.ErrorKindAuthFailed,
+			fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
 		web.Warn(reqID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
 		return attemptResult{switchAccount: true}
 	}
@@ -339,6 +352,8 @@ func (e *Engine) handleUpstreamError(
 
 	// 4) 429 且 code=3010：模型并发准入限制，账号仍可用，按原版客户端延迟重试
 	if IsModelConcurrencyLimit(resp.StatusCode, text) {
+		// 账号状态不变，但这次失败要留痕（并发准入是模型级限制，与账号健康无关）。
+		e.recordError(acc, model.ErrorKindModelBusy, "模型并发准入受限 HTTP 429 code=3010")
 		if b.busy < len(e.BusyRetryDelays) {
 			delay := e.BusyRetryDelays[b.busy]
 			b.busy++
@@ -355,7 +370,43 @@ func (e *Engine) handleUpstreamError(
 		}}
 	}
 
-	// 5) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 先原地重试，用尽才冷却换号
+	// 5) 529 / 业务码 1305：平台服务过载。必须排在 429 分支之前——官方错误码表把
+	// 1305 标成 429，若先过 429 分支，一次平台过载就会被当成「该账号被限速」而挨上
+	// 30→60→120→300s 的递进冷却，整池健康账号会被逐个踢出调度。
+	//
+	// 官方定义 1305 属于「平台服务过载，与单一账户的调用行为无直接关系」（1302 才是
+	// 账户维度的速率限制）。因此这里既不标账号状态、也不换号：换号救不了过载，冷却
+	// 只会缩小可用池。只按自己的档位退避重试，用尽后原样透传——让上层看到上游原始的
+	// 529 与 1305 文案，而不是被改写成别的错误。
+	//
+	// 判据走 IsUpstreamOverload 而非直接比 429：上游在 Anthropic 兼容面用 529 承载
+	// 1305（线上 30 次实测全部如此），只看 429 会整类漏掉。此处刻意不 bumpFail：
+	// 平台过载不是账号的错，与 402/429 一致。
+	if IsUpstreamOverload(resp.StatusCode, text) {
+		code := orDash(UpstreamBusinessCode(text))
+		// 账号状态、冷却、失败计数都不动，但这次失败要留痕——否则前台无从得知
+		// 「这个号刚才失败过，而且是平台过载」。
+		e.recordError(acc, model.ErrorKindUpstreamOverload,
+			fmt.Sprintf("上游平台过载 HTTP %d code=%s", resp.StatusCode, code))
+		if b.overload < len(e.OverloadRetryDelays) {
+			delay := JitteredDelay(e.OverloadRetryDelays[b.overload])
+			b.overload++
+			web.Warn(reqID, fmt.Sprintf("上游平台过载 HTTP %d code=%s，%g s 后原地重试（账号状态不变）",
+				resp.StatusCode, code, delay.Seconds()))
+			if !sleepCtx(ctx, delay) {
+				return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
+			}
+			return attemptResult{retrySame: true}
+		}
+		web.Warn(reqID, fmt.Sprintf("上游平台过载持续（账号 %s），原样透传 HTTP %d code=%s",
+			acc.Name, resp.StatusCode, code))
+		return attemptResult{final: runResult{
+			Status: resp.StatusCode,
+			Body:   passthroughBodyWithType(text, "upstream_error"),
+		}}
+	}
+
+	// 6) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 先原地重试，用尽才冷却换号
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
 			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
@@ -381,17 +432,20 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 
-	// 6) 503 → 冷却换号
+	// 7) 503 → 冷却换号
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		e.bumpFail(acc)
-		e.mark(acc, model.StatusCooling, "上游服務不可用 HTTP 503")
+		e.bumpFail(acc, model.ErrorKindUpstreamUnavailable)
+		e.mark(acc, model.StatusCooling, model.ErrorKindUpstreamUnavailable, "上游服務不可用 HTTP 503")
 		web.Warn(reqID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
 		return attemptResult{switchAccount: true}
 	}
 
-	// 7) 其余错误：非已知信号，不做账号状态推断，直接原样继承上游响应
-	e.bumpFail(acc)
-	web.ReqErr(reqID, fmt.Sprintf("上游错误 HTTP %d（账号 %s）", resp.StatusCode, acc.Name))
+	// 8) 其余错误：非已知信号，不做账号状态推断，直接原样继承上游响应
+	e.bumpFail(acc, model.ErrorKindUpstreamError)
+	// 日志带上业务码与截断预览：只记状态码时，1305 / 风控这类「关键信息在 body 里」
+	// 的失败在日志里完全不可见。
+	web.ReqErr(reqID, fmt.Sprintf("上游错误 HTTP %d（账号 %s）: %s",
+		resp.StatusCode, acc.Name, ErrorPreview(text)))
 	return attemptResult{final: runResult{
 		Status: resp.StatusCode,
 		Body:   passthroughBodyWithType(text, "upstream_error"),
@@ -424,6 +478,7 @@ func (e *Engine) handleUpstreamJSON(
 	case needsCaptcha && code == "3007":
 		e.Captcha.Invalidate()
 		b.captcha++
+		e.recordError(acc, model.ErrorKindCaptchaFailed, "上游拒絕驗證碼 code=3007")
 		web.Warn(reqID, fmt.Sprintf("帳號 %s 驗證碼失效，刷新重試（第 %d 次）", acc.Name, b.captcha))
 		if b.captcha >= MaxCaptchaRetries {
 			return attemptResult{final: e.captchaRequired(reqID, "上游連續拒絕驗證碼")}
@@ -431,7 +486,7 @@ func (e *Engine) handleUpstreamJSON(
 		return attemptResult{retrySame: true}
 
 	case code != "" && code != "0":
-		e.bumpFail(acc)
+		e.bumpFail(acc, model.ErrorKindUpstreamError)
 		web.ReqErr(reqID, fmt.Sprintf("上游業務錯誤 code=%s（帳號 %s）", code, acc.Name))
 		return attemptResult{final: runResult{
 			Status: http.StatusBadGateway,
@@ -443,7 +498,7 @@ func (e *Engine) handleUpstreamJSON(
 		}}
 
 	case stream:
-		e.bumpFail(acc)
+		e.bumpFail(acc, model.ErrorKindInvalidResponse)
 		web.ReqErr(reqID, fmt.Sprintf("上游串流請求返回非 SSE JSON（帳號 %s）", acc.Name))
 		return attemptResult{final: errResult(http.StatusBadGateway, "invalid_upstream_response", "上游未返回有效的 SSE 串流")}
 	}
@@ -515,18 +570,22 @@ func (e *Engine) accumulateUsage(acc *model.Account, usage *UsageCollector) mode
 // MarkAccount / MarkModelExhausted 同时导出，供 asyncpool 复用同一套状态机；
 // 两条请求路径对同一账号必须标出相同状态（曾因 asyncpool 自行实现而分歧）。
 
-// MarkAccount 设置账号状态；status 为 cooling 时按配置写入冷却截止时间。
+// MarkAccount 设置账号状态并记下这次失败的归类；status 为 cooling 时按配置写入
+// 冷却截止时间。
 //
 // 按 provider + ID 在 store 锁内改「当前」对象：调用方持有的是账号副本，直接改它
 // 既不落库、也会与并发读写相撞；账号已不存在时静默跳过（可能刚被后台删除）。
-func MarkAccount(st *store.Store, provider, idOrName, status, errMsg string, now time.Time) {
+//
+// kind 必填而不是可选（见 classify.go「最近错误」一节）：账号状态与错误归类在同一次
+// 写入里落库，既省一次持久化，也避免两处对同一次失败给出不同分类。
+func MarkAccount(st *store.Store, provider, idOrName, status, kind, errMsg string, now time.Time) {
 	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
 		acc.Status = status
-		acc.LastError = &errMsg
 		if status == model.StatusCooling {
 			until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
 			acc.CoolingUntil = &until
 		}
+		StampAccountError(acc, kind, errMsg, now)
 	})
 }
 
@@ -566,7 +625,10 @@ func isClientGone(ctx context.Context) bool {
 // 整段读改写都在 store 锁内完成——包括 isStrongStatus 守卫与对 Quota 的遍历。
 // 这两处都需要读「当下」的值：守卫若在锁外判定，判定与写入之间仍有一个窗口，
 // 另一路请求足以把刚判 invalid 的账号刷回可用。
-func MarkModelExhausted(st *store.Store, provider, idOrName string, modelName any, errMsg string) {
+//
+// 错误归类固定为 quota_exhausted：本函数的全部调用点（402、429 上限码族、200+1005）
+// 都是额度/用量上限这一件事，kind 由函数语义唯一确定，故不开放成参数。
+func MarkModelExhausted(st *store.Store, provider, idOrName string, modelName any, errMsg string, now time.Time) {
 	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
 		// 先记额度事实（与账号状态无关，任何情况下都要落库）。
 		marked := acc.MarkModelExhausted(modelName)
@@ -575,7 +637,7 @@ func MarkModelExhausted(st *store.Store, provider, idOrName string, modelName an
 			if !strong {
 				acc.Status = model.StatusExhausted
 			}
-			acc.LastError = &errMsg
+			StampAccountError(acc, model.ErrorKindQuotaExhausted, errMsg, now)
 			return
 		}
 		anyState := false
@@ -599,16 +661,22 @@ func MarkModelExhausted(st *store.Store, provider, idOrName string, modelName an
 			}
 			acc.CoolingUntil = nil
 		}
-		acc.LastError = &errMsg
+		StampAccountError(acc, model.ErrorKindQuotaExhausted, errMsg, now)
 	})
 }
 
-func (e *Engine) mark(acc *model.Account, status, errMsg string) {
-	MarkAccount(e.Store, acc.Provider, acc.ID, status, errMsg, e.now())
+func (e *Engine) mark(acc *model.Account, status, kind, errMsg string) {
+	MarkAccount(e.Store, acc.Provider, acc.ID, status, kind, errMsg, e.now())
 }
 
 func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
-	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg)
+	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg, e.now())
+}
+
+// recordError 写一次「最近错误」，不改账号状态、不计失败次数。
+// 用于「该失败不影响账号可用性」的分类：平台过载、并发准入、验证码、客户端取消。
+func (e *Engine) recordError(acc *model.Account, kind, detail string) {
+	RecordAccountError(e.Store, acc.Provider, acc.ID, kind, detail, e.now())
 }
 
 // markRateLimited 瞬时限流的递进冷却，返回（本次冷却秒数, 累加后的连续次数）。
@@ -637,9 +705,17 @@ func (e *Engine) success(acc *model.Account) {
 	e.fireRefresh(acc)
 }
 
-func (e *Engine) bumpFail(acc *model.Account) {
+// bumpFail 记一次失败计数，并一并写下这次失败的归类。
+// kind 必填：调用点都是「已知分类但不需要改账号状态」的出口，漏给会编译失败。
+//
+// 刻意不覆盖 LastError 文案：LastError 的既有契约是「带可读文案的失败原因」，由
+// MarkAccount / MarkModelExhausted / MarkRateLimited 负责写。这里只补归类与时间，
+// 保持 last_error 语义不变（store 侧用 last_error == nil 表示账号已恢复健康）。
+func (e *Engine) bumpFail(acc *model.Account, kind string) {
+	now := e.now()
 	_, _ = e.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
 		live.FailCount++
+		StampAccountError(live, kind, "", now)
 	})
 }
 

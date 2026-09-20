@@ -59,6 +59,10 @@ type Pool struct {
 
 	// RateLimitRetryDelay 瞬时限流原地重试的等待时长（默认 gateway.RateLimitRetryDelay；测试可置 0）。
 	RateLimitRetryDelay time.Duration
+	// OverloadRetryDelays 平台过载（529 / 业务码 1305）的原地退避档位，
+	// 默认 gateway.OverloadRetryDelays（1s/3s；测试可缩短）。与 RateLimitRetryDelay
+	// 分开配置：过载与账号无关，既不冷却也不换号。
+	OverloadRetryDelays []time.Duration
 
 	mu      sync.Mutex
 	tickets map[string]*ticket
@@ -71,6 +75,7 @@ func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
 		Auth:                au,
 		Captcha:             cm,
 		RateLimitRetryDelay: gateway.RateLimitRetryDelay,
+		OverloadRetryDelays: gateway.OverloadRetryDelays,
 		tickets:             map[string]*ticket{},
 	}
 }
@@ -392,9 +397,10 @@ func (p *Pool) emitError(ctx context.Context, ticketID, message, errType string)
 	})
 }
 
-// attemptUpstream 发起一次上游请求；瞬时限流（非额度码族的 429）先在本账号
-// 原地重试一次，重试用尽才递进冷却并把换号交给外层——与 engine 的 sync 路径
-// 保持同一套语义。重试次数与延迟都取自 gateway，两条路径不会各自漂移。
+// attemptUpstream 发起一次上游请求，并处理两类「不换号先归地重试」的失败：
+// 瞬时限流（非额度码族的 429，用尽后递进冷却并交外层换号）与平台过载
+// （529 / 业务码 1305，用尽后原样投递上游错误体并终止本票）。
+// 两类各有独立预算，互不挤占；次数与延迟都取自 gateway，两条路径不会各自漂移。
 func (p *Pool) attemptUpstream(
 	ctx context.Context,
 	ticketID string,
@@ -403,11 +409,32 @@ func (p *Pool) attemptUpstream(
 	req upstream.Request,
 	payload []byte,
 ) (bool, error) {
-	for rateAttempt := 0; ; rateAttempt++ {
+	rateAttempt, overloadAttempt := 0, 0
+	for {
 		midStream, err := p.attemptUpstreamOnce(ctx, ticketID, acc, modelName, req, payload)
 		if err == nil || midStream {
 			return midStream, err
 		}
+
+		// 平台过载：与账号无关，既不标状态也不换号。换号救不了过载，只会在平台
+		// 已经拥塞时替它放大流量；冷却更糟，一次过载就能把整池健康账号踢出去。
+		var ol errOverloaded
+		if errors.As(err, &ol) {
+			if overloadAttempt >= len(p.OverloadRetryDelays) {
+				p.emitError(ctx, ticketID, ol.body, "upstream_error")
+				return false, errDelivered
+			}
+			delay := gateway.JitteredDelay(p.OverloadRetryDelays[overloadAttempt])
+			overloadAttempt++
+			web.Warn(ticketID, fmt.Sprintf("上游平台过载，%g s 后原地重试（账号状态不变）", delay.Seconds()))
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+
 		var rl errRateLimited
 		if !errors.As(err, &rl) {
 			return false, err
@@ -418,6 +445,7 @@ func (p *Pool) attemptUpstream(
 				acc.Name, streak, secs))
 			return false, errNetwork{rl.body}
 		}
+		rateAttempt++
 		delay := gateway.JitteredDelay(p.RateLimitRetryDelay)
 		web.Warn(ticketID, fmt.Sprintf("账号 %s 被瞬时限流 429，%g s 后原地重试", acc.Name, delay.Seconds()))
 		select {
@@ -472,12 +500,14 @@ func (p *Pool) attemptUpstreamOnce(
 		if gateway.IsCaptchaError(bodyText, resp.StatusCode, resp.Header) {
 			// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
 			p.Captcha.Invalidate()
+			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindCaptchaFailed,
+				fmt.Sprintf("上游拒絕驗證碼 HTTP %d", resp.StatusCode), time.Now())
 			return false, errCaptchaRejected
 		}
 
 		// 401/403 → 账号失效，换号
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid,
+			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid, model.ErrorKindAuthFailed,
 				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
 			return false, errNetwork{bodyText}
@@ -486,22 +516,40 @@ func (p *Pool) attemptUpstreamOnce(
 		// 402 → 该模型额度用完
 		if resp.StatusCode == http.StatusPaymentRequired {
 			gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
-				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
+				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
 			return false, errNetwork{bodyText}
 		}
 
 		// 429 且 code=3010：模型并发准入限制，账号仍可用，不标状态
 		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
+			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindModelBusy,
+				"模型并发准入受限 HTTP 429 code=3010", time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态", acc.Name))
 			return false, errNetwork{bodyText}
+		}
+
+		// 529 / 业务码 1305：平台服务过载，与账号无关。必须排在 429 分支之前——官方
+		// 错误码表把 1305 标成 429，若先过 429 分支，一次平台过载就会被当成「该账号
+		// 被限速」而挨上递进冷却，整池健康账号会被逐个踢出调度。
+		// 不标状态、不换号，交由 attemptUpstream 按 OverloadRetryDelays 原地退避重试；
+		// 用尽后原样投递上游错误体并终止本票（与 sync 路径的「原样透传」严格对齐）。
+		if gateway.IsUpstreamOverload(resp.StatusCode, bodyText) {
+			// 账号状态、冷却、失败计数都不动，但这次失败要留痕（与 sync 路径同）。
+			code := gateway.UpstreamBusinessCode(bodyText)
+			if code == "" {
+				code = "-"
+			}
+			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindUpstreamOverload,
+				fmt.Sprintf("上游平台过载 HTTP %d code=%s", resp.StatusCode, code), time.Now())
+			return false, errOverloaded{bodyText}
 		}
 
 		// 429：额度上限码族 → 该模型耗尽
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if gateway.IsQuotaExhaustedCode(bodyText) {
 				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
-					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
+					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)), time.Now())
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
 				return false, errNetwork{bodyText}
 			}
@@ -511,15 +559,19 @@ func (p *Pool) attemptUpstreamOnce(
 
 		// 503 → 冷却换号
 		if resp.StatusCode == http.StatusServiceUnavailable {
-			p.bumpFail(acc)
+			p.bumpFail(acc, model.ErrorKindUpstreamUnavailable)
 			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling,
-				"上游服務不可用 HTTP 503", time.Now())
+				model.ErrorKindUpstreamUnavailable, "上游服務不可用 HTTP 503", time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
 			return false, errNetwork{bodyText}
 		}
 
 		// 其余错误：原样回传上游错误体，终止本票
-		p.bumpFail(acc)
+		p.bumpFail(acc, model.ErrorKindUpstreamError)
+		// 日志带上业务码与截断预览（与 sync 路径同）：只记状态码时，关键信息在 body
+		// 里的失败（1305 平台过载、风控 405）在日志里完全不可见。
+		web.ReqErr(ticketID, fmt.Sprintf("上游错误 HTTP %d（账号 %s）: %s",
+			resp.StatusCode, acc.Name, gateway.ErrorPreview(bodyText)))
 		p.emit(ctx, ticketID, ticketEvent{
 			Type: "error",
 			Data: map[string]any{"error": map[string]any{"message": bodyText, "type": "upstream_error"}},
@@ -558,17 +610,19 @@ func (p *Pool) handleUpstreamJSON(
 	case code == "1005":
 		// 每日额度耗尽：标该模型耗尽后换号（与 sync 同）。
 		gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
-			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
+			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)), time.Now())
 		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
 		return false, errNetwork{text}
 
 	case code == "3007":
 		// 验证码失效：令牌作废，由调用方换令牌重试（不换号）。
 		p.Captcha.Invalidate()
+		gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindCaptchaFailed,
+			"上游拒絕驗證碼 code=3007", time.Now())
 		return false, errCaptchaRejected
 
 	case code != "" && code != "0":
-		p.bumpFail(acc)
+		p.bumpFail(acc, model.ErrorKindUpstreamError)
 		p.emit(ctx, ticketID, ticketEvent{
 			Type: "error",
 			Data: map[string]any{"error": map[string]any{
@@ -582,7 +636,7 @@ func (p *Pool) handleUpstreamJSON(
 
 	// 业务码缺失 / 为 0：本票据承诺的是 SSE 流，上游却回了 JSON 正文。
 	// 当作成功转发会破坏 chunk 契约（同步路径同样判为无效流），故投递错误后终止。
-	p.bumpFail(acc)
+	p.bumpFail(acc, model.ErrorKindInvalidResponse)
 	p.emit(ctx, ticketID, ticketEvent{
 		Type: "error",
 		Data: map[string]any{"error": map[string]any{
@@ -618,11 +672,24 @@ type errRateLimited struct{ body string }
 
 func (e errRateLimited) Error() string { return e.body }
 
-// bumpFail 记一次失败计数。改的是 store 锁内的「当前」对象：acc 是 Select 交出的
-// 账号副本，直接 `acc.FailCount++` 既不落库、也会与并发读写相撞。
-func (p *Pool) bumpFail(acc *model.Account) {
+// errOverloaded 平台过载（529 / 业务码 1305）：与账号无关，账号状态完全不变。
+// 由 attemptUpstream 按 OverloadRetryDelays 原地退避重试，用尽后原样投递上游
+// 错误体并终止本票——不换号，因为换号救不了平台过载。
+type errOverloaded struct{ body string }
+
+func (e errOverloaded) Error() string { return e.body }
+
+// bumpFail 记一次失败计数，并一并写下这次失败的归类。改的是 store 锁内的「当前」
+// 对象：acc 是 Select 交出的账号副本，直接 `acc.FailCount++` 既不落库、也会与并发
+// 读写相撞。
+//
+// 刻意不覆盖 LastError 文案（与 sync 侧同名方法一致）：LastError 的既有契约是
+// 「带可读文案的失败原因」，由 MarkAccount / MarkModelExhausted / MarkRateLimited 负责写。
+func (p *Pool) bumpFail(acc *model.Account, kind string) {
+	now := time.Now()
 	_, _ = p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
 		live.FailCount++
+		gateway.StampAccountError(live, kind, "", now)
 	})
 }
 

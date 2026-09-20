@@ -721,6 +721,7 @@ func TestRateLimitMarksCoolingAndRetries(t *testing.T) {
 	if acc.RateLimitStreak != 1 {
 		t.Fatalf("连续限流计数应为 1: %d", acc.RateLimitStreak)
 	}
+	wantErrorKind(t, acc, model.ErrorKindRateLimited)
 }
 
 // 瞬时限流原地重试成功时不得把账号标成冷却（与 engine 的 sync 路径同语义）。
@@ -754,6 +755,79 @@ func TestRateLimitRetrySucceedsInPlace(t *testing.T) {
 	}
 	if acc.RateLimitStreak != 0 {
 		t.Fatalf("成功后连续限流计数应清零: %d", acc.RateLimitStreak)
+	}
+}
+
+// 529 / 业务码 1305 是平台服务过载（官方明确它与单一账户的调用行为无关）。
+// 异步链必须与 sync 路径同语义：不标状态、不冷却、不换号、不计 fail_count，
+// 只按 gateway.OverloadRetryDelays 原地退避重试；用尽后原样投递上游错误体并终止本票。
+func Test529OverloadInAsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "overload-acc")
+	p.OverloadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+
+	overloadBody := `{"code":1305,"msg":"该模型当前访问量过大，请您稍后再试"}`
+	// 每次调用都要给一档脚本：超出 specs 长度会拿到默认 502，混淆断言。
+	specs := make([]upstreamSpec, 0, 1+len(p.OverloadRetryDelays))
+	for range 1 + len(p.OverloadRetryDelays) {
+		specs = append(specs, upstreamSpec{status: 529, body: overloadBody})
+	}
+	up := &scriptedUpstream{specs: specs}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-529", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-529")
+
+	events := drainEvents(tk)
+	last := events[len(events)-1]
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if errObj == nil || errObj["message"] != overloadBody {
+		t.Fatalf("过载用尽后应原样投递上游错误体: %v", events)
+	}
+	if n := up.callCount(); n != 1+len(p.OverloadRetryDelays) {
+		t.Fatalf("应按档位退避重试后放弃，上游调用 %d 次", n)
+	}
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
+		t.Fatalf("平台过载不应改变账号状态: status=%s cooling=%v", acc.Status, acc.CoolingUntil)
+	}
+	if acc.FailCount != 0 {
+		t.Fatalf("平台过载不是账号的错，不应计入 fail_count: %d", acc.FailCount)
+	}
+	if acc.RateLimitStreak != 0 {
+		t.Fatalf("平台过载不应累加限流阶梯计数: %d", acc.RateLimitStreak)
+	}
+	wantErrorKind(t, acc, model.ErrorKindUpstreamOverload)
+}
+
+// 过载退避后恢复就必须成功：这是「不换号、只退避」这个选择的意义所在。
+func Test529OverloadRecoversInAsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "overload-recover")
+	p.OverloadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: 529, body: `{"code":1305,"msg":"该模型当前访问量过大，请您稍后再试"}`},
+		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: [DONE]`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-529-ok", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-529-ok")
+
+	events := drainEvents(tk)
+	types := make([]string, 0, len(events))
+	for _, ev := range events {
+		types = append(types, ev.Type)
+	}
+	if strings.Join(types, ",") != "ready,chunk,done" {
+		t.Fatalf("过载退避一次后应成功: %v", events)
+	}
+	if up.callCount() != 2 {
+		t.Fatalf("应恰好重试一次: %d", up.callCount())
+	}
+	if acc := st.ListAccounts(model.ProviderZai)[0]; acc.Status != model.StatusActive {
+		t.Fatalf("恢复后账号应仍为正常: %s", acc.Status)
 	}
 }
 
@@ -794,6 +868,7 @@ func TestQuotaExhaustedCodeMarksModelNotCooling(t *testing.T) {
 	if !containsStr(acc.ExhaustedModels, "glm-5.3") {
 		t.Fatalf("应标记该模型耗尽（正規化為小寫）: %v", acc.ExhaustedModels)
 	}
+	wantErrorKind(t, acc, model.ErrorKindQuotaExhausted)
 }
 
 // 200 包业务错误（code=1005 每日额度耗尽）：异步路径必须与同步路径一样标记该模型
@@ -884,6 +959,7 @@ func TestUnauthorizedMarksInvalid(t *testing.T) {
 	if acc.Status != model.StatusInvalid {
 		t.Fatalf("401 应标 invalid: %s", acc.Status)
 	}
+	wantErrorKind(t, acc, model.ErrorKindAuthFailed)
 }
 
 // 3010 并发准入限制：账号仍可用，不得标 cooling 或 invalid。
@@ -902,6 +978,25 @@ func TestConcurrencyLimitKeepsAccountState(t *testing.T) {
 	acc := st.ListAccounts(model.ProviderZai)[0]
 	if acc.Status != model.StatusActive {
 		t.Fatalf("3010 不应改变账号状态（当前 %s）", acc.Status)
+	}
+	wantErrorKind(t, acc, model.ErrorKindModelBusy)
+}
+
+// wantErrorKind 断言账号上记录的「最近错误归类」。
+// 归类是前端筛选账号的依据，异步路径必须与同步路径写出相同的值。
+func wantErrorKind(t *testing.T, acc *model.Account, want string) {
+	t.Helper()
+	if acc.LastErrorKind == nil {
+		t.Fatalf("应写出错误归类（last_error=%v）", acc.LastError)
+	}
+	if *acc.LastErrorKind != want {
+		t.Fatalf("错误归类不符: got %q want %q", *acc.LastErrorKind, want)
+	}
+	if acc.LastErrorAt == nil {
+		t.Fatal("应写出错误发生时间")
+	}
+	if !model.ErrorKindValid(*acc.LastErrorKind) {
+		t.Fatalf("归类必须是已登记的枚举值: %q", *acc.LastErrorKind)
 	}
 }
 

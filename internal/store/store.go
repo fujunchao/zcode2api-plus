@@ -1210,9 +1210,12 @@ func (s *Store) EditAccount(provider, idOrName string, edit AccountEdit) (bool, 
 				acc.APIKey = &secret
 				acc.JWTToken = nil
 			}
-			// 换凭据即视为重新可用：清掉旧的失效状态与错误。
+			// 换凭据即视为重新可用：清掉旧的失效状态与错误（含错误归类与时间，
+			// 否则前端会留下「已恢复健康但仍带着旧错误类型」的脏标记）。
 			acc.Status = model.StatusActive
 			acc.LastError = nil
+			acc.LastErrorKind = nil
+			acc.LastErrorAt = nil
 		}
 		if edit.SetProxyURL {
 			// 地址没变则保留原线路指派；变了说明要改成手工代理，解除指派。

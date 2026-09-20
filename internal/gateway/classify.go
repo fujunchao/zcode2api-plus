@@ -33,6 +33,20 @@ const (
 // 账号仍然可用，不能把模型准入限制写成账号 cooling。
 var defaultBusyRetryDelays = []time.Duration{time.Second, 2 * time.Second}
 
+// statusOverloaded 上游表达「平台服务过载」的状态码。它不在 net/http 的常量表里：
+// Anthropic 兼容面沿用 Anthropic 的 529（overloaded），而官方错误码表把同一业务码
+// 1305 标为 429——只认 429 会整类漏掉平台过载（线上实测：529 全部落到「其余错误」
+// 分支被原样透传，网关一次都不重试）。
+const statusOverloaded = 529
+
+// OverloadRetryDelays 平台过载的原地退避档位（1s、3s，均施加 ±20% 抖动）。
+// 官方文档对 1305 的处置建议是「增加重试间隔，避免立即高频重试」——过载是平台侧
+// 的拥塞，退避只用来对冲瞬时峰值，给两次机会即可，再多只是替上游挡枪。
+//
+// 导出是为了让 asyncpool 复用同一份默认值：同一次平台过载若在 sync 侧退避、在
+// async 侧立刻失败，两条路径的语义就漂移了。
+var OverloadRetryDelays = []time.Duration{time.Second, 3 * time.Second}
+
 // rateLimitCoolingSteps 瞬时限流的递进冷却阶梯（秒）：同一账号连续被限流则逐级
 // 加重，任意一次成功调用后归零。第 4 次起落到 config.CoolingSeconds（默认 300s），
 // 与连接失败/503 同值——阶梯最重也只与硬故障惩罚持平，不会更重。
@@ -68,13 +82,52 @@ func MarkRateLimited(st *store.Store, provider, idOrName, errMsg string, now tim
 		until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
 		acc.Status = model.StatusCooling
 		acc.CoolingUntil = &until
-		acc.LastError = &errMsg
+		StampAccountError(acc, model.ErrorKindRateLimited, errMsg, now)
 	})
 	if streak == 0 {
 		// 账号已被删除（并发删除）：不落库，但仍给日志一个可用的秒数。
 		secs = transientCoolingSeconds(1)
 	}
 	return secs, streak
+}
+
+// ── 最近错误（last_error_kind / last_error_at） ───────────────────────────────
+//
+// 一次失败要留下两样东西：给人看的文案（LastError）与给筛选用的归类（LastErrorKind）。
+// 归类必须由「产生这次失败的那条分支」决定，因此每个写入点都要求显式给出 kind——
+// 漏给会编译失败，分类不可能被静默漏掉。
+//
+// 各 Mark* / bumpFail 只负责自己那一类错误的 kind（如 MarkRateLimited 恒为
+// rate_limited、MarkModelExhausted 恒为 quota_exhausted），不把 kind 开放成参数：
+// 函数语义已唯一确定 kind，开放成参数反而多给了写错的机会。
+
+// StampAccountError 在 store 锁内写入错误归类与时间；detail 非空时才覆盖 LastError 文案。
+//
+// 必须是「锁内」形态（只改字段、不落库）：调用方已经在 store.Update 的回调里，
+// 从这里再调一次 store.Update 就是自锁。导出是为了让 asyncpool 在它自己的
+// bumpFail 里复用同一套写入语义，两条路径对同一次失败必须写出相同的字段。
+func StampAccountError(acc *model.Account, kind, detail string, now time.Time) {
+	ts := float64(now.UnixNano()) / 1e9
+	acc.LastErrorKind = &kind
+	acc.LastErrorAt = &ts
+	if detail != "" {
+		acc.LastError = &detail
+	}
+}
+
+// RecordAccountError 记一次「最近错误」：归类 + 时间。
+//
+// detail 传空串的语义是「只归类、不污染错误文本」——客户端取消走这条路：用户按一下
+// ESC 不该把上一次真实故障的文案冲掉，但「这个号最近发生过什么」仍值得留痕。
+//
+// ⚠️ 只在「该失败出口本来没有任何账号写入」时才用它（3010 并发准入、验证码、客户端
+// 取消）。若该出口已经会调 MarkAccount / MarkModelExhausted / bumpFail，请把 kind 并进
+// 那一次写入，否则同一分支会两次 store.Update、两次落库。两次是顺序调用而非嵌套，
+// 不会自锁，但白白多一倍持久化 IO。
+func RecordAccountError(st *store.Store, provider, idOrName, kind, detail string, now time.Time) {
+	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+		StampAccountError(acc, kind, detail, now)
+	})
 }
 
 // ResetRateLimitStreak 成功调用后清零「连续被限流」计数。
@@ -121,7 +174,11 @@ func ModelAllowed(m any) bool {
 // quotaExhaustedCodes Z.AI 官方 429 业务码中的额度/用量上限族（docs.z.ai 错误码表）：
 // 1113 欠费；1308 用量上限；1309 套餐过期；1310 周/月上限；1311 套餐不含此模型；
 // 1313 公平使用；1316-1321 5小时/7天上限及子账户/企业消费上限。
-// 与瞬时限流（1302/1305）区分：上限族按「模型耗尽」换号，限流按冷却换号。
+// 与瞬时限流（1302）区分：上限族按「模型耗尽」换号，限流按冷却换号。
+//
+// ⚠️ 1305 刻意不在这里：官方定义它是「平台服务过载」，与单一账户的调用行为无关
+// （1302 才是账户维度的速率限制）。它由 IsUpstreamOverload 单列处理——既不标账号
+// 状态、也不冷却，否则一次平台过载会把整池健康账号逐个踢出调度。
 var quotaExhaustedCodes = map[string]bool{
 	"1113": true, "1308": true, "1309": true, "1310": true, "1311": true, "1313": true,
 	"1316": true, "1317": true, "1318": true, "1319": true, "1320": true, "1321": true,
@@ -204,3 +261,70 @@ func IsModelConcurrencyLimit(statusCode int, text string) bool {
 	}
 	return strings.Contains(strings.ToLower(text), "model admission concurrency limit")
 }
+
+// IsUpstreamOverload 识别平台级服务过载：官方业务码 1305 的文案是「该模型当前访问量
+// 过大」，官方文档明确它属于「平台服务过载，与单一账户的调用行为无直接关系」。
+//
+// 判据必须同时看状态码与业务码：上游在 Anthropic 兼容面用 HTTP 529 承载它，而官方
+// 错误码表把它标成 429——只认 429 会漏掉整类过载，只认 529 则会漏掉上游改用 429 的
+// 情形。若上游将来换成 Anthropic 原生的 {"type":"error","error":{"type":"overloaded_error"}}
+// 形态（无 code 字段），状态码一侧仍能兜住。
+//
+// 与 1302 的区别是这条判定的存在意义：1302 是账户维度的速率限制，冷却该账号语义正确；
+// 1305 是平台过载，冷却账号既不解决问题、又白白缩短可用池。
+func IsUpstreamOverload(statusCode int, text string) bool {
+	if statusCode == statusOverloaded {
+		return true
+	}
+	return UpstreamBusinessCode(text) == "1305"
+}
+
+// ErrorPreview 生成上游错误体的日志预览：优先取业务码与可读文案，单行化后截断到
+// 200 字符；形态认不出来就退回原文截断。
+//
+// 存在的理由：上游错误日志此前只记状态码（`上游错误 HTTP %d`），于是「状态码看不出
+// 问题、业务码才是关键」的失败在日志里完全不可见——1305 平台过载与风控 405 都是这类，
+// 线上排查只能依赖用户贴出客户端报错（实测一整份 5362 行日志里 1305 出现 0 次）。
+//
+// 必须截断：错误体可能回显用户内容，也可能是一整页 HTML。
+func ErrorPreview(text string) string {
+	preview := text
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(text), &payload); err == nil {
+		parts := []string{}
+		if code := payload["code"]; code != nil {
+			parts = append(parts, fmt.Sprintf("code=%v", code))
+		}
+		for _, key := range []string{"msg", "message"} {
+			if s, ok := payload[key].(string); ok && s != "" {
+				parts = append(parts, s)
+				break
+			}
+		}
+		// Anthropic 风格：{"error":{"type":"..","message":".."}}
+		if len(parts) == 0 {
+			if errObj, ok := payload["error"].(map[string]any); ok {
+				if t, ok := errObj["type"]; ok && fmt.Sprint(t) != "" {
+					parts = append(parts, fmt.Sprintf("type=%v", t))
+				}
+				if s, ok := errObj["message"].(string); ok && s != "" {
+					parts = append(parts, s)
+				}
+			}
+		}
+		if len(parts) > 0 {
+			preview = strings.Join(parts, " ")
+		}
+	}
+	preview = strings.TrimSpace(strings.Join(strings.Fields(preview), " "))
+	// 按 rune 而非字节截断：上游文案多为中文/多字节字符，按字节切会把最后一个字符
+	// 截成半个 UTF-8 序列，日志里就是乱码。
+	if r := []rune(preview); len(r) > errorPreviewLimit {
+		return string(r[:errorPreviewLimit]) + "…"
+	}
+	return preview
+}
+
+// errorPreviewLimit 日志预览的字符（rune）上限。够放下业务码 + 一句上游文案即可；
+// 上游文案偶有整段 JSON/HTML，不设限会把日志撑爆。
+const errorPreviewLimit = 200

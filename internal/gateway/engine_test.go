@@ -306,8 +306,12 @@ func Test401MarksInvalidAndSwitches(t *testing.T) {
 		t.Fatalf("全部失效应 503: %d %s", status, raw)
 	}
 	for _, id := range []string{a1.ID, a2.ID} {
-		if got := f.st.Find(model.ProviderZai, id); got.Status != model.StatusInvalid {
+		got := f.st.Find(model.ProviderZai, id)
+		if got.Status != model.StatusInvalid {
 			t.Fatalf("账号 %s 应 invalid: %s", id, got.Status)
+		}
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindAuthFailed {
+			t.Fatalf("账号 %s 应归类为 auth_failed: %v", id, got.LastErrorKind)
 		}
 	}
 	if f.callCount() != 2 {
@@ -334,6 +338,9 @@ func Test402MarksModelExhausted(t *testing.T) {
 	if got.LastError == nil || !strings.Contains(*got.LastError, "額度已用完") {
 		t.Fatalf("last_error 不符: %v", got.LastError)
 	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindQuotaExhausted {
+		t.Fatalf("402 应归类为 quota_exhausted: %v", got.LastErrorKind)
+	}
 }
 
 func Test429QuotaFamilyExhaustsAndRateLimitCools(t *testing.T) {
@@ -345,6 +352,9 @@ func Test429QuotaFamilyExhaustsAndRateLimitCools(t *testing.T) {
 		got := f.st.Find(model.ProviderZai, acc.ID)
 		if got.Status != model.StatusActive || len(got.ExhaustedModels) != 1 {
 			t.Fatalf("上限族应标记模型耗尽而保留账号: %+v", got)
+		}
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindQuotaExhausted {
+			t.Fatalf("上限族应归类为 quota_exhausted: %v", got.LastErrorKind)
 		}
 	})
 	t.Run("1302 瞬时限流→原地重试一次后递进冷却", func(t *testing.T) {
@@ -365,6 +375,9 @@ func Test429QuotaFamilyExhaustsAndRateLimitCools(t *testing.T) {
 		}
 		if got.RateLimitStreak != 1 {
 			t.Fatalf("连续限流计数应为 1: %d", got.RateLimitStreak)
+		}
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRateLimited {
+			t.Fatalf("瞬时限流应归类为 rate_limited: %v", got.LastErrorKind)
 		}
 		// 首次被限流走阶梯最低档 30s，而不是连接失败/503 的 CoolingSeconds(300s)
 		want := float64(time.Now().Add(30*time.Second).UnixNano()) / 1e9
@@ -511,6 +524,147 @@ func Test500PassthroughVerbatim(t *testing.T) {
 	if got.FailCount != 1 {
 		t.Fatalf("失败计数应 +1: %d", got.FailCount)
 	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindUpstreamError {
+		t.Fatalf("未识别错误应归类为 upstream_error: %v", got.LastErrorKind)
+	}
+}
+
+// 529 / 业务码 1305 是平台服务过载，官方明确它「与单一账户的调用行为无直接关系」。
+// 它必须走自己的退避分支：不标状态、不冷却、不计 fail_count，重试用尽后原样透传。
+//
+// 防的是线上真实故障：分类链只认 HTTP 429，而 z.ai 在 Anthropic 兼容面用 529 承载
+// 1305，于是整类过载落到「其余错误」分支被原样透传，网关一次都不重试，全部重试压力
+// 推给上层中转（实测以 80ms 间隔连冲 26 次）。
+func Test529OverloadRetriesThenPassesThrough(t *testing.T) {
+	f := newFixture(t)
+	f.eng.OverloadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	upstreamBody := `{"code":1305,"msg":"该模型当前访问量过大，请您稍后再试"}`
+	f.respond = jsonResp(529, upstreamBody)
+	acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 529 || raw != upstreamBody {
+		t.Fatalf("平台过载用尽后应原样透传: %d %q", status, raw)
+	}
+	if n := f.callCount(); n != 1+len(f.eng.OverloadRetryDelays) {
+		t.Fatalf("应按档位退避重试后放弃，上游调用 %d 次", n)
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive {
+		t.Fatalf("平台过载不应改变账号状态: %s", got.Status)
+	}
+	if got.CoolingUntil != nil {
+		t.Fatalf("平台过载不应冷却账号: %v", got.CoolingUntil)
+	}
+	if got.FailCount != 0 {
+		t.Fatalf("平台过载不是账号的错，不应计入 fail_count: %d", got.FailCount)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindUpstreamOverload {
+		t.Fatalf("平台过载应归类为 upstream_overload: %v", got.LastErrorKind)
+	}
+	if got.LastErrorAt == nil {
+		t.Fatal("平台过载应记录发生时间")
+	}
+}
+
+// 分类链的每个出口都必须写出对应的错误归类——这是前端「按错误类型筛选账号」的数据
+// 基础，也是「同步与异步两条路径对同一账号标出相同状态」这条不变式的延伸。
+func TestErrorKindRecordedPerBranch(t *testing.T) {
+	cases := []struct {
+		name    string
+		respond responder
+		stream  bool
+		want    string
+	}{
+		{"401 鉴权失败", jsonResp(401, ""), false, model.ErrorKindAuthFailed},
+		{"403 鉴权失败", jsonResp(403, `{"error":{"message":"forbidden"}}`), false, model.ErrorKindAuthFailed},
+		{"402 该模型额度用完", jsonResp(402, `{"error":{"message":"payment required"}}`), false, model.ErrorKindQuotaExhausted},
+		{"429+1302 瞬时限流", jsonResp(429, `{"code":1302,"msg":"rate limited"}`), false, model.ErrorKindRateLimited},
+		{"429+1310 用量上限", jsonResp(429, `{"code":1310,"msg":"usage cap reached"}`), false, model.ErrorKindQuotaExhausted},
+		{"429+3010 并发准入", jsonResp(429, `{"code":3010,"msg":"model admission concurrency limit exceeded"}`), false, model.ErrorKindModelBusy},
+		{"529+1305 平台过载", jsonResp(529, `{"code":1305,"msg":"overloaded"}`), false, model.ErrorKindUpstreamOverload},
+		{"429+1305 平台过载（官方表形态）", jsonResp(429, `{"code":1305,"msg":"overloaded"}`), false, model.ErrorKindUpstreamOverload},
+		{"503 上游不可用", jsonResp(503, `{"error":{"message":"unavailable"}}`), false, model.ErrorKindUpstreamUnavailable},
+		{"500 未识别错误", jsonResp(500, `{"error":{"message":"boom"}}`), false, model.ErrorKindUpstreamError},
+		{"200+1005 每日额度", jsonResp(200, `{"code":1005,"msg":"exceed quota limit"}`), false, model.ErrorKindQuotaExhausted},
+		{"200+未知业务码", jsonResp(200, `{"code":9999,"msg":"weird"}`), false, model.ErrorKindUpstreamError},
+		{"200 非 SSE JSON", jsonResp(200, `{"unexpected":"json"}`), true, model.ErrorKindInvalidResponse},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			// 缩短平台过载档位，避免每个用例真等 1s+3s。
+			f.eng.OverloadRetryDelays = []time.Duration{time.Millisecond}
+			f.respond = tc.respond
+			acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+			body := msgBody()
+			if tc.stream {
+				body["stream"] = true
+			}
+			f.post(t, body, "sk-test")
+
+			got := f.st.Find(model.ProviderZai, acc.ID)
+			if got.LastErrorKind == nil {
+				t.Fatalf("应写出错误归类（last_error=%v）", got.LastError)
+			}
+			if *got.LastErrorKind != tc.want {
+				t.Fatalf("错误归类不符: got %q want %q", *got.LastErrorKind, tc.want)
+			}
+			if got.LastErrorAt == nil {
+				t.Fatal("应写出错误发生时间")
+			}
+			if !model.ErrorKindValid(*got.LastErrorKind) {
+				t.Fatalf("归类必须是已登记的枚举值: %q", *got.LastErrorKind)
+			}
+		})
+	}
+}
+
+// 过载是瞬时拥塞：退避一次后恢复就必须成功，而不是把整个档位等完。
+func Test529RecoversOnRetry(t *testing.T) {
+	f := newFixture(t)
+	f.eng.OverloadRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+		if n == 1 {
+			return jsonResp(529, `{"code":1305,"msg":"该模型当前访问量过大，请您稍后再试"}`)(n, nil)
+		}
+		return jsonResp(200, okUpstreamJSON)(n, nil)
+	}
+	acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 200 || !strings.Contains(raw, "msg_1") {
+		t.Fatalf("过载退避一次后应成功: %d %s", status, raw)
+	}
+	if f.callCount() != 2 {
+		t.Fatalf("应恰好重试一次: %d", f.callCount())
+	}
+	if got := f.st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusActive {
+		t.Fatalf("恢复后账号应仍为正常: %s", got.Status)
+	}
+}
+
+// 1305 若以 HTTP 429 返回（官方错误码表就是这么标的），也必须走平台过载分支，
+// 不能被「瞬时限流」分支接走——那条路会给账号打 30→60→120→300s 的递进冷却，
+// 而平台过载冷却账号既不解决问题、又白白缩小可用池。
+func Test429With1305IsOverloadNotRateLimit(t *testing.T) {
+	f := newFixture(t)
+	f.eng.OverloadRetryDelays = []time.Duration{time.Millisecond}
+	f.respond = jsonResp(429, `{"code":1305,"msg":"该模型当前访问量过大，请您稍后再试"}`)
+	acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
+
+	status, _ := f.post(t, msgBody(), "sk-test")
+	if status != 429 {
+		t.Fatalf("1305 应走平台过载分支并原样透传: %d", status)
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive || got.CoolingUntil != nil {
+		t.Fatalf("1305 不应冷却账号: status=%s cooling=%v", got.Status, got.CoolingUntil)
+	}
+	if got.RateLimitStreak != 0 {
+		t.Fatalf("1305 不应累加限流阶梯计数: %d", got.RateLimitStreak)
+	}
 }
 
 func TestBusinessCode1005ExhaustsDailyQuota(t *testing.T) {
@@ -528,6 +682,9 @@ func TestBusinessCode1005ExhaustsDailyQuota(t *testing.T) {
 	}
 	if got.LastError == nil || !strings.Contains(*got.LastError, "每日額度已用完") {
 		t.Fatalf("last_error 不符: %v", got.LastError)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindQuotaExhausted {
+		t.Fatalf("1005 应归类为 quota_exhausted: %v", got.LastErrorKind)
 	}
 }
 
@@ -584,7 +741,7 @@ func TestQuotaSignalKeepsStrongStatus(t *testing.T) {
 
 			// 账号没有额度快照 → anyState=false，正是原先会落到 else 分支
 			// 把状态写成 active 的那条路径。
-			MarkModelExhausted(st, model.ProviderZai, acc.ID, "glm-5.3", "GLM-5.3 額度已用完")
+			MarkModelExhausted(st, model.ProviderZai, acc.ID, "glm-5.3", "GLM-5.3 額度已用完", time.Now())
 
 			got := st.Find(model.ProviderZai, acc.ID)
 			if got.Status != strong {
