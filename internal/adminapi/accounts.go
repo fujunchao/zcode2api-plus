@@ -498,18 +498,18 @@ func (h *Handler) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	captchaSec, retrySec, previewSec := h.Store.ClaimCooldowns()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"admin_key":              h.Store.AdminKey(),
-		"gateway_key":            h.Store.GatewayKey(),
-		"quota_refresh_interval": h.Store.QuotaRefreshInterval(),
-		"claim_auto_enabled":     h.Store.ClaimAutoEnabled(),
-		"claim_schedule_enabled": h.Store.ClaimScheduleEnabled(),
-		"claim_schedule_time":    h.Store.ClaimScheduleTime(),
-		"claim_captcha_cooldown": captchaSec,
-		"claim_retry_cooldown":   retrySec,
-		"claim_preview_cooldown": previewSec,
-		"proxy_health_enabled":   h.Store.ProxyHealthEnabled(),
-		"proxy_health_interval":  h.Store.ProxyHealthIntervalMinutes(),
-		"risk_cooling_steps":     h.Store.RiskCoolingStepsString(),
+		"admin_key":                  h.Store.AdminKey(),
+		"gateway_key":                h.Store.GatewayKey(),
+		"quota_refresh_interval":     h.Store.QuotaRefreshInterval(),
+		"claim_auto_enabled":         h.Store.ClaimAutoEnabled(),
+		"claim_schedule_enabled":     h.Store.ClaimScheduleEnabled(),
+		"claim_schedule_time":        h.Store.ClaimScheduleTime(),
+		"claim_captcha_cooldown":     captchaSec,
+		"claim_retry_cooldown":       retrySec,
+		"claim_preview_cooldown":     previewSec,
+		"proxy_health_enabled":       h.Store.ProxyHealthEnabled(),
+		"proxy_health_interval":      h.Store.ProxyHealthIntervalMinutes(),
+		"risk_cooling_steps":         h.Store.RiskCoolingStepsString(),
 		"upstream_503_cooling_steps": h.Store.Upstream503CoolingStepsString(),
 	})
 }
