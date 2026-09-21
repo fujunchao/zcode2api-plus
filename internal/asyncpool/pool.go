@@ -288,7 +288,15 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		modelName, _ := body["model"].(string)
 		acc := p.Store.Select(model.ProviderZai, tried, modelName)
 		if acc == nil || acc.Mode != "jwt" {
-			p.emitError(ctx, ticketID, "无可用 OAuth 账号", "no_account")
+			// 与 sync 路径同口径：选不出号要如实说明「为什么」——冷却/风控/停用
+			// 都会走到这里，别让静态文案把它误读成绑定/额度问题（2026-09-20 事故）。
+			stat := p.Store.PoolStats(model.ProviderZai, modelName)
+			msg := "无可用 OAuth 账号"
+			if text := gateway.PoolStatusText(stat); text != "" {
+				msg += "（" + text + "）"
+			}
+			p.emitErrorWithDetails(ctx, ticketID, msg, "no_account",
+				gateway.PoolStatusDetails(stat, modelName))
 			return
 		}
 		tried[acc.ID] = true
@@ -394,6 +402,19 @@ func (p *Pool) emitError(ctx context.Context, ticketID, message, errType string)
 	p.emit(ctx, ticketID, ticketEvent{
 		Type: "error",
 		Data: map[string]any{"error": map[string]any{"message": message, "type": errType}},
+	})
+}
+
+// emitErrorWithDetails 在错误事件上附加结构化 details（error.details）。
+// 与 sync 路径的 errResultWithDetails 同一形态：文案给人看、结构给程序看。
+func (p *Pool) emitErrorWithDetails(ctx context.Context, ticketID, message, errType string, details map[string]any) {
+	body := map[string]any{"message": message, "type": errType}
+	if details != nil {
+		body["details"] = details
+	}
+	p.emit(ctx, ticketID, ticketEvent{
+		Type: "error",
+		Data: map[string]any{"error": body},
 	})
 }
 
@@ -557,12 +578,13 @@ func (p *Pool) attemptUpstreamOnce(
 			return false, errRateLimited{body: bodyText}
 		}
 
-		// 503 → 冷却换号
+		// 503 → 按连续次数递进冷却换号（与 sync 路径同一 MarkUpstreamUnavailable，
+		// 默认 30/60/120s 可后台配置，超阶梯封顶 CoolingSeconds）。日志带 body 预览。
 		if resp.StatusCode == http.StatusServiceUnavailable {
-			p.bumpFail(acc, model.ErrorKindUpstreamUnavailable)
-			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusCooling,
-				model.ErrorKindUpstreamUnavailable, "上游服務不可用 HTTP 503", time.Now())
-			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
+			errMsg := "上游服務不可用 HTTP 503: " + gateway.ErrorPreview(bodyText)
+			secs, streak := gateway.MarkUpstreamUnavailable(p.Store, acc.Provider, acc.ID, errMsg, time.Now())
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503（連續第 %d 次），冷卻 %d s 並切換下一個: %s",
+				acc.Name, streak, secs, gateway.ErrorPreview(bodyText)))
 			return false, errNetwork{bodyText}
 		}
 
@@ -760,8 +782,10 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		live.AccumulateTokens(got)
 		// 与 engine.success 对齐：成功即认为限流窗口已过，清零连续计数。
 		// 风控计数同理：冷却到期后能真正打通一次，说明这次拦截是偶发的。
+		// 503 计数同理：上游链路真正恢复了一次，下次抖动从最短档重新起算。
 		gateway.ResetRateLimitStreak(live)
 		gateway.ResetRiskControlStreak(live)
+		gateway.ResetUpstream503Streak(live)
 	}); err != nil {
 		web.Warn("async", "用量统计落库失败: "+err.Error())
 	}

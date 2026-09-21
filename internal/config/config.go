@@ -147,6 +147,17 @@ var (
 	RiskCoolingSteps = env("ZCODE_RISK_COOLING_STEPS", "300,900,3600")
 )
 
+// ── 上游 503 冷却阶梯 ────────────────────────────────────────────────────────
+// 上游 503（服务不可用）是上游健康信号而非账号问题。此前一律固定冷却
+// CoolingSeconds（300s），上游抖动时个位数账号池会在几十秒内被整池清空
+// （2026-09-20 线上事故）。改为按连续命中次数递进：第 N 次取第 N 档，
+// 超过档位数封顶 CoolingSeconds（与硬故障惩罚持平，不升 invalid）。
+//
+// 与风控阶梯同一约定：环境变量只是默认值，后台写入后以落库值为准。
+var (
+	Upstream503CoolingSteps = env("ZCODE_UPSTREAM_503_COOLING_STEPS", "30,60,120")
+)
+
 // ── 上游端点 ────────────────────────────────────────────────────────────────
 var (
 	UpstreamZai         = env("ZAI_UPSTREAM_URL", "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages")

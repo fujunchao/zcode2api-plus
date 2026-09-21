@@ -1065,3 +1065,96 @@ func containsStr(list []string, want string) bool {
 	}
 	return false
 }
+
+// async 路径的 503 必须与 engine 用同一套递进冷却：首档 30s（而非固定 300s）、
+// last_error 带 body 预览、FailCount 与 streak 同一次落库。
+// （newTestPool 里 AsyncMaxRetries=0，单账号 503 后换号无号可选，最终以
+// max_retries 收尾——本用例只验证账号侧状态，收尾事件见下一个用例。）
+func TestUpstream503LadderAsync(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccount(t, st, "acc-503")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusServiceUnavailable, body: `{"error":{"message":"upstream maintenance"}}`},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-503", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-503")
+
+	acc := st.ListAccounts(model.ProviderZai)[0]
+	if acc.Status != model.StatusCooling || acc.CoolingUntil == nil {
+		t.Fatalf("503 应 cooling: %+v", acc)
+	}
+	want := float64(time.Now().Add(30*time.Second).UnixNano()) / 1e9
+	if diff := *acc.CoolingUntil - want; diff > 5 || diff < -5 {
+		t.Fatalf("async 首次 503 冷却应约 30s（阶梯最低档）: %v", *acc.CoolingUntil)
+	}
+	if acc.Upstream503Streak != 1 {
+		t.Fatalf("连续 503 计数应为 1: %d", acc.Upstream503Streak)
+	}
+	if acc.FailCount != 1 {
+		t.Fatalf("FailCount 应 +1: %d", acc.FailCount)
+	}
+	if acc.LastError == nil || !strings.Contains(*acc.LastError, "upstream maintenance") {
+		t.Fatalf("last_error 应带 body 预览: %v", acc.LastError)
+	}
+	wantErrorKind(t, acc, model.ErrorKindUpstreamUnavailable)
+}
+
+// async 选不出号的 no_account 事件必须携带池状态分解：message 内联文案 +
+// error.details 结构化字段（与 sync 路径的 no_available_account 同一形态）。
+// 预置一个冷却中的 jwt 账号，首轮 Select 即空。
+func TestAsyncNoAccountCarriesPoolDetails(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "acc-cooling")
+	until := float64(time.Now().Add(120*time.Second).UnixNano()) / 1e9
+	kind := model.ErrorKindUpstreamUnavailable
+	if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &until
+		a.LastErrorKind = &kind
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tk := insertTicket(p, "ticket-noacc", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-noacc")
+
+	events := drainEvents(tk)
+	var noAccount *ticketEvent
+	for i := range events {
+		ev := events[i]
+		if ev.Type != "error" {
+			continue
+		}
+		body, _ := ev.Data.(map[string]any)
+		errObj, _ := body["error"].(map[string]any)
+		if errObj != nil && errObj["type"] == "no_account" {
+			noAccount = &events[i]
+		}
+	}
+	if noAccount == nil {
+		t.Fatal("应投递 no_account 错误事件")
+	}
+	body := noAccount.Data.(map[string]any)["error"].(map[string]any)
+	details, _ := body["details"].(map[string]any)
+	if details == nil {
+		t.Fatalf("no_account 事件应带 details: %v", body)
+	}
+	// 事件 Data 未做 JSON 往返，数值保持 int；兼容 float64 以防未来改为序列化传递
+	cooling := 0
+	switch v := details["cooling"].(type) {
+	case int:
+		cooling = v
+	case float64:
+		cooling = int(v)
+	}
+	if cooling != 1 {
+		t.Fatalf("details.cooling 应为 1: %v", details)
+	}
+	msg, _ := body["message"].(string)
+	if !strings.Contains(msg, "冷卻中") || !strings.Contains(msg, "上游503") {
+		t.Fatalf("message 应内联池状态分解: %s", msg)
+	}
+}

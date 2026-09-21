@@ -49,7 +49,8 @@ var OverloadRetryDelays = []time.Duration{time.Second, 3 * time.Second}
 
 // rateLimitCoolingSteps 瞬时限流的递进冷却阶梯（秒）：同一账号连续被限流则逐级
 // 加重，任意一次成功调用后归零。第 4 次起落到 config.CoolingSeconds（默认 300s），
-// 与连接失败/503 同值——阶梯最重也只与硬故障惩罚持平，不会更重。
+// 与连接失败同值——阶梯最重也只与硬故障惩罚持平，不会更重。
+// （上游 503 有自己独立的 Upstream503CoolingSteps 阶梯，见 MarkUpstreamUnavailable。）
 var rateLimitCoolingSteps = []int{30, 60, 120}
 
 // transientCoolingSeconds 取「连续第 streak 次被瞬时限流」对应的冷却时长（秒）。
@@ -202,6 +203,71 @@ func ResetRiskControlStreak(acc *model.Account) {
 // （或 store 持锁路径内的对象）。传账号副本只是白改一次，不会生效。
 func ResetRateLimitStreak(acc *model.Account) {
 	acc.RateLimitStreak = 0
+}
+
+// ── 上游 503 冷却阶梯 ─────────────────────────────────────────────────────────
+//
+// 背景：503 一律固定冷却 config.CoolingSeconds（默认 300s）的年代，一次上游抖动
+// 会把个位数账号池在几十秒内整池冷却清空，客户端收到成片的 no_available_account
+// （2026-09-20 线上事故，docs/analysis-503-no-available-account-20260920.md）。
+// 503 大多是上游侧瞬时不可用，秒级到分钟级的递进冷却足够对冲；只有持续失败的
+// 账号才逐步升到 CoolingSeconds 封顶。
+
+// upstream503CoolingSeconds 取「连续第 streak 次收到上游 503」对应的冷却秒数。
+// 超过阶梯长度封顶 config.CoolingSeconds——与连接失败等硬故障持平，不再更重。
+func upstream503CoolingSeconds(st *store.Store, streak int) int {
+	if streak < 1 {
+		streak = 1
+	}
+	steps := st.Upstream503CoolingSteps()
+	if streak > len(steps) {
+		return config.CoolingSeconds
+	}
+	secs := steps[streak-1]
+	if secs > config.CoolingSeconds {
+		return config.CoolingSeconds
+	}
+	return secs
+}
+
+// MarkUpstreamUnavailable 记录一次上游 503 并按连续次数递进冷却。
+// 返回本次实际写入的冷却秒数与累加后的连续次数，供日志展示。
+//
+// 与 MarkRiskControl 的两点刻意差异：
+//   - 超阶梯长度**不升 invalid**：503 是上游健康信号而非账号问题，换号救不了
+//     「上游真的挂了」，封顶冷却即可，不该判账号死刑；
+//   - 换凭据（EditAccount）不清零：它衡量的是「这个账号的上游链路最近有多不
+//     健康」，与凭据无关（风控清零是因为换凭据=换身份，503 没有这层语义）。
+//
+// 形状与 MarkRateLimited 一致（锁内自增 → 选档 → 写状态 → StampAccountError），
+// sync（engine）与 async（asyncpool）两条路径共用本函数，行为必须保持一致。
+//
+// FailCount 的递增折在同一次 Update 里：旧实现在调用点是「先 bumpFail 再 mark」
+// 两次落库，语义完全等价（503 恒 ErrorKindUpstreamUnavailable、FailCount 恒 +1），
+// 合并后少一半持久化 IO，也不会再出现两路只调其一的漂移。
+func MarkUpstreamUnavailable(st *store.Store, provider, idOrName, errMsg string, now time.Time) (secs, streak int) {
+	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+		acc.FailCount++
+		acc.Upstream503Streak++
+		streak = acc.Upstream503Streak
+		secs = upstream503CoolingSeconds(st, streak)
+		until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
+		acc.Status = model.StatusCooling
+		acc.CoolingUntil = &until
+		StampAccountError(acc, model.ErrorKindUpstreamUnavailable, errMsg, now)
+	})
+	if streak == 0 {
+		// 账号已被删除（并发删除）：不落库，但仍给日志一个可用的秒数。
+		secs = upstream503CoolingSeconds(st, 1)
+	}
+	return secs, streak
+}
+
+// ResetUpstream503Streak 成功调用后清零「连续收到上游 503」计数。
+// 与 ResetRateLimitStreak 同语义：必须传 store.Update 回调里的 live 对象；
+// sync（engine.success）与 async（asyncpool.forwardSSE）两条路径都要调用。
+func ResetUpstream503Streak(acc *model.Account) {
+	acc.Upstream503Streak = 0
 }
 
 // JitteredDelay 给重试等待施加 ±20% 抖动：多个请求在同一瞬间被限流时，

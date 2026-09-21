@@ -569,6 +569,51 @@ func parseRiskCoolingSteps(raw string) ([]int, error) {
 	return steps, nil
 }
 
+// ── 上游 503 冷却阶梯 ────────────────────────────────────────────────────────
+//
+// 与风控阶梯同构但语义不同：503 是上游健康信号，超阶梯长度只封顶
+// config.CoolingSeconds、不升 invalid（见 gateway.MarkUpstreamUnavailable）。
+// 解析/钳制复用风控的 parseRiskCoolingSteps——两者的合法形态完全一致
+// （逗号分隔的正整数秒、单档上限 7 天）。
+
+// Upstream503CoolingStepsKey 上游 503 冷却阶梯的设定键（逗号分隔的秒数）。
+const Upstream503CoolingStepsKey = "upstream_503_cooling_steps"
+
+// Upstream503CoolingStepsString 返回设定原始串；缺失或为空回退环境变量默认值。
+func (s *Store) Upstream503CoolingStepsString() string {
+	if v, ok := s.GetSetting(Upstream503CoolingStepsKey); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return config.Upstream503CoolingSteps
+}
+
+// NormalizeUpstream503CoolingSteps 校验并规范化 503 冷却阶梯（语义同风控版本）。
+func NormalizeUpstream503CoolingSteps(raw string) (string, bool) {
+	steps, err := parseRiskCoolingSteps(raw)
+	if err != nil {
+		return "", false
+	}
+	parts := make([]string, len(steps))
+	for i, n := range steps {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ","), true
+}
+
+// Upstream503CoolingSteps 解析并钳制 503 冷却阶梯；解析失败回退默认值。
+// 回退而不是报错：与风控同一理由——这是调度路径上的读取，脏设定不能拒绝服务。
+func (s *Store) Upstream503CoolingSteps() []int {
+	if steps, err := parseRiskCoolingSteps(s.Upstream503CoolingStepsString()); err == nil {
+		return steps
+	}
+	if steps, err := parseRiskCoolingSteps(config.Upstream503CoolingSteps); err == nil {
+		return steps
+	}
+	return []int{30, 60, 120}
+}
+
 // ── 線路自動巡檢設定 ────────────────────────────────────────────────────────
 //
 // 与领取设置同一约定：环境变量（ZCODE_PROXY_HEALTH_*）只是**默认值**，落库后
@@ -1499,6 +1544,90 @@ func orStar(modelName string) string {
 		return "*"
 	}
 	return modelName
+}
+
+// ── 池状态聚合（no_available_account 出口用） ────────────────────────────────
+//
+// 背景：503「無可用帳號」的文案曾是静态字符串，线上一次整池冷却事故里，客户端
+// 与运维都以为「账号没绑定模型/额度用完」，实际是全池冷却中（见
+// docs/analysis-503-no-available-account-20260920.md）。此聚合让错误体与日志
+// 能如实回答「此刻池子里每个账号为什么不可选」。
+//
+// 只在选号失败的出口路径调用（低频），锁内 O(n) 遍历可接受；不进请求热路径。
+
+// PoolStat 池状态快照：按「为什么不可选」分桶 + 冷却细分 + 指定模型的可用性分布。
+//
+// 桶口径与 Select 第一层一致（IsSelectable）：归档 / 停用 / 失效 / 整号耗尽 /
+// 冷却中（未到期）/ 其余计入 Active。Active 桶再按 ModelAvailability(modelName)
+// 细分，直接回答「健康账号里有多少被模型层排除、为什么」。
+type PoolStat struct {
+	Total     int
+	Archived  int
+	Disabled  int // Enabled=false 或 Status=disabled
+	Invalid   int
+	Exhausted int // 整号 exhausted（全部已知模型耗尽）
+	Cooling   int // Status=cooling 且冷却未到期
+	Active    int // 通过健康门槛（Select 第一层）的账号数
+	// CoolingEarliest 冷却账号中最早的到期时间（unix 秒）；无冷却账号为 nil。
+	CoolingEarliest *float64
+	// CoolingByKind 冷却账号按 last_error_kind 细分（upstream_unavailable /
+	// risk_control / rate_limited / …），键为空串表示未记录成因。
+	CoolingByKind map[string]int
+	// ModelStat Active 账号中该模型的可用性分布
+	// （available/exhausted/absent/disabled/unknown 计数）。modelName 为空时为 nil。
+	ModelStat map[string]int
+}
+
+// PoolStats 聚合指定 provider 池的状态快照。modelName 非空时附带模型维度分布。
+func (s *Store) PoolStats(provider, modelName string) PoolStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	stat := PoolStat{CoolingByKind: map[string]int{}}
+	for _, a := range s.accounts[provider] {
+		stat.Total++
+		if a.ArchivedAt != nil {
+			stat.Archived++
+			continue
+		}
+		if !a.Enabled || a.Status == model.StatusDisabled {
+			stat.Disabled++
+			continue
+		}
+		switch a.Status {
+		case model.StatusInvalid:
+			stat.Invalid++
+			continue
+		case model.StatusExhausted:
+			stat.Exhausted++
+			continue
+		case model.StatusCooling:
+			// 与 IsSelectable 同口径：到期未刷新状态的冷却账号视为已恢复，
+			// 归入 Active（Select 第一层就是这么放行的）。
+			if a.CoolingUntil == nil || now.Before(time.Unix(0, int64(*a.CoolingUntil*1e9))) {
+				stat.Cooling++
+				if a.CoolingUntil != nil &&
+					(stat.CoolingEarliest == nil || *a.CoolingUntil < *stat.CoolingEarliest) {
+					v := *a.CoolingUntil
+					stat.CoolingEarliest = &v
+				}
+				kind := ""
+				if a.LastErrorKind != nil {
+					kind = *a.LastErrorKind
+				}
+				stat.CoolingByKind[kind]++
+				continue
+			}
+		}
+		stat.Active++
+		if modelName != "" {
+			if stat.ModelStat == nil {
+				stat.ModelStat = map[string]int{}
+			}
+			stat.ModelStat[a.ModelAvailability(modelName)]++
+		}
+	}
+	return stat
 }
 
 // hasPromoQuota 账号额度快照中是否存在未耗尽的一次性优惠额度。

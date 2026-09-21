@@ -1668,3 +1668,183 @@ func TestProxyHealthSettings(t *testing.T) {
 		t.Fatalf("间隔 0 应钳到下限 1: %d", got)
 	}
 }
+
+// ── 上游 503 冷却阶梯设定 ────────────────────────────────────────────────────
+
+// 503 冷却阶梯设定的读取与规范化：与风控阶梯同一约定（回退而不报错、PUT 层
+// 用 Normalize 挡非法输入、超大值钳制）。默认 30,60,120——503 是上游健康
+// 信号，首档秒级即可，超过档位数由调用方封顶 CoolingSeconds。
+func TestUpstream503CoolingStepsSetting(t *testing.T) {
+	s := newTestStore(t)
+
+	assertSteps := func(want []int, ctx string) {
+		t.Helper()
+		got := s.Upstream503CoolingSteps()
+		if len(got) != len(want) {
+			t.Fatalf("%s: 档位数 got %v want %v", ctx, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s: got %v want %v", ctx, got, want)
+			}
+		}
+	}
+
+	// 未设置 → 回退环境变量默认（config 层默认 30,60,120）。
+	assertSteps([]int{30, 60, 120}, "未设置")
+	if got := s.Upstream503CoolingStepsString(); got != config.Upstream503CoolingSteps {
+		t.Fatalf("未设置应回退 config 默认: %q", got)
+	}
+
+	// 合法覆盖；档位数可多可少。
+	if err := s.SetSetting(Upstream503CoolingStepsKey, "15,30"); err != nil {
+		t.Fatal(err)
+	}
+	assertSteps([]int{15, 30}, "两档")
+	if err := s.SetSetting(Upstream503CoolingStepsKey, "10,20,30,40"); err != nil {
+		t.Fatal(err)
+	}
+	assertSteps([]int{10, 20, 30, 40}, "四档")
+
+	// 非法 → 回退默认（空切片会让封顶判断失真，必须是非空默认）。
+	for _, bad := range []string{"", " ", "0", "-5", "abc", "30,,60", "30,abc,60", ",", "30,"} {
+		if err := s.SetSetting(Upstream503CoolingStepsKey, bad); err != nil {
+			t.Fatal(err)
+		}
+		assertSteps([]int{30, 60, 120}, "非法 "+bad)
+	}
+
+	// 超大值钳到上限。
+	if err := s.SetSetting(Upstream503CoolingStepsKey, "99999999999"); err != nil {
+		t.Fatal(err)
+	}
+	assertSteps([]int{riskCoolingStepMax}, "超大值钳制")
+
+	// Normalize：PUT 层校验 + 规范化。
+	norm := []struct {
+		in     string
+		want   string
+		wantOk bool
+	}{
+		{"30,60,120", "30,60,120", true},
+		{" 30, 60 ,90 ", "30,60,90", true},
+		{"5", "5", true},
+		{"", "", false},
+		{"0", "", false},
+		{"-1", "", false},
+		{"abc", "", false},
+		{"30,,60", "", false},
+		{"30,abc,60", "", false},
+		{"99999999999", "604800", true},
+	}
+	for _, tc := range norm {
+		got, ok := NormalizeUpstream503CoolingSteps(tc.in)
+		if ok != tc.wantOk || got != tc.want {
+			t.Fatalf("NormalizeUpstream503CoolingSteps(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOk)
+		}
+	}
+}
+
+// PoolStats 桶口径与 Select 第一层一致：按「为什么不可选」分桶、冷却按成因细分、
+// active 桶再按模型可用性细分——这是 no_available_account 错误体的数据源，
+// 口径错了整条错误信息就会误导排查。
+func TestPoolStatsAggregates(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	quota := map[string]map[string]any{
+		"glm-5.3": {"model": "glm-5.3", "remaining": 100.0},
+	}
+
+	add := func(name string) *model.Account {
+		acc, err := s.AddAccount(model.ProviderZai, name, "sk-"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return acc
+	}
+	mut := func(id string, f func(*model.Account)) {
+		t.Helper()
+		if _, err := s.Update(model.ProviderZai, id, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	aAvail := add("avail")
+	mut(aAvail.ID, func(a *model.Account) { a.Quota = cloneQuotaForTest(quota) })
+	aModelExh := add("mexh")
+	mut(aModelExh.ID, func(a *model.Account) {
+		a.Quota = cloneQuotaForTest(quota)
+		a.ExhaustedModels = []string{"glm-5.3"}
+	})
+	aCool503 := add("cool503")
+	mut(aCool503.ID, func(a *model.Account) {
+		kind := model.ErrorKindUpstreamUnavailable
+		until := float64(now.Add(100*time.Second).UnixNano()) / 1e9
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &until
+		a.LastErrorKind = &kind
+	})
+	aCoolRisk := add("coolrisk")
+	mut(aCoolRisk.ID, func(a *model.Account) {
+		kind := model.ErrorKindRiskControl
+		until := float64(now.Add(50*time.Second).UnixNano()) / 1e9
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &until
+		a.LastErrorKind = &kind
+	})
+	aInvalid := add("invalid")
+	mut(aInvalid.ID, func(a *model.Account) { a.Status = model.StatusInvalid })
+	aDisabled := add("disabled")
+	mut(aDisabled.ID, func(a *model.Account) { a.Enabled = false })
+	aArchived := add("archived")
+	mut(aArchived.ID, func(a *model.Account) {
+		ts := float64(now.UnixNano()) / 1e9
+		a.ArchivedAt = &ts
+	})
+
+	stat := s.PoolStats(model.ProviderZai, "glm-5.3")
+	if stat.Total != 7 {
+		t.Fatalf("Total: %d", stat.Total)
+	}
+	if stat.Archived != 1 || stat.Disabled != 1 || stat.Invalid != 1 {
+		t.Fatalf("归档/停用/失效桶: %d/%d/%d", stat.Archived, stat.Disabled, stat.Invalid)
+	}
+	if stat.Exhausted != 0 {
+		t.Fatalf("无整号耗尽账号: %d", stat.Exhausted)
+	}
+	if stat.Cooling != 2 || stat.Active != 2 {
+		t.Fatalf("冷却/active 桶: %d/%d", stat.Cooling, stat.Active)
+	}
+	if stat.CoolingByKind[model.ErrorKindUpstreamUnavailable] != 1 ||
+		stat.CoolingByKind[model.ErrorKindRiskControl] != 1 {
+		t.Fatalf("冷却成因细分: %v", stat.CoolingByKind)
+	}
+	if stat.CoolingEarliest == nil {
+		t.Fatal("应给出最早恢复时间")
+	}
+	wantEarliest := float64(now.Add(50*time.Second).UnixNano()) / 1e9
+	if diff := *stat.CoolingEarliest - wantEarliest; diff > 1 || diff < -1 {
+		t.Fatalf("最早恢复应取 50s 后那个账号: %v", *stat.CoolingEarliest)
+	}
+	if stat.ModelStat == nil || stat.ModelStat["available"] != 1 || stat.ModelStat["exhausted"] != 1 {
+		t.Fatalf("模型维度分布: %v", stat.ModelStat)
+	}
+
+	// modelName 为空 → 不做模型维度聚合（Select 未按模型过滤，无此口径）
+	if stat2 := s.PoolStats(model.ProviderZai, ""); stat2.ModelStat != nil {
+		t.Fatalf("无模型名时 ModelStat 应为 nil: %v", stat2.ModelStat)
+	}
+}
+
+// cloneQuotaForTest 避免测试间共享同一 quota map（Update 落库后归 store 所有）。
+func cloneQuotaForTest(src map[string]map[string]any) map[string]map[string]any {
+	out := make(map[string]map[string]any, len(src))
+	for k, v := range src {
+		c := map[string]any{}
+		for kk, vv := range v {
+			c[kk] = vv
+		}
+		out[k] = c
+	}
+	return out
+}

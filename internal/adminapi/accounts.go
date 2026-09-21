@@ -510,6 +510,7 @@ func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"proxy_health_enabled":   h.Store.ProxyHealthEnabled(),
 		"proxy_health_interval":  h.Store.ProxyHealthIntervalMinutes(),
 		"risk_cooling_steps":     h.Store.RiskCoolingStepsString(),
+		"upstream_503_cooling_steps": h.Store.Upstream503CoolingStepsString(),
 	})
 }
 
@@ -645,6 +646,19 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.Store.SetSetting(store.RiskCoolingStepsKey, raw); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	// ── 上游 503 冷卻階梯 ── 同樣嚴格校驗（整串都是正整數秒）。與風控的差異：
+	// 連續次數超過檔位數只封頂冷卻、不升級為失效——503 是上游健康信號而非帳號問題。
+	if v, ok := payload[store.Upstream503CoolingStepsKey]; ok {
+		raw, valid := store.NormalizeUpstream503CoolingSteps(strOf(v))
+		if !valid {
+			writeAPIError(w, errBadRequest("上游 503 冷卻階梯需為逗號分隔的正整數秒，如 30,60,120"))
+			return
+		}
+		if err := h.Store.SetSetting(store.Upstream503CoolingStepsKey, raw); err != nil {
 			writeError500(w, err)
 			return
 		}

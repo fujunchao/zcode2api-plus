@@ -158,10 +158,28 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		return res.final
 	}
 
+	// 选不出号 ≠ 「账号没绑定模型/额度用完」：冷却、风控、停用、整号耗尽都会走到
+	// 这里。错误体如实携带池状态分解（文案 + 结构化 details），别再让一次整池
+	// 冷却被静态文案误读成绑定问题（2026-09-20 事故）。
+	stat := e.Store.PoolStats(model.ProviderZai, modelName)
+	detailText := PoolStatusText(stat)
 	if modelName != "" {
+		if detailText != "" {
+			web.ReqErr(reqID, fmt.Sprintf("模型 %s 無可用帳號（%s）", modelName, detailText))
+			return errResultWithDetails(http.StatusServiceUnavailable, "no_available_account",
+				fmt.Sprintf("模型 %s 目前無可用帳號（%s），請在後台檢查帳號狀態", modelName, detailText),
+				PoolStatusDetails(stat, modelName))
+		}
 		web.ReqErr(reqID, fmt.Sprintf("模型 %s 無可用帳號（未提供此模型或額度已用完）", modelName))
-		return errResult(http.StatusServiceUnavailable, "no_available_account",
-			fmt.Sprintf("模型 %s 目前無可用帳號（帳號未提供此模型或額度已用完），請在後台檢查帳號狀態", modelName))
+		return errResultWithDetails(http.StatusServiceUnavailable, "no_available_account",
+			fmt.Sprintf("模型 %s 目前無可用帳號（帳號未提供此模型或額度已用完），請在後台檢查帳號狀態", modelName),
+			PoolStatusDetails(stat, modelName))
+	}
+	if detailText != "" {
+		web.ReqErr(reqID, "无可用账号: "+detailText)
+		return errResultWithDetails(http.StatusServiceUnavailable, "no_available_account",
+			fmt.Sprintf("所有账号均不可用（%s），请在后台检查账号状态", detailText),
+			PoolStatusDetails(stat, modelName))
 	}
 	web.ReqErr(reqID, "无可用账号 / 额度均已耗尽")
 	return errResult(http.StatusServiceUnavailable, "no_available_account",
@@ -432,11 +450,15 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 
-	// 7) 503 → 冷却换号
+	// 7) 503 → 按连续次数递进冷却换号（默认 30/60/120s，可后台配置；超阶梯封顶
+	//    CoolingSeconds）。固定 300s 的年代，一次上游抖动会把整池在几十秒内冷却
+	//    清空（2026-09-20 事故）。日志带 body 预览：503 的关键信息（是 z.ai 侧
+	//    还是线路侧的 5xx）在 body 里，只记状态码不可见。
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		e.bumpFail(acc, model.ErrorKindUpstreamUnavailable)
-		e.mark(acc, model.StatusCooling, model.ErrorKindUpstreamUnavailable, "上游服務不可用 HTTP 503")
-		web.Warn(reqID, fmt.Sprintf("账号 %s 上游返回 503，進入冷卻並切換下一個", acc.Name))
+		errMsg := "上游服務不可用 HTTP 503: " + ErrorPreview(text)
+		secs, streak := e.markUpstreamUnavailable(acc, errMsg)
+		web.Warn(reqID, fmt.Sprintf("账号 %s 上游返回 503（連續第 %d 次），冷卻 %d s 並切換下一個: %s",
+			acc.Name, streak, secs, ErrorPreview(text)))
 		return attemptResult{switchAccount: true}
 	}
 
@@ -715,6 +737,12 @@ func (e *Engine) markRiskControl(acc *model.Account, errMsg string) (int, int, b
 	return MarkRiskControl(e.Store, acc.Provider, acc.ID, errMsg, e.now())
 }
 
+// markUpstreamUnavailable 上游 503 的递进冷却，返回（本次冷却秒数, 累加后的连续次数）。
+// 与 markRateLimited 同理：streak 只能取返回值（acc 是 Select 交出的副本）。
+func (e *Engine) markUpstreamUnavailable(acc *model.Account, errMsg string) (int, int) {
+	return MarkUpstreamUnavailable(e.Store, acc.Provider, acc.ID, errMsg, e.now())
+}
+
 // success 记录成功调用的账号状态；并异步触发一次额度刷新
 // （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 func (e *Engine) success(acc *model.Account) {
@@ -725,8 +753,10 @@ func (e *Engine) success(acc *model.Account) {
 		// 成功即认为限流窗口已过：清零连续计数，下一次再被限流从最短档重新起算。
 		// 必须对 live 调用——对副本清零不会落库，会出现「一边归零、一边继续递增」。
 		// 风控计数同理：冷却到期后能真正打通一次，说明这次拦截是偶发的，回到最低档。
+		// 503 计数同理：上游链路真正恢复了一次，下次抖动从最短档重新起算。
 		ResetRateLimitStreak(live)
 		ResetRiskControlStreak(live)
+		ResetUpstream503Streak(live)
 		if live.Status == model.StatusCooling || live.Status == model.StatusExhausted {
 			live.Status = model.StatusActive
 		}
@@ -824,6 +854,20 @@ func errResult(status int, errType, msg string) runResult {
 	return runResult{
 		Status: status,
 		Body:   map[string]any{"error": map[string]any{"message": msg, "type": errType}},
+	}
+}
+
+// errResultWithDetails 在错误体上附加结构化 details（error.details）。
+// 仅用于 no_available_account 这类「成因需要程序化判读」的出口；message 仍是
+// 完整可读文案，details 只是同一信息的机器可读形态，不携带账号名等敏感信息。
+func errResultWithDetails(status int, errType, msg string, details map[string]any) runResult {
+	return runResult{
+		Status: status,
+		Body: map[string]any{"error": map[string]any{
+			"message": msg,
+			"type":    errType,
+			"details": details,
+		}},
 	}
 }
 

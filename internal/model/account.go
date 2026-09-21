@@ -134,6 +134,18 @@ type Account struct {
 	// 不新增 accounts.data 的键。人工换凭据（见 store.EditAccount）时会一并清零，
 	// 否则救回来的账号下一次命中就是老 streak，会立刻又被判失效。
 	RiskControlStreak int `json:"-"`
+
+	// Upstream503Streak 连续收到上游 503（服务不可用）的次数，成功调用后归零，
+	// 用于选择递进冷却档位（默认 30/60/120s，可后台配置）。
+	//
+	// 背景：此前 503 一律固定冷却 config.CoolingSeconds（300s），上游抖动时
+	// 个位数账号池会在几十秒内被整池冷却清空（2026-09-20 线上事故，
+	// docs/analysis-503-no-available-account-20260920.md）。
+	// 与上面两个 streak 一样 json:"-"：纯运行期退避状态，重启归零无正确性影响。
+	// 与 RiskControlStreak 的区别：503 是上游健康信号而非账号问题，超阶梯长度
+	// 只封顶冷却、不升 invalid。换凭据（EditAccount）刻意不清零——它衡量的是
+	// 「这个账号的上游链路最近有多不健康」，与凭据无关。
+	Upstream503Streak int `json:"-"`
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -293,6 +305,7 @@ func (a *Account) Clone() *Account {
 
 		RateLimitStreak:   a.RateLimitStreak,
 		RiskControlStreak: a.RiskControlStreak,
+		Upstream503Streak: a.Upstream503Streak,
 	}
 }
 
