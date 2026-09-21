@@ -664,6 +664,42 @@ func (s *Store) listProxyProfilesLocked() []ProxyProfile {
 	return out
 }
 
+// ProxyLabel 返回账号出口线路的日志标签，供观测诊断行使用。
+//
+// 三种形态：
+//   - ProxyID 命中命名线路 → 线路名（后台「线路」页里显示的那个名字）；
+//   - 只有手工填的 ProxyURL（ProxyID 为 nil，见 SetProxyURL/EditAccount 会主动清空）
+//     → "proxy:" + 掩码 URL（proxy.MaskURL 会藏掉凭据）；
+//   - 都没有 → "direct"（直连）。
+//
+// 调用频率是「每次选号一次」，不在逐 chunk 热路径上，故这里直接线性扫一遍线路表；
+// 线路数量级是几十，且本方法只在收尾打日志时用。
+func (s *Store) ProxyLabel(acc *model.Account) string {
+	if acc == nil {
+		return "direct"
+	}
+	if acc.ProxyID != nil && *acc.ProxyID != "" {
+		s.mu.Lock()
+		name := ""
+		for _, p := range s.listProxyProfilesLocked() {
+			if p.ID == *acc.ProxyID {
+				name = p.Name
+				break
+			}
+		}
+		s.mu.Unlock()
+		if name != "" {
+			return name
+		}
+		// 线路已被删除（或本进程尚未加载）：至少给出可追踪的 ID。
+		return "proxy-id:" + *acc.ProxyID
+	}
+	if acc.ProxyURL != nil && *acc.ProxyURL != "" {
+		return "proxy:" + proxy.MaskURL(*acc.ProxyURL)
+	}
+	return "direct"
+}
+
 func (s *Store) saveProxyProfilesLocked(profiles []ProxyProfile) error {
 	data, err := marshalJSON(profiles)
 	if err != nil {

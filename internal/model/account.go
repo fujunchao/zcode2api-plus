@@ -146,6 +146,20 @@ type Account struct {
 	// 只封顶冷却、不升 invalid。换凭据（EditAccount）刻意不清零——它衡量的是
 	// 「这个账号的上游链路最近有多不健康」，与凭据无关。
 	Upstream503Streak int `json:"-"`
+
+	// StreamTruncateCount 累计被上游中途掐断（SSE 流未交出终值）的次数。
+	//
+	// 与上面三个 streak 的**根本区别**：它不驱动任何状态机——不冷却、不换号、不改
+	// Status、不参与 Select。它的唯一用途是让运维能回答「断流是否集中在某几个账号
+	// 或某几条出口线路上」（2026-09-21 上游固定 ~300s 时长墙事故，
+	// docs/analysis-flash-5min-stream-cut-20260921.md §5.2）。
+	//
+	// 刻意只增不清：既不在成功时归零，也不在换凭据时归零。「集中度」要用累计值比较
+	// 才有意义；而「连续次数」语义在这个结构下不可靠——sync 路径的 e.success(acc)
+	// 在流开始读取**之前**就被调用（engine.deliverStream 首行），一旦用它归零，计数
+	// 会被同一次请求提前清掉。另外它是纯观测量，故同样 json:"-"：不为它新增
+	// accounts.data 的键（34 键硬契约）。
+	StreamTruncateCount int `json:"-"`
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -303,9 +317,10 @@ func (a *Account) Clone() *Account {
 		VirtualDeviceMid: a.VirtualDeviceMid,
 		Claim:            a.ClaimView(),
 
-		RateLimitStreak:   a.RateLimitStreak,
-		RiskControlStreak: a.RiskControlStreak,
-		Upstream503Streak: a.Upstream503Streak,
+		RateLimitStreak:     a.RateLimitStreak,
+		RiskControlStreak:   a.RiskControlStreak,
+		Upstream503Streak:   a.Upstream503Streak,
+		StreamTruncateCount: a.StreamTruncateCount,
 	}
 }
 

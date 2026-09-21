@@ -706,3 +706,35 @@ func TestNewAccountIDTruncatesByRune(t *testing.T) {
 		t.Fatalf("短名不应被改写: %q", short)
 	}
 }
+
+// StreamTruncateCount 是纯观测字段（json:"-"）。仓库没有反射式 Clone 齐全性测试
+// （见 TestCloneIsDetached 上方注释自认），所以每新增一个运行期字段，这条用例就是
+// 唯一的守卫——漏写 Clone 不会编译报错，只会让副本视角静默读到 0。
+func TestCloneCopiesStreamTruncateCount(t *testing.T) {
+	a := Create(ProviderZai, "k", "sk-abc")
+	a.StreamTruncateCount = 3
+
+	clone := a.Clone()
+	if clone.StreamTruncateCount != 3 {
+		t.Fatalf("Clone 未复制 StreamTruncateCount: %d", clone.StreamTruncateCount)
+	}
+	clone.StreamTruncateCount = 9
+	if a.StreamTruncateCount != 3 {
+		t.Fatal("Clone 应返回深拷贝：改副本不应影响原件")
+	}
+}
+
+// 观测计数不得被序列化：accounts.data 的 34 键是与 Python 版互读的硬契约，
+// 为观测量新增键会破坏它。（TestJSONContractWithPython 从另一侧守住同一件事。）
+func TestStreamTruncateCountNotSerialized(t *testing.T) {
+	a := Create(ProviderZai, "k", "sk-abc")
+	a.StreamTruncateCount = 7
+
+	raw, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "stream_truncate") || strings.Contains(string(raw), "StreamTruncate") {
+		t.Fatalf("观测计数不应进入序列化键集: %s", raw)
+	}
+}

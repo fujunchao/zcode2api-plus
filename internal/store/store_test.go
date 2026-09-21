@@ -1848,3 +1848,59 @@ func cloneQuotaForTest(src map[string]map[string]any) map[string]map[string]any 
 	}
 	return out
 }
+
+// ProxyLabel 是「日志能不能回答走了哪条线路」的唯一来源，三种形态都必须覆盖；
+// 手工填的代理只能给掩码 URL，绝不能把凭据写进日志。
+func TestProxyLabel(t *testing.T) {
+	s := newTestStore(t)
+
+	prof, err := s.AddProxyProfile("prx-zai-433", "http://user:secret@proxy.example:8080", true)
+	if err != nil {
+		t.Fatalf("新增线路失败: %v", err)
+	}
+
+	acc, err := s.AddAccount(model.ProviderZai, "a1", "sk-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ① 未指派 → 直连
+	if got := s.ProxyLabel(acc); got != "direct" {
+		t.Fatalf("未指派应为 direct，实得 %q", got)
+	}
+
+	// ② 指派命名线路 → 线路名
+	if _, err := s.AssignProxyProfile(acc.ID, prof.ID); err != nil {
+		t.Fatalf("指派线路失败: %v", err)
+	}
+	assigned := s.Find(model.ProviderZai, acc.ID)
+	if got := s.ProxyLabel(assigned); got != "prx-zai-433" {
+		t.Fatalf("应显示线路名，实得 %q", got)
+	}
+
+	// ③ 只有手工 ProxyURL（ProxyID 为 nil）→ 掩码 URL，且不含凭据
+	manual := s.Find(model.ProviderZai, acc.ID).Clone()
+	manual.ProxyID = nil
+	raw := "http://user:secret@proxy.example:8080"
+	manual.ProxyURL = &raw
+	got := s.ProxyLabel(manual)
+	if !strings.HasPrefix(got, "proxy:") {
+		t.Fatalf("手工代理应带 proxy: 前缀，实得 %q", got)
+	}
+	if strings.Contains(got, "secret") {
+		t.Fatalf("日志标签泄露了代理密码: %q", got)
+	}
+
+	// ④ 线路被删（ProxyID 仍在）→ 退化成可追踪的 ID 而不是空串
+	manual2 := manual.Clone()
+	id := "prof-gone"
+	manual2.ProxyID = &id
+	if got := s.ProxyLabel(manual2); got != "proxy-id:prof-gone" {
+		t.Fatalf("线路已删时应回落到 ID，实得 %q", got)
+	}
+
+	// ⑤ nil 账号不 panic
+	if got := s.ProxyLabel(nil); got != "direct" {
+		t.Fatalf("nil 账号应为 direct，实得 %q", got)
+	}
+}

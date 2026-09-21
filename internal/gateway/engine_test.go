@@ -258,7 +258,11 @@ func TestAbortedDeliveryStillCountsFinalUsage(t *testing.T) {
 	complete := NewUsageCollector(true)
 	complete.FeedLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}`)
 	complete.FeedLine(`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}`)
-	res := f.eng.finishDelivery("t1", acc, complete, errors.New("write tcp: 客户端已断开"))
+
+	// 客户端断开：请求 ctx 已结束 ⇒ 属于客户端侧，观测计数不得被污染。
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	res := f.eng.finishDelivery(canceled, "t1", acc, complete, errors.New("write tcp: 客户端已断开"), nil)
 	if !res.final.Delivered {
 		t.Fatal("交付中断仍应记为 Delivered（200 已发出，不得再写响应）")
 	}
@@ -270,11 +274,16 @@ func TestAbortedDeliveryStillCountsFinalUsage(t *testing.T) {
 	partial := NewUsageCollector(true)
 	partial.FeedLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}`)
 	partial.FeedLine(`data: {"type":"message_delta","usage":{"output_tokens":17}}`)
-	if res := f.eng.finishDelivery("t2", acc, partial, errors.New("上游串流在 message_stop 之前结束: unexpected EOF")); !res.final.Delivered {
+	if res := f.eng.finishDelivery(context.Background(), "t2", acc, partial, errors.New("上游串流在 message_stop 之前结束: unexpected EOF"), nil); !res.final.Delivered {
 		t.Fatal("交付中断仍应记为 Delivered")
 	}
 	if got := f.st.Find(model.ProviderZai, acc.ID); got.TotalOutputTokens != 42 {
 		t.Fatalf("usage 不完整不应计入: %+v", got)
+	}
+
+	// 观测计数只认「上游掐断」：t1（客户端断开）不计，t2（上游截断）计一次。
+	if got := f.st.Find(model.ProviderZai, acc.ID); got.StreamTruncateCount != 1 {
+		t.Fatalf("StreamTruncateCount 应只统计上游侧掐断，实得 %d", got.StreamTruncateCount)
 	}
 }
 

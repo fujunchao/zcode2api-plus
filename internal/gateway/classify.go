@@ -205,6 +205,24 @@ func ResetRateLimitStreak(acc *model.Account) {
 	acc.RateLimitStreak = 0
 }
 
+// RecordStreamTruncate 记一次「上游中途掐断流」的观测计数，返回累加后的总数。
+//
+// 这是**纯观测**入口：只动 Account.StreamTruncateCount，不写 Status、不写
+// CoolingUntil、不写 last_error/last_error_kind——中途截断发生在响应头已经发给
+// 客户端之后，无法换号重试，也没有任何证据表明责任在账号；把它当账号故障处理
+// 会把上游的模型级时长墙变成对账号的集体惩罚（与 2026-09-20 的 503 事故同类）。
+//
+// 计数只增不清（见 Account.StreamTruncateCount 的注释），所以这里没有配对的 Reset。
+// 必须经 store.Update 对「当前」对象自增：调用方持有的是 Select 交出的副本。
+// 返回值必须是锁内自增后的新值——读副本只会拿到旧值，与 markRateLimited 同一个坑。
+func RecordStreamTruncate(st *store.Store, provider, idOrName string) (total int) {
+	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+		acc.StreamTruncateCount++
+		total = acc.StreamTruncateCount
+	})
+	return total
+}
+
 // ── 上游 503 冷却阶梯 ─────────────────────────────────────────────────────────
 //
 // 背景：503 一律固定冷却 config.CoolingSeconds（默认 300s）的年代，一次上游抖动
@@ -458,3 +476,19 @@ func ErrorPreview(text string) string {
 // errorPreviewLimit 日志预览的字符（rune）上限。够放下业务码 + 一句上游文案即可；
 // 上游文案偶有整段 JSON/HTML，不设限会把日志撑爆。
 const errorPreviewLimit = 200
+
+// ErrorDetail 把错误体预览拼成日志后缀。
+//
+// 上游错误日志此前只记状态码与业务码，于是「状态码看不出问题、业务码才是关键」的
+// 分支（401/403、402、3010、529/1305、1005、3007）在日志里没有 body，排查只能靠用户
+// 贴客户端报错。这里统一提供后缀；**没有可读内容时返回空串**，避免在既有文案后面留下
+// 一个孤零零的冒号（JWT 上游的裸 401 就是空 body）。
+//
+// 导出给 asyncpool 复用：同一次上游失败在 sync/async 两条路径下必须给出相同的日志口径。
+func ErrorDetail(text string) string {
+	preview := ErrorPreview(text)
+	if preview == "" {
+		return ""
+	}
+	return ": " + preview
+}

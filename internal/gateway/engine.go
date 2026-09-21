@@ -139,6 +139,16 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	modelName, _ := body["model"].(string)
 	stream := bodyBool(body, "stream")
 	reqID := randomHex(3)
+	// 观测诊断行：每请求恰好一条，收尾期输出（defer 保证早退路径也发）。
+	// 刻意不改 web.Req/ReqOk/ReqErr 的形态，也不改本函数的导出签名
+	//（reqID 本就在函数内生成，三个外部调用点无需改动）。
+	diag := NewReqDiag(reqID, orDash(modelName), stream, body, e.now)
+	defer func() {
+		// 总耗时在这里统一冻结（而不是在 finishDelivery 里）：早退路径
+		//（如 no_available_account）从来没走到交付，也应当有可读的耗时。
+		diag.Finish(diag.Now())
+		web.Diag(diag.ReqID, diag.Format())
+	}()
 	web.Req(reqID, orDash(modelName), stream)
 
 	tried := map[string]bool{}
@@ -148,7 +158,8 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 			break
 		}
 		tried[acc.ID] = true
-		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, deliver)
+		diag.Attempts++
+		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, deliver, diag)
 		if res.retrySame {
 			continue
 		}
@@ -198,8 +209,17 @@ func (e *Engine) tryAccount(
 	stream bool,
 	incomingHeaders map[string]string,
 	deliver DeliverFunc,
+	diag *ReqDiag,
 ) attemptResult {
 	needsCaptcha := acc.Mode == "jwt"
+
+	// 记录出口身份：账号名与线路标签。账号在 Select 之后才可得，这正是起始行
+	// （web.Req）打不出它的原因。多次尝试时以最后一次为准，逐次明细仍在既有
+	// [~] 行里（那些行本来就带账号名）。
+	if diag != nil {
+		diag.AccName = acc.Name
+		diag.Route = e.Store.ProxyLabel(acc)
+	}
 
 	var b attemptBudget
 	budget := 1 + MaxCaptchaRetries + len(e.BusyRetryDelays) + MaxRateLimitRetries + len(e.OverloadRetryDelays)
@@ -231,6 +251,10 @@ func (e *Engine) tryAccount(
 			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
 			return attemptResult{final: errResult(http.StatusBadRequest, "invalid_request", "请求体无法序列化")}
 		}
+		if diag != nil {
+			// 真正发给上游的请求体字节数（已含注入的 system）。入口处拿不到这个真值。
+			diag.BodyBytes = len(payload)
+		}
 
 		req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, incomingHeaders)
 		if err != nil {
@@ -248,6 +272,10 @@ func (e *Engine) tryAccount(
 			httpReq.Header.Set(k, v)
 		}
 
+		if diag != nil {
+			// 首字节延迟与耗时的基准点：紧贴出站调用。
+			diag.UpstreamStart = diag.Now()
+		}
 		resp, err := e.clientFor(acc).Do(httpReq)
 		if err != nil {
 			if isClientGone(ctx) {
@@ -262,6 +290,10 @@ func (e *Engine) tryAccount(
 			e.mark(acc, model.StatusCooling, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
+		}
+
+		if diag != nil {
+			diag.Status = resp.StatusCode
 		}
 
 		if resp.StatusCode >= 400 {
@@ -286,7 +318,7 @@ func (e *Engine) tryAccount(
 				web.ReqErr(reqID, fmt.Sprintf("上游错误体读取失败（账号 %s）", acc.Name))
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_error", textPreview(err.Error()))}
 			}
-			res := e.handleUpstreamJSON(reqID, acc, modelName, needsCaptcha, stream, contentType, buffered, &b, deliver)
+			res := e.handleUpstreamJSON(ctx, reqID, acc, modelName, needsCaptcha, stream, contentType, buffered, &b, deliver, diag)
 			if res.retrySame {
 				continue
 			}
@@ -294,7 +326,7 @@ func (e *Engine) tryAccount(
 		}
 
 		// SSE 成功：tee 读取流，交付完整后计入 usage
-		return e.deliverStream(reqID, acc, contentType, resp, deliver)
+		return e.deliverStream(ctx, reqID, acc, contentType, resp, deliver, diag)
 	}
 
 	// 预算耗尽（防御分支：每个 continue 都已各自记账，正常路径不会走到这里）
@@ -356,14 +388,14 @@ func (e *Engine) handleUpstreamError(
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		e.mark(acc, model.StatusInvalid, model.ErrorKindAuthFailed,
 			fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
-		web.Warn(reqID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
+		web.Warn(reqID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个%s", acc.Name, resp.StatusCode, ErrorDetail(text)))
 		return attemptResult{switchAccount: true}
 	}
 
 	// 3) 402 → 该模型耗尽
 	if resp.StatusCode == http.StatusPaymentRequired {
 		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
-		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個%s", acc.Name, orCurrent(modelName), ErrorDetail(text)))
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
 	}
@@ -375,13 +407,13 @@ func (e *Engine) handleUpstreamError(
 		if b.busy < len(e.BusyRetryDelays) {
 			delay := e.BusyRetryDelays[b.busy]
 			b.busy++
-			web.Warn(reqID, fmt.Sprintf("模型并发准入受限，%g s 后重试（账号仍可用）", delay.Seconds()))
+			web.Warn(reqID, fmt.Sprintf("模型并发准入受限，%g s 后重试（账号仍可用）%s", delay.Seconds(), ErrorDetail(text)))
 			if !sleepCtx(ctx, delay) {
 				return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
 			}
 			return attemptResult{retrySame: true}
 		}
-		web.Warn(reqID, fmt.Sprintf("模型并发准入持续受限（账号 %s），保留账号状态", acc.Name))
+		web.Warn(reqID, fmt.Sprintf("模型并发准入持续受限（账号 %s），保留账号状态%s", acc.Name, ErrorDetail(text)))
 		return attemptResult{final: runResult{
 			Status: resp.StatusCode,
 			Body:   passthroughBodyWithType(text, "upstream_rate_limit"),
@@ -409,15 +441,15 @@ func (e *Engine) handleUpstreamError(
 		if b.overload < len(e.OverloadRetryDelays) {
 			delay := JitteredDelay(e.OverloadRetryDelays[b.overload])
 			b.overload++
-			web.Warn(reqID, fmt.Sprintf("上游平台过载 HTTP %d code=%s，%g s 后原地重试（账号状态不变）",
-				resp.StatusCode, code, delay.Seconds()))
+			web.Warn(reqID, fmt.Sprintf("上游平台过载 HTTP %d code=%s，%g s 后原地重试（账号状态不变）%s",
+				resp.StatusCode, code, delay.Seconds(), ErrorDetail(text)))
 			if !sleepCtx(ctx, delay) {
 				return attemptResult{final: errResult(http.StatusServiceUnavailable, "canceled", "请求已取消")}
 			}
 			return attemptResult{retrySame: true}
 		}
-		web.Warn(reqID, fmt.Sprintf("上游平台过载持续（账号 %s），原样透传 HTTP %d code=%s",
-			acc.Name, resp.StatusCode, code))
+		web.Warn(reqID, fmt.Sprintf("上游平台过载持续（账号 %s），原样透传 HTTP %d code=%s%s",
+			acc.Name, resp.StatusCode, code, ErrorDetail(text)))
 		return attemptResult{final: runResult{
 			Status: resp.StatusCode,
 			Body:   passthroughBodyWithType(text, "upstream_error"),
@@ -428,7 +460,7 @@ func (e *Engine) handleUpstreamError(
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
 			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
-			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
+			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個%s", acc.Name, orCurrent(modelName), ErrorDetail(text)))
 			e.fireRefresh(acc)
 			return attemptResult{switchAccount: true}
 		}
@@ -497,6 +529,7 @@ func (e *Engine) handleUpstreamError(
 // handleUpstreamJSON 处理 HTTP 200 且 content-type 为 JSON 的响应：
 // ZCode 的业务错误有时仍使用 HTTP 200，不能当成 Anthropic 成功回應。
 func (e *Engine) handleUpstreamJSON(
+	ctx context.Context,
 	reqID string,
 	acc *model.Account,
 	modelName string,
@@ -506,6 +539,7 @@ func (e *Engine) handleUpstreamJSON(
 	buffered []byte,
 	b *attemptBudget,
 	deliver DeliverFunc,
+	diag *ReqDiag,
 ) attemptResult {
 	text := string(buffered)
 	code := UpstreamBusinessCode(text)
@@ -513,7 +547,7 @@ func (e *Engine) handleUpstreamJSON(
 	switch {
 	case code == "1005":
 		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)))
-		web.Warn(reqID, fmt.Sprintf("帳號 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 的 %s 每日額度用完，切換下一個%s", acc.Name, orCurrent(modelName), ErrorDetail(text)))
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
 
@@ -521,7 +555,7 @@ func (e *Engine) handleUpstreamJSON(
 		e.Captcha.Invalidate()
 		b.captcha++
 		e.recordError(acc, model.ErrorKindCaptchaFailed, "上游拒絕驗證碼 code=3007")
-		web.Warn(reqID, fmt.Sprintf("帳號 %s 驗證碼失效，刷新重試（第 %d 次）", acc.Name, b.captcha))
+		web.Warn(reqID, fmt.Sprintf("帳號 %s 驗證碼失效，刷新重試（第 %d 次）%s", acc.Name, b.captcha, ErrorDetail(text)))
 		if b.captcha >= MaxCaptchaRetries {
 			return attemptResult{final: e.captchaRequired(reqID, "上游連續拒絕驗證碼")}
 		}
@@ -556,21 +590,21 @@ func (e *Engine) handleUpstreamJSON(
 		Header:      http.Header{},
 		Body:        bytes.NewReader(buffered),
 	})
-	return e.finishDelivery(reqID, acc, usage, err)
+	return e.finishDelivery(ctx, reqID, acc, usage, err, diag)
 }
 
 // deliverStream 交付 SSE 流式响应；usage 随读取同步收集，客户端完整接收后计入。
-func (e *Engine) deliverStream(reqID string, acc *model.Account, contentType string, resp *http.Response, deliver DeliverFunc) attemptResult {
+func (e *Engine) deliverStream(ctx context.Context, reqID string, acc *model.Account, contentType string, resp *http.Response, deliver DeliverFunc, diag *ReqDiag) attemptResult {
 	e.success(acc)
 	usage := NewUsageCollector(strings.Contains(contentType, "text/event-stream"))
 	err := deliver(Delivery{
 		StatusCode:  resp.StatusCode,
 		ContentType: contentType,
 		Header:      resp.Header,
-		Body:        &teeReader{r: resp.Body, c: usage},
+		Body:        &teeReader{r: resp.Body, c: usage, diag: diag, now: e.now},
 	})
 	_ = resp.Body.Close()
-	return e.finishDelivery(reqID, acc, usage, err)
+	return e.finishDelivery(ctx, reqID, acc, usage, err, diag)
 }
 
 // finishDelivery 交付收尾：累计 usage 并写日志。
@@ -580,8 +614,24 @@ func (e *Engine) deliverStream(reqID string, acc *model.Account, contentType str
 // 已经到手，用量是准的；若沿用旧的「客户端没读完就不计入」，账号用量会系统性少算
 // （线上曾漏计一次 57,352 output token 的生成，详见
 // docs/analysis-flash-30min-stream-cut.md §5）。usage 不完整时仍旧不计入。
-func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCollector, err error) attemptResult {
+func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Account, usage *UsageCollector, err error, diag *ReqDiag) attemptResult {
+	if diag == nil {
+		// 防御：单测可以只关心状态机而不提供诊断容器。
+		diag = &ReqDiag{clock: e.now}
+	}
 	if err != nil {
+		diag.Usage = usage.AsDict()
+		diag.UsageComplete = usage.UsageComplete()
+		diag.ErrText = err.Error()
+		// 纯观测计数，且**只统计上游侧掐断**：这个出口同时承载「客户端写失败/断开」
+		// （客户端收到 finish_reason 就关流是常态），把那种也算进去会让计数失真。
+		// 判据沿用仓库既有的 isClientGone(ctx)——ctx 结束即客户端侧，不是上游掐断；
+		// 这也与日志里 `context canceled` 与 `unexpected EOF` 的区分口径一致。
+		// 计数不冷却、不换号、不改状态：响应头已经发给客户端，无法换号重试，且没有
+		// 证据表明责任在账号（把上游的时长墙记成账号故障＝集体惩罚）。
+		if !isClientGone(ctx) {
+			diag.TruncTotal = RecordStreamTruncate(e.Store, acc.Provider, acc.ID)
+		}
 		if usage.UsageComplete() {
 			got := e.accumulateUsage(acc, usage)
 			web.ReqErr(reqID, fmt.Sprintf("流传输中断，上游 usage 已完整，仍计入 %d tok: %v", got.Output, err))
@@ -591,7 +641,10 @@ func (e *Engine) finishDelivery(reqID string, acc *model.Account, usage *UsageCo
 		return attemptResult{final: runResult{Delivered: true}}
 	}
 	usage.Finish()
-	web.ReqOk(reqID, e.accumulateUsage(acc, usage).Output)
+	got := e.accumulateUsage(acc, usage)
+	diag.Usage = got
+	diag.UsageComplete = usage.UsageComplete()
+	web.ReqOk(reqID, got.Output)
 	return attemptResult{final: runResult{Delivered: true}}
 }
 
@@ -825,16 +878,26 @@ func marshalJSON(v any) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
-// teeReader 在读取时同步餵入 usage 收集器。
+// teeReader 在读取时同步餵入 usage 收集器，并把「首字节 / 最大 chunk 间隔 / 总字节数」
+// 记进诊断容器（读上游 body 的唯一必经点；非流式缓冲交付不经这里）。
 type teeReader struct {
-	r io.Reader
-	c *UsageCollector
+	r    io.Reader
+	c    *UsageCollector
+	diag *ReqDiag
+	now  func() time.Time
 }
 
 func (t *teeReader) Read(p []byte) (int, error) {
 	n, err := t.r.Read(p)
 	if n > 0 {
 		t.c.Feed(p[:n])
+		if t.diag != nil {
+			if t.now != nil {
+				t.diag.MarkRead(t.now(), n)
+			} else {
+				t.diag.MarkRead(time.Now(), n)
+			}
+		}
 	}
 	return n, err
 }

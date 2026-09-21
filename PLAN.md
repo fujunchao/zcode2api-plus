@@ -63,7 +63,7 @@
 | 浏览器自动化 | `github.com/go-rod/rod` | 验证码求解；复用 cloakbrowser 下载的 Chromium 二进制 |
 | 前端嵌入 | `embed` | dist 打进二进制，单文件交付 |
 | 配置 | 环境变量（沿用 `ZCODE_*` 命名）+ `.env`（`godotenv` 或自写 30 行） | 与 Python 版配置兼容 |
-| 日志 | `log/slog` | 标准库；彩色终端输出按需自写 |
+| 日志 | 自写包 `internal/web`（彩色终端 + writer 可注入） | 原计划用 `log/slog`，实际未采用：契约要求与 Python 版 `app/logs.py` 的彩色行形态逐字对齐（`>>>`/`<<<`/`<!>` 等），标准库结构化的收益抵不上重写成本。详见 §5.14 |
 | 依赖原则 | 最少依赖：sqlite、rod、godotenv，其余标准库 | 便于审计与长期维护 |
 
 ## 4. 目标目录结构
@@ -480,6 +480,49 @@ meta(key TEXT PK, value TEXT)
 
 **不做模型级冷却**：已论证无效（见本节开头）。**不让额度轮询驱动阶梯**：计费路径只记归类。
 
+### 5.14 观测契约：诊断行、出口标签与截断计数（Go 版增量，2026-09-21 新增）
+
+立项背景：2026-09-21 出现「上游流在约 300s 处被掐断」的故障（15 次 `unexpected EOF`，全部落在
+301–308s），当时**无法只靠日志定论**——不知道是哪个账号、走了哪条出口线路、数据是在流还是静默。
+根因分析见 `docs/analysis-flash-5min-stream-cut-20260921.md` §5（两个观测盲区）。
+
+**诊断行（`[#]`）**：每请求恰好一条，收尾期输出，由 `web.Diag(reqID, msg)` 打印。
+
+- 承载 `>>>`/`<<<`/`<!>` 三类行**结构上装不下**的字段：账号名、出口线路、请求体字节数、
+  首字节延迟、最大 chunk 间隔、已收 usage、是否完整、总耗时、上游状态码、错误原文。
+- 自带 reqID，可与同一请求的既有行 join；async 同时输出 `ticket=<UUID>`，两种检索习惯都保留。
+- sync 落点：`internal/gateway/diagnostics.go`（`ReqDiag`）+ `engine.go` 的
+  `RunMessages`/`tryAccount`/`deliverStream`/`finishDelivery`/`teeReader`。
+- async 落点：`internal/asyncpool/pool.go` 的 `processTicket`/`attemptUpstream`/`attemptUpstreamOnce`/`forwardSSE`；
+  **async 从此有了起始/完成与诊断行**（此前只有 `Warn` 与一条 `ReqErr`），并新增 6 位十六进制
+  `shortID` 与 sync 的 reqID 同构。
+- 首字节/最大间隔的采集点：sync 在 `teeReader.Read`，async 在 `forwardSSE` 的 `bufio.Scanner` 循环
+  ——**两条路径都必须单独采集**（async 不走 teeReader）。非流式缓冲交付不经此路径，打印为 `-`。
+
+**冻结既有行**：`>>>` / `<<<` / `<!>` 的格式串与文案**不得改动**（外部日志分析脚本按它们配对请求）。
+`internal/web/logs_test.go` 的 `TestLegacyLineFormatsFrozen` 是这条约定的守卫。
+
+**`web.SetOut`**：日志 writer 可注入（`atomic.Value` + 定长结构体持有 `io.Writer`；**不要直接把
+`io.Writer` 存进 `atomic.Value`**，具体类型不一致会 panic）。生产路径不调用它，行为与直接写 stdout 等价。
+⚠️ 禁止在 store 持锁路径里同步写日志（stdout 阻塞会锁死 Store，参见 `store.logPersistFailure` 的脱锁处理）。
+
+**出口标签 `Store.ProxyLabel(acc)`**：`ProxyID` 命中线路 → 线路名；仅手工 `ProxyURL` → `proxy:` + 掩码；
+皆空 → `direct`；线路已删 → `proxy-id:<id>`。每次选号调用一次，不在逐 chunk 热路径。
+
+**`Account.StreamTruncateCount`（`json:"-"`）**：累计被上游中途掐断的次数。
+
+- **只增不清**：成功不归零、换凭据不归零。「断流是否集中在某账号/某线路」要用累计值比较。
+  ⚠️ 不要改成「连续次数 + 成功归零」：sync 的 `e.success(acc)` 在 `deliverStream` 读流**之前**调用，
+  会先把计数清掉。
+- **不参与任何状态机**：不冷却、不换号、不改 `Status`、不参与 `Select`、不进 `PublicView`、
+  **不新增 `ErrorKind`**、不动 `accounts.data` 的 34 键契约（`TestJSONContractWithPython` 守）。
+- 只统计**上游侧**掐断：判据是 `isClientGone(ctx)` 为假（客户端收到 finish_reason 就关流是常态，
+  把它算进去会让计数失真）。
+- 写入入口仅 `gateway.RecordStreamTruncate`；async 侧复用同一函数。
+
+**业务码分支的 body 预览**：401/403、402、3010、529/1305、1005、3007 等分支的 `[~]` 行统一追加
+`gateway.ErrorDetail(body)`（空 body 不留孤立冒号）。此前只有通用分支带预览，业务码在日志里不可见。
+
 ## 6. 里程碑
 
 ### M0 骨架 + 数据层
@@ -680,6 +723,16 @@ meta(key TEXT PK, value TEXT)
   扩 `TestErrorKindRecordedPerBranch` 两行（405 风控 / 405 非风控）。
 - [ ] 在线观察：风控文案是否只有 `unusual activity` 一族；升级阈值（= 档位数）默认三档是否合适。
 
+### M19 观测数据补齐（2026-09-21）
+- [x] `internal/web`：writer 可注入 + `[#]` 诊断原语 — `logs.go`（`SetOut`/`Diag`/`writerHolder`）
+- [x] `ReqDiag` 容器与格式化，贯穿 sync 全链路（请求体画像 / 出口身份 / 首字节 / 最大间隔 / usage / 耗时）
+- [x] `Store.ProxyLabel`：账号 → 线路名/掩码/直连，三态 + 线路已删回落
+- [x] `Account.StreamTruncateCount`（`json:"-"`，累计、不驱动状态机）+ `gateway.RecordStreamTruncate`
+- [x] async 对称：`shortID`、诊断行、scanner 侧流形采集、上游侧掐断计数
+- [x] 业务码分支补 `ErrorDetail`（sync + async 同口径）
+- [x] 守卫用例：既有三类行格式冻结、诊断行字段、首字节/间隔、累计语义、线路标签、Clone 齐全性
+- [ ] **验收**：下一次 flash 长流场景只用日志即可判定 300s 墙归属（判定矩阵见分析报告 §4.1）
+
 ## 7. 测试策略
 
 - 单测**逐个移植** Python 版 `tests/`（错误分类、池协议、路由白名单、quota 合并、oauth、usage、鉴权引导），
@@ -687,7 +740,10 @@ meta(key TEXT PK, value TEXT)
 - OpenAI 转换层：§5.7 每条映射一行单测；流式重编码按事件序列断言输出 chunk 序列；
   最终用 openai 官方客户端（python）指向网关做真客户端回归。
 - httptest 起完整服务打 mock 上游做端到端；SSE 用 `curl -N` 与 Python 版逐字节对比分块行为。
-- 全部测试在 `-race` 下通过。
+- 日志行可断言的：`web.SetOut(w)` 注入 writer（默认 stdout），测试用管道/缓冲捕获后断言行内容。
+  `TestLegacyLineFormatsFrozen` 冻结 `>>>`/`<<<`/`<!>` 的形态；诊断行 `[#]` 的字段、
+  截断计数语义、首字节与最大间隔、`ProxyLabel` 三态各有专门用例（§5.14）。
+- 全部测试在 `-race` 下通过（本机无 gcc，`-race` 只能由 CI 跑）。
 - 数据互通夹具：把一份脱敏 `accounts.db` 提交到 `testdata/` 作为固定夹具。
 
 ## 8. 风险与对策

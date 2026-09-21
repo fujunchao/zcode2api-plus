@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
+	"zcode2api/internal/web"
 )
 
 // fakeSolver 依次返回预置令牌；tokens 耗尽时回退默认令牌（不关注
@@ -179,6 +181,7 @@ func insertTicket(p *Pool, id string, body map[string]any) *ticket {
 		body:      body,
 		queue:     make(chan ticketEvent, 256),
 		createdAt: time.Now(),
+		shortID:   newShortID(), // 与 newTicket 同形：诊断行要用它当 reqID
 	}
 	p.mu.Lock()
 	p.tickets[id] = tk
@@ -1156,5 +1159,102 @@ func TestAsyncNoAccountCarriesPoolDetails(t *testing.T) {
 	msg, _ := body["message"].(string)
 	if !strings.Contains(msg, "冷卻中") || !strings.Contains(msg, "上游503") {
 		t.Fatalf("message 应内联池状态分解: %s", msg)
+	}
+}
+
+// ── 观测诊断行（async 侧） ────────────────────────────────────────────────────
+
+// diagBuf 并发安全的日志缓冲：后台任务跑在别的 goroutine 里，裸 bytes.Buffer
+// 会在 -race 下报错。
+type diagBuf struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *diagBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *diagBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+var ansiRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+func (b *diagBuf) diagLine(t *testing.T) string {
+	t.Helper()
+	for _, line := range strings.Split(b.String(), "\n") {
+		if strings.Contains(line, "[#]") {
+			return ansiRE.ReplaceAllString(line, "")
+		}
+	}
+	t.Fatalf("async 日志里没有诊断行：\n%s", ansiRE.ReplaceAllString(b.String(), ""))
+	return ""
+}
+
+// TestNewTicketAssignsShortID：async 此前只用 36 字符 ticketID，与 sync 的 6 位
+// 十六进制 reqID 风格不一致，排查时无法用同一套检索习惯对照两条路径。
+func TestNewTicketAssignsShortID(t *testing.T) {
+	p, _, _, _ := newTestPool(t)
+	id := p.newTicket(map[string]any{"model": "GLM-5.3"})
+	t.Cleanup(func() { p.releaseTicket(id) })
+
+	tk := p.getTicket(id)
+	if tk == nil {
+		t.Fatal("票务未建立")
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{6}$`).MatchString(tk.shortID) {
+		t.Fatalf("shortID 应为 6 位十六进制，实得 %q", tk.shortID)
+	}
+}
+
+// TestAsyncDiagLineOnMidStreamBreak：async 的中断必须与 sync 同口径落到诊断行上
+// ——哪个账号、哪条线路、usage 是否完整、是不是上游侧掐断。
+func TestAsyncDiagLineOnMidStreamBreak(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "diag-async")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, lines: []string{`data: {"id":"msg1"}`}, abort: true},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	buf := &diagBuf{}
+	web.SetOut(buf)
+	t.Cleanup(func() { web.SetOut(nil) })
+
+	tk := insertTicket(p, "ticket-diag", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-diag")
+	_ = drainEvents(tk)
+
+	line := buf.diagLine(t)
+	if !regexp.MustCompile(`\[#\] [0-9a-f]{6} `).MatchString(line) {
+		t.Fatalf("诊断行应带 6 位十六进制 reqID：%s", line)
+	}
+	for _, want := range []string{
+		"model=GLM-5.3",
+		"stream=true",
+		"ticket=ticket-diag", // 既有按 ticketID 的检索不受影响
+		"acc=diag-async",
+		"route=direct",
+		"attempts=1",
+		"complete=0",
+		"trunc_total=1",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("async 诊断行缺少 %q\n行=%s", want, line)
+		}
+	}
+	// 上游侧掐断记到 live 账号上（不是副本）。
+	if got := st.Find(model.ProviderZai, acc.ID); got.StreamTruncateCount != 1 {
+		t.Fatalf("StreamTruncateCount=%d，期望 1", got.StreamTruncateCount)
+	}
+	// 既有「流转发中断」Warn 行未受影响。
+	if !strings.Contains(ansiRE.ReplaceAllString(buf.String(), ""), "流转发中断") {
+		t.Fatalf("既有中断日志丢失：\n%s", ansiRE.ReplaceAllString(buf.String(), ""))
 	}
 }

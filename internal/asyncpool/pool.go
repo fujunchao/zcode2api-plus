@@ -48,6 +48,11 @@ type ticket struct {
 	queue     chan ticketEvent
 	createdAt time.Time
 	cancel    context.CancelFunc // 中止后台任务（释放票务时调用）
+
+	// shortID 6 位十六进制短标识，与 sync 路径的 reqID 同构。async 此前只用 36 字符
+	// ticketID，与 sync 的 6 hex 风格不一致，排查时无法用同一套检索习惯对照两条路径。
+	// 诊断行同时带 reqID=<shortID> 与 ticket=<ticketID>，两种检索方式都不破坏。
+	shortID string
 }
 
 // Pool Async 空闲池：票务存储 + 入口路由 + 后台处理。
@@ -210,6 +215,7 @@ func (p *Pool) newTicket(body map[string]any) string {
 		queue:     make(chan ticketEvent, 256),
 		createdAt: time.Now(),
 		cancel:    cancel,
+		shortID:   newShortID(),
 	}
 	p.mu.Lock()
 	p.tickets[ticketID] = tk
@@ -280,12 +286,20 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		return
 	}
 	body := tk.body
+	modelName, _ := body["model"].(string)
+	// 观测诊断行：每票一条，与 sync 路径同口径（复用 gateway.ReqDiag）。
+	// 账号/线路要等 Select 之后才可得，故数据集中在收尾期输出。
+	diag := gateway.NewReqDiag(tk.shortID, modelName, true, body, time.Now)
+	diag.Ticket = ticketID
+	defer func() {
+		diag.Finish(time.Now())
+		web.Diag(diag.ReqID, diag.Format())
+	}()
 	retries := 0
 	announcedReady := false
 	tried := map[string]bool{}
 
 	for {
-		modelName, _ := body["model"].(string)
 		acc := p.Store.Select(model.ProviderZai, tried, modelName)
 		if acc == nil || acc.Mode != "jwt" {
 			// 与 sync 路径同口径：选不出号要如实说明「为什么」——冷却/风控/停用
@@ -300,6 +314,9 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			return
 		}
 		tried[acc.ID] = true
+		diag.Attempts++
+		diag.AccName = acc.Name
+		diag.Route = p.Store.ProxyLabel(acc)
 
 		// 每个账号在副本上注入 zcode_system（NormalizeBody 的 system 注入不幂等）
 		actualBody := shallowCopyBody(body)
@@ -309,6 +326,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			p.emitError(ctx, ticketID, "请求体序列化失败", "build_error")
 			return
 		}
+		diag.BodyBytes = len(payload)
 
 		networkRetry := false
 		lastNetworkError := ""
@@ -341,7 +359,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				announcedReady = true
 			}
 
-			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, modelName, req, payload)
+			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, modelName, req, payload, diag)
 			if midStream {
 				// 已向客户端发出内容块，不能换号重发（会收到重复事件），终止本票
 				web.Warn(ticketID, fmt.Sprintf("流转发中断: %s", streamErr.Error()))
@@ -429,10 +447,11 @@ func (p *Pool) attemptUpstream(
 	modelName string,
 	req upstream.Request,
 	payload []byte,
+	diag *gateway.ReqDiag,
 ) (bool, error) {
 	rateAttempt, overloadAttempt := 0, 0
 	for {
-		midStream, err := p.attemptUpstreamOnce(ctx, ticketID, acc, modelName, req, payload)
+		midStream, err := p.attemptUpstreamOnce(ctx, ticketID, acc, modelName, req, payload, diag)
 		if err == nil || midStream {
 			return midStream, err
 		}
@@ -492,6 +511,7 @@ func (p *Pool) attemptUpstreamOnce(
 	modelName string,
 	req upstream.Request,
 	payload []byte,
+	diag *gateway.ReqDiag,
 ) (bool, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, strings.NewReader(string(payload)))
 	if err != nil {
@@ -501,11 +521,18 @@ func (p *Pool) attemptUpstreamOnce(
 		httpReq.Header.Set(k, v)
 	}
 
+	if diag != nil {
+		// 首字节延迟与耗时的基准点：紧贴出站调用（与 sync 路径同）。
+		diag.UpstreamStart = diag.Now()
+	}
 	resp, err := p.client().Do(httpReq)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
+	if diag != nil {
+		diag.Status = resp.StatusCode
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		// 限长：错误体要整段读进内存做分类，上游或代理异常时可能回一个任意大的
@@ -530,7 +557,7 @@ func (p *Pool) attemptUpstreamOnce(
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid, model.ErrorKindAuthFailed,
 				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
-			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个", acc.Name, resp.StatusCode))
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个%s", acc.Name, resp.StatusCode, gateway.ErrorDetail(bodyText)))
 			return false, errNetwork{bodyText}
 		}
 
@@ -538,7 +565,7 @@ func (p *Pool) attemptUpstreamOnce(
 		if resp.StatusCode == http.StatusPaymentRequired {
 			gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)), time.Now())
-			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個%s", acc.Name, orCurrent(modelName), gateway.ErrorDetail(bodyText)))
 			return false, errNetwork{bodyText}
 		}
 
@@ -546,7 +573,7 @@ func (p *Pool) attemptUpstreamOnce(
 		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
 			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindModelBusy,
 				"模型并发准入受限 HTTP 429 code=3010", time.Now())
-			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态", acc.Name))
+			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态%s", acc.Name, gateway.ErrorDetail(bodyText)))
 			return false, errNetwork{bodyText}
 		}
 
@@ -571,7 +598,7 @@ func (p *Pool) attemptUpstreamOnce(
 			if gateway.IsQuotaExhaustedCode(bodyText) {
 				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)), time.Now())
-				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個", acc.Name, orCurrent(modelName)))
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個%s", acc.Name, orCurrent(modelName), gateway.ErrorDetail(bodyText)))
 				return false, errNetwork{bodyText}
 			}
 			// 其余为瞬时限流：此处不标状态，交由 attemptUpstream 决定原地重试还是冷却
@@ -624,7 +651,7 @@ func (p *Pool) attemptUpstreamOnce(
 	}
 
 	// 200：转发 SSE；转发开始后中断按 chunk 计数区分两种出路
-	return p.forwardSSE(ctx, ticketID, resp, acc)
+	return p.forwardSSE(ctx, ticketID, resp, acc, diag)
 }
 
 // handleUpstreamJSON 处理「200 + JSON」的上游响应。分类口径与同步路径
@@ -648,7 +675,7 @@ func (p *Pool) handleUpstreamJSON(
 		// 每日额度耗尽：标该模型耗尽后换号（与 sync 同）。
 		gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
 			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)), time.Now())
-		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個", acc.Name, orCurrent(modelName)))
+		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個%s", acc.Name, orCurrent(modelName), gateway.ErrorDetail(text)))
 		return false, errNetwork{text}
 
 	case code == "3007":
@@ -741,7 +768,11 @@ const maxErrorBodyBytes = 64 << 10
 // 完整结束时投递 done 并返回 (false, nil)；转发开始后中断时返回
 // (true, err)，零 chunk 时返回 (false, err) 由调用方换号重试。
 // 中断时若上游已交出终值，用量仍由 accumulateFinalUsage 补记。
-func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Response, acc *model.Account) (bool, error) {
+//
+// diag 为观测诊断容器（可为 nil）：每读到一行就记一次「首字节/最大间隔/字节数」，
+// 与 sync 路径的 teeReader 同口径——async 走 bufio.Scanner，不是 teeReader，
+// 所以这两个指标必须在各自路径上单独采集。
+func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Response, acc *model.Account, diag *gateway.ReqDiag) (bool, error) {
 	usage := gateway.NewUsageCollector(true)
 	chunksSent := 0
 	scanner := bufio.NewScanner(resp.Body)
@@ -749,6 +780,10 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	for scanner.Scan() {
 		line := scanner.Text()
 		usage.FeedLine(line)
+		if diag != nil {
+			// scanner.Text() 去掉了换行符，补 1 让字节数与「上游实际发出的量」同量级。
+			diag.MarkRead(diag.Now(), len(line)+1)
+		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -763,12 +798,27 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		if !p.emit(ctx, ticketID, ticketEvent{Type: "chunk", Data: payload}) {
 			// 消费者提前断开（票务被释放）：上游若已交出终值，这笔用量仍要计入
 			p.accumulateFinalUsage(ticketID, acc, usage)
+			if diag != nil {
+				diag.Usage = usage.AsDict()
+				diag.UsageComplete = usage.UsageComplete()
+				diag.ErrText = fmt.Sprintf("consumer gone: %v", ctx.Err())
+			}
 			return false, ctx.Err()
 		}
 		chunksSent++
 	}
 	if err := scanner.Err(); err != nil {
 		p.accumulateFinalUsage(ticketID, acc, usage)
+		if diag != nil {
+			diag.Usage = usage.AsDict()
+			diag.UsageComplete = usage.UsageComplete()
+			diag.ErrText = err.Error()
+			// 只统计「上游侧掐断」：ctx 已结束说明是票务被释放/消费者断开，
+			// 那属于客户端侧，记进去会让「断流是否集中在某账号/线路」失真。
+			if ctx.Err() == nil {
+				diag.TruncTotal = gateway.RecordStreamTruncate(p.Store, acc.Provider, acc.ID)
+			}
+		}
 		if chunksSent > 0 {
 			return true, err
 		}
@@ -778,6 +828,10 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	// 统计落库失败不应触发换号重发
 	usage.Finish()
 	got := usage.AsDict()
+	if diag != nil {
+		diag.Usage = got
+		diag.UsageComplete = usage.UsageComplete()
+	}
 	if _, err := p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
 		live.AccumulateTokens(got)
 		// 与 engine.success 对齐：成功即认为限流窗口已过，清零连续计数。
@@ -816,6 +870,16 @@ func (p *Pool) accumulateFinalUsage(ticketID string, acc *model.Account, usage *
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
+
+// newShortID 生成 6 位十六进制短标识，与 gateway 的 reqID（randomHex(3)）同构。
+// 只用于日志检索，不参与任何身份判定，因此不需要密码学强度之外的特殊处理。
+func newShortID() string {
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "000000"
+	}
+	return fmt.Sprintf("%x", b)
+}
 
 func (p *Pool) client() *http.Client {
 	if p.Client != nil {
