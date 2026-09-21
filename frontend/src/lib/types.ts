@@ -118,6 +118,8 @@ export interface SettingsResponse {
   proxy_health_interval: number
   /* 風控冷卻階梯：逗號分隔的秒數。檔位數同時是升級點——連續命中超過檔位數則帳號失效 */
   risk_cooling_steps: string
+  /* 上游 503 冷卻階梯：逗號分隔的秒數。超過檔位數封頂於固定冷卻秒數，不升級為失效 */
+  upstream_503_cooling_steps: string
 }
 
 /* z.ai 側的單個探測目標（主站 / 備援站） */

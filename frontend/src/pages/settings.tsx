@@ -43,6 +43,10 @@ export function SettingsPage() {
   const [riskCoolingSteps, setRiskCoolingSteps] = useState('300,900,3600')
   const [savingRiskCooling, setSavingRiskCooling] = useState(false)
 
+  /* ── 上游 503 冷卻 ── */
+  const [upstream503Steps, setUpstream503Steps] = useState('30,60,120')
+  const [saving503Steps, setSaving503Steps] = useState(false)
+
   /* 載入完成後填入表單（僅在尚未編輯時同步） */
   useEffect(() => {
     if (!data) return
@@ -58,6 +62,7 @@ export function SettingsPage() {
     setProxyHealth(data.proxy_health_enabled)
     setProxyHealthInterval(String(data.proxy_health_interval ?? 30))
     setRiskCoolingSteps(data.risk_cooling_steps || '300,900,3600')
+    setUpstream503Steps(data.upstream_503_cooling_steps || '30,60,120')
   }, [data])
 
   async function save(e: FormEvent) {
@@ -174,6 +179,29 @@ export function SettingsPage() {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
       setSavingRiskCooling(false)
+    }
+  }
+
+  /* 上游 503 冷卻階梯：独立表单，只提交这一个字段。校验与風控階梯同一套严格规则。 */
+  async function saveUpstream503Steps(e: FormEvent) {
+    e.preventDefault()
+    const steps = upstream503Steps
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== '')
+    if (steps.length === 0 || steps.some((s) => !/^\d+$/.test(s) || parseInt(s, 10) < 1)) {
+      toast.error('階梯需為逗號分隔的正整數秒，如 30,60,120')
+      return
+    }
+    setSaving503Steps(true)
+    try {
+      await api('PUT', '/settings', { upstream_503_cooling_steps: steps.join(',') })
+      toast.success('已儲存')
+      void qc.invalidateQueries({ queryKey: ['settings'] })
+    } catch (err) {
+      toast.error('儲存失敗：' + errMsg(err))
+    } finally {
+      setSaving503Steps(false)
     }
   }
 
@@ -402,6 +430,42 @@ export function SettingsPage() {
             <div className="flex justify-end">
               <Button type="submit" disabled={savingRiskCooling}>
                 {savingRiskCooling ? <Loader2 className="animate-spin" /> : null}
+                儲存
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      {/* 上游 503 冷卻 */}
+      <Card>
+        <CardContent className="flex flex-col gap-5">
+          <div className="text-sm font-semibold">上游 503 冷卻</div>
+          <form className="flex flex-col gap-5" onSubmit={saveUpstream503Steps}>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-503-steps">冷卻階梯（秒，逗號分隔）</Label>
+              <div className="text-xs text-muted-foreground">
+                上游 503（服務不可用）是<strong>上游健康信號</strong>而非帳號問題。連續第 N 次收到
+                503 取第 N 檔冷卻該帳號；<strong>超過檔位數封頂</strong>於固定冷卻秒數（預設 300s），
+                不會像風控那樣升級為失效。帳號成功調用一次後計數歸零。
+              </div>
+              <Input
+                id="set-503-steps"
+                className="w-64"
+                placeholder="30,60,120"
+                value={upstream503Steps}
+                onChange={(e) => setUpstream503Steps(e.target.value)}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              預設 <span className="tabular-nums">30,60,120</span>：上游瞬時抖動秒級退避即可吸收，
+              避免一次抖動把整池帳號清空（2026-09-20 事故）；持續不可用的帳號逐級加重至封頂。
+              日誌與 503「無可用帳號」錯誤詳情均按此口徑展示各帳號冷卻成因與最早恢復時間。
+              單檔上限 7 天。
+            </p>
+            <div className="flex justify-end">
+              <Button type="submit" disabled={saving503Steps}>
+                {saving503Steps ? <Loader2 className="animate-spin" /> : null}
                 儲存
               </Button>
             </div>

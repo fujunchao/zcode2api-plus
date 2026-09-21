@@ -1,5 +1,5 @@
 /* 帳號池額度列：模型名＋套餐名＋進度條＋剩餘/總量（語義照搬舊版 quotaCell） */
-import { fmtCompact, fmtDate } from '@/lib/format'
+import { fmtCompact, fmtDate, normalizeModel } from '@/lib/format'
 import type { Account } from '@/lib/types'
 
 const COLOR_EMPTY = '#c9c9cf'
@@ -69,6 +69,9 @@ export function QuotaRows({ account }: { account: Account }) {
   }
   /* 多套餐帳號每列自帶 plan_name；單套餐帳號後端留空，整體回退到帳號層的方案名 */
   const hasPlanNames = keys.some((k) => !!quota[k]?.plan_name)
+  /* 已耗盡模型（後端按歸一化小寫維護）：該行標註「每日已用完」，區分「每日額度
+     用完、額度刷新後自動恢復」與「就是沒了」；不在列內展示的模型經 title 兜底 */
+  const exhausted = new Set((account.exhausted_models || []).map(normalizeModel))
 
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
@@ -82,14 +85,24 @@ export function QuotaRows({ account }: { account: Account }) {
         const reset = w.period_end ? ` · 重置 ${fmtDate(Number(w.period_end))}` : ''
         const model = w.model || k
         const planName = w.plan_name || (hasPlanNames ? '' : account.plan_name || '')
+        const modelExhausted = exhausted.has(normalizeModel(model))
+        const title = modelExhausted
+          ? `${k} · ${period}額度已用完（額度刷新後自動恢復）${reset}`
+          : `${k} · ${period}配額${reset}`
         return (
-          <div key={k} className="flex items-center gap-2 text-xs" title={`${k} · ${period}配額${reset}`}>
+          <div key={k} className="flex items-center gap-2 text-xs" title={title}>
             {/* 固定寬度而非 flex-1：進度條曾撐滿整個儲存格，把右側的呼叫／失敗／
                 Tokens／操作等欄位擠出視窗外。名稱為固定寬度是為了讓各行的條對齊，
                 寬度取 96px——再寬就會頂大整個表格、把最右的「操作」列擠出去。 */}
             <span className="flex w-24 shrink-0 flex-col leading-tight">
               <span className="truncate font-medium">{model}</span>
-              {planName ? <span className="truncate text-[11px] text-muted-foreground">{planName}</span> : null}
+              {modelExhausted ? (
+                <span className="truncate text-[11px]" style={{ color: COLOR_EMPTY }}>
+                  每日已用完
+                </span>
+              ) : planName ? (
+                <span className="truncate text-[11px] text-muted-foreground">{planName}</span>
+              ) : null}
             </span>
             <span className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-muted">
               <span className="block h-full rounded-full" style={{ width: `${pct}%`, background: color }} />
