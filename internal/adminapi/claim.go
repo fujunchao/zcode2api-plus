@@ -82,6 +82,18 @@ func claimCooldownActive(acc *model.Account, now time.Time) bool {
 	return next != nil && float64(now.Unix()) < *next
 }
 
+// claimBlockedByCooling 「刷新資格」与「領取」共用的风控/限流冷却闸门。
+//
+// 必须用 IsSelectable 而不是裸 Status：EffectiveStatus 把「冷却已到期」视为可用，
+// 只看原始 Status 会让同一账号在同一时刻 preview 可查、claim 被拒，用户看到自相
+// 矛盾的结果。两处共用这一个函数也是为了防止判据再次漂移。
+//
+// 注意语义：返回 true 只表示「被这条冷却闸门拦住」；invalid / disabled 等不满足
+// IsSelectable 但状态不是 cooling 的账号由此返回 false，交给各自原有的分支处理。
+func claimBlockedByCooling(acc *model.Account, now time.Time) bool {
+	return !acc.IsSelectable(now) && acc.Status == model.StatusCooling
+}
+
 // claimCooldownUntil 计算下次可领时间。优先用上游给的 ends_at——那是它自己算好的
 // 节奏，比在本地拍一个时长更准；没有时才按失败成因分档（对齐 zcode-switch）：
 // 验证码类与「已领过但上游没给时间」取长档，其余取短档。
@@ -367,7 +379,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 	_, _, previewSec := h.Store.ClaimCooldowns()
 	out := []map[string]any{}
 	for _, acc := range h.jwtAccounts(ids) {
-		if !acc.IsSelectable(now) && acc.Status == model.StatusCooling {
+		if claimBlockedByCooling(acc, now) {
 			out = append(out, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "plans": []any{},
 				"error":     "賬號冷卻中（風控/限流），已跳過上游查詢",
@@ -429,7 +441,10 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	candidates := h.jwtAccounts(ids)
 	outcomes := []map[string]any{}
 	for _, acc := range candidates {
-		if acc.Status == model.StatusCooling {
+		// 用 claimBlockedByCooling 判断（与 preview 同一函数）：EffectiveStatus 把
+		// 「冷却已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、
+		// claim 被拒，用户看到自相矛盾的结果。
+		if claimBlockedByCooling(acc, time.Now()) {
 			outcomes = append(outcomes, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "ok": false,
 				"message": "賬號冷卻中（風控/限流），已跳過領取",

@@ -44,6 +44,66 @@ func TestTransportForCache(t *testing.T) {
 	}
 }
 
+// TestTransportForTimeoutSeparatesCacheByTimeout 缓存键必须包含超时值。
+//
+// 网关用 120s、async 池用 180s，两者都走 TransportForTimeout。若缓存键只有代理
+// URL，先到的那次调用会把自己的 ResponseHeaderTimeout 固化进共享 Transport，
+// 另一个用途静默拿到错误的超时（SSE 被提前掐断，且极难归因）。
+// 本用例是缺口 0d370e5 的回归守卫：把 key 改回只含 URL，两条断言即红。
+func TestTransportForTimeoutSeparatesCacheByTimeout(t *testing.T) {
+	const gatewayTimeout, asyncTimeout = 120 * time.Second, 180 * time.Second
+
+	g, err := TransportForTimeout("http://127.0.0.1:7890", gatewayTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.ResponseHeaderTimeout != gatewayTimeout {
+		t.Fatalf("网关用途应拿到 %v，实际 %v", gatewayTimeout, g.ResponseHeaderTimeout)
+	}
+
+	a, err := TransportForTimeout("http://127.0.0.1:7890", asyncTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == g {
+		t.Fatal("同 URL 不同超时必须各自持有一份 Transport，否则超时语义互相覆盖")
+	}
+	if a.ResponseHeaderTimeout != asyncTimeout {
+		t.Fatalf("async 用途应拿到 %v，实际 %v", asyncTimeout, a.ResponseHeaderTimeout)
+	}
+
+	// 同 URL 同超时仍要命中缓存（缓存复用不能被这次改动破坏）
+	g2, err := TransportForTimeout("http://127.0.0.1:7890", gatewayTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g2 != g {
+		t.Fatal("同 URL 同超时应命中缓存返回同一 Transport")
+	}
+
+	// TransportFor 等价于「默认超时」那一档
+	d, err := TransportFor("http://127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != g {
+		t.Fatal("TransportFor 应等价于 TransportForTimeout(默认 120s)")
+	}
+
+	// 直连（空 URL）同样按超时区分
+	d180, err := TransportForTimeout("", asyncTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d120, err := TransportForTimeout("", gatewayTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d180 == d120 {
+		t.Fatal("直连的两种超时也不应共用 Transport")
+	}
+}
+
 // fakeSocks5 启动一个最小 socks5 服务器：支持无鉴权 CONNECT 并回成功，
 // 之后把后续字节转发给 behind（模拟真实目标）。
 func fakeSocks5(t *testing.T, behind *httptest.Server) string {

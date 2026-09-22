@@ -104,6 +104,9 @@ var (
 	AsyncEnabled       = envBool("ZCODE_ASYNC_ENABLED", true)
 	AsyncTicketTimeout = max(30, envInt("ZCODE_ASYNC_TICKET_TIMEOUT", 300))
 	AsyncMaxRetries    = max(0, envInt("ZCODE_ASYNC_MAX_RETRIES", 3))
+	// AsyncForceDirect 强制 async 池忽略账号代理、恒直连上游。
+	// 只是默认值：落库后以后台「系統設定」的开关为准（store.AsyncForceDirect）。
+	AsyncForceDirect = envBool("ZCODE_ASYNC_FORCE_DIRECT", false)
 )
 
 // ── 用量监控 ────────────────────────────────────────────────────────────────

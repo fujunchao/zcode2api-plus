@@ -265,8 +265,12 @@ func (e *Engine) tryAccount(
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(payload))
 		if err != nil {
-			e.mark(acc, model.StatusInvalid, model.ErrorKindAuthFailed, err.Error())
-			return attemptResult{switchAccount: true}
+			// 失败源于 req.URL（即 ZAI_UPSTREAM_URL 配置），与账号凭证无关。
+			// 标 invalid 会把整池账号逐个标失效并落库，且 last_error 指向错误方向；
+			// 配置错误换号也修不好，直接终止并如实报告。
+			web.Err(reqID, fmt.Sprintf("上游地址无效（检查 ZAI_UPSTREAM_URL）: %v", err))
+			return attemptResult{final: errResult(http.StatusBadGateway, "invalid_upstream_url",
+				"上游地址配置无效，请检查 ZAI_UPSTREAM_URL")}
 		}
 		for k, v := range req.Headers {
 			httpReq.Header.Set(k, v)
@@ -796,11 +800,18 @@ func (e *Engine) markUpstreamUnavailable(acc *model.Account, errMsg string) (int
 	return MarkUpstreamUnavailable(e.Store, acc.Provider, acc.ID, errMsg, e.now())
 }
 
-// success 记录成功调用的账号状态；并异步触发一次额度刷新
-// （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
-func (e *Engine) success(acc *model.Account) {
-	ts := float64(e.now().UnixNano()) / 1e9
-	_, _ = e.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+// MarkSuccess 记录一次成功调用：累计调用次数与最后使用时间、清零三个「连续失败」
+// 计数、并把 cooling/exhausted 复位为 active（有成功响应即证明账号当前可用）。
+//
+// 导出供 async 池复用：两条请求路径对同一账号必须记出相同的统计与状态，否则后台
+// 用量页会漏算 async 流量，冷却到期的账号也只能等下一轮额度轮询才恢复调度。
+//
+// ⚠️ 三个 Reset*Streak 是本仓库相对上游的实现（上游版本只记 UseCount/LastUsedAt
+// 与状态复位）。任何上游同步都不得把它们删掉：漏掉后「冷却到期 + 一次成功」不会
+// 把限流/风控/503 的连续计数归零，下一次失败会直接跳到高位冷却档。
+func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
+	ts := float64(now.UnixNano()) / 1e9
+	_, _ = st.Update(provider, id, func(live *model.Account) {
 		live.UseCount++
 		live.LastUsedAt = &ts
 		// 成功即认为限流窗口已过：清零连续计数，下一次再被限流从最短档重新起算。
@@ -814,6 +825,13 @@ func (e *Engine) success(acc *model.Account) {
 			live.Status = model.StatusActive
 		}
 	})
+}
+
+// success 记录成功调用的账号状态；并异步触发一次额度刷新
+// （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
+// 额度刷新仍只属于 engine：async 池不触发额度轮询。
+func (e *Engine) success(acc *model.Account) {
+	MarkSuccess(e.Store, acc.Provider, acc.ID, e.now())
 	e.fireRefresh(acc)
 }
 

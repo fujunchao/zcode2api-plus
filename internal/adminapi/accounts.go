@@ -308,15 +308,18 @@ func (h *Handler) handleEditAccount(w http.ResponseWriter, r *http.Request) {
 		edit.SetDisabled = true
 		edit.Disabled = models
 	}
-	if _, err := h.Store.EditAccount(acc.Provider, acc.ID, edit); err != nil {
-		writeError500(w, err)
-		return
-	}
+	// 先指派线路再套用其他字段：AssignProxyProfile 自带锁，不能放进 EditAccount
+	// 的闭包（会自锁），而它可能因 profile 已被并发删除而失败。放在前面，失败时
+	// 其余字段尚未落库，避免「回 500 但 name/secret 已生效」的半套用。
 	if hasProfile {
 		if _, err := h.Store.AssignProxyProfile(acc.ID, profileID); err != nil {
 			writeError500(w, err)
 			return
 		}
+	}
+	if _, err := h.Store.EditAccount(acc.Provider, acc.ID, edit); err != nil {
+		writeError500(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -402,9 +405,12 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var targets []*model.Account
+	// 与后台周期监控（quota.Monitor）同一套筛选：跳过已归档与已停用账号。
+	// store.SetArchived 的契约是「调度、领取、刷新全部跳过」，而刷新还会经
+	// handleBillingResponse 把归档账号的状态写回 active，与归档语义直接冲突。
 	if truthy(payload["all"]) {
 		for _, a := range h.Store.ListAccounts(model.ProviderZai) {
-			if a.Mode == "jwt" {
+			if a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
 				targets = append(targets, a)
 			}
 		}
@@ -418,7 +424,7 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, a := range h.Store.ListAccounts("") {
-			if ids[a.ID] && a.Mode == "jwt" {
+			if ids[a.ID] && a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
 				targets = append(targets, a)
 			}
 		}
@@ -431,6 +437,15 @@ func (h *Handler) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	acc := h.Store.FindAny(r.PathValue("account_id"))
 	if acc == nil {
 		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	// 归档账号不参与刷新（与周期监控、批量刷新一致）：刷新会经 handleBillingResponse
+	// 把它写回 active，与「归档即停止调用」的语义冲突。
+	if acc.ArchivedAt != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      false,
+			"message": "账号已归档，不参与额度刷新",
+		})
 		return
 	}
 	if acc.Mode != "jwt" {
@@ -511,6 +526,7 @@ func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"proxy_health_interval":      h.Store.ProxyHealthIntervalMinutes(),
 		"risk_cooling_steps":         h.Store.RiskCoolingStepsString(),
 		"upstream_503_cooling_steps": h.Store.Upstream503CoolingStepsString(),
+		"async_force_direct":         h.Store.AsyncForceDirect(),
 	})
 }
 
@@ -632,6 +648,19 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.Store.SetSetting("proxy_health_interval", strconv.Itoa(n)); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	// ── Async 出口强制直連 ── 排障用的控制開關：開啟後 async 池忽略帳號代理、
+	// 恆直連上游。用於保留「線路 vs 直連」的斷流歸因對照組（見 store.AsyncForceDirect）。
+	if v, ok := payload[store.AsyncForceDirectKey]; ok {
+		b, valid := pyBool(v)
+		if !valid {
+			writeAPIError(w, errBadRequest("Async 強制直連開關需為布爾值"))
+			return
+		}
+		if err := h.Store.SetSetting(store.AsyncForceDirectKey, boolText(b)); err != nil {
 			writeError500(w, err)
 			return
 		}

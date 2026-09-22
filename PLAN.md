@@ -214,10 +214,18 @@ meta(key TEXT PK, value TEXT)
   超时**——thinking 档拉满的长请求在 sync `/v1/messages` 上能跑满 8 分钟（无总超时），但在 async 上
   到点必被截断，客户端收到 `type: ticket_timeout` 的错误事件。凡是要跑长流的工作流走 async，
   必须先把这档调高，否则故障是**设计使然**而非上游故障。
-- ⚠️ **已知缺口：async 不套用账号出站线路**。Python 版 `make_async_client(account, …)` 收 account
-  参数（隐含按账号建带代理的 client），Go 版 `p.client()` 丢掉了该参数，于是 async 恒直连。
-  影响：① 诊断行 `route` 只能报 `direct`（见 §5.14）；② 若部署环境必须经线路才能连上 z.ai，
-  async 会整条不可用。**未修**（改动会影响已发布行为，且当前它正好充当归因实验的「直连臂」）。
+- ✅ **async 出站线路已对齐网关**（v2.4.0-go 修复）。历史成因**不是「移植时丢参数」**，而是上游
+  2026-09-15 的 `0d370e5 fix: route async requests through the account proxy` 我们没挑
+  ——该提交是 v2.0.9-go 的祖先，我们却没跟（血缘与逐笔对照见
+  `docs/upstream-async-audit-2026-09-22.md`）。修复形态：`p.client()` → `p.clientFor(acc)`，
+  走 `proxy.TransportForTimeout(raw, 180s)`；`TransportFor` 拆出 `TransportForTimeout`
+  且**缓存键纳入超时值**（网关 120s 与 async 180s 各持一份 Transport，否则先到者污染另一个用途）。
+  ⚠️ **不要用 `proxy.ClientFor`**：它设的是 `http.Client.Timeout`（整体超时），对 SSE 等于给流设上限。
+  同批另三处缺口一并回移：跳过 apiKey 账号（`e86c5bc`）、成功时记用量并复位状态（`5105b5d`）、
+  入口模型归一化（`6da8df6`，另含 M11 的 5 个伴生项）。
+- 归因对照改由**显式开关**提供：`async_force_direct`（后台「系統設定 → Async 強制直連」，
+  env 默认值 `ZCODE_ASYNC_FORCE_DIRECT`，默认关）。开启后 async 忽略账号代理恒直连，
+  诊断行 `route` 如实报 `direct`。这样「线路 vs 直连」两个方向都可复现，不再依赖实现缺陷。
 - 泄漏防护三件套照搬：SSE 退出 finally 释放 + 中止后台任务；孤儿 ticket 建票时清扫（生命周期 + 60s 宽限）。
 - 流中断：**已发出 chunk → 终止票务（upstream_stream_interrupted）不重试**；零 chunk → 换号重试（最多 3 次，指数退避 2^n）。
 
@@ -518,12 +526,14 @@ meta(key TEXT PK, value TEXT)
 **出口标签 `Store.ProxyLabel(acc)`**：`ProxyID` 命中线路 → 线路名；仅手工 `ProxyURL` → `proxy:` + 掩码；
 皆空 → `direct`；线路已删 → `proxy-id:<id>`。每次选号调用一次，不在逐 chunk 热路径。
 
-⚠️ **该标签只对 sync 路径成立**。`internal/asyncpool` 从不套用 `acc.ProxyURL`（`p.client()` 只设
-`ResponseHeaderTimeout`，`Transport.Proxy` 为 nil ⇒ 连环境代理都不生效），因此 async 的诊断行**硬编码
-`route=direct`**，不用 `ProxyLabel`——否则会打出本次并未使用的线路名。这条不是措辞问题：
-「sync 走线路 vs async 直连」是判定 300s 墙属于**出口线路**还是**上游模型侧**最便宜的一次对照实验，
-`route` 读反即结论反。守卫用例 `TestAsyncDiagRouteIgnoresAccountProxyLine`（账号绑了线路仍须报
-`direct`；将来给 async 补线路支持时它会红，那时须连同 §5.6 一起改）。
+**两条路径同口径**（v2.4.0-go 起）：async 的 `route` 取自 `Pool.clientFor(acc)` 的第二个返回值，
+与 sync 的 `ProxyLabel` 语义一致——账号绑线路则报线路名，无代理/代理无效回退/开关强制直连则报
+`direct`。标签由 `clientFor` 一手交出，保证读数与实际出口不可能不一致（不另起判据）。
+守卫用例 `TestAsyncDiagRouteReportsAccountProxyLine`（绑了线路必须报线路名）与
+`TestAsyncForceDirectIgnoresAccountProxyLine`（开关打开必须报 `direct` 且不出现线路名）。
+
+要复现「sync 走线路 vs async 直连」这个归因对照时，用后台「Async 強制直連」开关把 async 臂
+显式关掉即可（`async_force_direct`，见 §5.6）；两个方向都可复现，`route` 读数在两个方向上都如实。
 
 **`Account.StreamTruncateCount`（`json:"-"`）**：累计被上游中途掐断的次数。
 

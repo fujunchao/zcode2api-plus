@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/store"
@@ -112,5 +113,37 @@ func TestVerifyGatewayKey(t *testing.T) {
 	r.Header.Set("x-api-key", key)
 	if e := svc.VerifyGatewayKey(r); e != nil {
 		t.Fatalf("x-api-key 应通过: %+v", e)
+	}
+}
+
+// TestFailureTableSweepsExpiredEntries 失败计数表必须能回收过期条目。
+//
+// pruneLocked 只在同一 host 再次请求时触发，而这张表的键是来源地址：未鉴权的请求
+// 可以用大量不同地址（IPv6 /64 内逐请求换地址）把它撑到无界。超过阈值时应全表
+// 清理，把已过窗口的条目删掉，否则内存只增不减。
+// 本用例是缺口 6da8df6（M11 段）的回归守卫：去掉 sweepLocked 调用后剩余条目数
+// 会停在 4097，用例即红。
+func TestFailureTableSweepsExpiredEntries(t *testing.T) {
+	svc := New(openStore(t))
+
+	old := time.Now().Add(-2 * failureWindow) // 全部已过期
+	svc.mu.Lock()
+	for i := range failureSweepThreshold {
+		host := fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+		svc.failures[host] = []time.Time{old}
+	}
+	svc.mu.Unlock()
+
+	svc.recordFailure("192.0.2.1", time.Now())
+
+	svc.mu.Lock()
+	remaining := len(svc.failures)
+	svc.mu.Unlock()
+	// 过期条目应被清空，只剩本次写入的那一条
+	if remaining > 2 {
+		t.Fatalf("过期条目应被清理，实际剩 %d 条", remaining)
+	}
+	if remaining == 0 {
+		t.Fatal("本次写入的失败记录不应被一并清掉")
 	}
 }

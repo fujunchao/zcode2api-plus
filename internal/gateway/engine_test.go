@@ -151,6 +151,44 @@ func msgBody() map[string]any {
 	}
 }
 
+// TestInvalidUpstreamURLDoesNotMarkAccount 上游地址配置无效时不得归咎于账号。
+//
+// req.URL 来自 ZAI_UPSTREAM_URL，构造失败与账号凭证毫无关系。旧实现把这种失败
+// 当作账号错误标 invalid 并换号——于是整池账号会被逐个标失效并落库，last_error
+// 也指向错误方向（看着像所有账号同时坏了），而换号根本修不好配置错误。
+// 本用例是缺口 6da8df6（M11 段）的回归守卫：退回「标 invalid + 换号」即红。
+func TestInvalidUpstreamURLDoesNotMarkAccount(t *testing.T) {
+	f := newFixture(t)
+	acc, err := f.st.AddAccount(model.ProviderZai, "cfg-bad", "sk-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 端口为非法字面量 ⇒ http.NewRequest 解析 URL 失败。
+	// 主/备地址都要设坏：BuildRequest 可能改用 fallback，只坏一个会被绕过。
+	config.UpstreamZai = "http://[::1]:namedport/zai"
+	config.UpstreamZaiFallback = "http://[::1]:namedport/fallback"
+
+	status, body := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusBadGateway {
+		t.Fatalf("上游地址配置无效应 502，实际 %d %s", status, body)
+	}
+	if !strings.Contains(body, "invalid_upstream_url") {
+		t.Fatalf("错误类型应为 invalid_upstream_url: %s", body)
+	}
+	if !strings.Contains(body, "ZAI_UPSTREAM_URL") {
+		t.Fatalf("错误文案应指明是配置问题: %s", body)
+	}
+
+	// 账号状态不得被这轮失败改动
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status == model.StatusInvalid {
+		t.Fatalf("配置问题不该把账号标为失效: %s (last_error=%v)", got.Status, got.LastError)
+	}
+	if got.FailCount != 0 {
+		t.Fatalf("配置问题不该累计账号失败计数: %d", got.FailCount)
+	}
+}
+
 func jsonResp(status int, body string) responder {
 	return func(int, *http.Request) (int, http.Header, string) {
 		return status, http.Header{"Content-Type": []string{"application/json"}}, body

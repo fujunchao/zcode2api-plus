@@ -20,7 +20,11 @@ import (
 // 直连客户端的拨号参数（对齐 Python 默认语义：连接超时 30s）。
 const dialTimeout = 30 * time.Second
 
-// transportCache 按"归一化代理 URL + 用途"缓存 Transport，避免每请求重建
+// DefaultResponseHeaderTimeout 网关与额度查询等短请求的响应头超时。
+// async 池需要更宽松的上限，见 TransportForTimeout。
+const DefaultResponseHeaderTimeout = 120 * time.Second
+
+// transportCache 按"归一化代理 URL + 响应头超时"缓存 Transport，避免每请求重建
 // 连接池；nil 代理 URL（直连）同样缓存，命中热路径零开销。
 var (
 	transportMu   sync.Mutex
@@ -30,6 +34,17 @@ var (
 // TransportFor 返回指定代理 URL 的出站 Transport；raw 为空字符串表示直连。
 // 代理 URL 非法时返回错误（调用方应把错误落到账号 last_error 而非 panic）。
 func TransportFor(raw string) (*http.Transport, error) {
+	return TransportForTimeout(raw, DefaultResponseHeaderTimeout)
+}
+
+// TransportForTimeout 同 TransportFor，但可指定响应头超时。
+//
+// 缓存键包含超时值：不同用途（网关 120s、async 池 180s）各自持有一份
+// Transport，避免共用连接池时超时语义互相覆盖。
+//
+// ⚠️ 需要给"带超时的客户端"时应使用本函数而非 ClientFor：ClientFor 设的是
+// http.Client.Timeout（整体超时），对 SSE 长连接等于给流设了上限。
+func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
 	normalized, err := NormalizeProxyURL(raw)
 	if err != nil {
 		return nil, err
@@ -38,6 +53,7 @@ func TransportFor(raw string) (*http.Transport, error) {
 	if normalized != nil {
 		key = *normalized
 	}
+	key = fmt.Sprintf("%s\x00%d", key, responseHeaderTimeout)
 	transportMu.Lock()
 	defer transportMu.Unlock()
 	if t, ok := transportPrec[key]; ok {
@@ -46,7 +62,7 @@ func TransportFor(raw string) (*http.Transport, error) {
 	t := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 120 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 		MaxIdleConnsPerHost:   8,
 		IdleConnTimeout:       90 * time.Second,
 	}

@@ -3,11 +3,13 @@
 package asyncpool
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -1259,14 +1261,18 @@ func TestAsyncDiagLineOnMidStreamBreak(t *testing.T) {
 	}
 }
 
-// TestAsyncDiagRouteIgnoresAccountProxyLine 钉住 async 的出口语义：async 从不套用
-// acc.ProxyURL（p.client() 无代理），所以账号即便绑了线路，诊断行也必须报 direct。
+// TestAsyncDiagRouteReportsAccountProxyLine 钉住 async 的出口读数：async 现在与
+// 网关一样套用 acc.ProxyURL，账号绑了线路就必须报出那个线路名。
 //
-// 这条用例同时是归因实验的护栏：拿 sync（走线路）与 async（直连）对照，是判定
-// 300s 墙属于「出口线路」还是「上游模型侧」最便宜的一次实验；一旦 async 报出线路名，
-// 这个对照就会得出反向结论。将来若给 async 补上账号线路，本用例会红——那时必须连同
-// PLAN §5.6 的出口说明一起改，而不是把断言放宽。
-func TestAsyncDiagRouteIgnoresAccountProxyLine(t *testing.T) {
+// 反向历史：这条用例原先叫 TestAsyncDiagRouteIgnoresAccountProxyLine，断言恰好相反
+// （「async 恒直连，不得出现线路名」）。那是 async 漏挑上游 0d370e5 时期的护栏——
+// 当时 route=direct 是真的，但出口是硬直连而非策略选择，还顺带泄露部署 IP。
+// 代理路由修好后硬编码 direct 变成了误报，故本用例连同 PLAN §5.6 的出口说明一起反转。
+//
+// 归因仍然靠 route 读数：要对照「线路侧 vs 上游侧」时，用后台「Async 強制直連」
+// 开关把这一臂再显式关掉（见 TestAsyncForceDirectIgnoresAccountProxyLine），
+// 而不是靠实现缺陷。
+func TestAsyncDiagRouteReportsAccountProxyLine(t *testing.T) {
 	p, st, _, _ := newTestPool(t)
 	line, err := st.AddProxyProfile("line-归因", "http://1.1.1.1:8080", true)
 	if err != nil {
@@ -1295,10 +1301,346 @@ func TestAsyncDiagRouteIgnoresAccountProxyLine(t *testing.T) {
 	_ = drainEvents(tk)
 
 	got := buf.diagLine(t)
-	if !strings.Contains(got, "route=direct") {
-		t.Fatalf("async 出口恒为直连，诊断行应报 route=direct：%s", got)
+	if !strings.Contains(got, "route=line-归因") {
+		t.Fatalf("账号绑了线路，诊断行应报该线路名：%s", got)
 	}
-	if strings.Contains(got, "line-归因") {
-		t.Fatalf("诊断行出现了本次并未使用的线路名（会把归因读反）：%s", got)
+	if strings.Contains(got, "route=direct") {
+		t.Fatalf("async 已套用账号代理，仍报 direct 说明读数与实际出口不一致：%s", got)
+	}
+}
+
+// TestAsyncForceDirectIgnoresAccountProxyLine 打开「Async 強制直連」后必须回到
+// 硬直连，且诊断行如实报 direct。
+//
+// 这个开关的存在理由就是保留「线路 vs 直连」的归因控制臂：代理路由修好后，
+// 那根本来靠实现缺陷得到的对照组就没了，改由显式旋钮提供，两个方向都可复现。
+func TestAsyncForceDirectIgnoresAccountProxyLine(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	t.Cleanup(func() { _ = st.SetSetting(store.AsyncForceDirectKey, "false") })
+
+	line, err := st.AddProxyProfile("line-强制直连", "http://1.1.1.1:8080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	acc := addJWTAccount(t, st, "diag-force-direct")
+	if ok, err := st.AssignProxyProfile(acc.ID, line.ID); !ok || err != nil {
+		t.Fatalf("指派线路失败: ok=%v err=%v", ok, err)
+	}
+	if err := st.SetSetting(store.AsyncForceDirectKey, "true"); err != nil {
+		t.Fatalf("打开开关失败: %v", err)
+	}
+	// 前置：开关确实读到了（否则下面会因账号仍走线路而红，却看不出是开关没生效）。
+	if !st.AsyncForceDirect() {
+		t.Fatal("前置条件不成立：AsyncForceDirect 应为 true")
+	}
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, lines: []string{`data: {"id":"msg1"}`}, abort: true},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	buf := &diagBuf{}
+	web.SetOut(buf)
+	t.Cleanup(func() { web.SetOut(nil) })
+
+	tk := insertTicket(p, "ticket-force-direct", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-force-direct")
+	_ = drainEvents(tk)
+
+	got := buf.diagLine(t)
+	if !strings.Contains(got, "route=direct") {
+		t.Fatalf("强制直连开关打开时诊断行应报 route=direct：%s", got)
+	}
+	if strings.Contains(got, "line-强制直连") {
+		t.Fatalf("强制直连开关未生效，仍打出了线路名：%s", got)
+	}
+}
+
+// TestAccountProxyIsUsed 账号配置的 proxy_url 必须作用于 async 路径。
+//
+// README 与 PLAN §5.9 都承诺「该账号的网关请求、额度查询与套餐领取均走对应代理」。
+// async 池曾忽略 proxy_url 直接出站：配置代理的账号在这条路径上以服务器真实 IP 连
+// 上游，正是使用者配置代理要规避的（IP 绑定、地区限制、风控）。
+// 本用例是缺口 0d370e5 的回归守卫：去掉 clientFor 的代理查找后，下面的 connects
+// 会变成 0（上游被直连访问），用例即红。
+func TestAccountProxyIsUsed(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "proxied")
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+			`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+		}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	// 最小转发代理：记录被请求的目标，再把请求原样转发到真实上游。
+	// 用裸 TCP listener 而非 httptest，因为需要接管连接后按代理协议转发。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	var targets []string
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				// 明文 http 目标走绝对 URI（Proxy 字段的标准行为），
+				// https 目标才走 CONNECT；两种都记为该代理被使用。
+				target := req.Host
+				if target == "" {
+					target = req.URL.Host
+				}
+				mu.Lock()
+				targets = append(targets, target)
+				mu.Unlock()
+
+				outReq := req.Clone(context.Background())
+				outReq.RequestURI = ""
+				if outReq.URL.Host == "" {
+					outReq.URL.Host = target
+				}
+				// 刻意用零值 Transport：其 Proxy 为 nil ⇒ 不吃环境代理，
+				// 避免本机 HTTP_PROXY 把转发又绕一层。
+				resp, err := (&http.Transport{}).RoundTrip(outReq)
+				if err != nil {
+					return
+				}
+				defer resp.Body.Close()
+				_ = resp.Write(c)
+			}(conn)
+		}
+	}()
+
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		proxyURL := "http://" + ln.Addr().String()
+		a.ProxyURL = &proxyURL
+	})
+
+	tk := insertTicket(p, "ticket-proxy", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-proxy")
+	_ = drainEvents(tk)
+
+	mu.Lock()
+	gotTargets := len(targets)
+	mu.Unlock()
+	if gotTargets == 0 {
+		t.Fatalf("账号配置了代理，请求却未经代理出站（上游调用=%d）", up.callCount())
+	}
+	if up.callCount() == 0 {
+		t.Fatal("上游应收到请求")
+	}
+}
+
+// TestSkipsAPIKeyAccountsInMixedPool 混合池里轮到 apiKey 账号时应跳过，而不是终止整张票。
+//
+// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号；Select 是 round-robin，一次只回
+// 一个。曾经的写法是「非 jwt 就 emitError 并 return」，且 tried 标记在检查之后，
+// 于是轮询再次轮到同一 apiKey 账号时依旧失败——池里明明有可用 JWT 账号，请求却
+// 间歇性、与账号状态无关地失败。本用例是缺口 e86c5bc 的回归守卫。
+func TestSkipsAPIKeyAccountsInMixedPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+
+	// 交错添加，确保 Select 的轮询顺序里 apiKey 账号排在 JWT 之前
+	if _, err := st.AddAccount(model.ProviderZai, "key-1", "sk-plain-key"); err != nil {
+		t.Fatal(err)
+	}
+	addJWTAccount(t, st, "jwt-1")
+
+	// 每次请求都要一个成功规格（scriptedUpstream 用完后回退 502）
+	okSpec := upstreamSpec{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+		`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+	}}
+	up := &scriptedUpstream{specs: []upstreamSpec{okSpec, okSpec, okSpec, okSpec}}
+	config.UpstreamZai = up.start(t).URL
+
+	// 多跑几次：无论轮询从哪个账号开始，都必须落到 JWT 账号上
+	for i := range 4 {
+		id := fmt.Sprintf("ticket-mixed-%d", i)
+		tk := insertTicket(p, id, map[string]any{"model": "GLM-5.3", "messages": []any{}})
+		p.processTicket(context.Background(), id)
+
+		events := drainEvents(tk)
+		last := events[len(events)-1]
+		if last.Type != "done" {
+			t.Fatalf("第 %d 次：应跳过 apiKey 账号并成功交付，实际 %+v", i, events)
+		}
+	}
+	if up.callCount() == 0 {
+		t.Fatal("上游应收到请求")
+	}
+}
+
+// TestSuccessRecordsUsageAndRevivesStatus async 成功交付后必须与 engine.success
+// 记出相同的账号状态。
+//
+// 曾只累加 token：后台用量页漏算 async 流量，且冷却到期的账号即使这里已经成功
+// 返回，状态仍停在 cooling，只能等下一轮额度轮询（默认 60s）才恢复调度。
+// 本用例是缺口 5105b5d 的回归守卫：去掉 MarkSuccess 调用即在 use_count 上变红。
+func TestSuccessRecordsUsageAndRevivesStatus(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "revive")
+
+	// 制造「冷却已到期」的前置状态：这是最需要被成功路径复位的情形
+	pastCooling := float64(time.Now().Add(-time.Minute).UnixNano()) / 1e9
+	msg := "上游限流 HTTP 429"
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &pastCooling
+		a.LastError = &msg
+	})
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":7}}}`,
+			`data: {"type":"message_delta","usage":{"output_tokens":3}}`,
+		}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	insertTicket(p, "ticket-success", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-success")
+
+	got := st.Find(model.ProviderZai, acc.ID)
+	if got.UseCount != 1 {
+		t.Fatalf("成功交付应累计 use_count（与 engine 一致）: %d", got.UseCount)
+	}
+	if got.LastUsedAt == nil {
+		t.Fatal("成功交付应写入 last_used_at")
+	}
+	if got.Status != model.StatusActive {
+		t.Fatalf("成功后应复位为 active: %s", got.Status)
+	}
+	if got.TotalInputTokens != 7 || got.TotalOutputTokens != 3 {
+		t.Fatalf("token 统计不符: in=%d out=%d", got.TotalInputTokens, got.TotalOutputTokens)
+	}
+}
+
+// TestEntryNormalizesProviderPrefixedModel 入口必须与 /v1/messages 一样先归一化
+// 模型名再判白名单，且票内 model 名已归一。
+//
+// `anthropic/GLM-5.3` 这类 `provider/model` 写法在 /v1/messages 能过、在 async 却
+// 400 model_not_allowed，与「模型白名单与 /v1/messages 一致」的承诺矛盾；票内
+// model 名不归一还会让 Select 的模型分档与额度比对用错键。本用例是缺口 6da8df6
+// 的回归守卫：去掉入口 NormalizeBody 后首条断言即 400 变红。
+func TestEntryNormalizesProviderPrefixedModel(t *testing.T) {
+	p, st, _, solver := newTestPool(t)
+	addJWTAccount(t, st, "async-acc")
+	srv := newTestMux(t, p)
+	_ = st.SetSetting("gateway_key", "sk-test")
+	solver.err = errors.New("browser down") // 后台任务走 captcha_required 失败路径，避免触网
+
+	oldEnabled := config.AsyncEnabled
+	config.AsyncEnabled = true
+	t.Cleanup(func() { config.AsyncEnabled = oldEnabled })
+
+	buf := &diagBuf{}
+	web.SetOut(buf)
+	t.Cleanup(func() { web.SetOut(nil) })
+
+	// 带 provider 前缀：入口归一化后才在白名单内
+	body := `{"model":"anthropic/GLM-5.3","max_tokens":8,"messages":[]}`
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/async/v1/messages", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anthropic/GLM-5.3 应经归一化后 200，实际 %d", resp.StatusCode)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+
+	// 票内 model 名也必须是归一化后的形态（否则 Select/额度比对会用错键）
+	got := buf.diagLine(t)
+	if !strings.Contains(got, "model=GLM-5.3") {
+		t.Fatalf("票内 model 未归一化，诊断行应报 model=GLM-5.3：%s", got)
+	}
+	if strings.Contains(got, "anthropic/") {
+		t.Fatalf("诊断行仍带 provider 前缀，说明归一化没作用到票上：%s", got)
+	}
+
+	// 对照：不在白名单的模型仍应 400 —— 证明归一化没有放宽白名单
+	req2, _ := http.NewRequest(http.MethodPost, srv.URL+"/async/v1/messages",
+		strings.NewReader(`{"model":"bogus/GLM-9","messages":[]}`))
+	req2.Header.Set("Authorization", "Bearer sk-test")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("白名单外模型应 400，实际 %d", resp2.StatusCode)
+	}
+}
+
+// TestSuccessClearsFailureStreaks async 成功交付必须把三个「连续失败」计数清零，
+// 并把冷却已到期的账号复位为 active。
+//
+// 这三个 Reset* 是本仓库相对上游的实现（上游的 MarkSuccess 只记 UseCount/
+// LastUsedAt 与状态复位），所以按上游窄版回移时会静默丢掉。丢掉不会立刻报错，
+// 但下一次失败会直接跳到高位冷却档：已连续 3 次 503 的账号，冷却到期后成功打通
+// 一次本该回到 30s 档，却会继续按 60/120 递进。
+//
+// 此前没有任何用例盯住这一点——TestRateLimitRetrySucceedsInPlace 的账号起始
+// streak 就是 0，断言恒真。故补上本用例：把 MarkSuccess 里的三个 Reset* 或整个
+// MarkSuccess 调用删掉，本用例即红。
+func TestSuccessClearsFailureStreaks(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "streak-reset")
+
+	// 冷却已到期（过期时间在过去）⇒ 账号可被选中，成功即应恢复调度。
+	pastCooling := float64(time.Now().Add(-time.Minute).UnixNano()) / 1e9
+	msg := "上游服務不可用 HTTP 503"
+	st.Update(acc.Provider, acc.ID, func(a *model.Account) {
+		a.Status = model.StatusCooling
+		a.CoolingUntil = &pastCooling
+		a.LastError = &msg
+		a.RateLimitStreak = 2
+		a.RiskControlStreak = 1
+		a.Upstream503Streak = 3
+	})
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
+			`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+		}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-streak-reset", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-streak-reset")
+	events := drainEvents(tk)
+	if last := events[len(events)-1]; last.Type != "done" {
+		t.Fatalf("应成功交付，实际 %+v", events)
+	}
+
+	got := st.Find(model.ProviderZai, acc.ID)
+	if got.RateLimitStreak != 0 {
+		t.Fatalf("成功后限流连续计数应清零: %d", got.RateLimitStreak)
+	}
+	if got.RiskControlStreak != 0 {
+		t.Fatalf("成功后风控连续计数应清零: %d", got.RiskControlStreak)
+	}
+	if got.Upstream503Streak != 0 {
+		t.Fatalf("成功后 503 连续计数应清零: %d", got.Upstream503Streak)
+	}
+	if got.Status != model.StatusActive {
+		t.Fatalf("冷却已到期的账号成功后应复位为 active: %s", got.Status)
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
@@ -112,6 +113,13 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// 入口整形一次，与 /v1/messages 一致（去掉 provider/ 前缀、套用名称映射）。
+	// 缺了它，`anthropic/GLM-5.3` 这类写法在前者能过、在这里 400，
+	// 与「模型白名单与 /v1/messages 一致」的承诺不符；票内 model 名若不归一，
+	// Select 的模型分档与额度比对也会用错键。
+	// 传 false：system 注入不幂等，必须留在每账号副本上（见 processTicket）。
+	gateway.NormalizeBody(body, false)
 
 	// 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕
 	if !gateway.ModelAllowed(body["model"]) {
@@ -300,8 +308,16 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	tried := map[string]bool{}
 
 	for {
+		// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号：Select 是 round-robin，
+		// 轮到 apiKey 账号时必须跳过并继续找下一个，而不是直接终止整张票——否则池里
+		// 明明有可用 JWT 账号，请求却与账号状态无关地间歇性失败。
+		// 先记 tried 再判断：漏记会让下一次轮询又选中同一账号。
 		acc := p.Store.Select(model.ProviderZai, tried, modelName)
-		if acc == nil || acc.Mode != "jwt" {
+		for acc != nil && acc.Mode != "jwt" {
+			tried[acc.ID] = true
+			acc = p.Store.Select(model.ProviderZai, tried, modelName)
+		}
+		if acc == nil {
 			// 与 sync 路径同口径：选不出号要如实说明「为什么」——冷却/风控/停用
 			// 都会走到这里，别让静态文案把它误读成绑定/额度问题（2026-09-20 事故）。
 			stat := p.Store.PoolStats(model.ProviderZai, modelName)
@@ -316,12 +332,9 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		tried[acc.ID] = true
 		diag.Attempts++
 		diag.AccName = acc.Name
-		// async 的出口恒为直连：p.client() 只设 ResponseHeaderTimeout，**不套用
-		// acc.ProxyURL**，且 Transport.Proxy 为 nil ⇒ 连环境代理都不生效（见 client()）。
-		// 所以这里必须报实际出口，不能沿用 sync 的 Store.ProxyLabel(acc)：后者会打出
-		// 一条本次并未使用的线路名，而「线路侧 vs 上游侧」的归因正是靠 route 读数
-		// 判定的（sync 走线路 vs async 直连是本项目最便宜的一次对照实验），读反即结论反。
-		diag.Route = "direct"
+		// 出口线路标签由 clientFor 一手交出（只有它知道代理是否真的生效、是否被
+		// async_force_direct 强制置空），此处不另起判据——两套判据必然漂移，
+		// 而「线路侧 vs 上游侧」的归因正是靠 route 读数判定的，读反即结论反。
 
 		// 每个账号在副本上注入 zcode_system（NormalizeBody 的 system 注入不幂等）
 		actualBody := shallowCopyBody(body)
@@ -526,11 +539,16 @@ func (p *Pool) attemptUpstreamOnce(
 		httpReq.Header.Set(k, v)
 	}
 
+	client, route := p.clientFor(acc)
 	if diag != nil {
 		// 首字节延迟与耗时的基准点：紧贴出站调用（与 sync 路径同）。
 		diag.UpstreamStart = diag.Now()
+		// 如实报本次实际出口（direct / 线路名 / proxy:掩码URL），与 sync 的
+		// Store.ProxyLabel 同口径。route 由 clientFor 一并交出，保证读数与实际
+		// 出口不可能不一致。
+		diag.Route = route
 	}
-	resp, err := p.client().Do(httpReq)
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return false, err
 	}
@@ -839,15 +857,15 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	}
 	if _, err := p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
 		live.AccumulateTokens(got)
-		// 与 engine.success 对齐：成功即认为限流窗口已过，清零连续计数。
-		// 风控计数同理：冷却到期后能真正打通一次，说明这次拦截是偶发的。
-		// 503 计数同理：上游链路真正恢复了一次，下次抖动从最短档重新起算。
-		gateway.ResetRateLimitStreak(live)
-		gateway.ResetRiskControlStreak(live)
-		gateway.ResetUpstream503Streak(live)
 	}); err != nil {
 		web.Warn("async", "用量统计落库失败: "+err.Error())
 	}
+	// 除 token 外还要记调用次数/最后使用时间、清零连续失败计数并把状态复位——
+	// 与 engine.success 共用同一份（gateway.MarkSuccess）。否则后台用量页漏算
+	// async 流量，且冷却已到期的账号即使这里已成功也仍停在 cooling，要等下一轮
+	// 额度轮询（默认 60s）才回到调度。
+	// ⚠️ 必须是独立的第二次 Update：Store.Update 持锁内不可再调（自锁）。
+	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now())
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
 }
@@ -886,17 +904,46 @@ func newShortID() string {
 	return fmt.Sprintf("%x", b)
 }
 
-func (p *Pool) client() *http.Client {
+// asyncResponseHeaderTimeout 对齐 Python make_async_client(account, timeout=httpx.Timeout(180))：
+// 各阶段上限 180s；响应体流式读取（SSE）不能设总超时。
+const asyncResponseHeaderTimeout = 180 * time.Second
+
+// clientFor 返回账号的出站客户端，以及本次实际生效的出口线路标签（供 [#] 诊断行读数）。
+//
+// 与网关一致：账号配置了 proxy_url 时走对应代理。README 与 PLAN 都承诺「该账号的
+// 网关请求、额度查询与套餐领取均走对应代理」——async 曾漏掉这一条，配置代理的账号
+// 在这条路径上以服务器真实 IP 直连上游（泄露部署 IP、正是配置代理要规避的）。
+// 代理无效时回退直连并记日志，与 engine.clientFor / quota.clientFor 同语义。
+//
+// ⚠️ 只能用 proxy.TransportForTimeout（Transport 层 ResponseHeaderTimeout），
+// 不能用 proxy.ClientFor——后者设的是 http.Client.Timeout（整体超时），
+// 对 SSE 长连接等于给流设了上限。
+//
+// 第二个返回值：raw 为空、代理无效回退、或被开关强制直连时均为 "direct"。
+func (p *Pool) clientFor(acc *model.Account) (*http.Client, string) {
 	if p.Client != nil {
-		return p.Client
+		// 注入口（测试/调试）：出口由注入方决定，未知即如实报 direct。
+		return p.Client, "direct"
 	}
-	// 对齐 Python make_async_client(account, timeout=httpx.Timeout(180))：
-	// 各阶段上限 180s；响应体流式读取（SSE）不能设总超时
-	return &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 180 * time.Second,
-		},
+	// async_force_direct：排障用的控制开关，强制忽略账号代理直连。
+	// 用途是保留「线路 vs 直连」的归因对照组——修好代理路由后这根本可复现的控制臂
+	// 会消失，改由显式开关声明，而不是继续依赖实现缺陷。
+	raw := ""
+	if acc != nil && acc.ProxyURL != nil && !p.Store.AsyncForceDirect() {
+		raw = *acc.ProxyURL
 	}
+	t, err := proxy.TransportForTimeout(raw, asyncResponseHeaderTimeout)
+	if err != nil {
+		// 仅当账号配了非法代理才会失败；回退直连（TransportForTimeout 对空 URL
+		// 永不报错，故下面的 t 一定非 nil）。
+		web.Warn("async", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
+		t, _ = proxy.TransportForTimeout("", asyncResponseHeaderTimeout)
+		return &http.Client{Transport: t}, "direct"
+	}
+	if raw == "" {
+		return &http.Client{Transport: t}, "direct"
+	}
+	return &http.Client{Transport: t}, p.Store.ProxyLabel(acc)
 }
 
 // marshalJSON 与网关一致（Python json.dumps(ensure_ascii=False) 形态）：

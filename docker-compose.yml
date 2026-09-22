@@ -68,6 +68,11 @@ services:
       ZCODE_ASYNC_ENABLED: ${ZCODE_ASYNC_ENABLED:-true}
       # 已建票但一个 chunk 都没收到时的换号重试次数；已有 chunk 后中断一律不重试
       ZCODE_ASYNC_MAX_RETRIES: ${ZCODE_ASYNC_MAX_RETRIES:-3}
+      # 排障控制开关：强制 async 忽略账号代理、恒直连上游（默认关）。
+      # 用途是保留「线路侧 vs 上游侧」断流归因的直连对照臂——开启后配了代理的账号会以
+      # 服务器真实 IP 直连上游（IP 绑定/地区要求/避风控失效）。这里只是默认值，
+      # 落库后以后台「系統設定 → Async 強制直連」的开关为准。
+      ZCODE_ASYNC_FORCE_DIRECT: ${ZCODE_ASYNC_FORCE_DIRECT:-false}
     volumes:
       # 必须持久化：accounts.db + device_mid.txt + 补丁 Chromium 都在这里。
       # device_mid 每次重建都变会被上游当成新设备（风控）。

@@ -614,6 +614,24 @@ func (s *Store) Upstream503CoolingSteps() []int {
 	return []int{30, 60, 120}
 }
 
+// ── Async 出口設定 ──────────────────────────────────────────────────────────
+
+// AsyncForceDirectKey 强制 async 池直连开关的设定键。
+const AsyncForceDirectKey = "async_force_direct"
+
+// AsyncForceDirect 强制 async 池忽略账号代理、恒直连上游（环境变量只是默认值）。
+//
+// 复用的是「线路自动巡检」同一套约定：env 只是默认值，落库后以后台设置页为准，
+// async 池每次选号重新读取，改完即时生效。
+//
+// 为什么需要这个开关：修好 async 的代理路由后，这条路径不再恒为直连，于是
+// 「线路侧 vs 上游侧」断流归因里那根现成的直连控制臂就没了。与其靠实现缺陷当
+// 对照组，不如把它做成一个显式声明的旋钮——两个方向都能复现，且诊断行的
+// route 读数在两个方向上都如实。
+func (s *Store) AsyncForceDirect() bool {
+	return s.claimBool(AsyncForceDirectKey, config.AsyncForceDirect)
+}
+
 // ── 線路自動巡檢設定 ────────────────────────────────────────────────────────
 //
 // 与领取设置同一约定：环境变量（ZCODE_PROXY_HEALTH_*）只是**默认值**，落库后
