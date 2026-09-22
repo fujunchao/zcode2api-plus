@@ -548,6 +548,53 @@ meta(key TEXT PK, value TEXT)
 **业务码分支的 body 预览**：401/403、402、3010、529/1305、1005、3007 等分支的 `[~]` 行统一追加
 `gateway.ErrorDetail(body)`（空 body 不留孤立冒号）。此前只有通用分支带预览，业务码在日志里不可见。
 
+### 5.15 线路断流熔断、账号短回避与短流探测（Go 版增量，2026-09-22 新增）
+
+立项依据：2026-09-22 事故定论（`docs/analysis-flash-5min-stream-cut-20260921.md` 09-22 附录）——
+DSH 会话 3 连切全部落在 mihomo-zai-024 **同一账号同一线路**（诊断行 `trunc_total` 1→2→3 铁证），
+成因是「中途断流不标账号」+「额度优先黏住最富账号」；当天其余 9 条线路 10 次 >300s 长流全部
+成功，墙是单线路的 ~300s 连接时长上限。
+
+**线路级熔断**（`gateway.RecordUpstreamTruncate`，sync/async 两路唯一入口）：
+
+- 计数按**线路**（proxy profile ID）聚合，不按账号：多账号可共享一条线路，责任也在线路——
+  按账号聚既命不中真凶，又会把上游的墙变成对账号的惩罚（与 405/503 的教训同源）。
+  内存态（`store.BumpLineTruncate/ResetLineTruncate/LineTruncateStats`），重启归零无害。
+- **「连续」的复位点是完整成功交付**（`finishDelivery` 成功分支 / async `forwardSSE` 成功
+  路径调 `gateway.ResetLineTruncate`），**不能**放进 `MarkSuccess`——engine 的 success 在流
+  开始读取之前调用，「每次正常开头、~300s 被切」的链会刚复位又被计入，永远凑不满连击。
+- 达到在线设定 `line_truncate_strikes`（默认 3，0=关闭）→ `PurgeProxyProfiles` 移除线路并
+  改派绑定账号（与 proxy-health 同一套原子路径），日志 `[~] line-guard ...`；线路删除时
+  计数条目一并清理。
+- 账号级 `StreamTruncateCount` 语义不变：纯观测、只增不清、不驱动状态机（§5.14 契约保持）。
+
+**账号短回避**（仅选号层软过滤，在线设定 `line_truncate_avoid_seconds`，默认 60，0=关闭）：
+
+- 断流时写 `Account.TruncateAvoidUntil`（`json:"-"`，Unix 秒；Clone 复制；不进 34 键契约）。
+- `Select` 第 1 层后软过滤：被回避账号只在**池内还有别的可选账号**时被剔除；全部被回避则
+  不过滤——软过滤永远不能让 Select 选不出号。它不是冷却：不写 Status/CoolingUntil/
+  last_error、不进面板、到期自动失效、成功不延长。
+- 动机：客户端 TRANSPORT 重试 ~2s 后原样重放，额度优先会再次选中同一「最富」账号；回避让
+  下一次重试自然换线，比 N 连击熔断更早止血。
+
+**断流即额度刷新**：断流分支调 `fireRefresh(acc)`（async 池新增 `OnQuotaRefresh` 钩子，
+main 接线 `qs.FetchQuota`）——断流账号的额度读数停在旧值，会以「幽灵最富」持续黏住选号。
+副作用已知且可接受：刷新失败记 `last_error=quota_query_failed`；计费面 401/403 会正确判
+invalid（本就是期望行为）。
+
+**手动短流探测**（`POST /admin/api/proxies/{id}/stream-test`，后台线路页按钮）：
+
+- 借该线路绑定的启用 JWT 账号发一条最小流式请求（flash、max_tokens=16、effort=low、
+  zcode_system 注入齐全），总预算 30s，出站走 `proxy.TransportForTimeout(url, 20s)`。
+- 判定：不可达 / 预算内无数据行（疑似缓冲）/ **流被中途掐断** / 缺 message_stop /
+  完整通过（附首数据延迟与耗时）；**任何完整业务响应（401/429/3007 等）判连通性通过**——
+  它证明线路能完整承载请求+响应，验证码挑战不消耗求解。
+- ⚠️ 能力边界：探测预算 30s，**测不出 300s 量级的连接时长上限**——那由熔断用真实流量兜底。
+  探测是手动运维工具（每次都是真实上游请求），不进周期巡检；**只读**：不写账号状态、
+  不记断流计数、不入用量账。
+- async 路径断流记录修掉一个缺陷：此前 `diag==nil` 时整段漏记（诊断行只是展示，账号计数
+  与线路熔断必须照常发生）。
+
 ## 6. 里程碑
 
 ### M0 骨架 + 数据层
@@ -757,6 +804,27 @@ meta(key TEXT PK, value TEXT)
 - [x] 业务码分支补 `ErrorDetail`（sync + async 同口径）
 - [x] 守卫用例：既有三类行格式冻结、诊断行字段、首字节/间隔、累计语义、线路标签、Clone 齐全性
 - [ ] **验收**：下一次 flash 长流场景只用日志即可判定 300s 墙归属（判定矩阵见分析报告 §4.1）
+
+### M20 线路断流熔断、账号短回避与短流探测（2026-09-22，v2.5.0-go）
+- [x] store：线路级断流计数（Bump/Reset/Stats，内存态；线路删除时清理条目）+
+  在线设定访问器（`line_truncate_strikes` / `line_truncate_avoid_seconds`，env 只是默认值）。
+- [x] gateway 共享入口 `RecordUpstreamTruncate`：账号计数（语义不变）+ 回避写入 +
+  线路连击与熔断（PurgeProxyProfiles 原子移除+改派，`[~] line-guard` 日志）；
+  sync（finishDelivery）与 async（forwardSSE）两路统一走它，并修掉 async
+  `diag==nil` 漏记缺陷。契约见 §5.15。
+- [x] 成功复位在「完整成功交付」处（engine 成功分支 / async 成功路径），不进 MarkSuccess。
+- [x] `Select` 第 1 层后加断流短回避软过滤（全池被回避不过滤）；`TruncateAvoidUntil`
+  `json:"-"` + Clone 复制 + 守卫用例。
+- [x] 断流即额度刷新：engine `fireRefresh` + async 新增 `OnQuotaRefresh` 钩子（main 接线）。
+- [x] 可观测性：PublicView 加 `stream_truncate_count`；`GET /admin/api/proxies` 合并
+  `truncate_streak`/`truncate_total`；前端线路页显示断流徽标。
+- [x] 手动短流探测端点 + 线路页「流式探测」按钮（判定与能力边界见 §5.15）。
+- [x] 回归：`TestLineTruncateStrikesPurgeLineAndReassign`、`TestLineTruncateStrikesZeroDisables`、
+  `TestLineTruncateSuccessResetsStreak`、`TestTruncateAvoidsAccountInSelection`（用额度差构造
+  黏性，证明回避而非轮询在换号）、`TestTruncateFiresQuotaRefresh`、async 同名三例 +
+  `TestAsyncForwardSSENilDiagStillRecords`、store 计数与软过滤两例、adminapi 设定往返与
+  探测四分支、`TestCloneCopiesTruncateAvoidUntil`。
+- [ ] 在线观察：熔断误杀率（好线路被 3 次偶发断流移除的频率）；阈值 3 / 回避 60s 是否合适。
 
 ## 7. 测试策略
 

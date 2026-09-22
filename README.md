@@ -121,6 +121,8 @@ Restart=on-failure
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
 | `ZCODE_ASYNC_ENABLED` | — | 掛載 /async/v1/messages 空閒池 |
+| `ZCODE_LINE_TRUNCATE_STRIKES` | 3 | 同一線路連續 N 次上游側斷流即移除線路並改派綁定賬號（0=關閉；後台可在線改） |
+| `ZCODE_LINE_TRUNCATE_AVOID_SECONDS` | 60 | 斷流後該賬號選號回避秒數（僅選號層軟過濾，不是冷卻；0=關閉） |
 
 ## 賬號級出站代理
 
