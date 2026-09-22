@@ -58,6 +58,16 @@ services:
       # 上游风控（HTTP 405 + unusual activity）的递进冷却阶梯（秒，逗号分隔）。
       # 档位数即升级点：连续命中超过档位数则账号置为失效，需人工介入。
       ZCODE_RISK_COOLING_STEPS: ${ZCODE_RISK_COOLING_STEPS:-300,900,3600}
+      # ── Async 空闲池（POST /async/v1/messages）────────────────────────────
+      # 票务总超时（秒）。**这是整票的墙钟寿命，不是空闲超时**：自建票起算，到点即向
+      # 客户端投递 ticket_timeout 错误事件并中止后台任务。需要 5 分钟以上思考的请求
+      # 若不调高，必然被它截断——这一点与 sync /v1/messages 不同（后者没有总超时）。
+      # 下限 30，调大不设上限（孤儿票清扫会跟着放宽）。
+      ZCODE_ASYNC_TICKET_TIMEOUT: ${ZCODE_ASYNC_TICKET_TIMEOUT:-300}
+      # 是否挂载 /async/v1/messages
+      ZCODE_ASYNC_ENABLED: ${ZCODE_ASYNC_ENABLED:-true}
+      # 已建票但一个 chunk 都没收到时的换号重试次数；已有 chunk 后中断一律不重试
+      ZCODE_ASYNC_MAX_RETRIES: ${ZCODE_ASYNC_MAX_RETRIES:-3}
     volumes:
       # 必须持久化：accounts.db + device_mid.txt + 补丁 Chromium 都在这里。
       # device_mid 每次重建都变会被上游当成新设备（风控）。
