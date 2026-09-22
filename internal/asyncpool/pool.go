@@ -316,7 +316,12 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		tried[acc.ID] = true
 		diag.Attempts++
 		diag.AccName = acc.Name
-		diag.Route = p.Store.ProxyLabel(acc)
+		// async 的出口恒为直连：p.client() 只设 ResponseHeaderTimeout，**不套用
+		// acc.ProxyURL**，且 Transport.Proxy 为 nil ⇒ 连环境代理都不生效（见 client()）。
+		// 所以这里必须报实际出口，不能沿用 sync 的 Store.ProxyLabel(acc)：后者会打出
+		// 一条本次并未使用的线路名，而「线路侧 vs 上游侧」的归因正是靠 route 读数
+		// 判定的（sync 走线路 vs async 直连是本项目最便宜的一次对照实验），读反即结论反。
+		diag.Route = "direct"
 
 		// 每个账号在副本上注入 zcode_system（NormalizeBody 的 system 注入不幂等）
 		actualBody := shallowCopyBody(body)

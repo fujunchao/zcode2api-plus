@@ -208,7 +208,16 @@ meta(key TEXT PK, value TEXT)
 
 ### 5.6 async ticket 语义
 
-- SSE 事件：`ticket`(pending) → `ready` → `data:` chunk… → `done`/`error`；每 10s `: keepalive`；总超时 300s。
+- SSE 事件：`ticket`(pending) → `ready` → `data:` chunk… → `done`/`error`；每 10s `: keepalive`；
+  总超时**默认 300s，可用 `ZCODE_ASYNC_TICKET_TIMEOUT` 调（下限 30，无上限）**。
+- ⚠️ 该超时是**整票的墙钟寿命**（`deadline = tk.createdAt + Timeout`，见 `streamTicket`），**不是空闲
+  超时**——thinking 档拉满的长请求在 sync `/v1/messages` 上能跑满 8 分钟（无总超时），但在 async 上
+  到点必被截断，客户端收到 `type: ticket_timeout` 的错误事件。凡是要跑长流的工作流走 async，
+  必须先把这档调高，否则故障是**设计使然**而非上游故障。
+- ⚠️ **已知缺口：async 不套用账号出站线路**。Python 版 `make_async_client(account, …)` 收 account
+  参数（隐含按账号建带代理的 client），Go 版 `p.client()` 丢掉了该参数，于是 async 恒直连。
+  影响：① 诊断行 `route` 只能报 `direct`（见 §5.14）；② 若部署环境必须经线路才能连上 z.ai，
+  async 会整条不可用。**未修**（改动会影响已发布行为，且当前它正好充当归因实验的「直连臂」）。
 - 泄漏防护三件套照搬：SSE 退出 finally 释放 + 中止后台任务；孤儿 ticket 建票时清扫（生命周期 + 60s 宽限）。
 - 流中断：**已发出 chunk → 终止票务（upstream_stream_interrupted）不重试**；零 chunk → 换号重试（最多 3 次，指数退避 2^n）。
 
@@ -508,6 +517,13 @@ meta(key TEXT PK, value TEXT)
 
 **出口标签 `Store.ProxyLabel(acc)`**：`ProxyID` 命中线路 → 线路名；仅手工 `ProxyURL` → `proxy:` + 掩码；
 皆空 → `direct`；线路已删 → `proxy-id:<id>`。每次选号调用一次，不在逐 chunk 热路径。
+
+⚠️ **该标签只对 sync 路径成立**。`internal/asyncpool` 从不套用 `acc.ProxyURL`（`p.client()` 只设
+`ResponseHeaderTimeout`，`Transport.Proxy` 为 nil ⇒ 连环境代理都不生效），因此 async 的诊断行**硬编码
+`route=direct`**，不用 `ProxyLabel`——否则会打出本次并未使用的线路名。这条不是措辞问题：
+「sync 走线路 vs async 直连」是判定 300s 墙属于**出口线路**还是**上游模型侧**最便宜的一次对照实验，
+`route` 读反即结论反。守卫用例 `TestAsyncDiagRouteIgnoresAccountProxyLine`（账号绑了线路仍须报
+`direct`；将来给 async 补线路支持时它会红，那时须连同 §5.6 一起改）。
 
 **`Account.StreamTruncateCount`（`json:"-"`）**：累计被上游中途掐断的次数。
 

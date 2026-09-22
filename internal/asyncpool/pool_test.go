@@ -1258,3 +1258,47 @@ func TestAsyncDiagLineOnMidStreamBreak(t *testing.T) {
 		t.Fatalf("既有中断日志丢失：\n%s", ansiRE.ReplaceAllString(buf.String(), ""))
 	}
 }
+
+// TestAsyncDiagRouteIgnoresAccountProxyLine 钉住 async 的出口语义：async 从不套用
+// acc.ProxyURL（p.client() 无代理），所以账号即便绑了线路，诊断行也必须报 direct。
+//
+// 这条用例同时是归因实验的护栏：拿 sync（走线路）与 async（直连）对照，是判定
+// 300s 墙属于「出口线路」还是「上游模型侧」最便宜的一次实验；一旦 async 报出线路名，
+// 这个对照就会得出反向结论。将来若给 async 补上账号线路，本用例会红——那时必须连同
+// PLAN §5.6 的出口说明一起改，而不是把断言放宽。
+func TestAsyncDiagRouteIgnoresAccountProxyLine(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	line, err := st.AddProxyProfile("line-归因", "http://1.1.1.1:8080", true)
+	if err != nil {
+		t.Fatalf("建线路失败: %v", err)
+	}
+	acc := addJWTAccount(t, st, "diag-async-line")
+	if ok, err := st.AssignProxyProfile(acc.ID, line.ID); !ok || err != nil {
+		t.Fatalf("指派线路失败: ok=%v err=%v", ok, err)
+	}
+	// 前置：账号确实绑上了线路 —— 否则这条用例什么也没验证（能空过）。
+	if got := st.ProxyLabel(acc); got != "line-归因" {
+		t.Fatalf("前置条件不成立：账号应绑定 line-归因，ProxyLabel=%q", got)
+	}
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, lines: []string{`data: {"id":"msg1"}`}, abort: true},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	buf := &diagBuf{}
+	web.SetOut(buf)
+	t.Cleanup(func() { web.SetOut(nil) })
+
+	tk := insertTicket(p, "ticket-diag-route", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-diag-route")
+	_ = drainEvents(tk)
+
+	got := buf.diagLine(t)
+	if !strings.Contains(got, "route=direct") {
+		t.Fatalf("async 出口恒为直连，诊断行应报 route=direct：%s", got)
+	}
+	if strings.Contains(got, "line-归因") {
+		t.Fatalf("诊断行出现了本次并未使用的线路名（会把归因读反）：%s", got)
+	}
+}
