@@ -175,7 +175,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.3.2-go"
+	AppVersion = "2.3.3-go"
 )
 
 // ── 遥测设备伪装 ────────────────────────────────────────────────────────────
