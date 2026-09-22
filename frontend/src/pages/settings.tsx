@@ -47,6 +47,10 @@ export function SettingsPage() {
   const [upstream503Steps, setUpstream503Steps] = useState('30,60,120')
   const [saving503Steps, setSaving503Steps] = useState(false)
 
+  /* ── Async 強制直連（排障控制開關） ── */
+  const [asyncForceDirect, setAsyncForceDirect] = useState(false)
+  const [savingAsyncForceDirect, setSavingAsyncForceDirect] = useState(false)
+
   /* 載入完成後填入表單（僅在尚未編輯時同步） */
   useEffect(() => {
     if (!data) return
@@ -63,6 +67,7 @@ export function SettingsPage() {
     setProxyHealthInterval(String(data.proxy_health_interval ?? 30))
     setRiskCoolingSteps(data.risk_cooling_steps || '300,900,3600')
     setUpstream503Steps(data.upstream_503_cooling_steps || '30,60,120')
+    setAsyncForceDirect(data.async_force_direct === true)
   }, [data])
 
   async function save(e: FormEvent) {
@@ -202,6 +207,21 @@ export function SettingsPage() {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
       setSaving503Steps(false)
+    }
+  }
+
+  /* Async 強制直連：獨立表單，只提交這一個開關。 */
+  async function saveAsyncForceDirect(e: FormEvent) {
+    e.preventDefault()
+    setSavingAsyncForceDirect(true)
+    try {
+      await api('PUT', '/settings', { async_force_direct: asyncForceDirect })
+      toast.success('已儲存')
+      void qc.invalidateQueries({ queryKey: ['settings'] })
+    } catch (err) {
+      toast.error('儲存失敗：' + errMsg(err))
+    } finally {
+      setSavingAsyncForceDirect(false)
     }
   }
 
@@ -466,6 +486,41 @@ export function SettingsPage() {
             <div className="flex justify-end">
               <Button type="submit" disabled={saving503Steps}>
                 {saving503Steps ? <Loader2 className="animate-spin" /> : null}
+                儲存
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      {/* Async 強制直連 */}
+      <Card>
+        <CardContent className="flex flex-col gap-5">
+          <div className="text-sm font-semibold">Async 強制直連</div>
+          <form className="flex flex-col gap-5" onSubmit={saveAsyncForceDirect}>
+            <label className="flex cursor-pointer items-start gap-2 text-sm">
+              <Checkbox
+                checked={asyncForceDirect}
+                onCheckedChange={(v) => setAsyncForceDirect(v === true)}
+              />
+              <span>
+                忽略帳號代理，async 請求恆直連上游
+                <span className="block text-xs text-muted-foreground">
+                  僅在排障取證時開啟：關閉時 async 與網關一致，走該帳號綁定的線路；
+                  開啟後這條路徑會以<strong>伺服器真實 IP</strong> 直連上游——IP 綁定、
+                  地區要求、避開風控全部失效。改動即時生效。
+                </span>
+              </span>
+            </label>
+            <p className="text-xs text-muted-foreground">
+              這個開關的用途是保留「線路側 vs 上游側」斷流歸因的<strong>對照組</strong>：
+              拿網關（走線路）與 async（直連）對比，就能判斷固定時長牆屬於出口線路
+              還是上游模型側。診斷行的 <code>route=</code> 讀數會如實跟隨本開關
+              （直連時報 <code>direct</code>，否則報線路名）。
+            </p>
+            <div className="flex justify-end">
+              <Button type="submit" disabled={savingAsyncForceDirect}>
+                {savingAsyncForceDirect ? <Loader2 className="animate-spin" /> : null}
                 儲存
               </Button>
             </div>

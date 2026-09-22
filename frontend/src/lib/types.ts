@@ -120,6 +120,8 @@ export interface SettingsResponse {
   risk_cooling_steps: string
   /* 上游 503 冷卻階梯：逗號分隔的秒數。超過檔位數封頂於固定冷卻秒數，不升級為失效 */
   upstream_503_cooling_steps: string
+  /* Async 強制直連：排障開關，開啟後 async 池忽略帳號代理、恆直連上游 */
+  async_force_direct: boolean
 }
 
 /* z.ai 側的單個探測目標（主站 / 備援站） */
