@@ -1,5 +1,5 @@
-/* 代理設定頁：線路清單、目前出口測試、新增／編輯／刪除／測試線路 */
-import { Activity, Pencil, Plus, Trash2 } from 'lucide-react'
+/* 代理設定頁：線路清單、目前出口測試、新增／編輯／刪除／測試線路、短流探測 */
+import { Activity, Pencil, Plus, Radio, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -18,7 +18,13 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { api, errMsg } from '@/lib/api'
 import { proxyScheme } from '@/lib/format'
-import type { ProbeResult, ProxyProfile, TestAllResponse, UpstreamProbe } from '@/lib/types'
+import type {
+  ProbeResult,
+  ProxyProfile,
+  StreamProbeResult,
+  TestAllResponse,
+  UpstreamProbe,
+} from '@/lib/types'
 
 interface ProxiesResponse {
   profiles: ProxyProfile[]
@@ -88,6 +94,8 @@ export function ProxiesPage() {
   const [testingCurrent, setTestingCurrent] = useState(false)
   const [rowResults, setRowResults] = useState<Record<string, RowResult>>({})
   const [testingAll, setTestingAll] = useState(false)
+  /* 短流探測結果（與可達性探測分開展示：兩者回答的問題不同） */
+  const [streamResults, setStreamResults] = useState<Record<string, { state: 'testing' | 'ok' | 'error'; text: string }>>({})
 
   const [modalOpen, setModalOpen] = useState(false)
   const [editingId, setEditingId] = useState('')
@@ -165,6 +173,32 @@ export function ProxiesPage() {
     } catch (e) {
       setRowResults((m) => ({ ...m, [p.id]: { state: 'error', text: errMsg(e) } }))
       toast.error('代理測試失敗：' + errMsg(e))
+    }
+  }
+
+  /* 帶憑據的短流探測：借這條線路綁定的 JWT 帳號發一條最小流式請求，驗證
+     「響應頭能到、首個數據行多久到、流能否走到 message_stop」。與可達性探測
+     互補——「能連上、能協商、但流在中途被掐」只有這個看得到。單次 ≤30 秒。 */
+  async function streamTest(p: ProxyProfile) {
+    setStreamResults((m) => ({ ...m, [p.id]: { state: 'testing', text: '正在發起短流探測（≤30 秒）…' } }))
+    try {
+      const d = await api<StreamProbeResult>(
+        'POST',
+        '/proxies/' + encodeURIComponent(p.id) + '/stream-test',
+      )
+      const extra = [
+        d.first_data_ms != null ? `首數據 ${d.first_data_ms} ms` : '',
+        d.total_ms != null ? `總耗時 ${(d.total_ms / 1000).toFixed(1)} s` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ')
+      const text = d.verdict + (extra ? `（${extra}）` : '') + (d.error ? `：${d.error}` : '')
+      setStreamResults((m) => ({ ...m, [p.id]: { state: d.ok ? 'ok' : 'error', text } }))
+      if (d.ok) toast.success(`${p.name}：${d.verdict}`)
+      else toast.error(`${p.name}：${d.verdict}`)
+    } catch (e) {
+      setStreamResults((m) => ({ ...m, [p.id]: { state: 'error', text: errMsg(e) } }))
+      toast.error('短流探測失敗：' + errMsg(e))
     }
   }
 
@@ -336,7 +370,30 @@ export function ProxiesPage() {
                           {result.text}
                         </em>
                       )}
+                      {streamResults[p.id] && (
+                        <em
+                          className={
+                            'mt-0.5 block truncate text-xs not-italic ' +
+                            (streamResults[p.id].state === 'ok'
+                              ? 'text-emerald-600'
+                              : streamResults[p.id].state === 'error'
+                                ? 'text-destructive'
+                                : 'text-muted-foreground')
+                          }
+                          title={streamResults[p.id].text}
+                        >
+                          短流：{streamResults[p.id].text}
+                        </em>
+                      )}
                     </div>
+                    {(p.truncate_total ?? 0) > 0 && (
+                      <span
+                        title="線路斷流計數（連續／累計；記憶體態，重啟歸零）。連續達到熔斷閾值會自動移除線路並改派帳號。"
+                        className="flex items-center gap-1 rounded-full bg-red-100 px-2.5 py-1 text-xs font-medium text-red-700"
+                      >
+                        斷流 {p.truncate_streak ?? 0}/{p.truncate_total}
+                      </span>
+                    )}
                     <span className="rounded-md bg-muted px-2 py-1 text-xs font-medium">{proxyScheme(p.url)}</span>
                     <span
                       className={
@@ -348,8 +405,16 @@ export function ProxiesPage() {
                       {p.enabled ? '啟用' : '停用'}
                     </span>
                     <span className="flex gap-0.5">
-                      <Button variant="ghost" size="icon-sm" title="測試線路" onClick={() => void testProxy(p)}>
+                      <Button variant="ghost" size="icon-sm" title="測試線路（z.ai 可達性）" onClick={() => void testProxy(p)}>
                         <Activity />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        title="流式探測（借綁定帳號發真實短流，驗證能否完整承載，≤30 秒）"
+                        onClick={() => void streamTest(p)}
+                      >
+                        <Radio />
                       </Button>
                       <Button variant="ghost" size="icon-sm" title="編輯" onClick={() => openModal(p)}>
                         <Pencil />

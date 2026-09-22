@@ -51,6 +51,11 @@ export function SettingsPage() {
   const [asyncForceDirect, setAsyncForceDirect] = useState(false)
   const [savingAsyncForceDirect, setSavingAsyncForceDirect] = useState(false)
 
+  /* ── 線路斷流熔斷 ── */
+  const [lineStrikes, setLineStrikes] = useState('3')
+  const [lineAvoid, setLineAvoid] = useState('60')
+  const [savingLineTruncate, setSavingLineTruncate] = useState(false)
+
   /* 載入完成後填入表單（僅在尚未編輯時同步） */
   useEffect(() => {
     if (!data) return
@@ -68,6 +73,8 @@ export function SettingsPage() {
     setRiskCoolingSteps(data.risk_cooling_steps || '300,900,3600')
     setUpstream503Steps(data.upstream_503_cooling_steps || '30,60,120')
     setAsyncForceDirect(data.async_force_direct === true)
+    setLineStrikes(String(data.line_truncate_strikes ?? 3))
+    setLineAvoid(String(data.line_truncate_avoid_seconds ?? 60))
   }, [data])
 
   async function save(e: FormEvent) {
@@ -222,6 +229,34 @@ export function SettingsPage() {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
       setSavingAsyncForceDirect(false)
+    }
+  }
+
+  /* 線路斷流熔斷：閾值 + 回避時長一起提交。 */
+  async function saveLineTruncate(e: FormEvent) {
+    e.preventDefault()
+    const strikes = parseInt(lineStrikes, 10)
+    const avoid = parseInt(lineAvoid, 10)
+    if (isNaN(strikes) || strikes < 0 || strikes > 100) {
+      toast.error('熔斷閾值需為 0–100 的整數（0=關閉）')
+      return
+    }
+    if (isNaN(avoid) || avoid < 0 || avoid > 3600) {
+      toast.error('回避時長需為 0–3600 的整數秒（0=關閉）')
+      return
+    }
+    setSavingLineTruncate(true)
+    try {
+      await api('PUT', '/settings', {
+        line_truncate_strikes: strikes,
+        line_truncate_avoid_seconds: avoid,
+      })
+      toast.success('已儲存')
+      void qc.invalidateQueries({ queryKey: ['settings'] })
+    } catch (err) {
+      toast.error('儲存失敗：' + errMsg(err))
+    } finally {
+      setSavingLineTruncate(false)
     }
   }
 
@@ -521,6 +556,49 @@ export function SettingsPage() {
             <div className="flex justify-end">
               <Button type="submit" disabled={savingAsyncForceDirect}>
                 {savingAsyncForceDirect ? <Loader2 className="animate-spin" /> : null}
+                儲存
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+
+      {/* 線路斷流熔斷 */}
+      <Card>
+        <CardContent className="flex flex-col gap-5">
+          <div className="text-sm font-semibold">線路斷流熔斷</div>
+          <form className="flex flex-col gap-5" onSubmit={saveLineTruncate}>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-line-strikes">熔斷閾值（同線路連續斷流次數，0=關閉）</Label>
+              <Input
+                id="set-line-strikes"
+                className="w-32"
+                placeholder="3"
+                value={lineStrikes}
+                onChange={(e) => setLineStrikes(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="set-line-avoid">斷流後帳號回避時長（秒，0=關閉）</Label>
+              <Input
+                id="set-line-avoid"
+                className="w-32"
+                placeholder="60"
+                value={lineAvoid}
+                onChange={(e) => setLineAvoid(e.target.value)}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              某條線路帶固定連線時長上限時（如 ~300 秒牆），上游會在回應中途掐斷串流。
+              達到閾值即<strong>移除該線路並改派綁定帳號</strong>（與自動巡檢同一套機制）；
+              「連續」以完整成功交付為復位點。回避是更早的止血：斷流後短時間內選號
+              跳過該帳號（僅選號層軟過濾，不是冷卻、不標狀態），讓用戶端的立即重試
+              換到別的線路。診斷行的 <code>trunc_total=</code> 與線路頁的斷流計數
+              可對照觀察。改動即時生效。
+            </p>
+            <div className="flex justify-end">
+              <Button type="submit" disabled={savingLineTruncate}>
+                {savingLineTruncate ? <Loader2 className="animate-spin" /> : null}
                 儲存
               </Button>
             </div>

@@ -42,6 +42,8 @@ export interface Account {
   use_count: number
   fail_count: number
   total_tokens: TotalTokens
+  /** 累計被上游中途掐斷的次數（只增不清的觀測量）。 */
+  stream_truncate_count: number
   last_used_at: number | null
   last_checked_at: number | null
   cooling_until: number | null
@@ -86,6 +88,9 @@ export interface ProxyProfile {
   name: string
   url: string
   enabled: boolean
+  /** 線路級斷流計數（後端記憶體態，有斷流記錄時才有值）：連續 / 累計。 */
+  truncate_streak?: number
+  truncate_total?: number
 }
 
 export interface AccountsResponse {
@@ -122,6 +127,25 @@ export interface SettingsResponse {
   upstream_503_cooling_steps: string
   /* Async 強制直連：排障開關，開啟後 async 池忽略帳號代理、恆直連上游 */
   async_force_direct: boolean
+  /* 線路斷流熔斷：同一線路連續 N 次上游側斷流即移除線路並改派綁定帳號（0=關閉） */
+  line_truncate_strikes: number
+  /* 斷流後帳號選號回避時長（秒，僅選號層軟過濾，0=關閉） */
+  line_truncate_avoid_seconds: number
+}
+
+/* 帶憑據短流探測的結果（POST /admin/api/proxies/{id}/stream-test）。 */
+export interface StreamProbeResult {
+  profile: string
+  account: string
+  ok: boolean
+  verdict: string
+  error?: string
+  status?: number
+  first_data_ms?: number
+  total_ms?: number
+  data_lines?: number
+  preview?: string
+  budget_s?: number
 }
 
 /* z.ai 側的單個探測目標（主站 / 備援站） */
