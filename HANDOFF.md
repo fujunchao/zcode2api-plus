@@ -16,13 +16,13 @@
 | 里程碑 | M0-M4 全部完成並勾選：M0 骨架+數據層、M1 網關核心、M2 Admin API+SPA、M3 額度+async、M4 OpenAI 兼容層；**M5 代碼完成**（rod 池 + 12 組失敗注入單測，真機驗收待做） |
 | 提交鏈 | d01c740（M0-M2）→ ff97604（M3）→ b97acc2（M4）→ M5 提交（見 git log），全部 GPG 簽名 |
 | 測試 | `go build ./... && go vet ./... && go test ./...` 全綠（9 個含測試的包）；`-race` 本機不可用（無 gcc），M6 驗收時補 |
-| 行為契約 | 主倉庫 Python 版（`C:\Projects\zcode2api`，`app/`）為權威對照；唯 M4 為 Go 版增量，契約是 `PLAN.md` §5.7 |
+| 行為契約 | 主倉庫 Python 版（`app/`）為權威對照；唯 M4 為 Go 版增量，契約是 `PLAN.md` §5.7 |
 
 ## 2. 新會話上手步驟
 
 1. 讀 `PLAN.md` 全文（約 300 行）——範圍、§5.x 端點契約、里程碑勾選狀態都在那裡。
 2. 本文件 §4 紅線與 §6 踩坑記錄**必讀**。
-3. 驗證環境：`cd C:\Projects\zcode2api-go && go build ./... && go test ./...`。
+3. 驗證環境：在本倉庫根目錄執行 `go build ./... && go test ./...`。
 4. 從 `PLAN.md` 未勾選的第一項開工（當前是 M5）。
 5. 用戶母語溝通用**繁體中文**（CLAUDE.md 全局強制）；提交訊息用英文。
 
@@ -114,7 +114,7 @@
 ## 8. 驗證命令
 
 ```bash
-cd C:\Projects\zcode2api-go
+# 在本倉庫根目錄執行
 go build ./... && go vet ./... && go test ./...   # 全量驗證（當前全綠）
 go test ./internal/openai/ -v                     # M4 轉換層詳情
 HTTPS_PROXY=http://127.0.0.1:7890 git push origin master   # 推送

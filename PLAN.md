@@ -1,8 +1,7 @@
 # zcode2api Go 版重写计划
 
-> 本仓库 `C:\Projects\zcode2api-go` 即 Go 重写仓库（原 `go/` 子目录已上提到仓库根，
-> Python 版实验工作区内容已移除）。计划与行为契约参照主仓库
-> `C:\Projects\zcode2api` 的 Python 版（`app/` + `main.py`）与 `HANDOFF.md`。
+> 本仓库即 Go 重写仓库（原 `go/` 子目录已上提到仓库根，Python 版实验工作区内容已移除）。
+> 计划与行为契约参照 Python 版主仓库的 `app/` + `main.py` 与 `HANDOFF.md`。
 > 目标：用 Go 重写 Python 版的全部后端功能，
 > 做到**与 Python 版行为对齐、数据互通（共用同一个 `data/accounts.db`）、前端零改动**。
 > 本文档是唯一的计划与进度台账，每完成一项就勾选对应 `- [ ]`。

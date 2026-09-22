@@ -299,7 +299,7 @@ if err := http.ListenAndServe(addr, mux); err != nil {
 比对命令（`gh` 与远端仓库均为只读访问）：
 
 ```bash
-GH="C:/Users/fujun/.local/tools/gh/bin/gh.exe"
+GH="${GH:-gh}"   # gh CLI，需已在 PATH 中
 
 # 跨 fork 比较，取分叉点与领先/落后数
 "$GH" api "repos/gakiyukr/zcode2api-plus/compare/<上游HEAD>...fujunchao:<我们HEAD>" \
