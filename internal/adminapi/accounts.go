@@ -513,20 +513,22 @@ func (h *Handler) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	captchaSec, retrySec, previewSec := h.Store.ClaimCooldowns()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"admin_key":                  h.Store.AdminKey(),
-		"gateway_key":                h.Store.GatewayKey(),
-		"quota_refresh_interval":     h.Store.QuotaRefreshInterval(),
-		"claim_auto_enabled":         h.Store.ClaimAutoEnabled(),
-		"claim_schedule_enabled":     h.Store.ClaimScheduleEnabled(),
-		"claim_schedule_time":        h.Store.ClaimScheduleTime(),
-		"claim_captcha_cooldown":     captchaSec,
-		"claim_retry_cooldown":       retrySec,
-		"claim_preview_cooldown":     previewSec,
-		"proxy_health_enabled":       h.Store.ProxyHealthEnabled(),
-		"proxy_health_interval":      h.Store.ProxyHealthIntervalMinutes(),
-		"risk_cooling_steps":         h.Store.RiskCoolingStepsString(),
-		"upstream_503_cooling_steps": h.Store.Upstream503CoolingStepsString(),
-		"async_force_direct":         h.Store.AsyncForceDirect(),
+		"admin_key":                   h.Store.AdminKey(),
+		"gateway_key":                 h.Store.GatewayKey(),
+		"quota_refresh_interval":      h.Store.QuotaRefreshInterval(),
+		"claim_auto_enabled":          h.Store.ClaimAutoEnabled(),
+		"claim_schedule_enabled":      h.Store.ClaimScheduleEnabled(),
+		"claim_schedule_time":         h.Store.ClaimScheduleTime(),
+		"claim_captcha_cooldown":      captchaSec,
+		"claim_retry_cooldown":        retrySec,
+		"claim_preview_cooldown":      previewSec,
+		"proxy_health_enabled":        h.Store.ProxyHealthEnabled(),
+		"proxy_health_interval":       h.Store.ProxyHealthIntervalMinutes(),
+		"risk_cooling_steps":          h.Store.RiskCoolingStepsString(),
+		"upstream_503_cooling_steps":  h.Store.Upstream503CoolingStepsString(),
+		"async_force_direct":          h.Store.AsyncForceDirect(),
+		"line_truncate_strikes":       h.Store.LineTruncateStrikes(),
+		"line_truncate_avoid_seconds": h.Store.LineTruncateAvoidSeconds(),
 	})
 }
 
@@ -688,6 +690,31 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.Store.SetSetting(store.Upstream503CoolingStepsKey, raw); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	// ── 線路斷流熔斷與帳號短回避 ── 同一線路連續 N 次上游側斷流即移除該線路並
+	// 改派綁定帳號（0=關閉）；斷流後帳號在 N 秒內暫不被選號（僅選號層軟過濾，
+	// 0=關閉）。即時生效：計數與選號路徑每次都重新讀設置。
+	if v, ok := payload[store.LineTruncateStrikesKey]; ok {
+		n, valid := pyInt(v)
+		if !valid || n < 0 || n > 100 {
+			writeAPIError(w, errBadRequest("线路断流熔断阈值需为 0–100 的整数（0=关闭）"))
+			return
+		}
+		if err := h.Store.SetSetting(store.LineTruncateStrikesKey, strconv.Itoa(n)); err != nil {
+			writeError500(w, err)
+			return
+		}
+	}
+	if v, ok := payload[store.LineTruncateAvoidSecondsKey]; ok {
+		n, valid := pyInt(v)
+		if !valid || n < 0 || n > 3600 {
+			writeAPIError(w, errBadRequest("断流账号回避时长需为 0–3600 的整数秒（0=关闭）"))
+			return
+		}
+		if err := h.Store.SetSetting(store.LineTruncateAvoidSecondsKey, strconv.Itoa(n)); err != nil {
 			writeError500(w, err)
 			return
 		}

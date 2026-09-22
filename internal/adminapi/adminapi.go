@@ -61,6 +61,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/proxies/test-current", guard(h.handleTestCurrentProxy))
 	mux.HandleFunc("POST /admin/api/proxies/test-all", guard(h.handleTestAllProxies))
 	mux.HandleFunc("POST /admin/api/proxies/{profile_id}/test", guard(h.handleTestProxy))
+	mux.HandleFunc("POST /admin/api/proxies/{profile_id}/stream-test", guard(h.handleStreamTestProxy))
 	mux.HandleFunc("POST /admin/api/proxies/assign", guard(h.handleAssignProxy))
 	mux.HandleFunc("GET /admin/api/monitor", guard(h.handleMonitor))
 	mux.HandleFunc("GET /admin/api/usage", guard(h.handleUsage))

@@ -21,7 +21,20 @@ import (
 )
 
 func (h *Handler) handleListProxies(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"profiles": h.Store.ListProxyProfiles()})
+	// 在 handler 层合并内存态的线路断流计数：ProxyProfile 本体是持久化 blob，
+	// 连续/累计计数是运行态（重启归零），不落库。
+	stats := h.Store.LineTruncateStats()
+	profiles := h.Store.ListProxyProfiles()
+	out := make([]map[string]any, 0, len(profiles))
+	for _, p := range profiles {
+		entry := map[string]any{"id": p.ID, "name": p.Name, "url": p.URL, "enabled": p.Enabled}
+		if s, ok := stats[p.ID]; ok {
+			entry["truncate_streak"] = s.Streak
+			entry["truncate_total"] = s.Total
+		}
+		out = append(out, entry)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": out})
 }
 
 func (h *Handler) handleAddProxy(w http.ResponseWriter, r *http.Request) {
