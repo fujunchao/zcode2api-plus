@@ -56,6 +56,12 @@ type Store struct {
 	settings map[string]string
 	rotation map[string]int
 
+	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
+	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
+	//（从真实流量重新累计），线路被删除时清理。
+	lineTruncStrikes map[string]int
+	lineTruncTotals  map[string]int
+
 	// settingsSnapshot 是 settings 的不可变快照，供无锁读取。
 	//
 	// 读设置的路径包含每次 API 请求的鉴权（VerifyGatewayKey → GetSetting）。若与
@@ -77,10 +83,12 @@ func New() (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		db:       db,
-		accounts: map[string][]*model.Account{model.ProviderZai: {}},
-		settings: map[string]string{},
-		rotation: map[string]int{},
+		db:               db,
+		accounts:         map[string][]*model.Account{model.ProviderZai: {}},
+		settings:         map[string]string{},
+		rotation:         map[string]int{},
+		lineTruncStrikes: map[string]int{},
+		lineTruncTotals:  map[string]int{},
 	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
@@ -837,6 +845,7 @@ func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error
 	if err := s.saveProxyProfilesLocked(remaining); err != nil {
 		return false, reassign, err
 	}
+	s.clearLineTruncateLocked(profileID)
 
 	// 第一步：摘掉失效指派。必须先做，补位时看到的才是干净的占用情况。
 	affected := []*model.Account{}
@@ -916,6 +925,9 @@ func (s *Store) PurgeProxyProfiles(ids []string) ([]string, ProxyReassign, error
 	if err := s.saveProxyProfilesLocked(remaining); err != nil {
 		return nil, reassign, err
 	}
+	for _, id := range purged {
+		s.clearLineTruncateLocked(id)
+	}
 
 	// 第一步：摘掉全部失效指派。必须先做，占用计数看到的才是干净状态
 	//（这一步同时保证了改派绝不会落到同批待删的线路上）。
@@ -978,6 +990,72 @@ func (s *Store) PurgeProxyProfiles(ids []string) ([]string, ProxyReassign, error
 		reassign.Assigned[acc.ID] = newID
 	}
 	return purged, reassign, nil
+}
+
+// ── 线路断流熔断 ─────────────────────────────────────────────────────────────
+//
+// 2026-09-22 事故定论：某条线路带 ~300s 连接时长上限，断流不标账号 + 额度优先
+// 调度黏住「最富」账号，客户端 TRANSPORT 盲重试三次全部撞同一条线路
+//（docs/analysis-flash-5min-stream-cut-20260921.md 09-22 附录）。处置按**线路**
+// 聚合计数：多账号可共享一条线路，只有按线路聚才能命中真凶；且移除线路不会
+// 把上游的锅变成对账号的惩罚（与 405/503 两次事故的教训同源）。
+// 「连续」以**完整成功交付**为复位点（ResetLineTruncate），不能用 MarkSuccess
+// 复位——engine 的 success 在流开始读取之前调用，「每次正常开头、中途被切」
+// 的链会永远凑不满连击。
+
+// LineTruncateStrikesKey 触发线路熔断的连续断流次数的设定键（0=关闭）。
+const LineTruncateStrikesKey = "line_truncate_strikes"
+
+// LineTruncateAvoidSecondsKey 断流后账号选号回避时长（秒）的设定键（0=关闭）。
+const LineTruncateAvoidSecondsKey = "line_truncate_avoid_seconds"
+
+// LineTruncateStrikes 读取熔断阈值；缺失/非法回退环境变量默认值，0=关闭。
+func (s *Store) LineTruncateStrikes() int {
+	return s.claimInt(LineTruncateStrikesKey, config.LineTruncateStrikes, 0)
+}
+
+// LineTruncateAvoidSeconds 读取账号选号回避时长；缺失/非法回退默认值，0=关闭。
+func (s *Store) LineTruncateAvoidSeconds() int {
+	return s.claimInt(LineTruncateAvoidSecondsKey, config.LineTruncateAvoidSeconds, 0)
+}
+
+// LineTruncateStat 一条线路的断流计数快照（供后台展示）。
+type LineTruncateStat struct {
+	Streak int // 连续（完整成功交付后归零）
+	Total  int // 累计（只增不清，对齐账号级 StreamTruncateCount 语义）
+}
+
+// BumpLineTruncate 记一次某线路的上游侧断流，返回连续次数。
+func (s *Store) BumpLineTruncate(profileID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lineTruncStrikes[profileID]++
+	s.lineTruncTotals[profileID]++
+	return s.lineTruncStrikes[profileID]
+}
+
+// ResetLineTruncate 在某线路完整成功交付后清零其连续计数（累计保留）。
+func (s *Store) ResetLineTruncate(profileID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.lineTruncStrikes, profileID)
+}
+
+// LineTruncateStats 返回全部线路的断流计数快照（副本）。
+func (s *Store) LineTruncateStats() map[string]LineTruncateStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]LineTruncateStat, len(s.lineTruncTotals))
+	for id, total := range s.lineTruncTotals {
+		out[id] = LineTruncateStat{Streak: s.lineTruncStrikes[id], Total: total}
+	}
+	return out
+}
+
+// clearLineTruncateLocked 清理被删线路的计数条目；调用方必须持有 s.mu。
+func (s *Store) clearLineTruncateLocked(profileID string) {
+	delete(s.lineTruncStrikes, profileID)
+	delete(s.lineTruncTotals, profileID)
 }
 
 // AssignProxyProfile 把账号指派到代理线路；profileID 为空表示直连。
@@ -1522,6 +1600,24 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	for _, a := range s.accounts[provider] {
 		if a.IsSelectable(now) && !skipIDs[a.ID] {
 			base = append(base, a)
+		}
+	}
+	// 断流短回避（软过滤）：刚被上游掐断的账号在回避期内暂不被选号，让紧接着的
+	// 客户端 TRANSPORT 重试自然落到别的线路（2026-09-22 事故里三次重试全撞同一条
+	// 带 ~300s 上限的线路，就是缺这一层）。只在池内还有其它可选账号时剔除；全部
+	// 被回避则不过滤——软过滤永远不能让 Select 选不出号。它不是冷却：不写状态、
+	// 到期自动失效，见 Account.TruncateAvoidUntil。
+	if len(base) > 1 {
+		nowF := float64(now.UnixNano()) / 1e9
+		var kept []*model.Account
+		for _, a := range base {
+			if a.TruncateAvoidUntil > nowF {
+				continue
+			}
+			kept = append(kept, a)
+		}
+		if len(kept) > 0 {
+			base = kept
 		}
 	}
 	pool := base

@@ -627,14 +627,20 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 		diag.Usage = usage.AsDict()
 		diag.UsageComplete = usage.UsageComplete()
 		diag.ErrText = err.Error()
-		// 纯观测计数，且**只统计上游侧掐断**：这个出口同时承载「客户端写失败/断开」
-		// （客户端收到 finish_reason 就关流是常态），把那种也算进去会让计数失真。
-		// 判据沿用仓库既有的 isClientGone(ctx)——ctx 结束即客户端侧，不是上游掐断；
-		// 这也与日志里 `context canceled` 与 `unexpected EOF` 的区分口径一致。
-		// 计数不冷却、不换号、不改状态：响应头已经发给客户端，无法换号重试，且没有
-		// 证据表明责任在账号（把上游的时长墙记成账号故障＝集体惩罚）。
+		// 只统计「上游侧掐断」并驱动线路级止血：这个出口同时承载「客户端写失败/
+		// 断开」（客户端收到 finish_reason 就关流是常态），把那种也算进去会让计数
+		// 失真。判据沿用仓库既有的 isClientGone(ctx)——ctx 结束即客户端侧，不是
+		// 上游掐断；这也与日志里 `context canceled` 与 `unexpected EOF` 的区分口径
+		// 一致。
+		//
+		// RecordUpstreamTruncate 在账号级纯观测计数（不冷却、不换号、不改 Status，
+		// 把上游的墙记成账号故障＝集体惩罚）之外，另做两级**线路向**止血：账号短
+		// 回避（仅选号软过滤）与线路 N 连击熔断（移除线路+改派，见其注释）。
+		// fireRefresh 同步额度快照：断流的账号额度读数停在旧值，刷新后选号不再
+		// 被「幽灵最富」黏住；刷新失败仅记 last_error，不影响请求结果。
 		if !isClientGone(ctx) {
-			diag.TruncTotal = RecordStreamTruncate(e.Store, acc.Provider, acc.ID)
+			diag.TruncTotal = RecordUpstreamTruncate(e.Store, acc, e.now())
+			e.fireRefresh(acc)
 		}
 		if usage.UsageComplete() {
 			got := e.accumulateUsage(acc, usage)
@@ -648,6 +654,9 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 	got := e.accumulateUsage(acc, usage)
 	diag.Usage = got
 	diag.UsageComplete = usage.UsageComplete()
+	// 完整成功交付：清零该线路的「连续断流」计数（熔断以「无一次完整成功的连击」
+	// 为判据）。必须在这里而不是 MarkSuccess——后者在流开始读取前被调用。
+	ResetLineTruncate(e.Store, acc)
 	web.ReqOk(reqID, got.Output)
 	return attemptResult{final: runResult{Delivered: true}}
 }

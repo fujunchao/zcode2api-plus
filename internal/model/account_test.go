@@ -738,3 +738,27 @@ func TestStreamTruncateCountNotSerialized(t *testing.T) {
 		t.Fatalf("观测计数不应进入序列化键集: %s", raw)
 	}
 }
+
+// TruncateAvoidUntil 同为 json:"-" 运行期字段：Clone 必须复制（选号软过滤要在
+// store 内部对象上生效），序列化不得携带（34 键硬契约）。
+func TestCloneCopiesTruncateAvoidUntil(t *testing.T) {
+	a := Create(ProviderZai, "k", "sk-abc")
+	a.TruncateAvoidUntil = 1790055386.5
+
+	clone := a.Clone()
+	if clone.TruncateAvoidUntil != 1790055386.5 {
+		t.Fatalf("Clone 未复制 TruncateAvoidUntil: %v", clone.TruncateAvoidUntil)
+	}
+	clone.TruncateAvoidUntil = 1
+	if a.TruncateAvoidUntil != 1790055386.5 {
+		t.Fatal("Clone 应返回深拷贝：改副本不应影响原件")
+	}
+
+	raw, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "TruncateAvoid") || strings.Contains(string(raw), "truncate_avoid") {
+		t.Fatalf("回避截止时刻不应进入序列化键集: %s", raw)
+	}
+}

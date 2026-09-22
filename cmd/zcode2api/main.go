@@ -124,7 +124,11 @@ func serve() int {
 
 	// Async 空闲池：与 Python 版一致按设置条件挂载
 	if config.AsyncEnabled {
-		asyncpool.NewPool(st, authSvc, cm).Register(mux)
+		pool := asyncpool.NewPool(st, authSvc, cm)
+		// 断流后的额度刷新与 sync 网关同源（engine.OnQuotaRefresh 同款接线）：
+		// 刷新额度快照，避免「幽灵最富」账号被额度优先调度反复选中。
+		pool.OnQuotaRefresh = func(acc *model.Account) { _ = qs.FetchQuota(acc) }
+		pool.Register(mux)
 	}
 
 	// SPA 托管（/ → /admin、/assets 静态、/admin/{path...} 回落 index.html、/meta）

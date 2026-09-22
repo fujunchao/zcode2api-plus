@@ -14,6 +14,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
+	"zcode2api/internal/web"
 )
 
 const (
@@ -221,6 +222,61 @@ func RecordStreamTruncate(st *store.Store, provider, idOrName string) (total int
 		total = acc.StreamTruncateCount
 	})
 	return total
+}
+
+// RecordUpstreamTruncate 记一次「上游侧中途掐断流」并驱动两级止血，返回账号累计
+// 断流数（与 RecordStreamTruncate 同口径，供诊断行 trunc_total 使用）。
+//
+// 在账号级纯观测计数之外，补上 2026-09-22 事故复盘定论缺的两层（见
+// docs/analysis-flash-5min-stream-cut-20260921.md 09-22 附录）：
+//
+//  1. 账号短回避：写 TruncateAvoidUntil（仅选号层软过滤，不是冷却、不标状态），
+//     让客户端 ~2s 后的 TRANSPORT 重试自然落到别的账号/线路；
+//  2. 线路级熔断：账号绑定命名线路时按线路累计「连续」断流，达到在线阈值
+//     （默认 3，0=关闭）即移除该线路并改派绑定账号——复用 PurgeProxyProfiles
+//     原子路径，与 proxy-health 同一套。责任在线路而非账号：多账号可共享一条
+//     线路，按线路聚合计数才命得中真凶，且不把上游的锅变成对账号的惩罚。
+//
+// sync 与 async 两条请求路径都必须经由本入口，否则会出现「一边熔断、一边只计数」
+// 的分歧。裸 ProxyURL / 直连账号无处熔断，只做账号级计数与回避。
+func RecordUpstreamTruncate(st *store.Store, acc *model.Account, now time.Time) int {
+	total := RecordStreamTruncate(st, acc.Provider, acc.ID)
+	if avoid := st.LineTruncateAvoidSeconds(); avoid > 0 {
+		until := float64(now.Add(time.Duration(avoid)*time.Second).UnixNano()) / 1e9
+		_, _ = st.Update(acc.Provider, acc.ID, func(live *model.Account) {
+			live.TruncateAvoidUntil = until
+		})
+	}
+	if acc.ProxyID == nil || *acc.ProxyID == "" {
+		return total
+	}
+	lineID := *acc.ProxyID
+	// 先取标签再熔断：移除后 ProxyLabel 只能给出 proxy-id:<id>，日志里就丢了线路名。
+	label := st.ProxyLabel(acc)
+	streak := st.BumpLineTruncate(lineID)
+	if threshold := st.LineTruncateStrikes(); threshold > 0 && streak >= threshold {
+		if purged, reassign, err := st.PurgeProxyProfiles([]string{lineID}); err != nil {
+			web.Warn("line-guard", fmt.Sprintf("线路 %s 连续 %d 次上游断流，但移除失败: %v", label, streak, err))
+		} else if len(purged) > 0 {
+			web.Warn("line-guard", fmt.Sprintf("线路 %s 连续 %d 次上游断流，已移除；改派 %d 个账号、%d 个退直连",
+				label, streak, len(reassign.Assigned), len(reassign.Direct)))
+		}
+	}
+	return total
+}
+
+// ResetLineTruncate 在完整成功交付后清零账号所绑线路的「连续断流」计数。
+//
+// ⚠️ 必须在「交付完成」处调用（engine.finishDelivery 成功分支 / async forwardSSE
+// 成功路径），不能塞进 MarkSuccess：engine 的 success 在流开始读取之前调用，
+// 「每次正常开头、~300s 处被切」的链会刚复位又被计入，永远凑不满熔断连击。
+// acc 的 ProxyID 是选号时的快照；若线路在流期间被改派，清的是旧线路的计数——
+// 该线路已无此账号，多清一次只会让它晚一档熔断，无害。
+func ResetLineTruncate(st *store.Store, acc *model.Account) {
+	if acc == nil || acc.ProxyID == nil || *acc.ProxyID == "" {
+		return
+	}
+	st.ResetLineTruncate(*acc.ProxyID)
 }
 
 // ── 上游 503 冷却阶梯 ─────────────────────────────────────────────────────────

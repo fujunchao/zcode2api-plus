@@ -59,6 +59,7 @@ func stripANSI(s string) string { return ansiRE.ReplaceAllString(s, "") }
 
 type diagFixture struct {
 	srv *httptest.Server
+	ups *httptest.Server // mock 上游（其 URL 也充当测试里的「代理线路」地址）
 	st  *store.Store
 	eng *Engine
 	buf *syncBuffer
@@ -94,7 +95,7 @@ func newDiagFixture(t *testing.T, up http.Handler) *diagFixture {
 	web.SetOut(buf)
 	t.Cleanup(func() { web.SetOut(nil) })
 
-	return &diagFixture{srv: srv, st: st, eng: eng, buf: buf}
+	return &diagFixture{srv: srv, ups: ups, st: st, eng: eng, buf: buf}
 }
 
 func (f *diagFixture) post(t *testing.T, body map[string]any) (int, string) {

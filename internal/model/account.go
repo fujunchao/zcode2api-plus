@@ -160,6 +160,20 @@ type Account struct {
 	// 会被同一次请求提前清掉。另外它是纯观测量，故同样 json:"-"：不为它新增
 	// accounts.data 的键（34 键硬契约）。
 	StreamTruncateCount int `json:"-"`
+
+	// TruncateAvoidUntil 上游侧断流后的「选号回避」截止时刻（Unix 秒，含小数）。
+	//
+	// 2026-09-22 事故复盘（docs/analysis-flash-5min-stream-cut-20260921.md 09-22 附录）：
+	// 客户端 TRANSPORT 重试 ~2s 后原样重放，断流本身不改账号状态，而额度优先调度
+	// 会再次选中同一个「额度最富」的账号——三次重试全部撞在同一条带 ~300s 时长
+	// 上限的线路上。本字段让该账号在回避期内暂不被选号：池内还有别的账号可选时
+	// 跳过它（下一次重试自然换线），全部账号都被回避时不过滤（软过滤永远不能让
+	// Select 选不出号）。
+	//
+	// 它不是冷却：不写 Status、不写 CoolingUntil、不进 last_error、不显示在面板、
+	// 到期自动失效、成功不延长。写入点唯一（gateway.RecordUpstreamTruncate）。
+	// json:"-"：纯运行期状态，不新增 accounts.data 的键（34 键硬契约）。
+	TruncateAvoidUntil float64 `json:"-"`
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -321,6 +335,7 @@ func (a *Account) Clone() *Account {
 		RiskControlStreak:   a.RiskControlStreak,
 		Upstream503Streak:   a.Upstream503Streak,
 		StreamTruncateCount: a.StreamTruncateCount,
+		TruncateAvoidUntil:  a.TruncateAvoidUntil,
 	}
 }
 
@@ -699,6 +714,8 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		"use_count":         a.UseCount,
 		"fail_count":        a.FailCount,
 		"rate_limit_streak": a.RateLimitStreak,
+		// 累计被上游中途掐断的次数（只增不清的观测量）：回答「断流是否集中在某账号」。
+		"stream_truncate_count": a.StreamTruncateCount,
 		"total_tokens": map[string]int{
 			"input":          a.TotalInputTokens,
 			"output":         a.TotalOutputTokens,

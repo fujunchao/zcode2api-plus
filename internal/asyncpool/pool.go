@@ -70,6 +70,12 @@ type Pool struct {
 	// 分开配置：过载与账号无关，既不冷却也不换号。
 	OverloadRetryDelays []time.Duration
 
+	// OnQuotaRefresh 上游侧断流后的额度刷新钩子（main 接 qs.FetchQuota，与
+	// gateway.Engine.OnQuotaRefresh 同形）。断流账号的额度快照停在旧值，会以
+	// 「幽灵最富」持续黏住选号（2026-09-22 事故）；刷新让下一次选号回到真实读数。
+	// nil 时跳过（测试默认）。
+	OnQuotaRefresh func(*model.Account)
+
 	mu      sync.Mutex
 	tickets map[string]*ticket
 }
@@ -836,11 +842,17 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 			diag.Usage = usage.AsDict()
 			diag.UsageComplete = usage.UsageComplete()
 			diag.ErrText = err.Error()
-			// 只统计「上游侧掐断」：ctx 已结束说明是票务被释放/消费者断开，
-			// 那属于客户端侧，记进去会让「断流是否集中在某账号/线路」失真。
-			if ctx.Err() == nil {
-				diag.TruncTotal = gateway.RecordStreamTruncate(p.Store, acc.Provider, acc.ID)
+		}
+		// 只统计「上游侧掐断」并驱动线路级止血：ctx 已结束说明是票务被释放/消费者
+		// 断开，那属于客户端侧，记进去会让「断流是否集中在某账号/线路」失真。
+		// 记录与熔断不依赖诊断容器（修掉此前 diag==nil 时整段漏记的缺陷——
+		// 诊断行只是展示，账号计数与线路熔断必须照常发生）。
+		if ctx.Err() == nil {
+			total := gateway.RecordUpstreamTruncate(p.Store, acc, time.Now())
+			if diag != nil {
+				diag.TruncTotal = total
 			}
+			p.fireQuotaRefresh(acc)
 		}
 		if chunksSent > 0 {
 			return true, err
@@ -866,8 +878,23 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	// 额度轮询（默认 60s）才回到调度。
 	// ⚠️ 必须是独立的第二次 Update：Store.Update 持锁内不可再调（自锁）。
 	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now())
+	// 完整成功交付：清零该线路的「连续断流」计数（与 sync 的 finishDelivery
+	// 成功分支同口径；不能进 MarkSuccess，见 gateway.ResetLineTruncate 注释）。
+	gateway.ResetLineTruncate(p.Store, acc)
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
+}
+
+// fireQuotaRefresh 异步触发断流账号的额度刷新（与 engine.fireRefresh 同语义）：
+// JWT 账号才有额度接口；go 出去不阻塞收尾路径。
+func (p *Pool) fireQuotaRefresh(acc *model.Account) {
+	if p.OnQuotaRefresh == nil {
+		return
+	}
+	if acc.Provider != model.ProviderZai || acc.Mode != "jwt" {
+		return
+	}
+	go p.OnQuotaRefresh(acc)
 }
 
 // accumulateFinalUsage 在「上游已交出最终 usage」时补记这笔用量。
