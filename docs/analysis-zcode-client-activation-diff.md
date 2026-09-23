@@ -10,7 +10,12 @@
 
 1. **激活事件体本身完全一致** —— 16 个字段、端点（`/api/v1/event/report`）、两个事件名（`app_launch` / `app_daily_active`）逐项对得上，这部分没有问题。
 2. **真正的差异在「请求头」与「版本号」上**：客户端 events 请求带 **11 个伪装头**，我们只带 `Content-Type`；客户端 `app_version` 是 **3.14.3**，我们默认写死 **3.11.2**（落后 3 个中版本）。
-3. 因此「激活上报成功但 preview 恒空/领取失败」最可疑的两个原因，按可能性排序是：**① 版本号过期导致上游不再投放；② 上报请求头形态不像官方客户端（上游可交叉比对头与事件体）**。二者都不需要改事件体。
+3. **【已验证 2026-09-23】版本号就是失效原因**：只把 `ZcodeClientVersion` 由 3.11.2 升到 3.14.3（v2.5.2-go），
+   preview 随即恢复投放 ⇒ **上游确实按 `app_version` 判定活动套餐投放资格**。
+   推论：**事件上报头缺失（仅 `Content-Type`）不是本次失效的原因** —— 该差异降级为「伪装一致性改进」，
+   不再是阻塞项；`session_create`、entitlement 过滤同理。
+4. 因此版本号是**硬门槛**而非可选装饰：官方每次抬版本而我们不跟进，投放就可能再次失效。
+   需要一条跟进约定（见第四节第 1 条末尾）。
 
 ---
 
@@ -118,10 +123,14 @@ body: { event_id, client_timezone, client_language, element_name, event_region, 
 
 ## 四、可执行修复清单（按性价比排序）
 
-1. **升版本号到 3.14.3**（一行常量，影响 UA、`X-ZCode-App-Version`、preview query、事件体 `app_version` 四处）：
-   `config.ZcodeClientVersion` 默认值 `3.11.2` → `3.14.3`；同步 `ZCODE_CLIENT_OS_VERSION` 等伪装字段核对一次。
-   若上游按版本灰度投放，这一步可能直接解决问题。
-2. **给 `PostActivationEvent` 补齐客户端同款请求头**（当前只有 `Content-Type`）：
+1. ✅ **已完成并实网验证有效**（v2.5.2-go）：版本号升至 3.14.3。
+   一处常量覆盖 UA、`X-ZCode-App-Version`、preview query、事件体 `app_version`；护栏见
+   `internal/config/version_test.go`（静态扫描禁止生产代码出现版本字面量）与
+   `internal/claim/version_test.go`（哨兵值锁住四处上行点）。
+   **运维约定**：伪装版本号必须跟随本机实装客户端（`ZCode.exe` 的 FileVersion）；官方抬版本后要跟着 bump，
+   否则投放可能再次失效 —— 这是本项最有价值的日常维护动作。
+2. **给 `PostActivationEvent` 补齐客户端同款请求头**（当前只有 `Content-Type`）—— **优先级已下调**：
+   实测证明它不是投放的必要条件，按「伪装一致性 / 抗风控」改进项排期即可。
    至少补 `User-Agent`（`ZCode/<ver>`）、`HTTP-Referer`、`X-Title: Z Code@electron`、`X-ZCode-App-Version`、`X-Platform`、`X-Client-Language`、`X-Client-Timezone`、`X-Os-Category`、`X-Os-Version`、`X-Device-Mid`、`X-Release-Channel`。
    事件体里已有 language/timezone/os 字段，头上缺失会造成「头与体不可互证」，是明显的非官方特征。
 3. **事件上报带上账号 JWT**（`Authorization: Bearer <jwt>`）——客户端就是这么做的，我们注释里的「端点不校验登录态」只说明不强制，不代表带上无益。
@@ -133,7 +142,11 @@ body: { event_id, client_timezone, client_language, element_name, event_region, 
 
 ---
 
-## 五、验证建议
+## 五、验证结果与建议
+
+**结果（2026-09-23）**：按第四节第 1 条只升版本号后，同一账号 preview 恢复投放、claim 成功 ——
+第三节的两个假设中，**① 版本号过期被证实**，**② 上报头形态被排除为本次失效原因**。
+以下建议保留，供下次出现同类症状时按序排查。
 
 1. **同账号对照**：用一个真实登录 z.ai 的账号，分别由（a）官方客户端、（b）网关修改前后 发起 `event/report` 与 `billing/preview`，对比上游响应（尤其 preview 的 `data.plans` 是否非空）。
 2. **在网关加一次性 DEBUG 出口**：把 event/report 与 preview 的实际请求头/响应体打印到 `[#]` 诊断行（**必须脱敏**：去掉 JWT、device_mid、邮箱）。
