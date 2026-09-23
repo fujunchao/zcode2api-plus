@@ -261,14 +261,17 @@ func authHeaders(acc *model.Account) map[string]string {
 
 // ReportActivationEvents 上报激活事件（app_launch + app_daily_active），
 // 返回错误文案或空串；首个失败即中止（日活键上游按 device_mid+日期去重）。
-func ReportActivationEvents(acc *model.Account) string {
+// 事件与 billing 请求共用 Service.clientFor 的账号出站——真实客户端的
+// event/report 与 billing/preview 永远同 IP，这里是同一口径。
+func (s *Service) ReportActivationEvents(acc *model.Account) string {
 	userID := JWTUserID(acc.Secret())
 	if userID == "" {
 		return "JWT 無 user_id，跳過激活上報"
 	}
 	deviceMid := acc.DeviceMidOr(config.DeviceMid())
+	client := s.clientFor(acc)
 	for _, element := range ActivationElements {
-		if err := PostActivationEvent(userID, element, deviceMid); err != nil {
+		if err := PostActivationEvent(client, userID, element, deviceMid); err != nil {
 			return fmt.Sprintf("激活事件 %s 上報失敗: %v", element, err)
 		}
 	}
@@ -400,7 +403,7 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 	}
 	outcomes := []map[string]any{}
 
-	if err := ReportActivationEvents(acc); err != "" {
+	if err := s.ReportActivationEvents(acc); err != "" {
 		web.Warn("claim", fmt.Sprintf("账号 %s 激活上报失败: %s", acc.Name, err))
 	}
 

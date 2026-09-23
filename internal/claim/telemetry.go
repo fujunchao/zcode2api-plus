@@ -2,6 +2,12 @@
 // Python 版 app/telemetry.py）。活动套餐投放疑似以「官方客户端当日活跃」
 // 为资格信号，preview 前模拟 app_launch / app_daily_active 两个事件。
 // 端点不校验登录态，请求不带 Authorization。
+//
+// 出站口径与 billing 一致：事件经 Service.clientFor(acc) 走**账号绑定的代理
+// 线路**。真实桌面客户端的 event/report 与 billing/preview 永远来自同一个 IP；
+// 此前事件用独立的裸直连客户端，账号绑了线路时同一 device_mid 会从两个不同
+// IP 出现（2026-09-23 事故：激活事件全部成功、preview 恒返回空套餐，
+// docs/releases/v2.5.1-go.md）。
 package claim
 
 import (
@@ -12,7 +18,6 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
-	"time"
 
 	"zcode2api/internal/config"
 )
@@ -25,9 +30,6 @@ var ActivationElements = []string{"app_launch", "app_daily_active"}
 
 // activationScreen 桌面端常见分辨率；上游仅做形态校验，固定值即可。
 const activationScreen = "2560x1440"
-
-// eventClient 上报客户端（测试可注入；默认 10s 超时直连）。
-var eventClient = &http.Client{Timeout: 10 * time.Second}
 
 // DeviceOSCategory 把客户端平台标识（win32-x64 / darwin-arm64 / linux-x64）映射为
 // 事件体的 device_os_category。
@@ -81,8 +83,9 @@ func BuildActivationEventBody(element, userID, deviceMid string) map[string]any 
 }
 
 // PostActivationEvent 单条激活事件上报（无 Authorization）。
+// client 必须与 billing 请求同源（Service.clientFor），保证两者同 IP 出站。
 // HTTP >= 400 或业务码非 0 返回错误；调用方决定容错策略。
-func PostActivationEvent(userID, element, deviceMid string) error {
+func PostActivationEvent(client HTTPClient, userID, element, deviceMid string) error {
 	body, err := json.Marshal(BuildActivationEventBody(element, userID, deviceMid))
 	if err != nil {
 		return err
@@ -92,7 +95,7 @@ func PostActivationEvent(userID, element, deviceMid string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	res, err := eventClient.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return err
 	}

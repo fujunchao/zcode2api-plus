@@ -353,15 +353,67 @@ func TestActivationReportingTolerated(t *testing.T) {
 		_, _ = w.Write([]byte(`{"code":0}`))
 	})).URL
 
-	if err := ReportActivationEvents(acc); err != "" {
+	// 零值 Service + 无代理账号 = 直连出站（clientFor 的无线路分支）。
+	svc := &Service{}
+	if err := svc.ReportActivationEvents(acc); err != "" {
 		t.Fatalf("激活上报应成功: %s", err)
 	}
 
 	// 失败上报仅返回文案，不 panic；preview 不被阻断由 AutoClaimAllPlans 覆盖
 	t.Cleanup(func() { EventReportURL = oldURL })
 	EventReportURL = "http://127.0.0.1:1/nope"
-	if err := ReportActivationEvents(acc); err == "" {
+	if err := svc.ReportActivationEvents(acc); err == "" {
 		t.Fatal("不可达端点应返回错误文案")
+	}
+}
+
+// TestActivationEventsUseAccountEgress：激活事件必须与 billing 请求走**同一个
+// 出站客户端**（Service.clientFor）——真实客户端的 event/report 与
+// billing/preview 永远同 IP；此前事件用独立的裸直连客户端，账号绑线路时同一
+// device_mid 会从两个 IP 出现（2026-09-23 事故：激活成功、preview 恒空）。
+func TestActivationEventsUseAccountEgress(t *testing.T) {
+	acc := newTestAccount(t)
+	var eventBodies []string
+	up := &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+		// EventReportURL 的末段是 report；fakeBilling 按「/billing/末段」分发。
+		"/billing/report": func(call upstreamCall) (int, string) {
+			eventBodies = append(eventBodies, string(call.Body))
+			return 200, `{"code":0}`
+		},
+		"/billing/preview": func(upstreamCall) (int, string) {
+			return 200, `{"code":0,"data":{"plans":[{"plan_id":"p1","name":"体验","priority":5}]}}`
+		},
+		"/billing/claim": func(upstreamCall) (int, string) {
+			return 200, `{"code":0,"data":{"plan":{"plan_id":"p1","plan_name":"体验"}}}`
+		},
+	}}
+	svc := &Service{Captcha: newSolvedManager(t), Client: up}
+	outcomes := svc.AutoClaimAllPlans(acc)
+	if len(outcomes) != 1 || outcomes[0]["ok"] != true {
+		t.Fatalf("应成功领取 1 个套餐: %v", outcomes)
+	}
+
+	// 两个激活事件先于 preview 发生，且都经过注入的同一个客户端。
+	if len(eventBodies) != 2 {
+		t.Fatalf("应上报 2 个激活事件，实际 %d（requests=%v）", len(eventBodies), up.requests)
+	}
+	if !strings.Contains(eventBodies[0], "app_launch") || !strings.Contains(eventBodies[1], "app_daily_active") {
+		t.Fatalf("激活事件体缺失元素名: %v", eventBodies)
+	}
+	sawPreview := false
+	for i, call := range up.requests {
+		if strings.HasSuffix(call.Path, "/event/report") {
+			if sawPreview {
+				t.Fatalf("激活事件必须先于 preview 发出（第 %d 个请求才上报事件）", i)
+			}
+			continue
+		}
+		if strings.Contains(call.Path, "/billing/preview") {
+			sawPreview = true
+		}
+	}
+	if !sawPreview {
+		t.Fatal("未见 preview 请求经过注入客户端")
 	}
 }
 

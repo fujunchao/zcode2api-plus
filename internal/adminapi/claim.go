@@ -398,7 +398,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		markPreview(acc.ID, now)
-		activationError := claim.ReportActivationEvents(acc)
+		activationError := svc.ReportActivationEvents(acc)
 		activated := activationError == ""
 		entry := map[string]any{
 			"account_id": acc.ID, "account_name": acc.Name,
@@ -440,6 +440,9 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 
 	candidates := h.jwtAccounts(ids)
 	outcomes := []map[string]any{}
+	// 激活上报与 Claim 共用同一个 Service：两者的出站都经 clientFor(acc) 走账号
+	// 线路（此前事件是独立的裸直连客户端，同一 device_mid 两个出口 IP）。
+	svc := claim.NewService(h.Captcha)
 	for _, acc := range candidates {
 		// 用 claimBlockedByCooling 判断（与 preview 同一函数）：EffectiveStatus 把
 		// 「冷却已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、
@@ -456,7 +459,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 		// 时 preview 会直接返回空套餐（对照 zcode-switch：claim_refresh 必先上报）。
 		// 放在闸门之外——它不改账号状态、无需串行；失败也不阻断，上游按
 		// device_mid + 日期去重，同一账号重复上报无害。
-		if activationError := claim.ReportActivationEvents(acc); activationError != "" {
+		if activationError := svc.ReportActivationEvents(acc); activationError != "" {
 			web.Warn("claim", fmt.Sprintf("账号 %s 激活上报失败: %s", acc.Name, activationError))
 		}
 		if !claimSlot.acquire() {
@@ -466,7 +469,6 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
-		svc := claim.NewService(h.Captcha)
 		result, err := func() (map[string]any, error) {
 			defer claimSlot.release() // 领取本身串行，之后的额度刷新不必占着闸门
 			return svc.Claim(acc, planID)

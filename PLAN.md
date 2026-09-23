@@ -313,8 +313,11 @@ meta(key TEXT PK, value TEXT)
 - 业务码映射：1001 套餐不存在 / 1002 活动结束 / 1003 已领取过 / 1004 不符合条件 /
   1005 今日名额用完 / 3001 参数错误 / 3007 验证码失败（换码重试一次）/ 401 未登录。
 - 激活上报：preview 前对 `https://zcode.z.ai/api/v1/event/report` 发 `app_launch` +
-  `app_daily_active` 两事件（16 字段体，无 Authorization；疑似活动投放资格信号；
-  失败仅记日志不阻断）。device_mid 取**账号自己的指纹**（见 §5.10）。
+  `app_daily_active` 两事件（16 字段体，无 Authorization；疑似活动投放资格信号；失败仅记日志
+  不阻断）。device_mid 取**账号自己的指纹**（见 §5.10）。**出站走账号线路**（`Service.clientFor`，
+  与 billing 同一出口，v2.5.1 起）：真实客户端的 event/report 与 billing/preview 永远同 IP，
+  事件若用独立直连客户端，绑线路账号的同一 device_mid 会从两个 IP 出现（2026-09-23 事故：
+  激活全部"成功"、preview 恒返回空套餐）。
 - 触发点：入池后（批量添加 / OAuth 完成 / CLI login）后台自动全量领取 +
   Admin API `GET /claim/preview`、`POST /claim`（account_ids 可选，冷却账号跳过）+
   前端账单页按钮（工具栏全量 + JWT 账号行内单账号）。
@@ -825,6 +828,22 @@ invalid（本就是期望行为）。
   `TestAsyncForwardSSENilDiagStillRecords`、store 计数与软过滤两例、adminapi 设定往返与
   探测四分支、`TestCloneCopiesTruncateAvoidUntil`。
 - [ ] 在线观察：熔断误杀率（好线路被 3 次偶发断流移除的频率）；阈值 3 / 回避 60s 是否合适。
+
+### M21 激活上报出口对齐账号线路（2026-09-23，v2.5.1-go）
+- [x] 立项依据：服务端（v2.5.0-go，17.5h 日志）新账号自动领取全部失败于「preview 返回
+  code=0 + 空 plans」（69 次，含手动强制领取），激活事件却全部成功；本地真实 ZCode 客户端
+  可正常领取。定位：`telemetry.eventClient` 是裸直连客户端（只认容器级 `HTTP_PROXY` 环境变量），
+  不走账号绑定线路——同一 `device_mid` 的 `event/report` 与 `billing/preview` 来自两个不同 IP，
+  真实客户端两者永远同 IP。
+- [x] 修复：删除包级 `eventClient`；`PostActivationEvent` 首参收 `HTTPClient`；
+  `ReportActivationEvents` 改为 `*Service` 方法并经 `s.clientFor(acc)` 出站（有线路走线路、
+  无效回退直连、无线路直连——与 billing 完全同一出口决策）。调用点三处对齐：
+  `AutoClaimAllPlans`、adminapi `handleClaimPreview`、`handleClaim`（svc 提到循环外共用）。
+- [x] 回归：`TestActivationEventsUseAccountEgress`（注入 fakeBilling，断言两个激活事件先于
+  preview 经过**同一个**客户端）、`TestActivationReportingTolerated` 改走零值 Service 的
+  直连分支；`TestAutoClaimPriorityOrder` 等 8 组既有用例不改而绿。
+- [ ] 上线验证：服务端入池一个新账号，claim 日志应出现 preview 含套餐并自动领取；若 preview
+  仍为空，则上游对机房 IP（线路/服务器）一并不放投——改走「真实客户端领取后导入」流程。
 
 ## 7. 测试策略
 
