@@ -190,8 +190,10 @@ var (
 	ZcodeBillingBase = "https://zcode.z.ai/api/v1/zcode-plan"
 
 	// 官方客户端版本号：随请求头 / URL 参数上行，用于伪装成官方客户端。
-	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.11.2")
+	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐；
+	// 2026-09-23 由 3.11.2 升至 3.14.3（本机实装客户端版本，激活失效排查项之一，
+	// 见 docs/analysis-zcode-client-activation-diff.md）。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.14.3")
 	// 与 Python 版保持一致的客户端平台标识；旧的 win32 参数已失效。
 	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", "win32-x64")
 
