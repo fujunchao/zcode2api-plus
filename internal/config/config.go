@@ -189,13 +189,34 @@ var (
 	// ZCode 计费 / 额度查询端点（不可配置，与官方客户端一致）。
 	ZcodeBillingBase = "https://zcode.z.ai/api/v1/zcode-plan"
 
+	// ZcodeEndpointOrigin 伪装身份的端点 origin。官方 HTTP-Referer 即此值，
+	// 且**不带尾斜杠**（`p1()` 返回 origin）——多一个 `/` 就与官方客户端不同。
+	// 所有面向 zcode.z.ai 的请求头都应引用本常量，不要各写一份字面量。
+	ZcodeEndpointOrigin = env("ZCODE_ENDPOINT_ORIGIN", "https://zcode.z.ai")
+
+	// UpstreamSendDeviceMid 是否在**推理请求**上发送 X-Device-Mid。
+	//
+	// 官方客户端的模型请求**不带**这个头（只有额度 / 领取 / 遥测等非模型接口带）——
+	// golden 抓包实测确认（见 docs/analysis-client-golden-diff-20260924.md）。官方把
+	// 设备指纹放在 **body 的 metadata.user_id.device_id** 里，本网关同样如此
+	//（upstream.InjectDeviceMetadata，每账号一份）⇒ 账号隔离不依赖这个头，默认 false。
+	//
+	// 保留开关只为应急回滚（设 true 可恢复历史行为），不要长期打开：多发一个官方
+	// 不发的头，与少发一样是可交叉比对的差异。见 docs/plan-client-format-parity.md GAP-7。
+	UpstreamSendDeviceMid = envBool("ZCODE_UPSTREAM_SEND_DEVICE_MID", false)
+
 	// 官方客户端版本号：随请求头 / URL 参数上行，用于伪装成官方客户端。
 	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐；
 	// 2026-09-23 由 3.11.2 升至 3.14.3（本机实装客户端版本，激活失效排查项之一，
 	// 见 docs/analysis-zcode-client-activation-diff.md）。
 	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.14.3")
-	// 与 Python 版保持一致的客户端平台标识；旧的 win32 参数已失效。
-	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", "win32-x64")
+	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
+	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
+	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
+	//
+	// ⚠️ 查询参数 `platform=` 用的是**另一种格式**（win32→windows、x64→x86_64，
+	// 即 windows-x86_64），必须走 ZcodeProfile.QueryPlatform()，不要复用本变量。
+	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", ZcodeClientBarePlatform+"-"+ZcodeClientArch)
 
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
@@ -207,8 +228,13 @@ var (
 // 激活事件体里的设备字段。刻意**不跟随运行环境**：网关多跑在 Linux 容器里，
 // 而 X-Platform / User-Agent 都声称桌面客户端，跟随环境会让 body 与请求头
 // 自相矛盾（上游可交叉比对，据此判定「非官方客户端」而不投放活动套餐）。
-// 三项都应与 ZcodeClientPlatform 相符：Windows 客户端报内核串，如 10.0.26100。
+//
+// ⚠️ 这四项与 profile.go 的裸平台 / 架构同属**一个身份**，必须成组一致：
+// 官方客户端把它们全部派生自 (platform, arch, os.release())。生产代码不要直接
+// 引用这些变量做拼接，改用 ZcodeClientProfile()——否则又会散出第二份真相。
 var (
+	// ZcodeClientOSVersion 内核发行串（官方 os.release()）。它同时是请求头
+	// X-Os-Version 的取值，以及 # Environment 段 `OS Version` 的中间那段。
 	ZcodeClientOSVersion = env("ZCODE_CLIENT_OS_VERSION", "10.0.26100")
 	ZcodeClientLanguage  = env("ZCODE_CLIENT_LANGUAGE", "zh-CN")
 	ZcodeClientTimezone  = env("ZCODE_CLIENT_TIMEZONE", "Asia/Shanghai")
@@ -249,6 +275,13 @@ func DeviceMid() string {
 // NewDeviceMid 生成新的设备指纹，供每账号分配（见 model.Account.VirtualDeviceMid）。
 // 与全局 DeviceMid() 不同：它不写 device_mid.txt，而是随账号存进 accounts.data。
 func NewDeviceMid() string { return newUUID() }
+
+// NewUUIDv4 生成 UUIDv4，供需要「每请求一个随机 id」的调用方使用
+// （如上游请求头 x-request-id / x-zcode-trace-id —— 官方客户端用 crypto.randomUUID()）。
+//
+// 放在本包是为了共用同一份实现：newUUID 在 config / claim / asyncpool 已各有一份，
+// 上游再造第四份没有意义。
+func NewUUIDv4() string { return newUUID() }
 
 // newUUID 生成 UUIDv4（不引入第三方依赖）。
 func newUUID() string {

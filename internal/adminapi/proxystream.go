@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
@@ -99,11 +100,16 @@ func streamProbeLine(profile store.ProxyProfile, acc *model.Account) map[string]
 		"output_config": map[string]any{"effort": "low"},
 	}
 	body = gateway.NormalizeBody(body, true)
+	// 与网关推理路径同口径：设备身份走 body 的 metadata.user_id（模型请求头里已
+	// 不带 X-Device-Mid），会话 id 与请求头共用同一份。探测请求若与真实路径形态
+	// 不同，探测的结论就代表不了真实路径。
+	attr := upstream.NewAttribution(nil, "")
+	upstream.InjectDeviceMetadata(body, acc.DeviceMidOr(config.DeviceMid()), attr.SessionID)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fail("构造探测请求失败", err.Error())
 	}
-	built, err := upstream.BuildRequest(acc, "", "", nil)
+	built, err := upstream.BuildRequestWithAttribution(acc, "", "", nil, attr)
 	if err != nil {
 		return fail("构造探测请求失败", err.Error())
 	}

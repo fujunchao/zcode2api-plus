@@ -42,15 +42,20 @@ func (b *syncBuffer) String() string {
 }
 
 // diagLine 从捕获到的日志里取出 `[#]` 诊断行（去 ANSI 后）。
+// 取多条用 diagLines（定义在 linetruncate_test.go，与本文件同包）。
 func (b *syncBuffer) diagLine(t *testing.T) string {
 	t.Helper()
-	for _, line := range strings.Split(b.String(), "\n") {
-		if strings.Contains(line, "[#]") {
-			return stripANSI(line)
-		}
+	return b.diagLines(t)[0]
+}
+
+// diagField 从诊断行里取 `key=value` 的值（值到下一个空白为止）。
+func diagField(t *testing.T, line, key string) string {
+	t.Helper()
+	m := regexp.MustCompile(regexp.QuoteMeta(key) + `=(\S+)`).FindStringSubmatch(line)
+	if m == nil {
+		t.Fatalf("诊断行里找不到 %s=：%s", key, line)
 	}
-	t.Fatalf("日志里没有诊断行：\n%s", stripANSI(b.String()))
-	return ""
+	return m[1]
 }
 
 var ansiRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
@@ -348,6 +353,125 @@ func TestStreamTruncateCountAccumulatesAcrossSuccess(t *testing.T) {
 			t.Fatalf("第 %d 次请求后 StreamTruncateCount=%d，期望 %d（成功不得清零累计值）",
 				i+1, got.StreamTruncateCount, want)
 		}
+	}
+}
+
+// TestDiagBodyHashIdentifiesSamePayload bodyhash 的用途是回答「这个请求体被打过几个
+// 账号」——那要求**同一份请求体得到同一个指纹、不同请求体得到不同指纹**。
+//
+// 背景：`body=` 只有字节数，而字节数相同 ≠ 内容相同。2026-09-24 整池冷却事故只能靠
+// 「14 条记录的 body 恰好都是 278081」这种旁证定性，正是缺这个字段。
+func TestDiagBodyHashIdentifiesSamePayload(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"ok"}]}`)
+	})
+	f := newDiagFixture(t, up)
+	if _, err := f.st.AddAccount(model.ProviderZai, "hash-a", "sk-abc"); err != nil {
+		t.Fatal(err)
+	}
+
+	f.post(t, msgBody()) // 第 1 次
+	f.post(t, msgBody()) // 第 2 次：内容完全相同（新建 map，序列化结果一致）
+
+	other := msgBody()
+	other["messages"] = []any{map[string]any{"role": "user", "content": "不一样的内容"}}
+	f.post(t, other) // 第 3 次：内容不同
+
+	lines := f.buf.diagLines(t)
+	if len(lines) != 3 {
+		t.Fatalf("期望 3 条诊断行，实得 %d：%v", len(lines), lines)
+	}
+	h1, h2, h3 := diagField(t, lines[0], "bodyhash"),
+		diagField(t, lines[1], "bodyhash"),
+		diagField(t, lines[2], "bodyhash")
+
+	for i, h := range []string{h1, h2, h3} {
+		if h == "-" || len(h) != 12 {
+			t.Fatalf("第 %d 条 bodyhash 形态不对（应为 12 位十六进制）：%q\n行=%s", i+1, h, lines[i])
+		}
+	}
+	if h1 != h2 {
+		t.Errorf("同一请求体的指纹必须一致：%s vs %s", h1, h2)
+	}
+	if h1 == h3 {
+		t.Errorf("不同请求体不应得到同一指纹：%s", h3)
+	}
+	// 指纹与字节数是同源登记的（SetBody 一起写），两者都必须有值。
+	if got := diagField(t, lines[0], "body"); strings.HasPrefix(got, "-") {
+		t.Errorf("body 字节数应与指纹一同登记: %s", lines[0])
+	}
+}
+
+// TestDiagRiskScopeDistinctAccounts riskscope 把「同一 body 已在几个不同账号上命中
+// 风控」直接落到日志里，让请求级判定在线上可检索，而不必事后统计推断。
+func TestDiagRiskScopeDistinctAccounts(t *testing.T) {
+	riskUp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, `{"error":{"message":"Request has been blocked due to unusual activity."}}`)
+	})
+
+	t.Run("两个账号被拒即请求级", func(t *testing.T) {
+		f := newDiagFixture(t, riskUp)
+		for _, n := range []string{"risk-a", "risk-b"} {
+			if _, err := f.st.AddAccount(model.ProviderZai, n, "sk-"+n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.post(t, msgBody())
+
+		line := f.buf.diagLine(t)
+		if got := diagField(t, line, "riskscope"); got != "2" {
+			t.Errorf("riskscope=%s，期望 2（两个不同账号）\n行=%s", got, line)
+		}
+		if got := diagField(t, line, "status"); got != "405" {
+			t.Errorf("status=%s，期望 405\n行=%s", got, line)
+		}
+	})
+
+	t.Run("单账号被拒仍是账号级", func(t *testing.T) {
+		f := newDiagFixture(t, riskUp)
+		if _, err := f.st.AddAccount(model.ProviderZai, "risk-solo", "sk-solo"); err != nil {
+			t.Fatal(err)
+		}
+		f.post(t, msgBody())
+
+		line := f.buf.diagLine(t)
+		if got := diagField(t, line, "riskscope"); got != "1" {
+			t.Errorf("riskscope=%s，期望 1（只有 1 个账号被拒，属账号级）\n行=%s", got, line)
+		}
+	})
+}
+
+// TestDiagNewFieldsAppendedAtTail 新增字段一律追加在行尾。
+//
+// 这不是审美问题：外部分析脚本可能按位置切分诊断行，把新字段插进既有字段之间会让它们
+// 既有的下标全部错位。本用例锁住「err= 之后才是新字段」这个顺序。
+func TestDiagNewFieldsAppendedAtTail(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"ok"}]}`)
+	})
+	f := newDiagFixture(t, up)
+	if _, err := f.st.AddAccount(model.ProviderZai, "tail-a", "sk-abc"); err != nil {
+		t.Fatal(err)
+	}
+	f.post(t, msgBody())
+
+	line := f.buf.diagLine(t)
+	idxErr := strings.Index(line, " err=")
+	idxHash := strings.Index(line, " bodyhash=")
+	idxScope := strings.Index(line, " riskscope=")
+	if idxErr < 0 || idxHash < 0 || idxScope < 0 {
+		t.Fatalf("诊断行缺少必要字段：%s", line)
+	}
+	if !(idxErr < idxHash && idxHash < idxScope) {
+		t.Errorf("新增字段必须排在 err= 之后（bodyhash < riskscope），实际下标 err=%d bodyhash=%d riskscope=%d\n行=%s",
+			idxErr, idxHash, idxScope, line)
+	}
+	if !regexp.MustCompile(`riskscope=\d+$`).MatchString(line) {
+		t.Errorf("riskscope 应是行尾的裸整数：%s", line)
 	}
 }
 

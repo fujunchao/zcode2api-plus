@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"time"
@@ -29,8 +31,19 @@ type ReqDiag struct {
 	MaxTokens string
 	Ticket    string // async 专用：同时带 36 字符 ticketID，保留既有检索习惯
 
-	BodyBytes int // 真正发给上游的请求体字节数（注入 system 之后）
-	Attempts  int // 本次请求内的选号尝试次数（>1 说明发生过换号/重试）
+	BodyBytes int    // 真正发给上游的请求体字节数（注入 system 之后）
+	BodyHash  string // 请求体的 sha256 前 12 位十六进制；空串 = 未构建出请求体
+	Attempts  int    // 本次请求内的选号尝试次数（>1 说明发生过换号/重试）
+
+	// RiskAccounts 本请求内给出风控信号的**不同账号数**（按账号 ID 去重）。
+	// 0 = 没出现过风控信号；≥2 即请求级（同一 body 换谁都被拒）。
+	//
+	// 存在的理由：`body=` 只有字节数，**字节数相同 ≠ 内容相同**，所以线上无法直接
+	// 回答「这个 body 打过几个账号」。2026-09-24 那次整池冷却事故只能靠「14 条
+	// 记录的 body 恰好都是 278081」这种旁证定性（见
+	// docs/analysis-riskcontrol-and-client-format-20260924.md）。有了 BodyHash 与
+	// 本字段，同一个 body 的跨账号命中可以直接检索出来。
+	RiskAccounts int
 
 	AccName string // 最后一次尝试的账号
 	Route   string // 出口线路：线路名 / proxy:***@host / direct
@@ -71,6 +84,43 @@ func NewReqDiag(reqID, modelName string, stream bool, body map[string]any, clock
 
 // Now 取当前时刻（走注入的时钟）。
 func (d *ReqDiag) Now() time.Time { return d.clock() }
+
+// bodyHashHexLen body 指纹的十六进制长度。12 位 = 48 bit，碰撞概率在「单日数千请求」
+// 的量级下可忽略，又短到能在日志行里直接读、直接做检索键。
+const bodyHashHexLen = 12
+
+// SetBody 登记请求体画像，一次调用写两个字段（分开设置迟早漂移）：
+//
+//   - payload：**真正发给上游**的字节，字节数取它；
+//   - contentView：**内容视图**，指纹取它 —— 即注入逐账号身份（设备指纹、会话 id）
+//     **之前**的请求体。为空时退回用 payload（等价于旧行为）。
+//
+// 为什么指纹不取 payload：设备身份是每账号一份的信封（见 upstream.InjectDeviceMetadata），
+// 直接哈希 payload 会让**同一份内容在换号后得到不同指纹**，而本字段的用途恰恰是
+// 「这个 body 被送到了几个账号」（见 ReqDiag.RiskAccounts）—— 用途与实现必须对齐。
+// 字节数则相反，要的是实际发出的真值。
+//
+// nil 接收者安全：部分调用点（如异步票的早退分支）不保证有 diag。
+func (d *ReqDiag) SetBody(payload, contentView []byte) {
+	if d == nil {
+		return
+	}
+	d.BodyBytes = len(payload)
+	if len(contentView) == 0 {
+		contentView = payload
+	}
+	sum := sha256.Sum256(contentView)
+	d.BodyHash = hex.EncodeToString(sum[:])[:bodyHashHexLen]
+}
+
+// SetRiskAccounts 记录本请求内已命中的**不同**风控账号数。
+// 由风控分支在每次命中后调用，最后一次写入即为本请求的最终值。
+func (d *ReqDiag) SetRiskAccounts(n int) {
+	if d == nil {
+		return
+	}
+	d.RiskAccounts = n
+}
 
 // MarkRead 记录一次「从上游读到 n 字节」。
 //
@@ -120,6 +170,14 @@ func (d *ReqDiag) Format() string {
 		boolToInt(d.UsageComplete), d.TruncTotal)
 	msg += fmt.Sprintf(" total=%s status=%s err=%s",
 		dashDur(d.total), dashInt(d.Status), dashErr(d.ErrText))
+	// 新增字段**一律追加在行尾**，不插进既有字段之间：外部分析脚本可能按位置切分，
+	// 插在中间会让它们既有的下标全部错位。
+	//
+	// riskscope 刻意打印裸整数（而不是沿用上面的 `-` 表示未知）：这个字段的 0 有
+	// 明确含义（本请求没出现过风控信号），判读时直接看 `riskscope>=2` 即可，
+	// 与 bodyhash 的「空串 = 没构建出请求体」是两回事。
+	msg += fmt.Sprintf(" bodyhash=%s riskscope=%d",
+		dashText(d.BodyHash), d.RiskAccounts)
 	return msg
 }
 

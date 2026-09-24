@@ -143,19 +143,30 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	// 刻意不改 web.Req/ReqOk/ReqErr 的形态，也不改本函数的导出签名
 	//（reqID 本就在函数内生成，三个外部调用点无需改动）。
 	diag := NewReqDiag(reqID, orDash(modelName), stream, body, e.now)
+	// 风控判定范围：**必须按请求创建**（Engine 跨请求共享，挂上去会让并发请求互相误判）。
+	// 用于把「账号级风控」（换号即成功）与「请求级风控」（同一 body 换谁都被拒）分开，
+	// 后者不得惩罚账号、并回滚本请求已施加的风控冷却。见 riskscope.go。
+	//
+	// 刻意与 diag 一起声明在 defer 之前：诊断行要排印本请求的风控范围，而 defer 里的
+	// 闭包只能引用它之前已声明的变量。
+	scope := NewRiskScope()
 	defer func() {
 		// 总耗时在这里统一冻结（而不是在 finishDelivery 里）：早退路径
 		//（如 no_available_account）从来没走到交付，也应当有可读的耗时。
 		diag.Finish(diag.Now())
+		// 风控范围取收尾期的最终值：本请求命中的**不同**账号数，≥2 即请求级。
+		// 放在这里而不是每条失败分支里，早退路径（选不出号、配置错误）也能带上。
+		diag.SetRiskAccounts(scope.Accounts())
 		web.Diag(diag.ReqID, diag.Format())
 	}()
 	web.Req(reqID, orDash(modelName), stream)
 
+	// 归因标识**按请求算一次**：出站头与 body 的 metadata.user_id.session_id 必须
+	// 共享同一个会话 id（官方恒等），两处各算一次必然分叉。换号重试沿用同一份，
+	// 因为它仍是同一个入站请求。见 upstream.NewAttribution。
+	attr := upstream.NewAttribution(incomingHeaders, upstream.MetadataSessionID(body))
+
 	tried := map[string]bool{}
-	// 风控判定范围：**必须按请求创建**（Engine 跨请求共享，挂上去会让并发请求互相误判）。
-	// 用于把「账号级风控」（换号即成功）与「请求级风控」（同一 body 换谁都被拒）分开，
-	// 后者不得惩罚账号、并回滚本请求已施加的风控冷却。见 riskscope.go。
-	scope := NewRiskScope()
 	for range MaxAccountAttempts {
 		acc := e.Store.Select(model.ProviderZai, tried, modelName)
 		if acc == nil {
@@ -163,7 +174,7 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		}
 		tried[acc.ID] = true
 		diag.Attempts++
-		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, deliver, diag, scope)
+		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, attr, deliver, diag, scope)
 		if res.retrySame {
 			continue
 		}
@@ -214,6 +225,7 @@ func (e *Engine) tryAccount(
 	modelName string,
 	stream bool,
 	incomingHeaders map[string]string,
+	attr upstream.Attribution,
 	deliver DeliverFunc,
 	diag *ReqDiag,
 	scope *RiskScope,
@@ -253,17 +265,28 @@ func (e *Engine) tryAccount(
 		// 每个账号在副本上做 NormalizeBody（system 注入不幂等，见 body.go）
 		actualBody := shallowCopyBody(body)
 		NormalizeBody(actualBody, needsCaptcha)
+		// 内容视图（= 下游内容 + 网关整形）在注入账号身份**之前**取：设备指纹每账号
+		// 一份，算进指纹会让同一份内容在换号后指纹不同，而 diag 的 bodyhash 正是用来
+		// 判读「这个 body 打过几个账号」的（见 ReqDiag.SetBody）。
+		var contentView []byte
+		if diag != nil {
+			contentView, _ = marshalJSON(actualBody)
+		}
+		// 设备身份走 body（官方形态）：模型请求头里**不带** X-Device-Mid，官方把指纹
+		// 放在 metadata.user_id.device_id 里。这里取**本账号**的指纹 —— 每账号一份，
+		// 账号隔离因此不依赖请求头（见 upstream.InjectDeviceMetadata / config 的开关）。
+		upstream.InjectDeviceMetadata(actualBody, acc.DeviceMidOr(config.DeviceMid()), attr.SessionID)
 		payload, err := marshalJSON(actualBody)
 		if err != nil {
 			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
 			return attemptResult{final: errResult(http.StatusBadRequest, "invalid_request", "请求体无法序列化")}
 		}
 		if diag != nil {
-			// 真正发给上游的请求体字节数（已含注入的 system）。入口处拿不到这个真值。
-			diag.BodyBytes = len(payload)
+			// 字节数取实际 payload，指纹取内容视图。入口处拿不到这两个真值。
+			diag.SetBody(payload, contentView)
 		}
 
-		req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, incomingHeaders)
+		req, err := upstream.BuildRequestWithAttribution(acc, verifyParam, verifyRegion, incomingHeaders, attr)
 		if err != nil {
 			e.mark(acc, model.StatusInvalid, model.ErrorKindAuthFailed, err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 凭证无效，切换下一个", acc.Name))

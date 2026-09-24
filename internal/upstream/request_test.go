@@ -30,8 +30,8 @@ func TestBuildRequestJWT(t *testing.T) {
 	if h["X-ZCode-App-Version"] != config.ZcodeClientVersion || h["X-ZCode-Agent"] != "glm" {
 		t.Fatalf("ZCode 标识头不符: %v", h)
 	}
-	if h["X-Device-Mid"] == "" {
-		t.Fatal("应携带设备标识")
+	if _, ok := h["X-Device-Mid"]; ok {
+		t.Fatal("模型请求不应携带 X-Device-Mid（设备身份在 body 的 metadata.user_id 里）")
 	}
 	if h["X-Aliyun-Captcha-Verify-Param"] != "server-token" ||
 		h["X-Aliyun-Captcha-Verify-Region"] != "sgp" {
@@ -127,15 +127,12 @@ func TestZcodeSystemBlocks(t *testing.T) {
 
 func strPtr(s string) *string { return &s }
 
-// 客户端送来的设备指纹头必须无效：每账号独立的 X-Device-Mid 是账号隔离的基础，
-// 被客户端指定等于让上游把多个账号看成同一台设备。
+// 客户端送来的 x-device-mid 必须**整个丢弃**。
 //
-// 同时钉住「只占一个键」——固定头与客户端头若因大小写不同各占一个 map 键，
-// 下游 Header.Set 会把它们归一到同一名字，最终取值便取决于 map 迭代顺序。
-func TestClientCannotOverrideDeviceMid(t *testing.T) {
-	acc := jwtAccount()
-	want := acc.DeviceMidOr(config.DeviceMid())
-
+// 我们不再自己写这个头（官方模型请求不带它），于是「固定头覆盖透传头」这条防线也
+// 没了 —— 若不显式拦掉，下游送来的值会原样到达上游，等于让客户端指定本账号的设备
+// 指纹，每账号一份指纹的账号隔离形同虚设。设备身份只走 body 的 metadata.user_id。
+func TestClientDeviceMidHeaderNeverReachesUpstream(t *testing.T) {
 	incomings := []map[string]string{
 		{"X-Device-Mid": "spoofed"},
 		{"x-device-mid": "spoofed"},
@@ -143,25 +140,18 @@ func TestClientCannotOverrideDeviceMid(t *testing.T) {
 		{"x-device-mid": "spoofed", "Accept": "application/json"},
 	}
 	for _, incoming := range incomings {
-		req, err := BuildRequest(acc, "", "", incoming)
+		req, err := BuildRequest(jwtAccount(), "", "", incoming)
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, ok := req.Headers["X-Device-Mid"]
-		if !ok {
-			t.Fatalf("应携带固定的设备标识: %v", req.Headers)
-		}
-		if got != want {
-			t.Fatalf("设备指纹被客户端覆盖: %q（期望 %q）", got, want)
-		}
-		count := 0
 		for key := range req.Headers {
 			if strings.EqualFold(key, "x-device-mid") {
-				count++
+				t.Fatalf("客户端 x-device-mid 不得出现在出站头: %v", req.Headers)
 			}
 		}
-		if count != 1 {
-			t.Fatalf("设备指纹头应只占一个键，实际 %d 个: %v", count, req.Headers)
+		// 剔除是定点拦截，不能把其它透传头一起带走。
+		if want, ok := incoming["Accept"]; ok && req.Headers["Accept"] != want {
+			t.Fatalf("普通透传头不应受影响: %v", req.Headers)
 		}
 	}
 }

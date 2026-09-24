@@ -249,7 +249,7 @@ func authHeaders(acc *model.Account) map[string]string {
 		"X-ZCode-App-Version": config.ZcodeClientVersion,
 		"X-Platform":          config.ZcodeClientPlatform,
 		"X-Device-Mid":        acc.DeviceMidOr(config.DeviceMid()),
-		"HTTP-Referer":        "https://zcode.z.ai/",
+		"HTTP-Referer":        config.ZcodeEndpointOrigin,
 	}
 	if acc.Mode == "jwt" && acc.JWTToken != nil {
 		headers["Authorization"] = "Bearer " + *acc.JWTToken

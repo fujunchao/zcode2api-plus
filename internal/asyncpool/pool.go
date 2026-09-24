@@ -305,16 +305,26 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	// 账号/线路要等 Select 之后才可得，故数据集中在收尾期输出。
 	diag := gateway.NewReqDiag(tk.shortID, modelName, true, body, time.Now)
 	diag.Ticket = ticketID
+	// 风控判定范围：**必须按票创建**（Pool 跨票共享，挂上去会让并发票务互相误判）。
+	// 与 sync 路径共用 gateway.RiskScope：同一份 body 在两条路径上必须得到同一判定。
+	//
+	// 刻意与 diag 一起声明在 defer 之前：诊断行要排印本票的风控范围，而 defer 里的
+	// 闭包只能引用它之前已声明的变量。
+	scope := gateway.NewRiskScope()
 	defer func() {
 		diag.Finish(time.Now())
+		// 与 sync 同口径：风控范围取收尾期的最终值（命中的不同账号数，≥2 即请求级）。
+		diag.SetRiskAccounts(scope.Accounts())
 		web.Diag(diag.ReqID, diag.Format())
 	}()
+	// 归因标识**按票算一次**：出站头与 body 的 metadata.user_id.session_id 必须共享
+	// 同一个会话 id（官方恒等），两处各算一次必然分叉。换号重试沿用同一份 ——
+	// 它仍是同一张票。async 没有下游头可沿用，会话 id 只能合成（见 NewAttribution）。
+	attr := upstream.NewAttribution(nil, upstream.MetadataSessionID(body))
+
 	retries := 0
 	announcedReady := false
 	tried := map[string]bool{}
-	// 风控判定范围：**必须按票创建**（Pool 跨票共享，挂上去会让并发票务互相误判）。
-	// 与 sync 路径共用 gateway.RiskScope：同一份 body 在两条路径上必须得到同一判定。
-	scope := gateway.NewRiskScope()
 
 	for {
 		// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号：Select 是 round-robin，
@@ -348,12 +358,16 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		// 每个账号在副本上注入 zcode_system（NormalizeBody 的 system 注入不幂等）
 		actualBody := shallowCopyBody(body)
 		gateway.NormalizeBody(actualBody, true)
+		// 内容视图先取（注入账号身份之前）：与 sync 路径同口径，见 ReqDiag.SetBody。
+		contentView, _ := marshalJSON(actualBody)
+		// 与 sync 路径同口径：设备身份走 body 的 metadata.user_id（本账号指纹）。
+		upstream.InjectDeviceMetadata(actualBody, acc.DeviceMidOr(config.DeviceMid()), attr.SessionID)
 		payload, err := marshalJSON(actualBody)
 		if err != nil {
 			p.emitError(ctx, ticketID, "请求体序列化失败", "build_error")
 			return
 		}
-		diag.BodyBytes = len(payload)
+		diag.SetBody(payload, contentView)
 
 		networkRetry := false
 		lastNetworkError := ""
@@ -373,7 +387,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				verifyParam, verifyRegion = token.VerifyParam, token.Region
 			}
 
-			req, err := upstream.BuildRequest(acc, verifyParam, verifyRegion, nil)
+			req, err := upstream.BuildRequestWithAttribution(acc, verifyParam, verifyRegion, nil, attr)
 			if err != nil {
 				p.emitError(ctx, ticketID, err.Error(), "build_error")
 				return

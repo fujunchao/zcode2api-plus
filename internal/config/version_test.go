@@ -26,8 +26,13 @@ func TestClientVersionShape(t *testing.T) {
 	}
 }
 
-// TestNoHardcodedClientVersion 三段式版本字面量只允许出现在本包 config.go（定义处）；
-// 生产代码其它位置必须引用常量——这是「升版本必全量生效」的静态保证。
+// TestNoHardcodedClientVersion 三段式版本字面量只允许出现在**定义处**（本包的
+// config.go 与 profile.go）；生产代码其它位置必须引用常量——这是「升版本必全量生效」
+// 的静态保证。
+//
+// profile.go 与 config.go 同级豁免：2026-09-24 起伪装身份的默认值集中在 profile.go
+// （见 profile_literals_test.go），ai-sdk / node 版本号也在那里定义一次。
+//
 // 刻意跳过 _test.go：测试夹具允许出现字面量（如故意伪装的透传头、OS 版本哨兵值）。
 func TestNoHardcodedClientVersion(t *testing.T) {
 	pat := regexp.MustCompile(`"\d+\.\d+\.\d+"`)
@@ -35,6 +40,8 @@ func TestNoHardcodedClientVersion(t *testing.T) {
 		".git": true, "node_modules": true, "frontend": true, "dist": true,
 		"zcode-switch": true, ".workbuddy": true, "data": true,
 	}
+	// 定义处豁免：版本号默认值只能在这里写一次。
+	skipFiles := map[string]bool{"config.go": true, "profile.go": true}
 	var bad []string
 	root := filepath.Join("..", "..")
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -48,7 +55,7 @@ func TestNoHardcodedClientVersion(t *testing.T) {
 			return nil
 		}
 		if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") ||
-			filepath.Base(p) == "config.go" {
+			skipFiles[filepath.Base(p)] {
 			return nil
 		}
 		raw, readErr := os.ReadFile(p)
