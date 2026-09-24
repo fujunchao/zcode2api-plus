@@ -2,6 +2,7 @@
 import {
   Archive,
   ArchiveRestore,
+  CheckCircle2,
   Copy,
   Download,
   Gift,
@@ -50,6 +51,7 @@ import {
   type AccountErrorKind,
   type AccountStatus,
   type AccountsResponse,
+  type BatchResult,
   type ProxyProfile,
 } from '@/lib/types'
 
@@ -132,6 +134,21 @@ export function AccountsPage() {
   const [errFilter, setErrFilter] = useState<ErrFilterKey>('all')
   const [showArchived, setShowArchived] = useState(false)
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set())
+
+  /* ── 批量選取 ── 勾選只針對當前篩選結果；切換篩選時清空，避免殘留不可見的勾選。
+     批量操作直接呼叫 v2.8.0 的 /accounts/batch/* 端點（整批事務、逐條明細）。 */
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [batchBusy, setBatchBusy] = useState(false)
+
+  function changeFilter(next: FilterKey) {
+    setFilter(next)
+    setSelected(new Set())
+  }
+
+  function changeErrFilter(next: ErrFilterKey) {
+    setErrFilter(next)
+    setSelected(new Set())
+  }
 
   /* 新增對話框 */
   const [addOpen, setAddOpen] = useState(false)
@@ -376,6 +393,90 @@ export function AccountsPage() {
     } catch (e) {
       toast.error('操作失敗：' + errMsg(e))
     }
+  }
+
+  /* ── 批量操作 ── 走 v2.8.0 的 /accounts/batch/* 端點：整批事務、逐條明細。
+     missing_ok=true：勾選與提交之間帳號被輪詢窗口外的操作刪掉時按缺失計，
+     不讓整批卡在 400（刪除與啟停都是管理員顯式選擇的集合，語義上寬鬆合理）。 */
+  const selectedInFilter = filtered.filter((a) => selected.has(a.id))
+
+  function toggleRow(id: string, checked: boolean) {
+    setSelected((s) => {
+      const next = new Set(s)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+
+  function toggleAll() {
+    /* 全選 = 當前篩選結果全部勾上；再點一次全部取消 */
+    setSelected((s) => {
+      const all = filtered.length > 0 && filtered.every((a) => s.has(a.id))
+      return all ? new Set() : new Set(filtered.map((a) => a.id))
+    })
+  }
+
+  /* 批量結果的 toast：成功合併成一條；失敗項逐條提示（最多 3 條，防止刷屏） */
+  function batchResultToast(op: string, d: BatchResult) {
+    const parts = [`成功 ${d.succeeded}`]
+    if (d.duplicated) parts.push(`重複 ${d.duplicated}`)
+    if (d.not_found) parts.push(`缺失 ${d.not_found}`)
+    if (d.failed) parts.push(`失敗 ${d.failed}`)
+    const summary = `批量${op}完成：${parts.join(' · ')}`
+    if (d.failed) {
+      toast.warning(summary)
+      for (const item of d.items.filter((x) => x.status === 'error').slice(0, 3)) {
+        toast.error(item.message || '操作失敗')
+      }
+    } else {
+      toast.success(summary)
+    }
+  }
+
+  async function runBatch(op: 'enable' | 'disable', ids: string[]) {
+    if (!ids.length) return
+    setBatchBusy(true)
+    try {
+      const d = await api<BatchResult>('POST', '/accounts/batch/' + op, { ids, missing_ok: true })
+      batchResultToast(op === 'enable' ? '啟用' : '停用', d)
+      setSelected(new Set())
+      invalidate()
+    } catch (e) {
+      toast.error('批量操作失敗：' + errMsg(e))
+    } finally {
+      setBatchBusy(false)
+    }
+  }
+
+  function batchDelete() {
+    const targets = [...selectedInFilter]
+    if (!targets.length) return
+    confirm({
+      title: '批量刪除帳號',
+      danger: true,
+      description: (
+        <>
+          確認刪除選中的 <b>{targets.length}</b> 個帳號？憑證將立即失效，此操作無法復原。
+        </>
+      ),
+      onConfirm: async () => {
+        setBatchBusy(true)
+        try {
+          const d = await api<BatchResult>('POST', '/accounts/batch/delete', {
+            ids: targets.map((a) => a.id),
+            missing_ok: true,
+          })
+          batchResultToast('刪除', d)
+          setSelected(new Set())
+          invalidate()
+        } catch (e) {
+          toast.error('批量刪除失敗：' + errMsg(e))
+        } finally {
+          setBatchBusy(false)
+        }
+      },
+    })
   }
 
   /* ── 歸檔 ┐─ 歸檔＝停止調用，帳號移入歸檔區僅保留記錄 */
@@ -652,7 +753,7 @@ export function AccountsPage() {
             size="sm"
             variant={filter === k ? 'default' : 'outline'}
             className="h-8 rounded-full"
-            onClick={() => setFilter(k)}
+            onClick={() => changeFilter(k)}
           >
             {l}
             <span className="tabular-nums opacity-70">{counts[k] || 0}</span>
@@ -660,7 +761,7 @@ export function AccountsPage() {
         ))}
         {/* 錯誤類型篩選：只列當前真的有帳號命中的類型，避免下拉被 12 個選項塞滿；
             計數為 0 的類型選了也看不到東西。 */}
-        <Select value={errFilter} onValueChange={(v) => setErrFilter(v as ErrFilterKey)}>
+        <Select value={errFilter} onValueChange={(v) => changeErrFilter(v as ErrFilterKey)}>
           <SelectTrigger className="h-8 w-[176px] rounded-full" aria-label="依錯誤類型篩選">
             <SelectValue />
           </SelectTrigger>
@@ -676,18 +777,69 @@ export function AccountsPage() {
         </Select>
       </div>
 
+      {/* 批量操作欄：勾選後浮現。啟用/停用可逆直接執行；刪除有確認對話框。 */}
+      {selectedInFilter.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2">
+          <span className="text-sm">
+            已選 <b className="tabular-nums">{selectedInFilter.length}</b> 個帳號
+          </span>
+          <Button variant="ghost" size="sm" className="h-7" onClick={() => setSelected(new Set())}>
+            清除選取
+          </Button>
+          <div className="flex-1" />
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={batchBusy}
+            onClick={() => void runBatch('enable', selectedInFilter.map((a) => a.id))}
+          >
+            {batchBusy ? <Loader2 className="animate-spin" /> : <CheckCircle2 />} 批量啟用
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={batchBusy}
+            onClick={() => void runBatch('disable', selectedInFilter.map((a) => a.id))}
+          >
+            {batchBusy ? <Loader2 className="animate-spin" /> : <XCircle />} 批量停用
+          </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            disabled={batchBusy}
+            onClick={batchDelete}
+          >
+            {batchBusy ? <Loader2 className="animate-spin" /> : <Trash2 />} 批量刪除
+          </Button>
+        </div>
+      )}
+
       {/* 帳號明細表 */}
       <Card>
         <CardContent className="overflow-x-auto px-0">
-          {/* 十列在 1150px 的卡片裏原本擠不下（九列時最小寬度和 1188px），最右的
-              「操作」會被裁掉。收緊格內留白（每格省 4px）把總寬壓到卡片以內；
-              新增「最近錯誤」列（104px）時又從呼叫／失敗／Tokens／最近使用／操作／
-              出口線路各讓出 16px，淨增 24px 由未定寬的「賬號」列吸收。
+          {/* 十一列（v2.8.1 新增多選列）。此前十列在 1150px 的卡片裏原本擠不下
+              （九列時最小寬度和 1188px），靠收緊格內留白（每格省 4px）壓進卡片；
+              「最近錯誤」列（104px）加入時又從呼叫／失敗／Tokens／最近使用／操作／
+              出口線路各讓出 16px。本輪多選列（w-8=32px）的淨增量由未定寬的
+              「賬號」列吸收（該列本就截斷，伸縮無副作用）。
               改動前後都要用 .workbuddy/measure-ui-layout.js 量一次：這一列的壞法
               是「表格被頂寬、右側被裁」，短數據看不出來。 */}
           <Table className="[&_td]:px-1 [&_th]:px-1">
             <TableHeader>
               <TableRow>
+                <TableHead className="w-8 text-center">
+                  <Checkbox
+                    checked={
+                      filtered.length > 0 && filtered.every((a) => selected.has(a.id))
+                        ? true
+                        : selectedInFilter.length > 0
+                          ? 'indeterminate'
+                          : false
+                    }
+                    onCheckedChange={toggleAll}
+                    aria-label="全選當前篩選結果"
+                  />
+                </TableHead>
                 <TableHead className="w-32 text-center">賬號</TableHead>
                 <TableHead className="w-20 text-center">狀態</TableHead>
                 <TableHead className="w-24 text-center">出口線路</TableHead>
@@ -706,13 +858,20 @@ export function AccountsPage() {
             <TableBody>
               {!filtered.length ? (
                 <TableRow>
-                  <TableCell colSpan={10} className="py-10 text-center text-sm text-muted-foreground">
+                  <TableCell colSpan={11} className="py-10 text-center text-sm text-muted-foreground">
                     尚無帳號，請點擊右上角「新增」
                   </TableCell>
                 </TableRow>
               ) : (
                 filtered.map((a) => (
                   <TableRow key={a.id}>
+                    <TableCell className="text-center">
+                      <Checkbox
+                        checked={selected.has(a.id)}
+                        onCheckedChange={(v) => toggleRow(a.id, v === true)}
+                        aria-label={`選取 ${a.email || a.name || a.id}`}
+                      />
+                    </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-1">
                         <EmailCell account={a} onCopy={() => void copyEmail(a)} />

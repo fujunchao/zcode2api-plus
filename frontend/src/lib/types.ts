@@ -100,6 +100,30 @@ export interface AccountsResponse {
   models: string[]
   proxies: ProxyProfile[]
   ts: number
+  /** 條件查詢（additive）：過濾後總數與分頁回顯；無過濾參數時 total = 全量 */
+  total?: number
+  offset?: number
+  limit?: number
+}
+
+/* 批量操作逐條明細：status 與後端 BatchItemStatus 對齊（ok/duplicate/not_found/error） */
+export interface BatchItemResult {
+  index: number
+  id?: string
+  name?: string
+  status: 'ok' | 'duplicate' | 'not_found' | 'error'
+  message?: string
+}
+
+/* 批量操作彙總結果（POST /accounts/batch/* 的統一響應形態） */
+export interface BatchResult {
+  total: number
+  succeeded: number
+  duplicated: number
+  not_found: number
+  failed: number
+  ids?: string[]
+  items: BatchItemResult[]
 }
 
 export interface StatusResponse {
