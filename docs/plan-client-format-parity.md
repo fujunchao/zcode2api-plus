@@ -395,3 +395,62 @@ func (p ZcodeProfile) EnvironOSVersion() string {
 **当前进度（2026-09-24）**：阶段 1、3a、3b、2、2b、5、6 **已完成**（改动未提交）；
 阶段 4（`platform=` 查询参数格式）**未做** —— 额度/领取链路现在是工作的，改前必须用真实账号
 验证一次。阶段 2b 的四条路径（sync / async / 线路探测 / 归因头合成）已全部覆盖。
+
+## 第九轮执行记录（2026-09-24 傍晚，调用机制逐项对齐）
+
+依据官方 CLI 日志（重试语义）与 golden 抓包（传输层头），完成第三批对齐：
+
+| # | 维度 | 官方（实测） | 修复前 | 处置 |
+|---|---|---|---|---|
+| GAP-15 | 鉴权头 | `x-api-key` + `Authorization: Bearer` **双头同值**（两种 plan 模式皆然） | JWT 只发 Authorization；APIKey 只发 X-Api-Key | ✅ 已修：两种模式统一双头同值 |
+| GAP-16 | 重试时 request-id | 同一 queryId（轮次）内**每次 attempt 换新** requestId（CLI 日志：4 次重试 4 个 id） | 整轮共享一个 request-id —— 上游可见「同一请求 id 出现在多个账号上」，直接暴露多账号同源 | ✅ 已修：`Attribution.WithFreshRequestID()`，sync 预算循环 / async 换号循环与内层验证码重试都按上游 HTTP 尝试刷新；session/trace/query 保持（轮次连续） |
+| GAP-17 | undici 传输层头 | `accept: */*`、`accept-language: *`、`sec-fetch-mode: cors` 恒在（golden 实测） | 三项全缺 | ✅ 已修：加入固定头（客户端透传不得覆盖） |
+| — | accept-encoding | `br, gzip, deflate`（undici） | Go 默认 `gzip` | ⚠️ **刻意不改**：对齐需引入 brotli 解压并改流式链路，风险/收益不成比例；编码协商的指纹敏感度远低于身份头 |
+| — | 头名字面形态 | undici 全小写（h1.1） | Go Canonical 形态 | ⚠️ **刻意不改**：h2 协商下 Go 自动全小写（与 undici 一致）；h1.1 差异记录为残留 |
+| — | maxRetries=10 | 同账号内重试 10 次 | MaxAccountAttempts 换号 + 指数退避 | ⚠️ 产品形态差异（池化），观测项 |
+| — | UA runtime 段 | `runtime/node.js/22`（golden 实测） | 同 | ✅ 已一致（勿凭 kit() 源码推断改写 —— golden 是事实） |
+| — | 验证码头 | 每请求实时解、恒带 | JWT 每请求从预解池取、恒带；无 token 不裸发 | ✅ 行为等价（上游只看到头） |
+
+**反向验证**：V1b（断言红）/ V2 / V4 / V5b（新增端到端守卫 `TestRequestIDRefreshesAcrossAttempts`）全红；
+V3 撤销 —— 固定头最后写回的结构本身保证恒胜，透传覆盖 Accept 不是可达威胁；V6b 验证套件仍绿。
+端到端实拍：出站 **25 头**与官方形态逐项对齐；换号对照 Request-Id 换新 / Session、Query 保持 / 双头同值。
+
+**一致性验证方法**（后续如何确认与官方一致）：
+1. **静态层**：`go run ./.workbuddy/tmp-logs/dump` 实拍出站头，与 golden 抓包（`golden-capture.jsonl`）逐字段 diff（脚本 `golden-diff.js`）；
+2. **行为层**：`TestRequestIDRefreshesAcrossAttempts`（换号语义）+ `TestAuthDualHeadersSameValue` + `TestUndiciTransportHeaders` + `TestSourceHeadersMatchOfficial` 守卫套件；
+3. **线上层**：v2.7.1 上线后抓一次网关出站（或看 `[#]` 行的 bodyhash 与头部日志），与官方桌面端 model_io 记录对照；
+4. **官方侧基准更新**：官方日志通道（`cli/log/zcode-*.jsonl` 的 `model.network.*`）可持续提供新的 attempt/requestId 样本，任何重试语义变化都能在客户端升级后第一时间发现。
+
+## 第十轮执行记录（2026-09-24 傍晚，P1-3 重放防护 + RiskScope 冷却不回滚）
+
+按账号级标记模型（§九）落地阻止标记扩散的两个机制：
+
+**1. 重放防护（P1-3）—— 新 `internal/gateway/replayguard.go`**
+
+- `ReplayGuard` 按「模型 + 内容指纹（入口 body 的 sha256 前 12 位）」记录最近一次请求级风控判定；
+- 窗口 `ZCODE_REPLAY_GUARD_TTL_SECONDS`（默认 60s，0 = 禁用，应急回退开关）内同内容请求
+  **直接快速失败**：sync 返回 503 `risk_control_cooldown`、async 投递同名 error 事件，均不消耗任何账号；
+- 挂在 Engine / Pool 字段上**跨请求/跨票共享** —— 防护的意义就在跨请求（上一个请求刚打爆两个账号，
+  下一个相同 body 的请求必须立即被挡住）；懒清理过期项 + 触顶 1024 整体清空（放行优于 OOM）。
+
+**2. RiskScope 冷却不回滚**
+
+- 删除 `Rollback` / `Record` / `RiskControlSnapshot` / `RollbackRiskControl`（riskscope.go 163 行瘦身）；
+  回滚冷却等于替服务端解封已被标记的账号；
+- `MarkRiskControlWithSnapshot` 合并回 `MarkRiskControl`（classify.go 的薄包装删除，主实现回 riskscope.go）；
+- 关键语义变化：请求级判定成立时**判定账号本身也吃 `MarkRiskControl`**（它同样吃了 405、同样被上游
+  标记），随后停止换号。日志文案：`风控判定為請求級（已在 N 個帳號上復現…），停止換號；冷卻保留
+  （上游已標記帳號，300 s），同內容 60 s 內直接拒絕`。
+
+**守卫与验证**
+
+- 新增 `replayguard_test.go`（TTL 窗口 / 键独立 / 容量触顶 / 禁用态 / ContentKey 稳定性）；
+- 端到端 `Test405RequestLevelRiskKeepsCoolingAndGuardsReplay`（sync）：恰好 2 个账号保留冷却、
+  1 个未动，同内容再请求返回 503 且上游调用数不增；async 侧 `Test405RequestLevelRiskInAsyncPool`
+  同语义改造（冷却保留 + 重放拦截）；
+- 反向验证 RB1-RB4 全红（断言红，非编译红）：不登记防护 / Blocked 恒 false / 退回不冷却 /
+  async 不登记，各对应守卫逐一点名变红；
+- 全量门禁：BUILD OK、17 包通过（仅 captcha 已知沙箱符号链接失败）、gofmt 107 文件 0 不合规。
+
+**上线观察项**：`[#]` 行 `riskscope=2` 之后应紧跟 `risk_control_cooldown` 快速失败（而非继续换号）；
+风控冷却账号数在事故后的增长应被截止在「参与判定的账号」范围内，不再出现整池扩散。
