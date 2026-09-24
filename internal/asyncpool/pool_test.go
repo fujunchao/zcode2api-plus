@@ -176,6 +176,19 @@ func addJWTAccount(t *testing.T, st *store.Store, name string) *model.Account {
 	return acc
 }
 
+// addJWTAccountN 添加第 n 个 jwt 账号。
+//
+// ⚠️ 凭据必须各不相同：AddAccount 按「同一账号」判重（凭据相同即命中既有记录），
+// 用同一个 secret 加三次只会得到一个账号——池里只有 1 个号，多账号用例全部失真。
+func addJWTAccountN(t *testing.T, st *store.Store, name string, n int) *model.Account {
+	t.Helper()
+	acc, err := st.AddAccount(model.ProviderZai, name, fmt.Sprintf("header.payload.sig%d", n))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return acc
+}
+
 // insertTicket 手工建票（不启动后台任务），供同步驱动 processTicket。
 func insertTicket(p *Pool, id string, body map[string]any) *ticket {
 	tk := &ticket{
@@ -862,6 +875,56 @@ func Test405RiskControlInAsyncPool(t *testing.T) {
 		t.Fatal("应写入冷却截止时间")
 	}
 	wantErrorKind(t, acc, model.ErrorKindRiskControl)
+}
+
+// 请求级风控（同一 body 在 ≥2 个不同账号上都被拒）：与 sync 同判定——不冷却任何账号、
+// 不继续换号，把上游原文投递一次并终止本票。
+//
+// 2026-09-24 事故的异步侧等价形态：一票最多试 AsyncMaxRetries+1 个账号，若无此判定，
+// 一份被上游拒绝的请求体会把整票的账号额度全部烧掉（sync 侧当日烧掉 67 个）。
+func Test405RequestLevelRiskInAsyncPool(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	// fixture 默认 AsyncMaxRetries=0（只试 1 个账号），而判定成立需要试到第 2 个账号。
+	// 这里放开到 3（生产默认值），第 3 个账号是否被试才成为有意义的断言。
+	// 换号退避是 1<<retries 秒（此用例付出 2s），是该路径既有代价，不为测试改动。
+	config.AsyncMaxRetries = 3
+	t.Cleanup(func() { config.AsyncMaxRetries = 0 })
+	addJWTAccountN(t, st, "req-level-1", 1)
+	addJWTAccountN(t, st, "req-level-2", 2)
+	addJWTAccountN(t, st, "req-level-3", 3)
+
+	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusMethodNotAllowed, body: riskBody},
+		{status: http.StatusMethodNotAllowed, body: riskBody},
+		{status: http.StatusMethodNotAllowed, body: riskBody},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-req-level", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-req-level")
+
+	events := drainEvents(tk)
+	last := events[len(events)-1]
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "upstream_error" {
+		t.Fatalf("请求级风控应投递上游原文（upstream_error）: %v", events)
+	}
+	if msg, _ := errObj["message"].(string); msg != riskBody {
+		t.Fatalf("应原样投递上游错误体: %q", msg)
+	}
+	// 第 2 个账号给出同一信号即判定成立，第 3 个账号不该再被试。
+	if n := up.callCount(); n != 2 {
+		t.Fatalf("判定成立后应停止换号，上游调用应为 2 次: %d", n)
+	}
+	for _, acc := range st.ListAccounts(model.ProviderZai) {
+		if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
+			t.Fatalf("请求级风控不该冷却账号 %s: status=%s until=%v", acc.Name, acc.Status, acc.CoolingUntil)
+		}
+		if acc.RiskControlStreak != 0 {
+			t.Fatalf("请求级风控不该推进账号 %s 的风控阶梯: %d", acc.Name, acc.RiskControlStreak)
+		}
+	}
 }
 
 // 非风控 405 在异步路径同样不冷却（与 sync 一致），落「其余错误」投递事件。

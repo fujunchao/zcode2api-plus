@@ -312,6 +312,9 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	retries := 0
 	announcedReady := false
 	tried := map[string]bool{}
+	// 风控判定范围：**必须按票创建**（Pool 跨票共享，挂上去会让并发票务互相误判）。
+	// 与 sync 路径共用 gateway.RiskScope：同一份 body 在两条路径上必须得到同一判定。
+	scope := gateway.NewRiskScope()
 
 	for {
 		// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号：Select 是 round-robin，
@@ -383,7 +386,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				announcedReady = true
 			}
 
-			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, modelName, req, payload, diag)
+			midStream, streamErr := p.attemptUpstream(ctx, ticketID, acc, modelName, req, payload, diag, scope)
 			if midStream {
 				// 已向客户端发出内容块，不能换号重发（会收到重复事件），终止本票
 				web.Warn(ticketID, fmt.Sprintf("流转发中断: %s", streamErr.Error()))
@@ -407,6 +410,13 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			if errors.Is(streamErr, errDelivered) {
 				return
 			}
+			// 请求级风控：不得换号。上游原文交给客户端后终止本票——与 errDelivered 同一条
+			// 出路，区别是这条还要把上游错误体投递出去（errDelivered 表示已经投递过）。
+			var reqLevelRisk errRequestLevelRisk
+			if errors.As(streamErr, &reqLevelRisk) {
+				p.emitError(ctx, ticketID, reqLevelRisk.body, "upstream_error")
+				return
+			}
 			if ctx.Err() != nil {
 				return // 票务已被释放，无需继续
 			}
@@ -423,6 +433,10 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		}
 
 		retries++
+		// 换号上限在这里，不在别处：这个计数同时被「网络错误换号」与「风控/503 冷却换号」
+		// 共用，所以一票最多试 config.AsyncMaxRetries+1 个账号——sync 侧的对应上限是
+		// gateway.MaxAccountAttempts，两者数值不同步是刻意的（async 允许更多次，因为它
+		// 没有客户端在等），但**语义必须一致**：请求级风控在这条路径上同样不得换号。
 		if retries > config.AsyncMaxRetries {
 			msg := lastNetworkError
 			if msg == "" {
@@ -464,6 +478,9 @@ func (p *Pool) emitErrorWithDetails(ctx context.Context, ticketID, message, errT
 // 瞬时限流（非额度码族的 429，用尽后递进冷却并交外层换号）与平台过载
 // （529 / 业务码 1305，用尽后原样投递上游错误体并终止本票）。
 // 两类各有独立预算，互不挤占；次数与延迟都取自 gateway，两条路径不会各自漂移。
+//
+// scope 是本票的风控判定范围：请求级风控（errRequestLevelRisk）不在此处理，直接上抛给
+// processTicket 终止本票——它不是「换号能解决」的错误，重试语义在这里就不该成立。
 func (p *Pool) attemptUpstream(
 	ctx context.Context,
 	ticketID string,
@@ -472,10 +489,11 @@ func (p *Pool) attemptUpstream(
 	req upstream.Request,
 	payload []byte,
 	diag *gateway.ReqDiag,
+	scope *gateway.RiskScope,
 ) (bool, error) {
 	rateAttempt, overloadAttempt := 0, 0
 	for {
-		midStream, err := p.attemptUpstreamOnce(ctx, ticketID, acc, modelName, req, payload, diag)
+		midStream, err := p.attemptUpstreamOnce(ctx, ticketID, acc, modelName, req, payload, diag, scope)
 		if err == nil || midStream {
 			return midStream, err
 		}
@@ -536,6 +554,7 @@ func (p *Pool) attemptUpstreamOnce(
 	req upstream.Request,
 	payload []byte,
 	diag *gateway.ReqDiag,
+	scope *gateway.RiskScope,
 ) (bool, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, strings.NewReader(string(payload)))
 	if err != nil {
@@ -644,17 +663,36 @@ func (p *Pool) attemptUpstreamOnce(
 			return false, errNetwork{bodyText}
 		}
 
-		// 405 + 风控文案：与 sync 路径同语义——整号冷却（按连续命中递进，超限置失效）
-		// 并换号。判定必须先看 body：405 也可能是计费接口的重复查询，或者我方缺
-		// system 注入时上游回的错（那种情况每个账号都会一样失败，冷却账号等于把
-		// 代码缺陷变成账号惩罚）。
+		// 405 + 风控文案：先分清「账号级」还是「请求级」，与 sync 路径同语义（项目硬不变式：
+		// 两条路径不得对同一份 body 给出不同判定）。
+		//
+		// 账号级（换号即成功）→ 整号冷却（按连续命中递进，超限置失效）并换号。
+		// 请求级（同一 body 在 ≥2 个不同账号上都被拒）→ 身份不是变量、剩下的只有请求体，
+		// 换号只是把健康账号送出去挨打：改为不冷却（并回滚本票已施加的冷却），把上游原文
+		// 终止性投递给客户端。判据与阈值见 gateway.RiskScope。
+		//
+		// 判定必须先看 body：405 也可能是计费接口的重复查询，或者我方缺 system 注入时上游
+		// 回的错（那种情况每个账号都会一样失败，冷却账号等于把代码缺陷变成账号惩罚）。
 		if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(bodyText) {
-			_, streak, invalid := gateway.MarkRiskControl(p.Store, acc.Provider, acc.ID,
-				"上游风控拦截 HTTP 405: "+gateway.ErrorPreview(bodyText), time.Now())
+			preview := gateway.ErrorPreview(bodyText)
+			if scope.Verdict(acc) {
+				restored, skipped := scope.Rollback(p.Store)
+				gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindRiskControl,
+					"上游风控拦截 HTTP 405（請求級）: "+preview, time.Now())
+				web.Warn(ticketID, fmt.Sprintf(
+					"风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號並回滾冷卻（回滾 %d、跳過 %d）",
+					scope.Accounts(), resp.StatusCode, preview, restored, skipped))
+				return false, errRequestLevelRisk{body: bodyText}
+			}
+			_, streak, invalid, snap := gateway.MarkRiskControlWithSnapshot(p.Store, acc.Provider, acc.ID,
+				"上游风控拦截 HTTP 405: "+preview, time.Now())
+			scope.Record(snap)
 			if invalid {
-				web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控，已置為失效待人工處理", acc.Name, streak))
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
+					acc.Name, streak, resp.StatusCode, preview))
 			} else {
-				web.Warn(ticketID, fmt.Sprintf("账号 %s 第 %d 次命中风控，進入冷卻並切換下一個", acc.Name, streak))
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 第 %d 次命中风控（HTTP %d，%s），進入冷卻並切換下一個",
+					acc.Name, streak, resp.StatusCode, preview))
 			}
 			return false, errNetwork{bodyText}
 		}
@@ -758,6 +796,15 @@ var errDelivered = errors.New("已投递错误事件")
 type errNetwork struct{ body string }
 
 func (e errNetwork) Error() string { return e.body }
+
+// errRequestLevelRisk 请求级风控（同一 body 在 ≥2 个不同账号上都被上游判风控）。
+//
+// 与 errNetwork 的区别在出路：errNetwork 由外层换号重试，本类型**不得换号**——换号救不了
+// 一份被拒的请求体，只会把健康账号一个个送出去挨打（2026-09-24 整池雪崩正是这条路径）。
+// processTicket 收到后把上游原文作为 error 事件投递一次并终止本票。
+type errRequestLevelRisk struct{ body string }
+
+func (e errRequestLevelRisk) Error() string { return "request-level risk control: " + e.body }
 
 // errRateLimited 瞬时限流（非额度码族的 429）：账号尚未标任何状态，
 // 由 attemptUpstream 决定是原地重试还是递进冷却后换号。

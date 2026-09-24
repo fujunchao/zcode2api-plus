@@ -152,6 +152,10 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	web.Req(reqID, orDash(modelName), stream)
 
 	tried := map[string]bool{}
+	// 风控判定范围：**必须按请求创建**（Engine 跨请求共享，挂上去会让并发请求互相误判）。
+	// 用于把「账号级风控」（换号即成功）与「请求级风控」（同一 body 换谁都被拒）分开，
+	// 后者不得惩罚账号、并回滚本请求已施加的风控冷却。见 riskscope.go。
+	scope := NewRiskScope()
 	for range MaxAccountAttempts {
 		acc := e.Store.Select(model.ProviderZai, tried, modelName)
 		if acc == nil {
@@ -159,7 +163,7 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		}
 		tried[acc.ID] = true
 		diag.Attempts++
-		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, deliver, diag)
+		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, deliver, diag, scope)
 		if res.retrySame {
 			continue
 		}
@@ -200,6 +204,8 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 // tryAccount 单个账号的尝试：内层为同账号重试（验证码刷新 / 3010 等待 / 瞬时限流）。
 // 循环的每一次 continue 都必须先从 attemptBudget 对应类目里扣一次预算，二者手动
 // 保持一致——预算之和加首次尝试即循环上界，任何一条路径漏记账都会让循环不收敛。
+//
+// scope 是本请求的风控判定范围，只读不写账号状态；为 nil 时（防御）退化为逐号冷却的旧行为。
 func (e *Engine) tryAccount(
 	ctx context.Context,
 	reqID string,
@@ -210,6 +216,7 @@ func (e *Engine) tryAccount(
 	incomingHeaders map[string]string,
 	deliver DeliverFunc,
 	diag *ReqDiag,
+	scope *RiskScope,
 ) attemptResult {
 	needsCaptcha := acc.Mode == "jwt"
 
@@ -301,7 +308,7 @@ func (e *Engine) tryAccount(
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, modelName, needsCaptcha, resp, &b)
+			res := e.handleUpstreamError(ctx, reqID, acc, modelName, needsCaptcha, resp, &b, scope)
 			if res.retrySame {
 				continue
 			}
@@ -356,6 +363,7 @@ func (e *Engine) handleUpstreamError(
 	needsCaptcha bool,
 	resp *http.Response,
 	b *attemptBudget,
+	scope *RiskScope,
 ) attemptResult {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	_ = resp.Body.Close()
@@ -498,22 +506,48 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 
-	// 8) 405 + 风控文案：上游风控拦截，冷却整个账号（按连续命中次数递进），
-	// 连续次数超过阶梯长度则置为失效、交人工处理。
+	// 8) 405 + 风控文案：先分清「账号级」还是「请求级」风控，再决定要不要惩罚账号。
+	//
+	// 账号级（换号即成功——2026-09-23 全天 17 次零星风控，17/17 在第 2 个账号上成功）
+	// → 整号冷却（按连续命中次数递进，超阶梯置失效）并换号，与既有行为一致。
+	//
+	// 请求级（同一 body 在 ≥2 个不同账号上都吃同一风控信号——2026-09-24 当日 67/67）
+	// → 身份已不是变量，剩下的只有请求体：此时换号是把健康账号一个个送出去挨打（当日
+	// 14 次重放冷却 67 个账号、清空 70 号池，GLM-5.3 中断约 5 分钟）。改为不冷却、不换号，
+	// 原样返回上游 405，并回滚本请求此前已施加的风控冷却（见 riskscope.go）。
 	//
 	// 先看 body 再看状态码：405 在本项目里有三种完全不同的含义——风控拦截、计费接口
 	// 的重复查询、以及 JWT 账号缺顶层 system 注入时上游回的 405。最后一种是**我方构造
 	// 请求的缺陷**（见 body.go / upstream/request.go 的说明），换号与冷却都没用，每个
-	// 账号都会一样地失败；只看状态码冷却会把它变成对账号的集体惩罚。
+	// 账号都会一样地失败；只看状态码冷却会把它变成对账号的集体惩罚。请求级判定是同一
+	// 思路的延伸：当身份不是变量时，别惩罚身份。
 	//
-	// 风控看身份维度（账号/设备指纹/出口 IP/请求头），与模型无关，所以这里不换模型、
+	// 风控看身份维度（账号/设备指纹/出口 IP/请求头），与模型无关，所以账号级处置不换模型、
 	// 直接停整个账号；冷却期间该号 IsSelectable 为 false，本请求自然换下一个。
 	if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(text) {
-		secs, streak, invalid := e.markRiskControl(acc, "上游风控拦截 HTTP 405: "+ErrorPreview(text))
+		preview := ErrorPreview(text)
+		if scope.Verdict(acc) {
+			restored, skipped := scope.Rollback(e.Store)
+			// 证据仍要留：判定的是「不该惩罚账号」，不是「这次拦截没发生过」。
+			// 只归类不覆盖文案之外的状态字段，故走 recordError 而非 mark。
+			e.recordError(acc, model.ErrorKindRiskControl, "上游风控拦截 HTTP 405（請求級）: "+preview)
+			web.Warn(reqID, fmt.Sprintf(
+				"风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號並回滾冷卻（回滾 %d、跳過 %d）",
+				scope.Accounts(), resp.StatusCode, preview, restored, skipped))
+			return attemptResult{final: runResult{
+				Status: resp.StatusCode,
+				Body:   passthroughBodyWithType(text, "upstream_error"),
+			}}
+		}
+		secs, streak, invalid, snap := MarkRiskControlWithSnapshot(e.Store, acc.Provider, acc.ID,
+			"上游风控拦截 HTTP 405: "+preview, e.now())
+		scope.Record(snap)
 		if invalid {
-			web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控，已置為失效待人工處理", acc.Name, streak))
+			web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
+				acc.Name, streak, resp.StatusCode, preview))
 		} else {
-			web.Warn(reqID, fmt.Sprintf("账号 %s 第 %d 次命中风控，冷却 %d s 后切换下一个", acc.Name, streak, secs))
+			web.Warn(reqID, fmt.Sprintf("账号 %s 第 %d 次命中风控（HTTP %d，%s），冷却 %d s 后切换下一个",
+				acc.Name, streak, resp.StatusCode, preview, secs))
 		}
 		return attemptResult{switchAccount: true}
 	}
@@ -794,13 +828,6 @@ func (e *Engine) recordError(acc *model.Account, kind, detail string) {
 // 打成「第 0 次」；asyncpool 侧一直用的就是返回值）。
 func (e *Engine) markRateLimited(acc *model.Account, errMsg string) (int, int) {
 	return MarkRateLimited(e.Store, acc.Provider, acc.ID, errMsg, e.now())
-}
-
-// markRiskControl 上游风控的递进冷却，返回（本次冷却秒数, 累加后的连续次数, 是否已失效）。
-// 与 markRateLimited 同理：连续次数只能取返回值，acc 是副本，读 acc.RiskControlStreak
-// 拿到的是旧值。
-func (e *Engine) markRiskControl(acc *model.Account, errMsg string) (int, int, bool) {
-	return MarkRiskControl(e.Store, acc.Provider, acc.ID, errMsg, e.now())
 }
 
 // markUpstreamUnavailable 上游 503 的递进冷却，返回（本次冷却秒数, 累加后的连续次数）。

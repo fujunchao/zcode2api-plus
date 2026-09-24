@@ -23,6 +23,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
+	"zcode2api/internal/web"
 )
 
 // upstreamCall 记录一次上游收包。
@@ -672,6 +673,121 @@ func Test405WithoutRiskBodyDoesNotCool(t *testing.T) {
 	}
 	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindUpstreamError {
 		t.Fatalf("非风控 405 应归类为 upstream_error: %v", got.LastErrorKind)
+	}
+}
+
+// 405 + 风控文案：同一请求体在 ≥2 个不同账号上被拒 ⇒ 判定为「请求级风控」，不惩罚账号。
+//
+// 2026-09-24 事故（docs/analysis-riskcontrol-pool-cascade-20260924.md）：一个 278,081B 的
+// 请求被上游判风控，网关逐号冷却（MaxAccountAttempts=5）+ 调用方重放 14 次，67 个健康账号
+// 在 2 分钟内被清空。判据的依据是同日对照组——09-23 全天 17 次账号级风控全部在第 2 个账号
+// 上成功，所以「≥2 个不同账号同一信号」这条阈值不会误伤账号级风控。
+func Test405RequestLevelRiskDoesNotCoolPool(t *testing.T) {
+	f := newFixture(t)
+	upstreamBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
+	f.respond = jsonResp(405, upstreamBody)
+	a1, _ := f.st.AddAccount(model.ProviderZai, "req-level-1", "sk-1")
+	a2, _ := f.st.AddAccount(model.ProviderZai, "req-level-2", "sk-2")
+	a3, _ := f.st.AddAccount(model.ProviderZai, "req-level-3", "sk-3")
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 405 || raw != upstreamBody {
+		t.Fatalf("请求级风控应原样透传上游 405: %d %q", status, raw)
+	}
+	// 第 2 个账号给出同一信号即判定成立，第 3 个账号不该再被试。
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("判定成立后应停止换号，上游调用应为 2 次: %d", n)
+	}
+	// 所有账号都不得被冷却（Select 是轮询，"哪两个账号被试"不可假设：断言取聚合形态）。
+	// 证据必须保留：判定的是「不惩罚账号」，不是「这次拦截没发生过」——只留痕不写状态。
+	withEvidence := 0
+	for _, acc := range []*model.Account{a1, a2, a3} {
+		got := f.st.Find(model.ProviderZai, acc.ID)
+		if got.Status != model.StatusActive || got.CoolingUntil != nil {
+			t.Fatalf("请求级风控不该冷却账号 %s: status=%s until=%v", got.Name, got.Status, got.CoolingUntil)
+		}
+		if got.RiskControlStreak != 0 {
+			t.Fatalf("请求级风控不该推进账号 %s 的风控阶梯: %d", got.Name, got.RiskControlStreak)
+		}
+		if got.FailCount != 0 {
+			t.Fatalf("请求级风控不该累计账号 %s 的失败计数: %d", got.Name, got.FailCount)
+		}
+		if got.LastErrorKind == nil {
+			continue
+		}
+		if *got.LastErrorKind != model.ErrorKindRiskControl {
+			t.Fatalf("账号 %s 的错误归类应为 risk_control: %v", got.Name, *got.LastErrorKind)
+		}
+		withEvidence++
+	}
+	// 恰好是被判定的那两个账号：一个回滚后留痕，一个作为判定依据留痕；第 3 个纹丝不动。
+	if withEvidence != 2 {
+		t.Fatalf("两个参与判定的账号都应留有风控证据: %d", withEvidence)
+	}
+}
+
+// 对照组：只有 1 个账号给出风控信号、第 2 个账号正常 ⇒ 仍是账号级风控，被拒账号必须冷却。
+// 这是「阈值 2 不误伤」的直接守卫——09-23 全天的 17 次零星风控都是这个形态。
+func Test405AccountLevelRiskStillCoolsAndSwitches(t *testing.T) {
+	f := newFixture(t)
+	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
+	f.respond = func(call int, _ *http.Request) (int, http.Header, string) {
+		if call == 1 {
+			return http.StatusMethodNotAllowed, http.Header{"Content-Type": []string{"application/json"}}, riskBody
+		}
+		return http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+	}
+	a1, _ := f.st.AddAccount(model.ProviderZai, "acct-level-1", "sk-1")
+	a2, _ := f.st.AddAccount(model.ProviderZai, "acct-level-2", "sk-2")
+
+	status, body := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusOK {
+		t.Fatalf("第 2 个账号可用时应成功: %d %s", status, body)
+	}
+	cooled := 0
+	for _, acc := range []*model.Account{a1, a2} {
+		got := f.st.Find(model.ProviderZai, acc.ID)
+		if got.Status != model.StatusCooling {
+			continue
+		}
+		cooled++
+		if got.RiskControlStreak != 1 {
+			t.Fatalf("账号级风控应推进一次阶梯: %d", got.RiskControlStreak)
+		}
+		if got.CoolingUntil == nil {
+			t.Fatal("账号级风控应写入冷却截止时间")
+		}
+	}
+	if cooled != 1 {
+		t.Fatalf("账号级风控应恰好冷却被拒的那 1 个账号: %d", cooled)
+	}
+}
+
+// 405 风控的日志必须带上游 body 预览，否则事后无法区分 405 的三种语义（风控 / 计费重复
+// 查询 / 缺顶层 system 注入）——2026-09-24 那份完整日志就是因为缺这一行，只能靠统计推断。
+func Test405RiskControlLogCarriesUpstreamBody(t *testing.T) {
+	f := newFixture(t)
+	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
+	f.respond = jsonResp(405, riskBody)
+	if _, err := f.st.AddAccount(model.ProviderZai, "a", "sk-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	web.SetOut(&buf)
+	t.Cleanup(func() { web.SetOut(nil) })
+
+	f.post(t, msgBody(), "sk-test")
+
+	out := buf.String()
+	if !strings.Contains(out, "命中风控") {
+		t.Fatalf("应打出风控命中行: %s", out)
+	}
+	if !strings.Contains(out, "unusual activity") {
+		t.Fatalf("风控命中行应带上游 body 预览: %s", out)
+	}
+	if !strings.Contains(out, "405") {
+		t.Fatalf("风控命中行应带状态码: %s", out)
 	}
 }
 

@@ -162,28 +162,12 @@ func riskControlCoolingSeconds(st *store.Store, streak int) (secs int, invalid b
 // IP、请求头与 UA——模型只是 body 里的一个字段。同一个身份换个模型照样被拦，按模型
 // 冷却只会把失败摊到别的模型上、把暴露时间拖长。这条分支必须排在「其余错误」兜底
 // 之前，否则 405 会被当成未识别错误原样透传、账号状态一点不变（线上曾如此）。
+//
+// ⚠️ 本函数只处理**账号级**风控。「同一请求体在 ≥2 个不同账号上都被拒」属请求级，
+// 不该惩罚账号、更要回滚已施加的冷却——见 riskscope.go 的 riskScope 与
+// MarkRiskControlWithSnapshot（本函数是它的薄包装，两者必须共用同一段锁内逻辑）。
 func MarkRiskControl(st *store.Store, provider, idOrName, errMsg string, now time.Time) (secs, streak int, invalid bool) {
-	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
-		acc.RiskControlStreak++
-		streak = acc.RiskControlStreak
-		secs, invalid = riskControlCoolingSeconds(st, streak)
-		if invalid {
-			// 失效是「需人工介入」的终态，没有等待窗口可言，故清掉冷却截止时间，
-			// 避免前台把它显示成一个到点就会自己好的冷却。
-			acc.Status = model.StatusInvalid
-			acc.CoolingUntil = nil
-			StampAccountError(acc, model.ErrorKindRiskControl, errMsg, now)
-			return
-		}
-		until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
-		acc.Status = model.StatusCooling
-		acc.CoolingUntil = &until
-		StampAccountError(acc, model.ErrorKindRiskControl, errMsg, now)
-	})
-	if streak == 0 {
-		// 账号已被删除（并发删除）：不落库，但仍给日志一个可用的档位。
-		secs, invalid = riskControlCoolingSeconds(st, 1)
-	}
+	secs, streak, invalid, _ = MarkRiskControlWithSnapshot(st, provider, idOrName, errMsg, now)
 	return secs, streak, invalid
 }
 
