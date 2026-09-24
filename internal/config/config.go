@@ -205,6 +205,11 @@ var (
 	// 不发的头，与少发一样是可交叉比对的差异。见 docs/plan-client-format-parity.md GAP-7。
 	UpstreamSendDeviceMid = envBool("ZCODE_UPSTREAM_SEND_DEVICE_MID", false)
 
+	// ReplayGuardTTLSeconds 重放防护窗口（秒，P1-3）：同一份请求内容被判定「请求级
+	// 风控」后，该窗口内同内容+同模型的请求直接快速失败，不再消耗任何账号 —— 阻止
+	// 上游账号标记随换号重试扩散（2026-09-24 整池雪崩的直接机制）。0 = 禁用（应急回退）。
+	ReplayGuardTTLSeconds = envInt("ZCODE_REPLAY_GUARD_TTL_SECONDS", 60)
+
 	// 官方客户端版本号：随请求头 / URL 参数上行，用于伪装成官方客户端。
 	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐；
 	// 2026-09-23 由 3.11.2 升至 3.14.3（本机实装客户端版本，激活失效排查项之一，

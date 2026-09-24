@@ -56,6 +56,12 @@ type Engine struct {
 	// OnQuotaRefresh 成功/耗尽后触发的额度刷新（M3 接入 quota 包；nil 跳过）。
 	OnQuotaRefresh func(acc *model.Account)
 
+	// replay 重放防护表（P1-3）：跨请求共享，按「内容指纹+模型」记住最近一次请求级
+	// 风控判定，TTL 内同内容请求直接快速失败 —— 阻止上游账号标记随重放扩散。
+	// nil = 禁用（ReplayGuardTTL <= 0）。跨请求共享正是它的意义：上一个请求刚把
+	// 两个账号喂给特征 body，下一个相同 body 的请求必须立即被挡住。
+	replay *ReplayGuard
+
 	now func() time.Time
 }
 
@@ -64,7 +70,7 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 	if client == nil {
 		client = defaultUpstreamClient()
 	}
-	return &Engine{
+	e := &Engine{
 		Store:               st,
 		Captcha:             cm,
 		Client:              client,
@@ -73,6 +79,10 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		OverloadRetryDelays: OverloadRetryDelays,
 		now:                 time.Now,
 	}
+	if ReplayGuardTTL > 0 {
+		e.replay = NewReplayGuard(time.Duration(ReplayGuardTTL)*time.Second, e.now)
+	}
+	return e
 }
 
 // SetNow 注入时钟（测试用）。
@@ -143,13 +153,23 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	// 刻意不改 web.Req/ReqOk/ReqErr 的形态，也不改本函数的导出签名
 	//（reqID 本就在函数内生成，三个外部调用点无需改动）。
 	diag := NewReqDiag(reqID, orDash(modelName), stream, body, e.now)
+	// 重放防护（P1-3）：同一份内容刚刚被判定请求级风控 ⇒ TTL 内直接快速失败。
+	// 上游 405 是两段式（内容触发 + 账号标记），请求级判定成立时每个被尝试的账号都
+	// 已被服务端标记；窗口期内继续接同内容请求只会把下一个健康账号再标记一个
+	//（09-24 凌晨 14 次重放冷却 67 号、整池清空的直接机制）。见 replayguard.go。
+	contentKey := ContentKey(orDash(modelName), body)
+	if e.replay.Blocked(contentKey) {
+		web.ReqErr(reqID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
+		return errResult(http.StatusServiceUnavailable, "risk_control_cooldown",
+			"相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容")
+	}
 	// 风控判定范围：**必须按请求创建**（Engine 跨请求共享，挂上去会让并发请求互相误判）。
-	// 用于把「账号级风控」（换号即成功）与「请求级风控」（同一 body 换谁都被拒）分开，
-	// 后者不得惩罚账号、并回滚本请求已施加的风控冷却。见 riskscope.go。
+	// 用于把「账号级风控」（换号即成功）与「请求级风控」（同一 body 换谁都被拒）分开。
+	// 请求级处置：停止换号、保留冷却（上游已标记账号）、登记重放防护。见 riskscope.go。
 	//
 	// 刻意与 diag 一起声明在 defer 之前：诊断行要排印本请求的风控范围，而 defer 里的
 	// 闭包只能引用它之前已声明的变量。
-	scope := NewRiskScope()
+	scope := NewRiskScope(contentKey)
 	defer func() {
 		// 总耗时在这里统一冻结（而不是在 finishDelivery 里）：早退路径
 		//（如 no_available_account）从来没走到交付，也应当有可读的耗时。
@@ -244,6 +264,10 @@ func (e *Engine) tryAccount(
 	budget := 1 + MaxCaptchaRetries + len(e.BusyRetryDelays) + MaxRateLimitRetries + len(e.OverloadRetryDelays)
 
 	for range budget {
+		// x-request-id 按**上游 HTTP 尝试**换新：官方同一轮次（queryId 不变）内每次
+		// attempt 都换新 requestId（CLI 日志实证）。本循环内的验证码重试等多次出站
+		// 同样如此；session/trace/query 保持（轮次与会话连续）。
+		attr = attr.WithFreshRequestID()
 		var verifyParam, verifyRegion string
 		if needsCaptcha {
 			token, err := e.Captcha.GetVerifyParam(ctx)
@@ -535,9 +559,10 @@ func (e *Engine) handleUpstreamError(
 	// → 整号冷却（按连续命中次数递进，超阶梯置失效）并换号，与既有行为一致。
 	//
 	// 请求级（同一 body 在 ≥2 个不同账号上都吃同一风控信号——2026-09-24 当日 67/67）
-	// → 身份已不是变量，剩下的只有请求体：此时换号是把健康账号一个个送出去挨打（当日
-	// 14 次重放冷却 67 个账号、清空 70 号池，GLM-5.3 中断约 5 分钟）。改为不冷却、不换号，
-	// 原样返回上游 405，并回滚本请求此前已施加的风控冷却（见 riskscope.go）。
+	// → 身份已不是变量，剩下的只有请求体：换号是把健康账号一个个送出去挨打。处置
+	// （账号级标记模型，见 riskscope.go 头注释）：停止换号、**保留**本请求已施加的
+	// 风控冷却（每个被尝试的账号都已被上游标记，本地冷却防止它们立即被再次选中）、
+	// 登记重放防护（同内容 TTL 内直接快速失败，阻止标记扩散）。
 	//
 	// 先看 body 再看状态码：405 在本项目里有三种完全不同的含义——风控拦截、计费接口
 	// 的重复查询、以及 JWT 账号缺顶层 system 注入时上游回的 405。最后一种是**我方构造
@@ -550,21 +575,28 @@ func (e *Engine) handleUpstreamError(
 	if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(text) {
 		preview := ErrorPreview(text)
 		if scope.Verdict(acc) {
-			restored, skipped := scope.Rollback(e.Store)
-			// 证据仍要留：判定的是「不该惩罚账号」，不是「这次拦截没发生过」。
-			// 只归类不覆盖文案之外的状态字段，故走 recordError 而非 mark。
-			e.recordError(acc, model.ErrorKindRiskControl, "上游风控拦截 HTTP 405（請求級）: "+preview)
-			web.Warn(reqID, fmt.Sprintf(
-				"风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號並回滾冷卻（回滾 %d、跳過 %d）",
-				scope.Accounts(), resp.StatusCode, preview, restored, skipped))
+			// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
+			// 相同（MarkRiskControl 内部落证据章），差别只在后续：停止换号 + 登记
+			// 重放防护，让同内容请求在窗口内直接失败。
+			secs, streak, invalid := MarkRiskControl(e.Store, acc.Provider, acc.ID,
+				"上游风控拦截 HTTP 405（請求級）: "+preview, e.now())
+			if e.replay != nil {
+				e.replay.Record(scope.ContentKey())
+			}
+			if invalid {
+				web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（請求級，HTTP %d，%s），已置為失效待人工處理；同內容 %d s 內直接拒絕",
+					acc.Name, streak, resp.StatusCode, preview, ReplayGuardTTL))
+			} else {
+				web.Warn(reqID, fmt.Sprintf("风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（上游已標記帳號，%d s），同內容 %d s 內直接拒絕",
+					scope.Accounts(), resp.StatusCode, preview, secs, ReplayGuardTTL))
+			}
 			return attemptResult{final: runResult{
 				Status: resp.StatusCode,
 				Body:   passthroughBodyWithType(text, "upstream_error"),
 			}}
 		}
-		secs, streak, invalid, snap := MarkRiskControlWithSnapshot(e.Store, acc.Provider, acc.ID,
+		secs, streak, invalid := MarkRiskControl(e.Store, acc.Provider, acc.ID,
 			"上游风控拦截 HTTP 405: "+preview, e.now())
-		scope.Record(snap)
 		if invalid {
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
 				acc.Name, streak, resp.StatusCode, preview))

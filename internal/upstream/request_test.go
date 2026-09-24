@@ -105,8 +105,16 @@ func TestClientHeadersFiltered(t *testing.T) {
 	if h["X-Aliyun-Captcha-Verify-Region"] != "sgp" {
 		t.Fatal("客户端不得覆盖验证码 region 头")
 	}
-	if h["Accept"] != "application/json" || h["X-Custom-Trace"] != "keep-me" {
+	// Accept 是官方恒带的传输层固定头（undici 默认 */*），客户端透传值被覆盖。
+	if h["Accept"] != "*/*" {
+		t.Fatalf("Accept 应为官方固定值 */*（客户端透传值被覆盖）: %v", h)
+	}
+	if h["X-Custom-Trace"] != "keep-me" {
 		t.Fatalf("普通透传头应保留: %v", h)
+	}
+	// 鉴权双头同值（官方形态）：Authorization 与 X-Api-Key 是同一凭据。
+	if h["X-Api-Key"] != "header.payload.sig" || h["Authorization"] != "Bearer header.payload.sig" {
+		t.Fatalf("JWT 账号应发鉴权双头且同值: %q / %q", h["X-Api-Key"], h["Authorization"])
 	}
 }
 
@@ -137,7 +145,7 @@ func TestClientDeviceMidHeaderNeverReachesUpstream(t *testing.T) {
 		{"X-Device-Mid": "spoofed"},
 		{"x-device-mid": "spoofed"},
 		{"X-DEVICE-MID": "spoofed"},
-		{"x-device-mid": "spoofed", "Accept": "application/json"},
+		{"x-device-mid": "spoofed", "X-Custom-Trace": "keep-me"},
 	}
 	for _, incoming := range incomings {
 		req, err := BuildRequest(jwtAccount(), "", "", incoming)
@@ -149,8 +157,9 @@ func TestClientDeviceMidHeaderNeverReachesUpstream(t *testing.T) {
 				t.Fatalf("客户端 x-device-mid 不得出现在出站头: %v", req.Headers)
 			}
 		}
-		// 剔除是定点拦截，不能把其它透传头一起带走。
-		if want, ok := incoming["Accept"]; ok && req.Headers["Accept"] != want {
+		// 剔除是定点拦截，不能把其它透传头一起带走（Accept 除外——它现在是
+		// 官方恒带的传输层固定头，恒胜透传）。
+		if v, ok := incoming["X-Custom-Trace"]; ok && req.Headers["X-Custom-Trace"] != v {
 			t.Fatalf("普通透传头不应受影响: %v", req.Headers)
 		}
 	}

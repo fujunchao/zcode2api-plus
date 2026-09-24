@@ -76,13 +76,18 @@ type Pool struct {
 	// nil 时跳过（测试默认）。
 	OnQuotaRefresh func(*model.Account)
 
+	// replay 重放防护表（P1-3，与 gateway.Engine 共用类型）：跨票共享，按
+	// 「内容指纹+模型」记住最近一次请求级风控判定，TTL 内同内容票直接快速失败。
+	// nil = 禁用（gateway.ReplayGuardTTL <= 0）。
+	replay *gateway.ReplayGuard
+
 	mu      sync.Mutex
 	tickets map[string]*ticket
 }
 
 // NewPool 创建空闲池。
 func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
-	return &Pool{
+	p := &Pool{
 		Store:               st,
 		Auth:                au,
 		Captcha:             cm,
@@ -90,6 +95,10 @@ func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
 		OverloadRetryDelays: gateway.OverloadRetryDelays,
 		tickets:             map[string]*ticket{},
 	}
+	if gateway.ReplayGuardTTL > 0 {
+		p.replay = gateway.NewReplayGuard(time.Duration(gateway.ReplayGuardTTL)*time.Second, time.Now)
+	}
+	return p
 }
 
 // Register 在 mux 上注册异步路由（调用方按 config.AsyncEnabled 决定是否挂载，
@@ -307,10 +316,17 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	diag.Ticket = ticketID
 	// 风控判定范围：**必须按票创建**（Pool 跨票共享，挂上去会让并发票务互相误判）。
 	// 与 sync 路径共用 gateway.RiskScope：同一份 body 在两条路径上必须得到同一判定。
+	// 请求级处置：停止换号、保留冷却（上游已标记账号）、登记重放防护。见 riskscope.go。
 	//
 	// 刻意与 diag 一起声明在 defer 之前：诊断行要排印本票的风控范围，而 defer 里的
 	// 闭包只能引用它之前已声明的变量。
-	scope := gateway.NewRiskScope()
+	contentKey := gateway.ContentKey(modelName, body)
+	if p.replay.Blocked(contentKey) {
+		web.ReqErr(ticketID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
+		p.emitError(ctx, ticketID, "相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容", "risk_control_cooldown")
+		return
+	}
+	scope := gateway.NewRiskScope(contentKey)
 	defer func() {
 		diag.Finish(time.Now())
 		// 与 sync 同口径：风控范围取收尾期的最终值（命中的不同账号数，≥2 即请求级）。
@@ -351,6 +367,10 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		tried[acc.ID] = true
 		diag.Attempts++
 		diag.AccName = acc.Name
+		// x-request-id 按**上游 HTTP 尝试**换新（与 sync 路径同口径）：换号后仍是
+		// 同一张票（query/session/trace 保持），但官方语义里每次上游请求都有新 id
+		// ——整票共享一个 id 会让上游看到「同一请求 id 出现在多个账号上」。
+		attr = attr.WithFreshRequestID()
 		// 出口线路标签由 clientFor 一手交出（只有它知道代理是否真的生效、是否被
 		// async_force_direct 强制置空），此处不另起判据——两套判据必然漂移，
 		// 而「线路侧 vs 上游侧」的归因正是靠 route 读数判定的，读反即结论反。
@@ -372,6 +392,8 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		networkRetry := false
 		lastNetworkError := ""
 		for attempt := range gateway.MaxCaptchaRetries {
+			// 内层（同账号验证码重试）也是独立的上游 HTTP 请求，同样换新请求 id。
+			attr = attr.WithFreshRequestID()
 			var verifyParam, verifyRegion string
 			token, err := p.Captcha.GetVerifyParam(ctx)
 			if err != nil {
@@ -681,26 +703,32 @@ func (p *Pool) attemptUpstreamOnce(
 		// 两条路径不得对同一份 body 给出不同判定）。
 		//
 		// 账号级（换号即成功）→ 整号冷却（按连续命中递进，超限置失效）并换号。
-		// 请求级（同一 body 在 ≥2 个不同账号上都被拒）→ 身份不是变量、剩下的只有请求体，
-		// 换号只是把健康账号送出去挨打：改为不冷却（并回滚本票已施加的冷却），把上游原文
-		// 终止性投递给客户端。判据与阈值见 gateway.RiskScope。
+		// 请求级（同一 body 在 ≥2 个不同账号上都被拒）→ 身份不是变量、剩下的只有请求体。
+		// 处置（账号级标记模型，见 gateway.RiskScope 头注释）：停止换号、**保留**本票
+		// 已施加的风控冷却（每个被尝试的账号都已被上游标记）、登记重放防护，把上游原文
+		// 终止性投递给客户端。
 		//
 		// 判定必须先看 body：405 也可能是计费接口的重复查询，或者我方缺 system 注入时上游
 		// 回的错（那种情况每个账号都会一样失败，冷却账号等于把代码缺陷变成账号惩罚）。
 		if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(bodyText) {
 			preview := gateway.ErrorPreview(bodyText)
 			if scope.Verdict(acc) {
-				restored, skipped := scope.Rollback(p.Store)
-				gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindRiskControl,
+				// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
+				// 相同，差别只在后续：停止换号 + 登记重放防护。
+				_, streak, invalid := gateway.MarkRiskControl(p.Store, acc.Provider, acc.ID,
 					"上游风控拦截 HTTP 405（請求級）: "+preview, time.Now())
-				web.Warn(ticketID, fmt.Sprintf(
-					"风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號並回滾冷卻（回滾 %d、跳過 %d）",
-					scope.Accounts(), resp.StatusCode, preview, restored, skipped))
+				p.replay.Record(scope.ContentKey())
+				if invalid {
+					web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（請求級，HTTP %d，%s），已置為失效待人工處理；同內容 %d s 內直接拒絕",
+						acc.Name, streak, resp.StatusCode, preview, gateway.ReplayGuardTTL))
+				} else {
+					web.Warn(ticketID, fmt.Sprintf("风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（上游已標記帳號），同內容 %d s 內直接拒絕",
+						scope.Accounts(), resp.StatusCode, preview, gateway.ReplayGuardTTL))
+				}
 				return false, errRequestLevelRisk{body: bodyText}
 			}
-			_, streak, invalid, snap := gateway.MarkRiskControlWithSnapshot(p.Store, acc.Provider, acc.ID,
+			_, streak, invalid := gateway.MarkRiskControl(p.Store, acc.Provider, acc.ID,
 				"上游风控拦截 HTTP 405: "+preview, time.Now())
-			scope.Record(snap)
 			if invalid {
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
 					acc.Name, streak, resp.StatusCode, preview))

@@ -95,6 +95,48 @@ func TestDeviceIdentityTravelsInBodyNotHeaders(t *testing.T) {
 	}
 }
 
+// TestRequestIDRefreshesAcrossAttempts 换号重试时 x-request-id 必须换新，而轮次与会话
+// 标识保持 —— 官方语义（CLI 日志实证）：同一 queryId 内每次上游 attempt 都有新
+// requestId。整轮共享一个 id 会让上游看到「同一请求 id 出现在多个账号上」，直接暴露
+// 多账号同源。
+func TestRequestIDRefreshesAcrossAttempts(t *testing.T) {
+	f := newFixture(t)
+	f.respond = func(call int, _ *http.Request) (int, http.Header, string) {
+		if call == 1 {
+			// 账号 1 命中风控 → 冷却并换号
+			return http.StatusMethodNotAllowed,
+				http.Header{"Content-Type": []string{"application/json"}},
+				`{"error":{"message":"Request has been blocked due to unusual activity."}}`
+		}
+		return 200, http.Header{"Content-Type": []string{"application/json"}}, okUpstreamJSON
+	}
+	for _, name := range []string{"acc-1", "acc-2"} {
+		if _, err := f.st.AddAccount(model.ProviderZai, name, "sk-"+name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status, raw := f.postWithHeaders(t, msgBody(), map[string]string{"x-session-id": "sess_refresh-1"})
+	if status != 200 {
+		t.Fatalf("第二次尝试应 200，实际 %d %s", status, raw)
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("应换号一次（上游 2 次调用），实际 %d", n)
+	}
+	f.mu.Lock()
+	first, second := f.calls[0], f.calls[1]
+	f.mu.Unlock()
+
+	if first.Header.Get("X-Request-Id") == second.Header.Get("X-Request-Id") {
+		t.Fatalf("两次尝试的 X-Request-Id 不应相同: %q", first.Header.Get("X-Request-Id"))
+	}
+	for _, key := range []string{"X-Session-Id", "X-Query-Id", "X-Zcode-Trace-Id", "X-Zcode-Session-Type"} {
+		if first.Header.Get(key) != second.Header.Get(key) {
+			t.Fatalf("%s 换号后应保持（同一轮次/会话）: %q vs %q",
+				key, first.Header.Get(key), second.Header.Get(key))
+		}
+	}
+}
+
 // TestDeviceIdentityPerAccount 同一次请求打到不同账号时，body 里的指纹必须跟着账号变
 // （否则账号隔离形同虚设）。用两个账号各发一次，比对两次出站的 device_id。
 func TestDeviceIdentityPerAccount(t *testing.T) {

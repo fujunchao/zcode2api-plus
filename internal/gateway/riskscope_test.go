@@ -1,5 +1,10 @@
-// 风控「账号级 / 请求级」判定的单元测试：阈值去重、快照回滚的两道闸。
-// 端到端行为（多账号同 body 风控 → 0 冷却）在 engine_test.go 与 asyncpool/pool_test.go。
+// 风控「账号级 / 请求级」判定的单元测试：阈值去重、冷却施加。
+// 端到端行为（多账号同 body 风控 → 冷却保留 + 重放防护）在 engine_test.go 与
+// asyncpool/pool_test.go，以及 replayguard_test.go。
+//
+// ⚠️ 曾有的「快照回滚」测试（正常回滚 / 并发放弃 / invalid 不回滚）随回滚机制一起删除：
+// 账号级标记模型下请求级判定的处置是**保留冷却**，回滚等于替服务端解封账号
+// （docs/analysis-auth-chain-vs-official.md §九）。
 package gateway
 
 import (
@@ -17,7 +22,7 @@ func TestRiskScopeVerdictCountsDistinctAccounts(t *testing.T) {
 	RiskControlRequestLevelThreshold = 2
 	t.Cleanup(func() { RiskControlRequestLevelThreshold = old })
 
-	sc := NewRiskScope()
+	sc := NewRiskScope("model|content")
 	a := &model.Account{ID: "acc-1"}
 	b := &model.Account{ID: "acc-2"}
 
@@ -33,107 +38,36 @@ func TestRiskScopeVerdictCountsDistinctAccounts(t *testing.T) {
 	if !sc.Verdict(b) {
 		t.Fatal("第 2 个不同账号应触发请求级判定")
 	}
+	if sc.ContentKey() != "model|content" {
+		t.Fatalf("ContentKey 应原样保存: %q", sc.ContentKey())
+	}
 }
 
-// 正常回滚：调度三字段（Status / CoolingUntil / RiskControlStreak）复原，
-// 但 last_error_kind 这条**证据**必须保留——判定的是「不惩罚账号」，不是「没发生过」。
-func TestRollbackRiskControlRestoresSchedulingFields(t *testing.T) {
+// 首次命中：调度三字段进入冷却，证据章落库 —— 这是账号级与请求级共用的动作
+// （请求级时账号同样被上游标记，本地冷却必须保留）。
+func TestMarkRiskControlAppliesCooling(t *testing.T) {
 	st := openStore(t)
 	acc, err := st.AddAccount(model.ProviderZai, "rb", "sk-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	_, streak, invalid, snap := MarkRiskControlWithSnapshot(st, model.ProviderZai, acc.ID, "上游风控拦截 HTTP 405: x", time.Now())
-	if streak != 1 || invalid {
-		t.Fatalf("首次命中应为 1 次、非失效: streak=%d invalid=%v", streak, invalid)
-	}
-	if got := st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusCooling || got.CoolingUntil == nil {
-		t.Fatalf("先要真的施加冷却: status=%s until=%v", got.Status, got.CoolingUntil)
-	}
-
-	restored, skipped := RollbackRiskControl(st, snap)
-	if !restored || skipped {
-		t.Fatalf("未并发改动时应回滚成功: restored=%v skipped=%v", restored, skipped)
-	}
-	got := st.Find(model.ProviderZai, acc.ID)
-	if got.Status != model.StatusActive || got.CoolingUntil != nil {
-		t.Fatalf("调度状态应复原: status=%s until=%v", got.Status, got.CoolingUntil)
-	}
-	if got.RiskControlStreak != 0 {
-		t.Fatalf("风控阶梯应复原为 0: %d", got.RiskControlStreak)
-	}
-	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
-		t.Fatalf("证据必须保留: %v", got.LastErrorKind)
-	}
-	if got.LastError == nil || *got.LastError == "" {
-		t.Fatal("证据文案必须保留")
-	}
-}
-
-// 并发守卫：回滚前被第三方（管理员改状态 / 另一路请求）动过的账号必须放弃回滚，
-// 否则会用本请求的旧前像覆盖别人的决定。
-func TestRollbackRiskControlSkipsWhenStateChanged(t *testing.T) {
-	st := openStore(t)
-	acc, err := st.AddAccount(model.ProviderZai, "rb-race", "sk-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, _, snap := MarkRiskControlWithSnapshot(st, model.ProviderZai, acc.ID, "上游风控拦截 HTTP 405: x", time.Now())
-
-	kind := model.ErrorKindUpstreamError
-	if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
-		a.RiskControlStreak = 5
-		a.LastErrorKind = &kind
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	restored, skipped := RollbackRiskControl(st, snap)
-	if restored || !skipped {
-		t.Fatalf("状态已被第三方改动时应放弃回滚: restored=%v skipped=%v", restored, skipped)
-	}
-	got := st.Find(model.ProviderZai, acc.ID)
-	if got.RiskControlStreak != 5 {
-		t.Fatalf("第三方写入不得被覆盖: %d", got.RiskControlStreak)
-	}
-	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindUpstreamError {
-		t.Fatalf("第三方的错误归类不得被覆盖: %v", got.LastErrorKind)
-	}
-}
-
-// 已升级 invalid 的账号不回滚：走到 invalid 说明该账号的风控阶梯早已耗尽，本次只是压垮
-// 它的最后一根稻草；复活它只会让下一个请求再吃一次同样的 405。
-func TestRollbackRiskControlSkipsInvalidUpgrade(t *testing.T) {
-	st := openStore(t)
-	acc, err := st.AddAccount(model.ProviderZai, "rb-invalid", "sk-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 钉住阶梯长度（默认 3 档 → 第 4 次命中升失效），避免依赖环境变量默认值。
+	// 钉住阶梯，避免依赖环境默认值。
 	if err := st.SetSetting(store.RiskCoolingStepsKey, "300,900,3600"); err != nil {
 		t.Fatal(err)
 	}
 
-	var snap RiskControlSnapshot
-	for i := 1; i <= 4; i++ {
-		_, streak, invalid, s := MarkRiskControlWithSnapshot(st, model.ProviderZai, acc.ID, "上游风控拦截 HTTP 405: x", time.Now())
-		if i == 4 {
-			if !invalid {
-				t.Fatalf("第 4 次命中应超过 3 档阶梯并升为失效: streak=%d invalid=%v", streak, invalid)
-			}
-			snap = s
-		}
+	secs, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "上游风控拦截 HTTP 405: x", time.Now())
+	if streak != 1 || invalid {
+		t.Fatalf("首次命中应为 1 次、非失效: streak=%d invalid=%v", streak, invalid)
 	}
-	if got := st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusInvalid {
-		t.Fatalf("超档应为 invalid: %s", got.Status)
+	if secs != 300 {
+		t.Fatalf("第一档冷却应为 300s: %d", secs)
 	}
-
-	restored, skipped := RollbackRiskControl(st, snap)
-	if restored || !skipped {
-		t.Fatalf("invalid 不该被回滚: restored=%v skipped=%v", restored, skipped)
+	got := st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusCooling || got.CoolingUntil == nil {
+		t.Fatalf("应进入冷却: status=%s until=%v", got.Status, got.CoolingUntil)
 	}
-	if got := st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusInvalid {
-		t.Fatalf("invalid 状态必须保持: %s", got.Status)
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
+		t.Fatalf("证据必须落库: %v", got.LastErrorKind)
 	}
 }

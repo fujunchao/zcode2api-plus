@@ -165,6 +165,21 @@ func (a Attribution) Headers() map[string]string {
 	}
 }
 
+// WithFreshRequestID 换一个新请求 id，其余归因标识原样保留。
+//
+// 官方语义（CLI 日志实证，model.retry.delay.resolved 事件）：同一轮次（queryId 不变）
+// 内**每次上游 HTTP 尝试都换新 requestId**——重试 4 次可见 4 个不同的 id；而
+// session/trace/query 保持。本网关的换号重试发生在同一轮次里，若整轮共享一个
+// request-id，上游会看到「同一个请求 id 出现在多个账号上」——那是官方从不出现的
+// 形态，且直接暴露多账号同源。
+//
+// body 不含 request-id（metadata 只有 device_id/account_uuid/session_id），因此
+// 刷新它不影响 body 与内容视图指纹。
+func (a Attribution) WithFreshRequestID() Attribution {
+	a.RequestID = config.NewUUIDv4()
+	return a
+}
+
 // stripInternalPrefixes 去掉官方客户端在输出归因头时会剥掉的内部前缀。
 //
 // 官方对 x-session-id 剥 sess_ / subagent_agent_（normalizeModelSessionIdForAttribution）、
@@ -192,7 +207,9 @@ type Request struct {
 }
 
 // BuildRequest 对应 Python 版 build_request：
-// JWT 账号走 zcode.z.ai 主端点（Bearer），API Key 账号走 api.z.ai 回退端点（x-api-key）。
+// JWT 账号走 zcode.z.ai 主端点，API Key 账号走 api.z.ai 回退端点；两种模式出站
+// 鉴权形态相同：`Authorization: Bearer <凭据>` + `X-Api-Key: <同一凭据>` 双头同值
+// （官方把凭据作为 AI SDK apiKey 注入 x-api-key，client 层再补 Authorization）。
 // verifyParam/verifyRegion 为验证码令牌（仅 JWT 账号）；incomingHeaders 为客户端透传头。
 //
 // 归因标识由本函数内部现算（不接收 body 的会话），只适合不关心 body 的调用方与测试；
@@ -217,14 +234,16 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 //     x-session-id / x-query-id —— 优先沿用下游的值，缺失则合成；
 //  3. 鉴权与传输头。
 func BuildRequestWithAttribution(acc *model.Account, verifyParam, verifyRegion string, incomingHeaders map[string]string, attr Attribution) (Request, error) {
-	var targetURL, authHeader, authValue string
+	var targetURL, authValue, apiKeyValue string
 	if acc.Provider == model.ProviderZai {
 		if acc.Mode == "jwt" && acc.JWTToken != nil {
 			targetURL = config.UpstreamZai
-			authHeader, authValue = "Authorization", "Bearer "+*acc.JWTToken
+			authValue = "Bearer " + *acc.JWTToken
+			apiKeyValue = *acc.JWTToken
 		} else if acc.APIKey != nil {
 			targetURL = config.UpstreamZaiFallback
-			authHeader, authValue = "X-Api-Key", *acc.APIKey
+			authValue = "Bearer " + *acc.APIKey
+			apiKeyValue = *acc.APIKey
 		} else {
 			return Request{}, errors.New("账号缺少有效凭证")
 		}
@@ -239,9 +258,20 @@ func BuildRequestWithAttribution(acc *model.Account, verifyParam, verifyRegion s
 
 	// 网关固定头：客户端透传头一律不得改写这些取值。
 	fixed := map[string]string{
-		"Content-Type":      "application/json",
-		authHeader:          authValue,
+		"Content-Type": "application/json",
+		// ⭐ 鉴权双头同值（GAP-15）：官方把凭据作为 AI SDK 的 apiKey 传入
+		// （fan({apiKey}) 注入 x-api-key），client 层 dRs() 再补一条
+		// Authorization: Bearer —— 两个头恒为同一个值。只发其一与官方形态
+		// 不同（golden 抓包与 zcode.cjs 静态还原双证）。
+		"Authorization":     authValue,
+		"X-Api-Key":         apiKeyValue,
 		"Anthropic-Version": "2023-06-01",
+		// undici（Node fetch）的传输层默认头：官方经 undici 出站，这三项恒在
+		//（golden 实测 accept: */*、accept-language: *、sec-fetch-mode: cors）。
+		// 缺它们与缺身份头一样可被指纹化。
+		"Accept":          "*/*",
+		"Accept-Language": "*",
+		"Sec-Fetch-Mode":  "cors",
 		// 模型请求的 UA 是 ai-sdk 拼的，带 provider-utils 与 runtime 后缀；
 		// 裸 `ZCode/<版本>` 是非模型接口（配置/额度/领取）用的，两者不可混用。
 		"User-Agent":          prof.ModelUserAgent(),

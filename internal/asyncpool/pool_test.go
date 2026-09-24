@@ -877,11 +877,12 @@ func Test405RiskControlInAsyncPool(t *testing.T) {
 	wantErrorKind(t, acc, model.ErrorKindRiskControl)
 }
 
-// 请求级风控（同一 body 在 ≥2 个不同账号上都被拒）：与 sync 同判定——不冷却任何账号、
-// 不继续换号，把上游原文投递一次并终止本票。
+// 请求级风控（同一 body 在 ≥2 个不同账号上都被拒）：与 sync 同判定——停止换号，把上游
+// 原文投递一次并终止本票。
 //
-// 2026-09-24 事故的异步侧等价形态：一票最多试 AsyncMaxRetries+1 个账号，若无此判定，
-// 一份被上游拒绝的请求体会把整票的账号额度全部烧掉（sync 侧当日烧掉 67 个）。
+// ⚠️ 2026-09-24 账号级标记模型修正处置：**冷却保留**。每个被尝试的账号都已被服务端
+// 标记（标记期内无论发什么都 405），本地冷却防止它们立即被再次选中；旧语义「不冷却、
+// 回滚」等于替服务端解封账号，已废弃（docs/analysis-auth-chain-vs-official.md §九）。
 func Test405RequestLevelRiskInAsyncPool(t *testing.T) {
 	p, st, _, _ := newTestPool(t)
 	// fixture 默认 AsyncMaxRetries=0（只试 1 个账号），而判定成立需要试到第 2 个账号。
@@ -917,13 +918,36 @@ func Test405RequestLevelRiskInAsyncPool(t *testing.T) {
 	if n := up.callCount(); n != 2 {
 		t.Fatalf("判定成立后应停止换号，上游调用应为 2 次: %d", n)
 	}
+	// 冷却保留：被尝试的两个账号都应处于风控冷却（上游已标记它们），阶梯已推进；
+	// 第 3 个账号必须保持 active —— 判定成立即停止换号，它不该被牵连。
+	cooled, untouched := 0, 0
 	for _, acc := range st.ListAccounts(model.ProviderZai) {
-		if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
-			t.Fatalf("请求级风控不该冷却账号 %s: status=%s until=%v", acc.Name, acc.Status, acc.CoolingUntil)
+		if acc.Status == model.StatusCooling && acc.CoolingUntil != nil && acc.RiskControlStreak == 1 {
+			wantErrorKind(t, acc, model.ErrorKindRiskControl)
+			cooled++
+			continue
 		}
-		if acc.RiskControlStreak != 0 {
-			t.Fatalf("请求级风控不该推进账号 %s 的风控阶梯: %d", acc.Name, acc.RiskControlStreak)
+		if acc.Status == model.StatusActive && acc.RiskControlStreak == 0 && acc.CoolingUntil == nil {
+			untouched++
+			continue
 		}
+		t.Fatalf("账号 %s 状态不属于任一预期形态: status=%s streak=%d until=%v",
+			acc.Name, acc.Status, acc.RiskControlStreak, acc.CoolingUntil)
+	}
+	if cooled != 2 || untouched != 1 {
+		t.Fatalf("应恰好 2 个账号保留冷却、1 个未被动: cooled=%d untouched=%d", cooled, untouched)
+	}
+	// 重放防护应已登记：同内容再来的票直接快速失败，不打上游。
+	tk2 := insertTicket(p, "ticket-req-level-2", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-req-level-2")
+	events2 := drainEvents(tk2)
+	last2 := events2[len(events2)-1]
+	errObj2, _ := last2.Data.(map[string]any)["error"].(map[string]any)
+	if errObj2 == nil || errObj2["type"] != "risk_control_cooldown" {
+		t.Fatalf("同内容票应命中重放防护（risk_control_cooldown）: %v", events2)
+	}
+	if n := up.callCount(); n != 2 {
+		t.Fatalf("重放防护生效后上游调用数不得增长: %d", n)
 	}
 }
 

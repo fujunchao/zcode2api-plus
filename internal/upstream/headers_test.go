@@ -332,3 +332,86 @@ func environmentPlatformFromBlocks(t *testing.T) string {
 	t.Fatal("未在系统提示词块里找到 Platform 行")
 	return ""
 }
+
+// TestAuthDualHeadersSameValue 鉴权双头同值（GAP-15）：官方把凭据作为 AI SDK 的
+// apiKey 传入（注入 x-api-key），client 层再补 Authorization: Bearer —— 两个头恒为
+// 同一个值，且**两种账号模式都如此**（start-plan 用 JWT、coding-plan 用铸造 key，
+// 出站形态相同）。只发其一与官方形态不同。
+func TestAuthDualHeadersSameValue(t *testing.T) {
+	jwt := jwtAccount()
+	jwtTok := *jwt.JWTToken
+	req, err := BuildRequest(jwt, "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Headers["Authorization"] != "Bearer "+jwtTok {
+		t.Errorf("JWT 模式 Authorization 应为 Bearer <jwt>，实际 %q", req.Headers["Authorization"])
+	}
+	if req.Headers["X-Api-Key"] != jwtTok {
+		t.Errorf("JWT 模式应补 X-Api-Key 且与 Authorization 同值，实际 %q", req.Headers["X-Api-Key"])
+	}
+
+	keyAcc := jwtAccount()
+	keyAcc.Mode = "apikey"
+	keyAcc.APIKey = strPtr("id.secret")
+	req, err = BuildRequest(keyAcc, "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Headers["X-Api-Key"] != "id.secret" {
+		t.Errorf("APIKey 模式 X-Api-Key 应为凭据本身，实际 %q", req.Headers["X-Api-Key"])
+	}
+	if req.Headers["Authorization"] != "Bearer id.secret" {
+		t.Errorf("APIKey 模式应补 Authorization: Bearer <同一凭据>，实际 %q", req.Headers["Authorization"])
+	}
+}
+
+// TestUndiciTransportHeaders 官方经 undici（Node fetch）出站，三个传输层默认头恒在
+// （golden 实测 accept: */*、accept-language: *、sec-fetch-mode: cors）。缺它们与缺
+// 身份头一样可被指纹化。同时钉住客户端不得改写（固定头恒胜）。
+func TestUndiciTransportHeaders(t *testing.T) {
+	incoming := map[string]string{"Accept": "application/json", "Accept-Language": "zh-CN"}
+	req, err := BuildRequest(jwtAccount(), "", "", incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"Accept":          "*/*",
+		"Accept-Language": "*",
+		"Sec-Fetch-Mode":  "cors",
+	} {
+		if got := req.Headers[key]; got != want {
+			t.Errorf("%s 应为官方固定值 %q（不受客户端透传影响），实际 %q", key, want, got)
+		}
+	}
+}
+
+// TestAttributionFreshRequestID 换号/重试 = 新的上游 HTTP 请求 ⇒ x-request-id 换新，
+// 而轮次（query）、会话（session/trace/type）保持 —— 官方 CLI 日志实证：同一 queryId
+// 的 4 次重试有 4 个不同的 requestId。整轮共享一个 id 会让「同一请求 id 出现在多个
+// 账号上」，直接暴露多账号同源。
+func TestAttributionFreshRequestID(t *testing.T) {
+	orig := NewAttribution(map[string]string{
+		"X-Session-Id":         "sess_demo",
+		"X-Zcode-Trace-Id":     "trace_demo",
+		"X-Zcode-Session-Type": "subagent",
+		"X-Query-Id":           "query_demo",
+	}, "")
+	fresh := orig.WithFreshRequestID()
+
+	if fresh.RequestID == orig.RequestID {
+		t.Fatal("RequestID 必须换新")
+	}
+	if fresh.SessionID != orig.SessionID || fresh.TraceID != orig.TraceID ||
+		fresh.SessionType != orig.SessionType || fresh.QueryID != orig.QueryID {
+		t.Fatalf("其余归因标识必须保持: %+v vs %+v", fresh, orig)
+	}
+	// 值必须是合法 UUIDv4（官方形态），不是空串或占位。
+	if len(fresh.RequestID) != 36 || strings.Count(fresh.RequestID, "-") != 4 {
+		t.Fatalf("新 RequestID 应为 UUID 形态: %q", fresh.RequestID)
+	}
+	// 原值不被修改（值语义）。
+	if orig.RequestID == "" {
+		t.Fatal("原 Attribution 不得被就地修改")
+	}
+}
