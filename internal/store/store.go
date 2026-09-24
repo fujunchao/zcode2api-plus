@@ -1536,6 +1536,17 @@ func sameStringPtr(a, b *string) bool {
 	return *a == *b
 }
 
+// applyEnabled 启用/禁用的状态转移。单账号 SetEnabled 与批量 BatchSetEnabled
+// 共用本函数，保证两个入口的字段语义**结构性**一致——改一处即同时生效，不会漂移。
+func applyEnabled(acc *model.Account, enabled bool) {
+	acc.Enabled = enabled
+	if !enabled {
+		acc.Status = model.StatusDisabled
+	} else if acc.Status == model.StatusDisabled {
+		acc.Status = model.StatusActive
+	}
+}
+
 // SetEnabled 启用/禁用账号（禁用同时置 DISABLED 状态）。
 func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error) {
 	s.mu.Lock()
@@ -1544,12 +1555,7 @@ func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error
 	if acc == nil {
 		return false, nil
 	}
-	acc.Enabled = enabled
-	if !enabled {
-		acc.Status = model.StatusDisabled
-	} else if acc.Status == model.StatusDisabled {
-		acc.Status = model.StatusActive
-	}
+	applyEnabled(acc, enabled)
 	if err := s.persistAccountLocked(acc); err != nil {
 		return false, err
 	}

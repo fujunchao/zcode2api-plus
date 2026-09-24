@@ -53,6 +53,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/refresh", guard(h.handleRefreshAll))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/refresh", guard(h.handleRefreshAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/reset-stats", guard(h.handleResetStats))
+	// 批量管理端点（docs/plan-account-batch-management.md）：字面量段 batch
+	// 不会被 {account_id} 通配吞掉——现有通配路由的尾段都是具体字面量
+	// （enabled/archived/refresh/reset-stats），与 batch/* 不相交。
+	mux.HandleFunc("POST /admin/api/accounts/batch/add", guard(h.handleBatchAddAccounts))
+	mux.HandleFunc("POST /admin/api/accounts/batch/delete", guard(h.handleBatchDeleteAccounts))
+	mux.HandleFunc("POST /admin/api/accounts/batch/enable", guard(h.handleBatchEnable))
+	mux.HandleFunc("POST /admin/api/accounts/batch/disable", guard(h.handleBatchDisable))
 	mux.HandleFunc("GET /admin/api/status", guard(h.handleStatus))
 	mux.HandleFunc("GET /admin/api/proxies", guard(h.handleListProxies))
 	mux.HandleFunc("POST /admin/api/proxies", guard(h.handleAddProxy))
@@ -178,16 +185,25 @@ func strOf(v any) string {
 func (h *Handler) accountSnapshot() ([]map[string]any, map[string]any) {
 	now := time.Now()
 	views := []map[string]any{}
+	for _, a := range h.Store.ListAccounts("") {
+		views = append(views, a.PublicView(now))
+	}
+	return views, h.poolStats(now)
+}
+
+// poolStats 概览统计。固定**全量口径**：不受列表过滤/分页参数影响——概览面板
+// 回答「池子整体怎么样」，条件查询回答「我筛出来的有哪些」，两者语义分离。
+func (h *Handler) poolStats(now time.Time) map[string]any {
 	var active, exhausted, cooling, invalid, disabled, archivedCount int
 	var calls, fail, tokensIn, tokensOut, tokensCache int
+	total := 0
 	for _, a := range h.Store.ListAccounts("") {
-		view := a.PublicView(now)
-		views = append(views, view)
 		if a.ArchivedAt != nil {
 			archivedCount++ // 已归档账号不计入统计（前端在归档区单独展示）
 			continue
 		}
-		switch view["status"] {
+		total++
+		switch a.EffectiveStatus(now) {
 		case model.StatusActive:
 			active++
 		case model.StatusExhausted:
@@ -205,8 +221,8 @@ func (h *Handler) accountSnapshot() ([]map[string]any, map[string]any) {
 		tokensOut += a.TotalOutputTokens
 		tokensCache += a.TotalCacheCreationTokens + a.TotalCacheReadTokens
 	}
-	return views, map[string]any{
-		"total":        len(views) - archivedCount,
+	return map[string]any{
+		"total":        total,
 		"active":       active,
 		"exhausted":    exhausted,
 		"cooling":      cooling,

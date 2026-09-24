@@ -43,14 +43,31 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
-	accounts, stats := h.accountSnapshot()
+	// 条件查询（additive 扩展）：不传任何参数时与旧版行为完全一致（全量返回）。
+	// stats/providers/models/proxies 保持全量口径，不受过滤影响（概览语义分离）。
+	q, apiErr := parseAccountQuery(r)
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		return
+	}
+	matched, total := h.Store.QueryAccounts(q)
+	now := time.Now()
+	views := make([]map[string]any, 0, len(matched))
+	for _, a := range matched {
+		views = append(views, a.PublicView(now))
+	}
+	_, stats := h.accountSnapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":  accounts,
+		"accounts":  views,
 		"stats":     stats,
 		"providers": store.Providers,
 		"models":    gateway.AvailableModels,
 		"proxies":   h.Store.ListProxyProfiles(),
 		"ts":        nowFloat(),
+		// 过滤后总数与分页回显（limit=0 表示未启用分页）：供前端做分页器。
+		"total":  total,
+		"offset": q.Offset,
+		"limit":  q.Limit,
 	})
 }
 
@@ -149,9 +166,24 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		added = append(added, acc.ID)
 	}
-	// 自动分配必须排在额度刷新之前：刷新要出站，而 clientFor 只认账号上的 ProxyURL，
-	// 线路得先落到账号上（与登录链路「先写线路再兑换/刷新」的约定一致）。
-	assignedCount, fallbackCount := 0, 0
+	// 收尾链路与批量新增共用（见 accounts_batch.go postAddAccounts）。
+	assignedCount, fallbackCount := h.postAddAccounts(provider, added, autoAssign)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count": len(added), "ids": added,
+		// assigned/direct_fallback 供前端提示「有账号没能用上线路」。
+		"assigned": assignedCount, "direct_fallback": fallbackCount,
+	})
+}
+
+// postAddAccounts 新账号入池的收尾链路：自动分配线路 → jwt 账号额度刷新 →
+// 入池自动领取。handleAddAccounts 与批量新增（handleBatchAddAccounts）共用。
+//
+// 自动分配必须排在额度刷新之前：刷新要出站，而 clientFor 只认账号上的 ProxyURL，
+// 线路得先落到账号上（与登录链路「先写线路再兑换/刷新」的约定一致）。
+// autoAssign 为 true 时返回 (assigned, direct_fallback) 计数，供前端提示
+// 「有账号没能用上线路」。
+func (h *Handler) postAddAccounts(provider string, added []string, autoAssign bool) (assignedCount, fallbackCount int) {
+	assignedCount, fallbackCount = 0, 0
 	if autoAssign {
 		assigned, fallback := h.Store.AutoAssignProxies(added)
 		assignedCount, fallbackCount = len(assigned), len(fallback)
@@ -174,11 +206,7 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 			h.scheduleAutoClaim(acc)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"count": len(added), "ids": added,
-		// assigned/direct_fallback 供前端提示「有账号没能用上线路」。
-		"assigned": assignedCount, "direct_fallback": fallbackCount,
-	})
+	return assignedCount, fallbackCount
 }
 
 // parseTokens 归一 tokens 字段：字符串按行拆分、数组逐项 strip，过滤空值。
