@@ -4,9 +4,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -155,23 +155,18 @@ func serve() int {
 	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
 	srv := newServer(addr, mux)
 
-	// 停机信号：容器里对应 docker stop 发的 SIGTERM。收到后停止接受新连接、
-	// 等待在途请求收尾，ListenAndServe 随之返回 ErrServerClosed，defer 依次执行。
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(stop)
-	go func() {
-		<-stop
-		web.Ok("main", "收到退出信号，开始优雅停机…")
-		ctx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			web.Warn("main", "优雅停机未在限时内完成: "+err.Error())
-		}
-	}()
+	// 将系统信号转换为取消上下文，服务生命周期可在测试中用取消信号驱动，
+	// 不必向测试进程或当前运行的服务发送真正的 SIGTERM。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		web.Err("main", "服务监听失败: "+err.Error())
+		return 1
+	}
 
 	web.Ok("main", "服务运行中 "+addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := serveHTTP(ctx, srv, listener, gracefulShutdownTimeout); err != nil {
 		web.Err("main", "服务退出: "+err.Error())
 		return 1
 	}

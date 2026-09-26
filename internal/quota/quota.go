@@ -212,8 +212,21 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 
 // apply 在 store 锁内修改账号并落库。Service 对账号的**任何**改动都必须走这里，
 // 否则会与并发读方相撞（见 fetchQuotaOnce 的说明）。fn 内别调 Store 的其它方法。
+//
+// 风控失效是人工处置终态：额度只作旁路观测，不能改变该状态及其持久化证据。
+// 保护放在统一回写边界，覆盖失败、405 幂等、空额度和耗尽等所有路径，而不只在
+// 成功分支判断 LastErrorKind——否则先前的查询失败会覆盖原因，下一次成功就误解封。
 func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
-	_, _ = s.Store.Update(acc.Provider, acc.ID, fn)
+	_, _ = s.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		if !isRiskControlInvalid(live) {
+			fn(live)
+			return
+		}
+		lastError, lastKind, lastAt, coolingUntil := live.LastError, live.LastErrorKind, live.LastErrorAt, live.CoolingUntil
+		fn(live) // 检查时间、套餐和额度快照仍正常更新。
+		live.Status = model.StatusInvalid
+		live.LastError, live.LastErrorKind, live.LastErrorAt, live.CoolingUntil = lastError, lastKind, lastAt, coolingUntil
+	})
 }
 
 // fail 记录一次查询失败：刷新检查时间、写失败原因与归类，status 非空时同时改状态。
@@ -465,15 +478,8 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 		}
 		switch live.Status {
 		case model.StatusExhausted, model.StatusInvalid:
-			// ⚠️ 风控失效是「需人工介入」的终态，额度探测成功不得把它撤销。
-			//
-			// 额度接口与消息接口是**不同端点**，风控未必同时命中：只探测通了额度就
-			// 复活账号，等于一次轮询就把刚升上去的封禁悄悄抹掉，账号立刻重新进入调度
-			// 再被拦——升级机制形同不存在。所以这里只放行「非风控成因」的失效
-			//（如凭据失效）保持既有语义：额度通了即视为恢复。
-			if isRiskControlInvalid(live) {
-				return
-			}
+			// 非风控成因的失效沿用「额度通了即恢复」。风控终态由 apply 在锁内
+			// 统一保留，不能仅在此判断最近错误（此前失败/幂等路径也会改该字段）。
 			live.Status = model.StatusActive
 			live.CoolingUntil = nil
 		case model.StatusCooling:

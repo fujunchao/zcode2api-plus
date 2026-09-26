@@ -106,6 +106,20 @@ func passthroughDeliver(w http.ResponseWriter, d Delivery) error {
 			return nil
 		}
 		if err != nil {
+			if strings.Contains(d.ContentType, "text/event-stream") {
+				// HTTP 200 已发出，只能用 SSE 错误事件通知客户端；额外空行隔开
+				// 上游可能残留的半行。写客户端失败仍由上面的 w.Write 分支直接返回。
+				data, _ := marshalJSON(map[string]any{
+					"type":  "error",
+					"error": map[string]any{"type": "api_error", "message": "上游流式响应中断: " + err.Error()},
+				})
+				if _, werr := fmt.Fprintf(w, "\n\nevent: error\ndata: %s\n\n", data); werr != nil {
+					return werr
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
 			return err
 		}
 	}

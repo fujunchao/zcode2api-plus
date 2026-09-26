@@ -925,7 +925,12 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		}
 		chunksSent++
 	}
-	if err := scanner.Err(); err != nil {
+	usage.Finish()
+	streamErr := scanner.Err()
+	if streamErr == nil {
+		streamErr = usage.StreamError()
+	}
+	if err := streamErr; err != nil {
 		p.accumulateFinalUsage(ticketID, acc, usage)
 		if diag != nil {
 			diag.Usage = usage.AsDict()
@@ -950,7 +955,6 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	}
 
 	// 统计落库失败不应触发换号重发
-	usage.Finish()
 	got := usage.AsDict()
 	if diag != nil {
 		diag.Usage = got

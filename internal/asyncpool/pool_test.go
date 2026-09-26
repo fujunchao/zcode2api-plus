@@ -224,7 +224,7 @@ func TestCode3007RefreshesTokenAndForwardsSSE(t *testing.T) {
 
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusBadRequest, body: `{"code":3007,"msg":"captcha verify failed"}`},
-		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: [DONE]`}},
+		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: {"type":"message_stop"}`}},
 	}}
 	config.UpstreamZai = up.start(t).URL
 	solver.tokens = []string{"first-token", "fresh-token"}
@@ -240,7 +240,7 @@ func TestCode3007RefreshesTokenAndForwardsSSE(t *testing.T) {
 	for _, ev := range events {
 		types = append(types, ev.Type)
 	}
-	if strings.Join(types, ",") != "ready,chunk,done" {
+	if strings.Join(types, ",") != "ready,chunk,chunk,done" {
 		t.Fatalf("事件序列不符: %v", events)
 	}
 	if chunk, ok := events[1].Data.(map[string]any); !ok || chunk["id"] != "ok" {
@@ -749,7 +749,7 @@ func TestRateLimitRetrySucceedsInPlace(t *testing.T) {
 
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusTooManyRequests, body: `{"code":1302,"msg":"rate limited"}`},
-		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: [DONE]`}},
+		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: {"type":"message_stop"}`}},
 	}}
 	config.UpstreamZai = up.start(t).URL
 
@@ -761,7 +761,7 @@ func TestRateLimitRetrySucceedsInPlace(t *testing.T) {
 	for _, ev := range events {
 		types = append(types, ev.Type)
 	}
-	if strings.Join(types, ",") != "ready,chunk,done" {
+	if strings.Join(types, ",") != "ready,chunk,chunk,done" {
 		t.Fatalf("限流后原地重试应成功: %v", events)
 	}
 	if up.callCount() != 1+gateway.MaxRateLimitRetries {
@@ -826,7 +826,7 @@ func Test529OverloadRecoversInAsyncPool(t *testing.T) {
 
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: 529, body: `{"code":1305,"msg":"该模型当前访问量过大，请您稍后再试"}`},
-		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: [DONE]`}},
+		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: {"type":"message_stop"}`}},
 	}}
 	config.UpstreamZai = up.start(t).URL
 
@@ -838,7 +838,7 @@ func Test529OverloadRecoversInAsyncPool(t *testing.T) {
 	for _, ev := range events {
 		types = append(types, ev.Type)
 	}
-	if strings.Join(types, ",") != "ready,chunk,done" {
+	if strings.Join(types, ",") != "ready,chunk,chunk,done" {
 		t.Fatalf("过载退避一次后应成功: %v", events)
 	}
 	if up.callCount() != 2 {
@@ -1457,6 +1457,7 @@ func TestAccountProxyIsUsed(t *testing.T) {
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
 			`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+			`data: {"type":"message_stop"}`,
 		}},
 	}}
 	config.UpstreamZai = up.start(t).URL
@@ -1549,6 +1550,7 @@ func TestSkipsAPIKeyAccountsInMixedPool(t *testing.T) {
 	// 每次请求都要一个成功规格（scriptedUpstream 用完后回退 502）
 	okSpec := upstreamSpec{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
 		`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+		`data: {"type":"message_stop"}`,
 	}}
 	up := &scriptedUpstream{specs: []upstreamSpec{okSpec, okSpec, okSpec, okSpec}}
 	config.UpstreamZai = up.start(t).URL
@@ -1593,6 +1595,7 @@ func TestSuccessRecordsUsageAndRevivesStatus(t *testing.T) {
 		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
 			`data: {"type":"message_start","message":{"usage":{"input_tokens":7}}}`,
 			`data: {"type":"message_delta","usage":{"output_tokens":3}}`,
+			`data: {"type":"message_stop"}`,
 		}},
 	}}
 	config.UpstreamZai = up.start(t).URL
@@ -1706,6 +1709,7 @@ func TestSuccessClearsFailureStreaks(t *testing.T) {
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusOK, contentType: "text/event-stream", lines: []string{
 			`data: {"type":"message_delta","usage":{"output_tokens":1}}`,
+			`data: {"type":"message_stop"}`,
 		}},
 	}}
 	config.UpstreamZai = up.start(t).URL

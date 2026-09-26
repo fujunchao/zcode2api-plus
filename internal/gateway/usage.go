@@ -23,6 +23,7 @@ import (
 // UsageCollector 收集单次回應的 token 用量。
 type UsageCollector struct {
 	isSSE         bool
+	stream        *sseState // 协议是否正常结束，不与 usage 的 final 混为一谈
 	buf           []byte
 	input         int
 	output        int
@@ -33,7 +34,11 @@ type UsageCollector struct {
 
 // NewUsageCollector 创建收集器；isSSE 决定逐行解析还是缓冲到 Finish 一次解析。
 func NewUsageCollector(isSSE bool) *UsageCollector {
-	return &UsageCollector{isSSE: isSSE}
+	u := &UsageCollector{isSSE: isSSE}
+	if isSSE {
+		u.stream = &sseState{}
+	}
+	return u
 }
 
 // Feed 餵入一段回應位元組。
@@ -55,6 +60,9 @@ func (u *UsageCollector) Feed(chunk []byte) {
 
 // FeedLine 解析一行 SSE data；供串流分块解析与 async 池逐行解析共用。
 func (u *UsageCollector) FeedLine(line string) {
+	if u.stream != nil {
+		u.stream.feedLine(line)
+	}
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "data:") {
 		return
@@ -113,10 +121,23 @@ func (u *UsageCollector) markFinalIfComplete(payload, usage map[string]any) {
 // （见 docs/analysis-flash-30min-stream-cut.md §5）。
 func (u *UsageCollector) UsageComplete() bool { return u.final }
 
+// StreamError 在 Finish 后检查 SSE 的协议终态；正常 EOF 但没有 message_stop
+// 仍是断流。非 SSE 返回 nil，不改变非流式响应的交付语义。
+func (u *UsageCollector) StreamError() error {
+	if u.stream != nil {
+		return u.stream.result()
+	}
+	return nil
+}
+
 // Finish 回應结束后收尾：非 SSE 模式在此解析缓冲的完整 JSON，并标记 usage 为终值。
 func (u *UsageCollector) Finish() {
 	if u.isSSE {
+		if len(u.buf) > 0 {
+			u.FeedLine(string(u.buf))
+		}
 		u.buf = nil
+		u.stream.finishEvent()
 		return
 	}
 	var payload map[string]any

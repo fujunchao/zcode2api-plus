@@ -369,12 +369,24 @@ func (e *Engine) tryAccount(
 
 		// HTTP 200 且为 JSON：先缓冲，处理 HTTP 200 包装的业务错误
 		if strings.Contains(contentType, "application/json") {
-			buffered, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+			limit := maxErrorBodyBytes
+			if !stream {
+				// 非流式成功正文可能远大于错误信息，不能共用 64 KiB 的错误体上限。
+				limit = maxJSONResponseBodyBytes
+			}
+			// 多读一个字节区分「恰好到上限」与「已被截断」，超限显式失败。
+			buffered, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 			_ = resp.Body.Close()
 			if err != nil {
 				e.bumpFail(acc, model.ErrorKindConnectionFailed)
-				web.ReqErr(reqID, fmt.Sprintf("上游错误体读取失败（账号 %s）", acc.Name))
+				web.ReqErr(reqID, fmt.Sprintf("上游 JSON 响应读取失败（账号 %s）", acc.Name))
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_error", textPreview(err.Error()))}
+			}
+			if len(buffered) > limit {
+				e.bumpFail(acc, model.ErrorKindInvalidResponse)
+				web.ReqErr(reqID, fmt.Sprintf("上游 JSON 响应超过 %d 字节（账号 %s）", limit, acc.Name))
+				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_response_too_large",
+					fmt.Sprintf("上游 JSON 响应超过 %d 字节上限", limit))}
 			}
 			res := e.handleUpstreamJSON(ctx, reqID, acc, modelName, needsCaptcha, stream, contentType, buffered, &b, deliver, diag)
 			if res.retrySame {
@@ -396,10 +408,13 @@ func (e *Engine) tryAccount(
 
 // maxErrorBodyBytes 错误响应体的读取上限。
 //
-// 正常响应走流式转发（边读边发）不受影响；只有错误分支要整段读进内存做分类，
-// 而上游或账号级代理异常时可能回一个任意大的 body，无上限会直接吃光内存。
-// 64KB 足以容纳业务码与错误消息。
+// 错误分支要整段读进内存做分类，上游或代理异常时可能回任意大的 body。
+// 64 KiB 足以容纳业务码与错误消息，不适用于正常的非流式 JSON 正文。
 const maxErrorBodyBytes = 64 << 10
+
+// maxJSONResponseBodyBytes 是正常非流式 JSON 的独立内存预算；SSE 仍逐块转发，
+// 不受此上限影响。超过预算返回明确的 502，绝不把截断后的正文当成成功交付。
+const maxJSONResponseBodyBytes = 16 << 20
 
 // handleUpstreamError 处理上游 >=400 的响应（分类链顺序对齐 PLAN §5.2，不可变）。
 func (e *Engine) handleUpstreamError(
@@ -1006,6 +1021,13 @@ func (t *teeReader) Read(p []byte) (int, error) {
 			} else {
 				t.diag.MarkRead(time.Now(), n)
 			}
+		}
+	}
+	if err == io.EOF {
+		t.c.Finish()
+		if streamErr := t.c.StreamError(); streamErr != nil {
+			// 将协议层的提前结束变成读取错误，三种同步交付器都走已有的中断收尾。
+			err = streamErr
 		}
 	}
 	return n, err

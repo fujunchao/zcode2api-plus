@@ -265,7 +265,8 @@ func TestJSONPassthroughAndUsage(t *testing.T) {
 func TestStreamPassthroughAndUsage(t *testing.T) {
 	f := newFixture(t)
 	sse := "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n" +
-		"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\ndata: [DONE]\n\n"
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
 	f.respond = func(int, *http.Request) (int, http.Header, string) {
 		return 200, http.Header{"Content-Type": []string{"text/event-stream"}}, sse
 	}
@@ -921,9 +922,8 @@ func TestBusinessCode1005ExhaustsDailyQuota(t *testing.T) {
 	}
 }
 
-// 错误/异常响应的读取限长 64KB：限内照常分类，限外不再参与分类。上游或账号级
-// 代理异常时可能回一个任意大的 body，不限长会直接吃光内存（正常流式路径边读边发，
-// 不受影响）。
+// HTTP 错误响应仍限长 64 KiB；HTTP 200 的非流式 JSON 则使用独立预算，
+// 不能因为业务码排在 64 KiB 之后就把损坏的 JSON 当成正常结果返回。
 func TestOversizedErrorBodyIsBounded(t *testing.T) {
 	t.Run("限内仍能分类", func(t *testing.T) {
 		f := newFixture(t)
@@ -938,17 +938,29 @@ func TestOversizedErrorBodyIsBounded(t *testing.T) {
 		}
 	})
 
-	t.Run("限外不再参与分类", func(t *testing.T) {
+	t.Run("非流式JSON使用独立预算", func(t *testing.T) {
 		f := newFixture(t)
-		// 业务码排在 64KB 之后：读取被截断后应看不到它，而不是把整个 body 读进内存
+		// 业务码排在 64 KiB 之后，但仍在正常 JSON 预算内，应完整读取并分类。
 		f.respond = jsonResp(200, `{"pad":"`+strings.Repeat(" ", 100<<10)+`","code":1005}`)
 		acc, _ := f.st.AddAccount(model.ProviderZai, "a", "sk-1")
 
-		if status, _ := f.post(t, msgBody(), "sk-test"); status != 200 {
-			t.Fatalf("限外的业务码不参与分类，应按无业务码处理: %d", status)
+		if status, _ := f.post(t, msgBody(), "sk-test"); status != 503 {
+			t.Fatalf("完整 JSON 的业务码应被识别，换号后返回 503: %d", status)
 		}
-		if got := f.st.Find(model.ProviderZai, acc.ID); len(got.ExhaustedModels) != 0 {
-			t.Fatalf("限外的业务码不应标记耗尽: %v", got.ExhaustedModels)
+		if got := f.st.Find(model.ProviderZai, acc.ID); len(got.ExhaustedModels) != 1 {
+			t.Fatalf("应标记该模型耗尽: %v", got.ExhaustedModels)
+		}
+	})
+
+	t.Run("HTTP错误体仍限长", func(t *testing.T) {
+		f := newFixture(t)
+		f.respond = jsonResp(400, `{"pad":"`+strings.Repeat(" ", 100<<10)+`","code":1305}`)
+		if _, err := f.st.AddAccount(model.ProviderZai, "a", "sk-1"); err != nil {
+			t.Fatal(err)
+		}
+		status, raw := f.post(t, msgBody(), "sk-test")
+		if status != 400 || f.callCount() != 1 || len(raw) > maxErrorBodyBytes+1024 {
+			t.Fatalf("HTTP 错误体不得无界读取或用限外业务码重试：status=%d calls=%d bytes=%d", status, f.callCount(), len(raw))
 		}
 	})
 }
