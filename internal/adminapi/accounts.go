@@ -449,7 +449,7 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 	// handleBillingResponse 把归档账号的状态写回 active，与归档语义直接冲突。
 	if truthy(payload["all"]) {
 		for _, a := range h.Store.ListAccounts(model.ProviderZai) {
-			if a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
+			if a.IsQuotaRefreshTarget() {
 				targets = append(targets, a)
 			}
 		}
@@ -463,7 +463,7 @@ func (h *Handler) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, a := range h.Store.ListAccounts("") {
-			if ids[a.ID] && a.Mode == "jwt" && a.ArchivedAt == nil && a.Status != model.StatusDisabled {
+			if ids[a.ID] && a.IsQuotaRefreshTarget() {
 				targets = append(targets, a)
 			}
 		}

@@ -941,7 +941,8 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		// 断开，那属于客户端侧，记进去会让「断流是否集中在某账号/线路」失真。
 		// 记录与熔断不依赖诊断容器（修掉此前 diag==nil 时整段漏记的缺陷——
 		// 诊断行只是展示，账号计数与线路熔断必须照常发生）。
-		if ctx.Err() == nil {
+		// 上游 error 事件不计：它能完整到达说明线路没有掐断（见 gateway.UpstreamErrorEvent）。
+		if ctx.Err() == nil && !gateway.IsUpstreamErrorEvent(err) {
 			total := gateway.RecordUpstreamTruncate(p.Store, acc, time.Now())
 			if diag != nil {
 				diag.TruncTotal = total

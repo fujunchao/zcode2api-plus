@@ -70,3 +70,33 @@ func TestAsyncChecksMessageStop(t *testing.T) {
 		})
 	}
 }
+
+// 上游在流里正常发出 error 事件：票务照常以 error 终止（不能伪装 done），
+// 但这不是线路掐断——不得累计断流计数，否则一波上游过载会连锁移除健康线路。
+func TestAsyncUpstreamErrorEventIsNotTruncation(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	acc := addJWTAccount(t, st, "stream-error-event")
+	up := &scriptedUpstream{specs: []upstreamSpec{{status: http.StatusOK, lines: []string{
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}`,
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`,
+		`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+	}}}}
+	config.UpstreamZai = up.start(t).URL
+	tk := insertTicket(p, "error-event", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "error-event")
+	events := drainEvents(tk)
+	if len(events) == 0 || events[len(events)-1].Type != "error" {
+		t.Fatalf("上游 error 事件后票务应以 error 终止：%+v", events)
+	}
+	for _, event := range events {
+		if event.Type == "done" {
+			t.Fatal("上游 error 事件后不应出现 done")
+		}
+	}
+	if got := st.FindAny(acc.ID); got.StreamTruncateCount != 0 || got.TruncateAvoidUntil != 0 {
+		t.Fatalf("上游 error 事件不是断流：trunc=%d avoid=%v", got.StreamTruncateCount, got.TruncateAvoidUntil)
+	}
+	if up.callCount() != 1 {
+		t.Fatalf("同一张票不得重复生成：calls=%d", up.callCount())
+	}
+}

@@ -1552,14 +1552,28 @@ func sameStringPtr(a, b *string) bool {
 	return *a == *b
 }
 
-// applyEnabled 启用/禁用的状态转移。单账号 SetEnabled 与批量 BatchSetEnabled
-// 共用本函数，保证两个入口的字段语义**结构性**一致——改一处即同时生效，不会漂移。
+// applyEnabled 启用/禁用的状态转移。单账号 SetEnabled、批量 BatchSetEnabled 与归档
+// 共用本函数，保证各入口的字段语义**结构性**一致——改一处即同时生效，不会漂移。
+//
+// 停用 → 启用不得成为解封后门（契约见 docs/plan-account-batch-management.md §1.3：
+// 不动 invalid/cooling/exhausted 的状态机归属）：
+//   - invalid 不属于可启停状态（model.IsManageable）：停用只翻 Enabled，状态保持
+//     invalid——否则先被覆写成 disabled，再启用就变回 active，风控/凭据失效被一键解除；
+//   - 冷却截止时间 CoolingUntil 全程保留：启用时若仍未到期则回到 cooling，而非 active。
 func applyEnabled(acc *model.Account, enabled bool) {
 	acc.Enabled = enabled
 	if !enabled {
-		acc.Status = model.StatusDisabled
-	} else if acc.Status == model.StatusDisabled {
-		acc.Status = model.StatusActive
+		if acc.Status != model.StatusInvalid {
+			acc.Status = model.StatusDisabled
+		}
+		return
+	}
+	if acc.Status != model.StatusDisabled {
+		return
+	}
+	acc.Status = model.StatusActive
+	if acc.CoolingUntil != nil && *acc.CoolingUntil > float64(time.Now().UnixNano())/1e9 {
+		acc.Status = model.StatusCooling
 	}
 }
 
@@ -1590,8 +1604,8 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 	if archived {
 		now := float64(time.Now().UnixNano()) / 1e9
 		acc.ArchivedAt = &now
-		acc.Enabled = false
-		acc.Status = model.StatusDisabled
+		// 与停用同一转移：归档再恢复、启用，同样不得复活失效账号。
+		applyEnabled(acc, false)
 	} else {
 		acc.ArchivedAt = nil
 	}

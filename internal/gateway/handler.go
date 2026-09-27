@@ -106,7 +106,8 @@ func passthroughDeliver(w http.ResponseWriter, d Delivery) error {
 			return nil
 		}
 		if err != nil {
-			if strings.Contains(d.ContentType, "text/event-stream") {
+			// 上游自己的 error 事件已原样转发给客户端，再追加一条「中断」既重复又失实。
+			if strings.Contains(d.ContentType, "text/event-stream") && !IsUpstreamErrorEvent(err) {
 				// HTTP 200 已发出，只能用 SSE 错误事件通知客户端；额外空行隔开
 				// 上游可能残留的半行。写客户端失败仍由上面的 w.Write 分支直接返回。
 				data, _ := marshalJSON(map[string]any{

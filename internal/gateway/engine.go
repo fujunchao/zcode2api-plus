@@ -742,15 +742,22 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 		// 回避（仅选号软过滤）与线路 N 连击熔断（移除线路+改派，见其注释）。
 		// fireRefresh 同步额度快照：断流的账号额度读数停在旧值，刷新后选号不再
 		// 被「幽灵最富」黏住；刷新失败仅记 last_error，不影响请求结果。
-		if !isClientGone(ctx) {
+		//
+		// 上游 error 事件同样不计：它能完整到达说明线路没有掐断（见 UpstreamErrorEvent）。
+		upstreamEvent := IsUpstreamErrorEvent(err)
+		if !isClientGone(ctx) && !upstreamEvent {
 			diag.TruncTotal = RecordUpstreamTruncate(e.Store, acc, e.now())
 			e.fireRefresh(acc)
 		}
+		label := "流传输中断"
+		if upstreamEvent {
+			label = "上游在流中返回错误事件"
+		}
 		if usage.UsageComplete() {
 			got := e.accumulateUsage(acc, usage)
-			web.ReqErr(reqID, fmt.Sprintf("流传输中断，上游 usage 已完整，仍计入 %d tok: %v", got.Output, err))
+			web.ReqErr(reqID, fmt.Sprintf("%s，上游 usage 已完整，仍计入 %d tok: %v", label, got.Output, err))
 		} else {
-			web.ReqErr(reqID, fmt.Sprintf("流传输中断: %v", err))
+			web.ReqErr(reqID, fmt.Sprintf("%s: %v", label, err))
 		}
 		return attemptResult{final: runResult{Delivered: true}}
 	}
@@ -920,6 +927,14 @@ func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
 	_, _ = st.Update(provider, id, func(live *model.Account) {
 		live.UseCount++
 		live.LastUsedAt = &ts
+		// 迟到的成功不能证明账号已恢复：请求在冷却生效**之前**选中账号、在冷却期间才
+		// 返回 200（同账号并发很常见，async 的窗口更是整条流的时长）。此时照旧复位
+		// 会冲掉并发请求刚施加的风控/限流/503 冷却与连击，阶梯永远升不上去
+		// （PLAN §5.13「冷却到期后成功才归零」）。失效是人工处置终态，同样不动。
+		if live.Status == model.StatusInvalid ||
+			(live.Status == model.StatusCooling && live.CoolingUntil != nil && ts < *live.CoolingUntil) {
+			return
+		}
 		// 成功即认为限流窗口已过：清零连续计数，下一次再被限流从最短档重新起算。
 		// 必须对 live 调用——对副本清零不会落库，会出现「一边归零、一边继续递增」。
 		// 风控计数同理：冷却到期后能真正打通一次，说明这次拦截是偶发的，回到最低档。

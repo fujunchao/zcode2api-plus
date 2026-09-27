@@ -388,7 +388,7 @@ export function AccountsPage() {
 
   async function toggleEnabled(a: Account) {
     try {
-      await api('POST', '/accounts/' + a.id + '/enabled', { enabled: a.status === 'disabled' })
+      await api('POST', '/accounts/' + a.id + '/enabled', { enabled: !a.enabled })
       invalidate()
     } catch (e) {
       toast.error('操作失敗：' + errMsg(e))
@@ -952,10 +952,10 @@ export function AccountsPage() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
-                          title={a.status === 'disabled' ? '恢復' : '停用'}
+                          title={a.enabled ? '停用' : '恢復'}
                           onClick={() => void toggleEnabled(a)}
                         >
-                          {a.status === 'disabled' ? <RotateCcw /> : <XCircle />}
+                          {a.enabled ? <XCircle /> : <RotateCcw />}
                         </Button>
                         <Button variant="ghost" size="icon-sm" title="歸檔（停止調用）" onClick={() => doArchive(a)}>
                           <Archive />

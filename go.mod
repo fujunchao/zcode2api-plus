@@ -1,6 +1,9 @@
 module zcode2api
 
-go 1.25.0
+// 语言版本兼最低工具链：CI 的 setup-go@v5 只读这一行（不认 toolchain 指令），
+// 发版二进制即由它决定。1.25.0 可达 29 个已修复的标准库漏洞（govulncheck
+// 二进制模式实测），1.25.14 为零；升级补丁版本时同步修改这里。
+go 1.25.14
 
 // 直接依赖（其余 require 为间接依赖，交由 go mod tidy 维护）：
 //   modernc.org/sqlite    纯 Go SQLite（无 CGo），账号库存储

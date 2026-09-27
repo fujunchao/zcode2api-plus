@@ -667,10 +667,8 @@ func (m *Monitor) refreshOnce() {
 	}
 	var targets []*model.Account
 	for _, a := range m.svc.Store.ListAccounts(model.ProviderZai) {
-		if a.ArchivedAt != nil {
-			continue // 已归档账号不再刷新额度
-		}
-		if a.Mode == "jwt" && a.Status != model.StatusDisabled {
+		// 已归档/已停用账号不再刷新额度（与后台手动刷新同一判据）
+		if a.IsQuotaRefreshTarget() {
 			targets = append(targets, a)
 		}
 	}

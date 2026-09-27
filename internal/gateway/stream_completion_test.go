@@ -74,3 +74,39 @@ func TestPassthroughChecksMessageStop(t *testing.T) {
 		})
 	}
 }
+
+// 上游在 SSE 里正常发出 error 事件（如 overloaded_error）说明线路把整条流完整送达了：
+// 这是上游的业务错误，不是线路掐断。不得累计账号断流、写回避期或推高线路连击
+// （连击到阈值会移除一条健康线路），也不得在上游自己的 error 事件后再追加一条
+// 「流式响应中断」——客户端已经收到了上游原文。
+func TestPassthroughUpstreamErrorEventIsNotTruncation(t *testing.T) {
+	oldData := config.DataDir
+	config.DataDir = t.TempDir()
+	t.Cleanup(func() { config.DataDir = oldData })
+	body := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+	f := newDiagFixture(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, body)
+	}))
+	acc, err := f.st.AddAccount(model.ProviderZai, "stream-error-event", "sk-stream-error-event")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, _ := bindToLine(t, f.st, acc, f.ups.URL)
+	f.st.BumpLineTruncate(line)
+	request := msgBody()
+	request["stream"] = true
+	status, raw := f.post(t, request)
+	if status != http.StatusOK || raw != body {
+		t.Fatalf("上游 error 事件应原样透传且不追加中断事件：status=%d body=%q", status, raw)
+	}
+	got := f.st.FindAny(acc.ID)
+	if got.StreamTruncateCount != 0 || got.TruncateAvoidUntil != 0 {
+		t.Fatalf("上游 error 事件不是断流：trunc=%d avoid=%v", got.StreamTruncateCount, got.TruncateAvoidUntil)
+	}
+	if streak := f.st.LineTruncateStats()[line].Streak; streak != 1 {
+		t.Fatalf("上游 error 事件不得改变线路连击：streak=%d want=1", streak)
+	}
+}

@@ -82,6 +82,23 @@ func TestRefreshSkipsArchivedAndDisabledAccounts(t *testing.T) {
 	if acc := st.FindAny(archivedID); acc.Status == model.StatusActive {
 		t.Fatal("刷新不得把归档账号写回 active（会撤销归档）")
 	}
+
+	// 失效后再停用：状态保持 invalid（启停不改写失效，见 store.applyEnabled），
+	// 刷新必须看 Enabled 而不只是 Status==disabled，否则停用号继续被轮询。
+	if _, err := st.Update(model.ProviderZai, okID, func(a *model.Account) { a.Status = model.StatusInvalid }); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := do(t, mux, st, http.MethodPost,
+		"/admin/api/accounts/"+okID+"/enabled", map[string]any{"enabled": false}); code != http.StatusOK {
+		t.Fatalf("停用应 200: %d", code)
+	}
+	if acc := st.FindAny(okID); acc.Enabled || acc.Status != model.StatusInvalid {
+		t.Fatalf("失效账号停用后应保持 invalid：enabled=%v status=%s", acc.Enabled, acc.Status)
+	}
+	code, body = do(t, mux, st, http.MethodPost, "/admin/api/accounts/refresh", map[string]any{"all": true})
+	if code != http.StatusOK || num(t, body["count"]) != 0 {
+		t.Fatalf("已停用的失效账号不得参与批量刷新: %d %v", code, body)
+	}
 }
 
 // TestClaimBlockedByCooling 领取与「刷新資格」共用的冷却闸门判据。

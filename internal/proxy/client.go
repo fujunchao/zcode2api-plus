@@ -154,10 +154,12 @@ func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string
 	}
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
-	// 方法协商：无需鉴权；URL 含用户名密码时追加 user/pass 方法
+	// 方法协商：无需鉴权；URL 含用户名密码时追加 user/pass 方法。
+	// 报文为 VER | NMETHODS | METHODS...：0x00=无鉴权、0x02=用户名/密码（RFC 1929）。
+	// 0x01 是 GSSAPI，本实现不支持，绝不能报给代理。
 	methods := []byte{0x01, 0x00}
 	if u.User != nil && u.User.Username() != "" {
-		methods = []byte{0x02, 0x01, 0x00}
+		methods = []byte{0x02, 0x02, 0x00}
 	}
 	if _, err := conn.Write(append([]byte{0x05}, methods...)); err != nil {
 		return fmt.Errorf("socks5 方法协商写入失败: %v", err)

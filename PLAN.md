@@ -235,6 +235,11 @@ meta(key TEXT PK, value TEXT)
 - **正常 EOF 不等于消息完成**：缺少 `message_stop` 也按流中断处理，不发送 `done`，
   不清零线路断流连击。原生 `/v1/messages` 同样通过 SSE `error` 事件报告截断；
   协议结束检查由同步与 async 共用。已经收到的终值 usage 仍按 §5.7 入账。
+- **上游 `error` 事件 ≠ 断流**（v2.8.4）：上游在流中正常发出的 `error` 事件（如
+  `overloaded_error`）说明线路完整送达了整条流。交付仍按失败收尾（async 不发 `done`、
+  OpenAI 报 `upstream_stream_error`、原生原样透传上游事件且不再追加「中断」），但**不**计
+  账号断流、不写回避期、不推线路连击。四条路径统一以 `gateway.UpstreamErrorEvent` 报告、
+  `IsUpstreamErrorEvent` 判别。
 
 ### 5.7 OpenAI（GPT）兼容端点契约（Go 版增量）
 
@@ -493,10 +498,17 @@ meta(key TEXT PK, value TEXT)
 
 1. **到期自动可再选**：`CoolingUntil` 过去后 `IsSelectable` 直接为真，无需显式清除。
 2. **成功即归零**：冷却到期后成功调用一次 ⇒ `Status → active` 且 `RiskControlStreak → 0`
-   （回到最低档）。所以只有「冷却一到期立刻又被拦」才会继续升级。
+   （回到最低档）。所以只有「冷却一到期立刻又被拦」才会继续升级。`MarkSuccess` 强制这个
+   「到期后」前提：冷却未到期或已失效时的成功（同账号并发请求在冷却生效前选中、之后才
+   返回 200）只累计调用次数，不复位状态与连击——否则阶梯对繁忙账号永远升不上去。
 3. **人工恢复**：换凭据（`store.EditAccount` 的 `SetSecret` 分支）会清 `Status`/`LastError*`
    **并清零 `RiskControlStreak`**——不清的话，救回来的账号下一次命中就是老计数 + 1，会立刻
    又判失效，等于人工修复无效。失效后真正要做的是换线路 / 换设备指纹 / 换凭据。
+
+**启停不是恢复出口**（v2.8.4）：`store.applyEnabled`（单账号、批量、归档共用）停用
+invalid 账号时只关闭 `Enabled`、状态保持 invalid，再启用也不复活；冷却截止时间全程保留，
+启用时未到期则回到 cooling。「是否已停用」一律看 `Enabled`（额度刷新筛选
+`Account.IsQuotaRefreshTarget`、后台启停按钮），不能只比 `Status == disabled`。
 
 **⚠️ 额度探测不得撤销风控封禁**：`quota.handleBillingResponse` 在探测成功时会把
 `exhausted`/`invalid` 刷回 `active`（既有语义）。但额度接口与消息接口是**不同端点**，风控未必

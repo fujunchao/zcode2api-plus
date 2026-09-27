@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"zcode2api/internal/model"
 )
 
 func TestChatStreamPreservesInitialToolInput(t *testing.T) {
@@ -88,5 +90,36 @@ func TestChatInitialToolArgumentsPrecedeFinish(t *testing.T) {
 	finishAt := strings.Index(raw, `"finish_reason":"tool_calls"`)
 	if status != http.StatusOK || argsAt < 0 || finishAt < 0 || argsAt > finishAt {
 		t.Fatalf("工具参数必须在 finish_reason 前发出: %d %s", status, raw)
+	}
+}
+
+// 上游 error 事件与线路掐断必须分开记账：两者都要向客户端报错，但只有掐断才累计
+// 账号断流（进而驱动线路熔断）。对照组「无结束事件」证明断流检测本身仍然生效。
+func TestStreamUpstreamErrorEventIsNotTruncation(t *testing.T) {
+	truncated := strings.Split(responseTextStream, "event: message_stop")[0]
+	errorEvent := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
+	for _, kind := range []string{"chat", "responses"} {
+		for _, tt := range []struct {
+			name      string
+			tail      string
+			wantTrunc int
+		}{
+			{"上游error事件", errorEvent, 0},
+			{"无结束事件", "", 1},
+		} {
+			t.Run(kind+"/"+tt.name, func(t *testing.T) {
+				f := newFixture(t)
+				f.setResponder(func(int) (int, string, string) { return http.StatusOK, "text/event-stream", truncated + tt.tail })
+				body := compatRequest(kind)
+				body["stream"] = true
+				if status, raw := postCompat(t, f, kind, body); status != http.StatusOK || strings.Contains(raw, "data: [DONE]") {
+					t.Fatalf("异常串流须显式报错且不能伪装正常结束: %d %s", status, raw)
+				}
+				accounts := f.st.ListAccounts(model.ProviderZai)
+				if len(accounts) != 1 || accounts[0].StreamTruncateCount != tt.wantTrunc {
+					t.Fatalf("断流计数不符：got=%d want=%d", accounts[0].StreamTruncateCount, tt.wantTrunc)
+				}
+			})
+		}
 	}
 }

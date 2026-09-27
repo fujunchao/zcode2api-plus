@@ -2,10 +2,40 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 )
+
+// UpstreamErrorEvent 上游在 SSE 中正常发出的 error 事件（如 overloaded_error）。
+//
+// 它与「流被掐断」是两回事：error 事件能完整到达，恰好说明线路把整条流送到了。
+// 交付仍按失败收尾（不能伪装成功），但断流记账——账号断流计数、回避期、线路
+// 连击与熔断——必须跳过它，否则一波上游过载就会连锁移除健康线路。
+// 原生透传、OpenAI 两种重编码与 async 池都用这个类型报告，调用方用
+// IsUpstreamErrorEvent 区分。
+type UpstreamErrorEvent struct {
+	Message string
+}
+
+func (e *UpstreamErrorEvent) Error() string { return "上游串流错误: " + e.Message }
+
+// NewUpstreamErrorEvent 从 error 事件的 JSON 载荷构造错误；缺 message 时给通用文案。
+func NewUpstreamErrorEvent(payload map[string]any) *UpstreamErrorEvent {
+	upstreamError, _ := payload["error"].(map[string]any)
+	msg, _ := upstreamError["message"].(string)
+	if msg == "" {
+		msg = "上游返回错误事件"
+	}
+	return &UpstreamErrorEvent{Message: msg}
+}
+
+// IsUpstreamErrorEvent 判断交付失败是否源于上游的 error 事件（而非线路掐断）。
+func IsUpstreamErrorEvent(err error) bool {
+	var target *UpstreamErrorEvent
+	return errors.As(err, &target)
+}
 
 // sseState 观察 Anthropic 消息的协议终态，与 usage 终值独立：收到最终用量不等于
 // 收到 message_stop。只观察、不改写字节，因此原生接口仍能透传正常 SSE。
@@ -55,7 +85,7 @@ func (s *sseState) finishEvent() {
 		s.stopped = true
 	case "error":
 		if s.err == nil {
-			s.err = fmt.Errorf("上游串流返回错误事件")
+			s.err = NewUpstreamErrorEvent(payload)
 		}
 	}
 }

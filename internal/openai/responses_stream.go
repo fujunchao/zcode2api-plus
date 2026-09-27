@@ -9,6 +9,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"zcode2api/internal/gateway"
 )
 
 func reencodeResponsesSSE(body io.Reader, write func(string) error, parallelTools bool) error {
@@ -136,8 +138,8 @@ func (e *responsesEncoder) dispatch(event, data string) error {
 	case "message_stop":
 		return e.onMessageStop()
 	case "error":
-		upstreamError, _ := payload["error"].(map[string]any)
-		return fmt.Errorf("上游串流错误: %s", stringOr(upstreamError["message"], "上游返回错误事件"))
+		// 专用错误类型：引擎据此把它与线路掐断区分开，不计断流（见 gateway.UpstreamErrorEvent）。
+		return gateway.NewUpstreamErrorEvent(payload)
 	}
 	// content_block_stop 暂不输出 done：待 message_stop 时按项目顺序统一完成，
 	// 让所有 done 事件都处于最终 response 之前，并保留交错工具参数的独立缓冲。

@@ -281,6 +281,89 @@ func TestSocks5RemoteResolveATYPDomain(t *testing.T) {
 	}
 }
 
+// URL 带用户名密码时，方法协商必须提供 RFC 1929 的用户名/密码方法（0x02），
+// 并完成子协商。假代理按规范实现：未提供 0x02 就回 0xFF 拒绝——此前协商误发
+// {0x02, 0x01, 0x00}（GSSAPI + 无鉴权），宽松的假代理测不出来，真实代理全部拒绝。
+func TestSocks5UsernamePasswordAuth(t *testing.T) {
+	var gotUser, gotPass string
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		head := make([]byte, 2)
+		if _, e := readFull(conn, head); e != nil || head[0] != 0x05 {
+			return
+		}
+		methods := make([]byte, head[1])
+		if _, e := readFull(conn, methods); e != nil {
+			return
+		}
+		if !strings.Contains(string(methods), "\x02") {
+			_, _ = conn.Write([]byte{0x05, 0xFF})
+			return
+		}
+		_, _ = conn.Write([]byte{0x05, 0x02})
+		// RFC 1929：VER=0x01 | ULEN | UNAME | PLEN | PASSWD
+		ver := make([]byte, 2)
+		if _, e := readFull(conn, ver); e != nil || ver[0] != 0x01 {
+			return
+		}
+		name := make([]byte, ver[1])
+		if _, e := readFull(conn, name); e != nil {
+			return
+		}
+		plen := make([]byte, 1)
+		if _, e := readFull(conn, plen); e != nil {
+			return
+		}
+		pass := make([]byte, plen[0])
+		if _, e := readFull(conn, pass); e != nil {
+			return
+		}
+		gotUser, gotPass = string(name), string(pass)
+		if gotUser != "alice" || gotPass != "s3cret" {
+			_, _ = conn.Write([]byte{0x01, 0x01})
+			return
+		}
+		_, _ = conn.Write([]byte{0x01, 0x00})
+		req := make([]byte, 4)
+		if _, e := readFull(conn, req); e != nil || req[3] != 0x03 {
+			return
+		}
+		n := make([]byte, 1)
+		if _, e := readFull(conn, n); e != nil {
+			return
+		}
+		rest := make([]byte, int(n[0])+2)
+		if _, e := readFull(conn, rest); e != nil {
+			return
+		}
+		_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}()
+
+	u, _ := url.Parse("socks5h://alice:s3cret@" + ln.Addr().String())
+	conn, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := socks5Handshake(ctx, conn, u, "example.com:80", true); err != nil {
+		t.Fatalf("带用户名密码的 socks5 握手失败: %v", err)
+	}
+	if gotUser != "alice" || gotPass != "s3cret" {
+		t.Fatalf("子协商收到的凭据不对：user=%q pass=%q", gotUser, gotPass)
+	}
+}
+
 // 本地解析得到 IPv6（或 IPv6 在首位）时，必须以 ATYP=0x04 发送，
 // 不得送出 addr 长度为 0 的畸形 CONNECT（IPv4 优先，找不到才用 IPv6）。
 func TestSocks5LocalResolveFallsBackToIPv6(t *testing.T) {

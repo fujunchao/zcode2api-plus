@@ -457,6 +457,15 @@ func jwtPayload(token string) string {
 	return ""
 }
 
+// IsQuotaRefreshTarget 是否参与额度刷新（后台周期监控与手动批量刷新共用）。
+//
+// 已归档或已停用的账号一律跳过：刷新会把状态写回 active，等于撤销归档/停用。
+// 停用必须看 Enabled 而不只是 Status==disabled——失效账号被停用后状态仍保持
+// invalid（见 store.applyEnabled），只比状态会让停用号继续被轮询。
+func (a *Account) IsQuotaRefreshTarget() bool {
+	return a.Mode == "jwt" && a.ArchivedAt == nil && a.Enabled && a.Status != StatusDisabled
+}
+
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。
 // 已归档账号一律不可选（归档即停止调用）。
 func (a *Account) IsSelectable(now time.Time) bool {

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"zcode2api/internal/gateway"
 )
 
 // reencodeSSE 读取上游 SSE 流并写出 OpenAI chunk 流；includeUsage 为 true 时
@@ -105,8 +107,8 @@ func (e *sseEncoder) dispatch(event, data string) error {
 	case "message_stop":
 		return e.onMessageStop()
 	case "error":
-		upstreamError, _ := payload["error"].(map[string]any)
-		return fmt.Errorf("上游串流错误: %s", stringOr(upstreamError["message"], "上游返回错误事件"))
+		// 专用错误类型：引擎据此把它与线路掐断区分开，不计断流（见 gateway.UpstreamErrorEvent）。
+		return gateway.NewUpstreamErrorEvent(payload)
 	default:
 		// ping 等无内容事件丢弃
 		return nil
