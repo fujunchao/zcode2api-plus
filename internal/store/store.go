@@ -395,17 +395,7 @@ var (
 
 // SetSetting 更新设置并落库。
 func (s *Store) SetSetting(key, value string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// 先落库再改内存，与 AddAccount / RemoveAccount 同一原则：落库失败时内存不能留下
-	// 一个未持久化的值，否则本次进程按新值运行、重启后回滚，而调用方收到错误以为没生效。
-	if err := s.setMeta(key, value); err != nil {
-		logPersistFailure("setting", key, err)
-		return err
-	}
-	s.settings[key] = value
-	s.publishSettings()
-	return nil
+	return s.SetSettings(map[string]string{key: value})
 }
 
 func (s *Store) AdminKey() string {
@@ -1276,15 +1266,7 @@ func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*m
 	if _, ok := s.providersSet()[provider]; !ok {
 		return nil, false, fmt.Errorf("不支持的 provider: %s", provider)
 	}
-	acc := model.Create(provider, name, secret)
-	if acc.Mode == "jwt" {
-		if uid := model.JWTUserID(acc.Secret()); uid != "" {
-			acc.UserID = &uid
-		}
-	}
-	if trimmed := strings.TrimSpace(email); trimmed != "" {
-		acc.Email = &trimmed
-	}
+	acc := accountWithIdentity(provider, name, secret, email)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing := s.duplicateLocked(provider, acc); existing != nil {
@@ -1306,7 +1288,26 @@ func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*m
 // duplicateLocked 按 user_id → email → 凭据 三轮判定是否已存在同一账号。
 // 高优先级判据未命中时才降级：token 会刷新而凭据字节会变，且不同账号可能共用邮箱。
 func (s *Store) duplicateLocked(provider string, acc *model.Account) *model.Account {
-	list := s.accounts[provider]
+	return findDuplicate(s.accounts[provider], acc)
+}
+
+// accountWithIdentity 统一普通新增、批量新增和授权入池的身份派生规则。
+func accountWithIdentity(provider, name, secret, email string) *model.Account {
+	acc := model.Create(provider, name, secret)
+	if acc.Mode == "jwt" {
+		if uid := model.JWTUserID(acc.Secret()); uid != "" {
+			acc.UserID = &uid
+		}
+	}
+	if trimmed := strings.TrimSpace(email); trimmed != "" {
+		acc.Email = &trimmed
+	}
+	return acc
+}
+
+// findDuplicate 在调用方给出的完整候选集内按身份优先级查重。批量操作必须把
+// 尚未提交的新账号也放入候选集，不能先查旧账号再查新账号，否则优先级会被打乱。
+func findDuplicate(list []*model.Account, acc *model.Account) *model.Account {
 	if uid := derefStr(acc.UserID); uid != "" {
 		for _, a := range list {
 			if derefStr(a.UserID) == uid {
@@ -1503,6 +1504,21 @@ func (s *Store) SetIdentity(provider, idOrName string, email, name *string) (boo
 		if name != nil {
 			acc.Name = *name
 		}
+	})
+}
+
+// RenewJWT 重新授权命中已有账号时换上新 JWT 登录令牌（OAuth 登录链路）。
+// 与编辑换凭据同语义：清掉旧失效状态与风控计数，真实状态交给随后的额度刷新判定；
+// 已有 API Key 保留，兑换成功后再覆盖。
+func (s *Store) RenewJWT(provider, idOrName, token string) (bool, error) {
+	return s.Update(provider, idOrName, func(acc *model.Account) {
+		acc.Mode = "jwt"
+		acc.JWTToken = &token
+		acc.Status = model.StatusActive
+		acc.LastError = nil
+		acc.LastErrorKind = nil
+		acc.LastErrorAt = nil
+		acc.RiskControlStreak = 0
 	})
 }
 

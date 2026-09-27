@@ -240,12 +240,12 @@ export function AccountsPage() {
     }
     setAdding(true)
     try {
-      const d = await api<{ count: number; direct_fallback?: number }>('POST', '/accounts', {
+      const d = await api<{ count: number; created?: number; duplicated?: number; direct_fallback?: number }>('POST', '/accounts', {
         tokens: list,
         proxy_id: addProxy,
       })
       setAddOpen(false)
-      toast.success(`新增 ${d.count} 個帳號`)
+      toast.success(`新增 ${d.created ?? d.count} 個帳號${d.duplicated ? `，${d.duplicated} 個已存在（未更動）` : ''}`)
       if (d.direct_fallback) {
         toast.warning(`其中 ${d.direct_fallback} 個沒有空閒線路，已使用直連`)
       }

@@ -120,8 +120,18 @@ func dedupeIDs(ids []string) []string {
 // markBatchRollback 把明细里所有 ok 项改标为 error（整批回滚的统一收尾）。
 // 新增场景同时清掉 ID 与计数——账号实际不存在，不能让调用方拿着假 ID 去指派线路。
 func markBatchRollback(res *BatchResult, cause error) {
+	rolledBack := make(map[string]bool, len(res.IDs))
+	for _, id := range res.IDs {
+		rolledBack[id] = true
+	}
 	for i := range res.Items {
-		if res.Items[i].Status == BatchStatusOK {
+		item := &res.Items[i]
+		// 指向同批新账号的 duplicate 也随事务回滚，不能返回一个不存在的 ID。
+		pendingDuplicate := item.Status == BatchStatusDuplicate && rolledBack[item.ID]
+		if item.Status == BatchStatusOK || pendingDuplicate {
+			if pendingDuplicate {
+				res.Duplicated--
+			}
 			res.Items[i].Status = BatchStatusError
 			res.Items[i].ID = ""
 			res.Items[i].Message = "持久化失败，整批已回滚: " + cause.Error()
@@ -184,18 +194,11 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 	defer s.mu.Unlock()
 
 	var fresh []*model.Account
+	// 独立切片只保存候选指针，不提前改动 store 的账号集合或对象。
+	candidates := append([]*model.Account(nil), s.accounts[provider]...)
 	for i, item := range items {
-		// 构造逻辑与 AddAccountWithIdentity 逐字一致：jwt 派生 user_id、email trim。
-		acc := model.Create(provider, item.Name, item.Secret)
-		if acc.Mode == "jwt" {
-			if uid := model.JWTUserID(acc.Secret()); uid != "" {
-				acc.UserID = &uid
-			}
-		}
-		if trimmed := strings.TrimSpace(item.Email); trimmed != "" {
-			acc.Email = &trimmed
-		}
-		if existing := s.duplicateLocked(provider, acc); existing != nil {
+		acc := accountWithIdentity(provider, item.Name, item.Secret, item.Email)
+		if existing := findDuplicate(candidates, acc); existing != nil {
 			res.Duplicated++
 			res.Items = append(res.Items, BatchItemResult{
 				Index: i, ID: existing.ID, Name: existing.Name,
@@ -207,6 +210,7 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 		mid := config.NewDeviceMid()
 		acc.VirtualDeviceMid = &mid
 		fresh = append(fresh, acc)
+		candidates = append(candidates, acc)
 		res.Succeeded++
 		res.IDs = append(res.IDs, acc.ID)
 		res.Items = append(res.Items, BatchItemResult{Index: i, ID: acc.ID, Name: acc.Name, Status: BatchStatusOK})

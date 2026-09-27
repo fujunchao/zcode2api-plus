@@ -138,6 +138,8 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	added := []string{}
+	newIDs := []string{}
+	duplicated := 0
 	seen := map[string]bool{}
 	for _, tok := range tokens {
 		if seen[tok] {
@@ -148,10 +150,16 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			name = fmt.Sprintf("%s-%d", provider, len(h.Store.ListAccounts(provider))+1)
 		}
-		acc, err := h.Store.AddAccount(provider, name, tok)
+		acc, isNew, err := h.Store.AddAccountWithIdentity(provider, name, tok, "")
 		if err != nil {
 			writeError500(w, err)
 			return
+		}
+		if !isNew {
+			// 添加不是编辑：重复凭据只回传已有 ID，不改线路、不重新刷新或领取。
+			added = append(added, acc.ID)
+			duplicated++
+			continue
 		}
 		if hasProfile {
 			if _, err := h.Store.AssignProxyProfile(acc.ID, profileID); err != nil {
@@ -165,11 +173,14 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		added = append(added, acc.ID)
+		newIDs = append(newIDs, acc.ID)
 	}
 	// 收尾链路与批量新增共用（见 accounts_batch.go postAddAccounts）。
-	assignedCount, fallbackCount := h.postAddAccounts(provider, added, autoAssign)
+	assignedCount, fallbackCount := h.postAddAccounts(provider, newIDs, autoAssign)
 	writeJSON(w, http.StatusOK, map[string]any{
+		// count/ids 保留历史命中口径；新增计数供前端区分真正新建与重复。
 		"count": len(added), "ids": added,
+		"created": len(newIDs), "duplicated": duplicated,
 		// assigned/direct_fallback 供前端提示「有账号没能用上线路」。
 		"assigned": assignedCount, "direct_fallback": fallbackCount,
 	})
@@ -566,16 +577,15 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, apiErr)
 		return
 	}
+	// 先完成整份请求的校验，最后一次提交；任一字段非法时还没有写入任何设置。
+	updates := map[string]string{}
 	if v, ok := payload["admin_key"]; ok {
 		key := strings.TrimSpace(strOf(v))
 		if key == "" {
 			writeAPIError(w, errBadRequest("后台密钥不能为空"))
 			return
 		}
-		if err := h.Store.SetSetting("admin_key", key); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["admin_key"] = key
 	}
 	if v, ok := payload["gateway_key"]; ok {
 		key := strings.TrimSpace(strOf(v))
@@ -584,10 +594,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("网关 API Key 不能为空"))
 			return
 		}
-		if err := h.Store.SetSetting("gateway_key", key); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["gateway_key"] = key
 	}
 	if v, ok := payload["quota_refresh_interval"]; ok {
 		interval, valid := pyInt(v)
@@ -596,10 +603,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		interval = max(0, interval)
-		if err := h.Store.SetSetting("quota_refresh_interval", strconv.Itoa(interval)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["quota_refresh_interval"] = strconv.Itoa(interval)
 	}
 	// ── 套餐领取 ── 全部即时生效：冷却与定时调度每轮都重新读设置。
 	if v, ok := payload["claim_auto_enabled"]; ok {
@@ -608,10 +612,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("入池自动领取开关需为布尔值"))
 			return
 		}
-		if err := h.Store.SetSetting("claim_auto_enabled", boolText(b)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["claim_auto_enabled"] = boolText(b)
 	}
 	if v, ok := payload["claim_schedule_enabled"]; ok {
 		b, valid := pyBool(v)
@@ -619,10 +620,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("每日定时领取开关需为布尔值"))
 			return
 		}
-		if err := h.Store.SetSetting("claim_schedule_enabled", boolText(b)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["claim_schedule_enabled"] = boolText(b)
 	}
 	if v, ok := payload["claim_schedule_time"]; ok {
 		t := strings.TrimSpace(strOf(v))
@@ -630,10 +628,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("定时时间需为 HH:MM（如 23:00）"))
 			return
 		}
-		if err := h.Store.SetSetting("claim_schedule_time", t); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["claim_schedule_time"] = t
 	}
 	// 三个冷却共用同一套解析；负数按既有 quota_refresh_interval 的语义钳到下限。
 	cooldownKeys := []struct {
@@ -654,10 +649,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest(item.key+" 必须是非负整数（秒）"))
 			return
 		}
-		if err := h.Store.SetSetting(item.key, strconv.Itoa(max(item.min, n))); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates[item.key] = strconv.Itoa(max(item.min, n))
 	}
 	// ── 線路自動巡檢 ── 同樣即時生效：調度器每輪重新讀設置。
 	if v, ok := payload["proxy_health_enabled"]; ok {
@@ -666,10 +658,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("线路自动巡检开关需为布尔值"))
 			return
 		}
-		if err := h.Store.SetSetting("proxy_health_enabled", boolText(b)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["proxy_health_enabled"] = boolText(b)
 	}
 	if v, ok := payload["proxy_health_interval"]; ok {
 		n, valid := pyInt(v)
@@ -677,10 +666,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("巡检间隔必须是 ≥1 的整数（分钟）"))
 			return
 		}
-		if err := h.Store.SetSetting("proxy_health_interval", strconv.Itoa(n)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates["proxy_health_interval"] = strconv.Itoa(n)
 	}
 	// ── Async 出口强制直連 ── 排障用的控制開關：開啟後 async 池忽略帳號代理、
 	// 恆直連上游。用於保留「線路 vs 直連」的斷流歸因對照組（見 store.AsyncForceDirect）。
@@ -690,10 +676,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("Async 強制直連開關需為布爾值"))
 			return
 		}
-		if err := h.Store.SetSetting(store.AsyncForceDirectKey, boolText(b)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates[store.AsyncForceDirectKey] = boolText(b)
 	}
 	// ── 風控冷卻階梯 ── 逗號分隔的秒數；檔位數同時是升級點（連續命中超過檔位數
 	// 就把帳號置為失效），所以非法值一律 400 拒收，不做「跳過壞項」的寬容解析：
@@ -704,10 +687,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("風控冷卻階梯需為逗號分隔的正整數秒，如 300,900,3600"))
 			return
 		}
-		if err := h.Store.SetSetting(store.RiskCoolingStepsKey, raw); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates[store.RiskCoolingStepsKey] = raw
 	}
 	// ── 上游 503 冷卻階梯 ── 同樣嚴格校驗（整串都是正整數秒）。與風控的差異：
 	// 連續次數超過檔位數只封頂冷卻、不升級為失效——503 是上游健康信號而非帳號問題。
@@ -717,10 +697,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("上游 503 冷卻階梯需為逗號分隔的正整數秒，如 30,60,120"))
 			return
 		}
-		if err := h.Store.SetSetting(store.Upstream503CoolingStepsKey, raw); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates[store.Upstream503CoolingStepsKey] = raw
 	}
 	// ── 線路斷流熔斷與帳號短回避 ── 同一線路連續 N 次上游側斷流即移除該線路並
 	// 改派綁定帳號（0=關閉）；斷流後帳號在 N 秒內暫不被選號（僅選號層軟過濾，
@@ -731,10 +708,7 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("线路断流熔断阈值需为 0–100 的整数（0=关闭）"))
 			return
 		}
-		if err := h.Store.SetSetting(store.LineTruncateStrikesKey, strconv.Itoa(n)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates[store.LineTruncateStrikesKey] = strconv.Itoa(n)
 	}
 	if v, ok := payload[store.LineTruncateAvoidSecondsKey]; ok {
 		n, valid := pyInt(v)
@@ -742,10 +716,11 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, errBadRequest("断流账号回避时长需为 0–3600 的整数秒（0=关闭）"))
 			return
 		}
-		if err := h.Store.SetSetting(store.LineTruncateAvoidSecondsKey, strconv.Itoa(n)); err != nil {
-			writeError500(w, err)
-			return
-		}
+		updates[store.LineTruncateAvoidSecondsKey] = strconv.Itoa(n)
+	}
+	if err := h.Store.SetSettings(updates); err != nil {
+		writeError500(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

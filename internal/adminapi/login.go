@@ -189,6 +189,12 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 	if err != nil {
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
+	if !isNew {
+		// 命中已有账号：必须换上本次授权的新令牌，否则旧令牌过期的账号重登也救不回来。
+		if _, err := h.Store.RenewJWT(account.Provider, account.ID, strings.TrimSpace(result.Token)); err != nil {
+			return nil, errUpstream(fmt.Sprintf("更新登录令牌失败: %v", err))
+		}
+	}
 	if email != "" {
 		var setEmail, setName *string
 		if account.Email == nil || *account.Email == "" {
