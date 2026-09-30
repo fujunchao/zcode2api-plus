@@ -131,7 +131,23 @@ func (e *sseEncoder) onMessageStart(payload map[string]any) error {
 
 func (e *sseEncoder) onContentBlockStart(payload map[string]any) error {
 	block, _ := payload["content_block"].(map[string]any)
-	if block == nil || block["type"] != "tool_use" {
+	if block == nil {
+		return nil
+	}
+	switch block["type"] {
+	case "text", "thinking":
+		kind, _ := block["type"].(string)
+		text, _ := block[kind].(string)
+		if text == "" {
+			return nil
+		}
+		key := "content"
+		if kind == "thinking" {
+			key = "reasoning_content"
+		}
+		return e.emit(chunk(e.id, e.model, map[string]any{key: text}, nil))
+	case "tool_use":
+	default:
 		return nil
 	}
 	index, _ := payload["index"].(float64)

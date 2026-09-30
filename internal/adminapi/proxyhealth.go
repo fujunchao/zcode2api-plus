@@ -7,6 +7,7 @@
 package adminapi
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -21,15 +22,22 @@ const tagProxyHealth = "proxy-health"
 
 // ProxyHealthScheduler 代理线路自动巡检调度器。
 type ProxyHealthScheduler struct {
-	store *store.Store
-	start sync.Once
-	stop  chan struct{}
-	done  chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	store  *store.Store
+	start  sync.Once
+	stop   <-chan struct{}
+	done   chan struct{}
 }
 
 // NewProxyHealthScheduler 创建巡检调度器（调用 Start 启动）。
-func NewProxyHealthScheduler(st *store.Store) *ProxyHealthScheduler {
-	return &ProxyHealthScheduler{store: st, stop: make(chan struct{}), done: make(chan struct{})}
+func NewProxyHealthScheduler(st *store.Store, parents ...context.Context) *ProxyHealthScheduler {
+	parent := context.Background()
+	if len(parents) > 0 {
+		parent = parents[0]
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &ProxyHealthScheduler{store: st, ctx: ctx, cancel: cancel, stop: ctx.Done(), done: make(chan struct{})}
 }
 
 // Start 启动调度循环；重复调用无操作。
@@ -38,10 +46,11 @@ func (s *ProxyHealthScheduler) Start() {
 }
 
 // Stop 停止调度循环并等待退出。进行中的一轮会尽快中止：未发出的探测不再
-// 发起、已发出的等其自然超时返回；移除与改派只发生在整轮探测完成之后，
+// 发起、已发出的网络请求响应取消；移除与改派只发生在整轮探测完成之后，
 // 所以中止不会留下半轮变更。
 func (s *ProxyHealthScheduler) Stop() {
-	close(s.stop)
+	s.cancel()
+	s.Start()
 	<-s.done
 }
 
@@ -85,8 +94,10 @@ type lineProbe struct {
 }
 
 // probeLine 探测单条线路并整理成巡检结论。
-func probeLine(p store.ProxyProfile) lineProbe {
-	info, err := probeProxy(p.URL)
+func probeLine(p store.ProxyProfile) lineProbe { return probeLineContext(context.Background(), p) }
+
+func probeLineContext(ctx context.Context, p store.ProxyProfile) lineProbe {
+	info, err := probeProxyContext(ctx, p.URL)
 	if err != nil {
 		// 客户端构造失败（协议不支持等）：线路同样不可用。
 		return lineProbe{profile: p, reason: err.Error()}
@@ -142,7 +153,7 @@ spawn:
 				return
 			default:
 			}
-			results[i] = probeLine(p)
+			results[i] = probeLineContext(s.ctx, p)
 		}(i, p)
 	}
 	wg.Wait()
@@ -173,7 +184,7 @@ spawn:
 	// 全部线路不可用时先看直连：连直连都够不着 z.ai，多半是本机网络或 z.ai
 	// 侧的故障——此刻移除会把整个线路池清空。宁可本轮空过，留给人来判断。
 	if len(failed) == len(profiles) {
-		direct, err := probeProxy("")
+		direct, err := probeProxyContext(s.ctx, "")
 		if err != nil || direct["ok"] != true {
 			why := "探测出错"
 			if err != nil {
@@ -209,6 +220,9 @@ spawn:
 		return
 	}
 
+	if s.ctx.Err() != nil {
+		return
+	}
 	purged, reassign, err := s.store.PurgeProxyProfiles(purgeIDs)
 	if err != nil {
 		web.Err(tagProxyHealth, "移除不可用线路失败: "+err.Error())

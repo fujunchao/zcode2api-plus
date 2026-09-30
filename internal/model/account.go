@@ -466,6 +466,16 @@ func (a *Account) IsQuotaRefreshTarget() bool {
 	return a.Mode == "jwt" && a.ArchivedAt == nil && a.Enabled && a.Status != StatusDisabled
 }
 
+// IsAutoClaimTarget 检查自动领取资格；额度耗尽仍允许领新套餐。
+func (a *Account) IsAutoClaimTarget(now time.Time) bool {
+	if a.Mode != "jwt" || a.JWTToken == nil || *a.JWTToken == "" ||
+		a.ArchivedAt != nil || !a.Enabled || !IsManageable(a.Status) {
+		return false
+	}
+	return a.Status != StatusCooling ||
+		(a.CoolingUntil != nil && !now.Before(unixTime(*a.CoolingUntil)))
+}
+
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。
 // 已归档账号一律不可选（归档即停止调用）。
 func (a *Account) IsSelectable(now time.Time) bool {

@@ -33,6 +33,10 @@ type HTTPClient interface {
 
 // Service 额度查询服务：inflight 去重 + 短缓存 + 账号状态回写。
 type Service struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	tasks  sync.WaitGroup
+	closed bool
 	Store  *store.Store
 	Client HTTPClient // nil 时使用 20s 总超时的默认客户端（对齐 make_async_client(timeout=20)）
 
@@ -57,8 +61,12 @@ type cacheEntry struct {
 }
 
 // NewService 创建服务（inflight / cache 按账号 ID 索引，语义对齐模块级全局表）。
-func NewService(st *store.Store) *Service {
-	return &Service{
+func NewService(st *store.Store) *Service { return NewServiceContext(context.Background(), st) }
+
+// NewServiceContext 将独立查询绑定到服务生命周期，不受单个 HTTP 调用方断开影响。
+func NewServiceContext(parent context.Context, st *store.Store) *Service {
+	ctx, cancel := context.WithCancel(parent)
+	return &Service{ctx: ctx, cancel: cancel,
 		Store:    st,
 		inflight: map[string]*inflightCall{},
 		cache:    map[string]cacheEntry{},
@@ -182,7 +190,7 @@ func mergeQuotaEntry(current map[string]any, incoming map[string]any) map[string
 // （凭据 / 设备指纹 / 代理都不是本次查询的权威来源），而**所有对账号的改动都经
 // s.apply 在 store 锁内落到「当前」对象上**。此前是"锁外改字段 → UpdateAccount"，
 // 读方（后台领取取快照）会与这里的写入相撞，CI 的 -race 实测抓到过。
-func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
+func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) map[string]any {
 	checkedAt := float64(s.now().UnixNano()) / 1e9
 	snap := s.Store.SnapshotAccount(acc.Provider, acc.ID)
 	if snap == nil {
@@ -193,7 +201,7 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeClientVersion)
 	query.Set("platform", config.ZcodeClientPlatform)
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		strings.TrimRight(config.ZcodeBillingBase, "/")+"/billing/balance?"+query.Encode(), nil)
 	if err == nil {
 		for k, v := range authHeaders(snap) {
@@ -204,6 +212,9 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 		if err == nil {
 			return s.handleBillingResponse(snap, checkedAt, resp)
 		}
+	}
+	if ctx.Err() != nil {
+		return map[string]any{"error": ctx.Err().Error()}
 	}
 	msg := "额度查询网络错误: " + err.Error()
 	s.fail(snap, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
@@ -218,13 +229,21 @@ func (s *Service) fetchQuotaOnce(acc *model.Account) map[string]any {
 // 成功分支判断 LastErrorKind——否则先前的查询失败会覆盖原因，下一次成功就误解封。
 func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
 	_, _ = s.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
-		if !isRiskControlInvalid(live) {
+		protectInvalid := isRiskControlInvalid(live)
+		protectCooling := live.Status == model.StatusCooling &&
+			(live.CoolingUntil == nil || *live.CoolingUntil > float64(s.now().UnixNano())/1e9)
+		if !protectInvalid && !protectCooling {
 			fn(live)
 			return
 		}
+		status := live.Status
 		lastError, lastKind, lastAt, coolingUntil := live.LastError, live.LastErrorKind, live.LastErrorAt, live.CoolingUntil
 		fn(live) // 检查时间、套餐和额度快照仍正常更新。
-		live.Status = model.StatusInvalid
+		// 额度变化不能解除冷却；真正的鉴权失败仍允许升级为 invalid。
+		if !protectInvalid && live.Status == model.StatusInvalid {
+			return
+		}
+		live.Status = status
 		live.LastError, live.LastErrorKind, live.LastErrorAt, live.CoolingUntil = lastError, lastKind, lastAt, coolingUntil
 	})
 }
@@ -504,11 +523,23 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 // 查询在独立 goroutine 中执行并与调用方解耦（对齐 Python create_task +
 // shield：调用方放弃不影响查询落库），重复调用共享同一进行中的查询。
 func (s *Service) FetchQuota(acc *model.Account) map[string]any {
+	return s.fetchQuotaContext(s.ctx, acc)
+}
+
+func (s *Service) fetchQuotaContext(ctx context.Context, acc *model.Account) map[string]any {
 	s.mu.Lock()
+	if s.closed || ctx.Err() != nil || s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return map[string]any{"error": "额度查询已取消"}
+	}
 	if call, ok := s.inflight[acc.ID]; ok {
 		s.mu.Unlock()
-		<-call.done
-		return call.result
+		select {
+		case <-call.done:
+			return call.result
+		case <-ctx.Done():
+			return map[string]any{"error": ctx.Err().Error()}
+		}
 	}
 	if entry, ok := s.cache[acc.ID]; ok {
 		if s.now().Sub(entry.at) < QuotaCacheTTL {
@@ -521,9 +552,14 @@ func (s *Service) FetchQuota(acc *model.Account) map[string]any {
 	}
 	call := &inflightCall{done: make(chan struct{})}
 	s.inflight[acc.ID] = call
+	s.tasks.Add(1)
 	s.mu.Unlock()
 
 	go func() {
+		defer s.tasks.Done()
+		queryCtx, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(s.ctx, cancel)
+		defer func() { stop(); cancel() }()
 		// 这个 goroutine 由本函数自己创建，不在 net/http 的 recover 保护范围内：
 		// fetchQuotaOnce 解析上游 JSON，遇到未预见的类型/结构会 panic，逃逸出去就是
 		// 整个进程死亡（所有在途串流一并陪葬）。Python 版经 gather 的
@@ -550,7 +586,7 @@ func (s *Service) FetchQuota(acc *model.Account) map[string]any {
 			call.result = result
 			close(call.done)
 		}()
-		result = s.fetchQuotaOnce(acc)
+		result = s.fetchQuotaOnce(queryCtx, acc)
 	}()
 	<-call.done
 	return call.result
@@ -573,6 +609,10 @@ func (s *Service) pruneCache() {
 
 // RefreshAccounts 并发刷新一批账号（信号量并发 8，对齐 refresh_accounts），返回汇总。
 func (s *Service) RefreshAccounts(accounts []*model.Account) map[string]any {
+	return s.refreshAccountsContext(s.ctx, accounts)
+}
+
+func (s *Service) refreshAccountsContext(ctx context.Context, accounts []*model.Account) map[string]any {
 	s.pruneCache()
 	if len(accounts) == 0 {
 		return map[string]any{"ok": 0, "fail": 0}
@@ -594,9 +634,13 @@ func (s *Service) RefreshAccounts(accounts []*model.Account) map[string]any {
 					web.Warn("quota", fmt.Sprintf("刷新账号 %s 时 panic（已隔离）: %v", acc.Name, r))
 				}
 			}()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
-			res := s.FetchQuota(acc)
+			res := s.fetchQuotaContext(ctx, acc)
 			if _, hasErr := res["error"]; !hasErr {
 				mu.Lock()
 				okCount++
@@ -612,15 +656,18 @@ func (s *Service) RefreshAccounts(accounts []*model.Account) map[string]any {
 
 // Monitor 后台周期性刷新可管理账号的额度，实现实时用量监控。
 type Monitor struct {
-	svc   *Service
-	stop  chan struct{}
-	done  chan struct{}
-	start sync.Once
+	ctx    context.Context
+	cancel context.CancelFunc
+	svc    *Service
+	stop   <-chan struct{}
+	done   chan struct{}
+	start  sync.Once
 }
 
 // NewMonitor 创建后台监控（调用 Start 启动）。
 func (s *Service) NewMonitor() *Monitor {
-	return &Monitor{svc: s, stop: make(chan struct{}), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(s.ctx)
+	return &Monitor{svc: s, ctx: ctx, cancel: cancel, stop: ctx.Done(), done: make(chan struct{})}
 }
 
 // Start 启动后台循环；重复调用无操作。
@@ -673,18 +720,24 @@ func (m *Monitor) refreshOnce() {
 		}
 	}
 	if len(targets) > 0 {
-		m.svc.RefreshAccounts(targets)
+		m.svc.refreshAccountsContext(m.ctx, targets)
 	}
 }
 
 // Stop 停止后台循环并等待 goroutine 退出（对齐 monitor.stop 的 gather 语义）。
 func (m *Monitor) Stop() {
-	select {
-	case <-m.stop:
-	default:
-		close(m.stop)
-	}
+	m.cancel()
+	m.Start()
 	<-m.done
+}
+
+// Close 禁止新查询，取消并等待全部独立查询；调用方可与 HTTP 关闭并行等待。
+func (s *Service) Close() {
+	s.mu.Lock()
+	s.closed = true
+	s.cancel()
+	s.mu.Unlock()
+	s.tasks.Wait()
 }
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────

@@ -597,7 +597,7 @@ DSH 会话 3 连切全部落在 mihomo-zai-024 **同一账号同一线路**（�
 **账号短回避**（仅选号层软过滤，在线设定 `line_truncate_avoid_seconds`，默认 60，0=关闭）：
 
 - 断流时写 `Account.TruncateAvoidUntil`（`json:"-"`，Unix 秒；Clone 复制；不进 34 键契约）。
-- `Select` 第 1 层后软过滤：被回避账号只在**池内还有别的可选账号**时被剔除；全部被回避则
+- `Select` 在目标模型候选池形成后软过滤：被回避账号只在**池内还有别的可选账号**时被剔除；全部被回避则
   不过滤——软过滤永远不能让 Select 选不出号。它不是冷却：不写 Status/CoolingUntil/
   last_error、不进面板、到期自动失效、成功不延长。
 - 动机：客户端 TRANSPORT 重试 ~2s 后原样重放，额度优先会再次选中同一「最富」账号；回避让

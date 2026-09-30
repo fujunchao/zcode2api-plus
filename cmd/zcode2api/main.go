@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -92,12 +93,20 @@ func newServer(addr string, handler http.Handler) *http.Server {
 // serve 启动网关 + 后台管理 + SPA（对应 Python 版 main.py serve）。
 // 返回进程退出码：0 为正常退出（含收到停机信号），1 为启动或运行失败。
 func serve() int {
-	st, err := store.New()
+	st, err := store.NewExclusive()
 	if err != nil {
 		web.Err("main", "存储初始化失败: "+err.Error())
 		return 1
 	}
-	defer func() { _ = st.Close() }()
+	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		_ = st.Close()
+		web.Err("main", "服务监听失败: "+err.Error())
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	mux := http.NewServeMux()
 	authSvc := auth.New(st)
@@ -106,25 +115,25 @@ func serve() int {
 	if config.CaptchaBrowserEnabled {
 		cm.SetSolver(captcha.NewBrowserSolver())
 	}
-	defer func() { _ = cm.Close() }()
 
 	// 额度查询：网关成功/耗尽路径触发刷新，后台管理端点与周期监控共用
-	qs := quota.NewService(st)
+	qs := quota.NewServiceContext(ctx, st)
 
 	// 网关 + 后台管理 API（各自端点内建鉴权）
 	engine := gateway.NewEngine(st, cm, nil)
 	engine.OnQuotaRefresh = func(acc *model.Account) { _ = qs.FetchQuota(acc) }
 	gw := gateway.Handler{Engine: engine, Auth: authSvc}
 	gw.Register(mux)
-	admin := adminapi.New(st, authSvc, cm, qs)
+	admin := adminapi.New(st, authSvc, cm, qs, ctx)
 	admin.Register(mux)
 
 	// OpenAI 兼容层：/v1/chat/completions 复用同一引擎（M4）
 	openai.New(engine, authSvc).Register(mux)
 
 	// Async 空闲池：与 Python 版一致按设置条件挂载
+	var pool *asyncpool.Pool
 	if config.AsyncEnabled {
-		pool := asyncpool.NewPool(st, authSvc, cm)
+		pool = asyncpool.NewPool(st, authSvc, cm)
 		// 断流后的额度刷新与 sync 网关同源（engine.OnQuotaRefresh 同款接线）：
 		// 刷新额度快照，避免「幽灵最富」账号被额度优先调度反复选中。
 		pool.OnQuotaRefresh = func(acc *model.Account) { _ = qs.FetchQuota(acc) }
@@ -137,36 +146,38 @@ func serve() int {
 	// 后台额度监控：随服务启动、退出时等待循环收尾（对齐 lifespan）
 	mon := qs.NewMonitor()
 	mon.Start()
-	defer mon.Stop()
 
 	// 每日定时领取调度器：实时读后台设置，开关关闭时为空转（每 30s 看一次）
 	sched := adminapi.NewClaimScheduler(admin)
 	sched.Start()
-	defer sched.Stop()
 
 	// 代理线路自动巡检：周期检测可用性，自动移除不可用线路并改派绑定账号
 	//（全部线路不可用且直连也不可达时跳过该轮，防本机网络故障清空线路池）
-	proxyHealth := adminapi.NewProxyHealthScheduler(st)
+	proxyHealth := adminapi.NewProxyHealthScheduler(st, ctx)
 	proxyHealth.Start()
-	defer proxyHealth.Stop()
 
 	printBanner(st)
 
-	addr := fmt.Sprintf("%s:%d", config.Host, config.Port)
 	srv := newServer(addr, mux)
-
-	// 将系统信号转换为取消上下文，服务生命周期可在测试中用取消信号驱动，
-	// 不必向测试进程或当前运行的服务发送真正的 SIGTERM。
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		web.Err("main", "服务监听失败: "+err.Error())
-		return 1
+	// 收到信号时共享 ctx 立即取消后台网络；HTTP 完成后在同一剩余预算内收尾。
+	cleanup := func() {
+		stop()
+		stops := []func(){mon.Stop, sched.Stop, proxyHealth.Stop, admin.Close, qs.Close}
+		if pool != nil {
+			stops = append(stops, pool.Close)
+		}
+		var wg sync.WaitGroup
+		for _, fn := range stops {
+			wg.Add(1)
+			go func(fn func()) { defer wg.Done(); fn() }(fn)
+		}
+		wg.Wait()
+		_ = cm.Close()
+		_ = st.Close()
 	}
 
 	web.Ok("main", "服务运行中 "+addr)
-	if err := serveHTTP(ctx, srv, listener, gracefulShutdownTimeout); err != nil {
+	if err := serveHTTP(ctx, srv, listener, gracefulShutdownTimeout, cleanup); err != nil {
 		web.Err("main", "服务退出: "+err.Error())
 		return 1
 	}

@@ -7,6 +7,7 @@
 package adminapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 )
 
@@ -272,11 +274,15 @@ func defaultUpstreamProbeTargets() []string {
 // 只有「连不上 z.ai」这一种结论。出口 IP 与 ASN 对判断可用性没有帮助，所以
 // 不再查询；线路本身活没活，由请求能不能拿到响应体现。
 func probeProxy(proxyURL string) (map[string]any, error) {
+	return probeProxyContext(context.Background(), proxyURL)
+}
+
+func probeProxyContext(ctx context.Context, proxyURL string) (map[string]any, error) {
 	client, err := newProbeClient(proxyURL)
 	if err != nil {
 		return nil, err
 	}
-	upstream := probeUpstream(client)
+	upstream := probeUpstreamContext(ctx, client)
 	result := map[string]any{"upstream": upstream}
 	reachable, _ := upstream["ok"].(bool)
 	result["ok"] = reachable
@@ -305,12 +311,20 @@ func upstreamReason(upstream map[string]any) string {
 //
 // targets 保留逐个目标的明细，便于后台区分「主站不通」与「备援站不通」。
 func probeUpstream(client *http.Client) map[string]any {
+	return probeUpstreamContext(context.Background(), client)
+}
+
+func probeUpstreamContext(ctx context.Context, client *http.Client) map[string]any {
 	report := map[string]any{"ok": false, "blocked": false, "error": "", "ms": 0}
 	entries := make([]any, 0, len(upstreamProbeTargets))
 	reachable, blocked := false, false
 	firstErr := ""
 	for _, target := range upstreamProbeTargets {
-		entry := probeUpstreamTarget(client, target)
+		if ctx.Err() != nil {
+			report["error"] = ctx.Err().Error()
+			return report
+		}
+		entry := probeUpstreamTargetContext(ctx, client, target)
 		entries = append(entries, entry)
 		switch {
 		case entry["ok"] == true && entry["blocked"] != true:
@@ -339,11 +353,15 @@ func probeUpstream(client *http.Client) map[string]any {
 // 无凭据请求本就该被 z.ai 拒（401/403），能拿到状态码恰恰证明请求已到达它的边缘；
 // 真正要区分的是「拿不到响应」与「拿到的其实是拦截页」。
 func probeUpstreamTarget(client *http.Client, target string) map[string]any {
+	return probeUpstreamTargetContext(context.Background(), client, target)
+}
+
+func probeUpstreamTargetContext(ctx context.Context, client *http.Client, target string) map[string]any {
 	entry := map[string]any{"url": target, "host": hostOfURL(target)}
 	started := time.Now()
 	// 用生产同款 UA：自造 UA 打在 z.ai 上可能被 WAF 直接拦掉，
 	// 那会把「线路通、只是 UA 不招人待见」误报成「线路不通」。
-	resp, err := probeGet(client, target)
+	resp, err := probeGetContext(ctx, client, target)
 	entry["ms"] = time.Since(started).Milliseconds()
 	if err != nil {
 		entry["ok"] = false
@@ -388,32 +406,21 @@ func hostOfURL(raw string) string {
 // 实际测到的是环境代理的出口，结论与生产直连不符。
 // Go 标准库支持 http/https/socks5 代理；socks5 拨号即远程解析主机名，
 // 与 socks5h 语义一致；socks4 无标准库支持，直接报错（呈 502 形态）。
+// 巡检与业务流量共用协议实现，避免健康线路因探测能力不同被误删。
 func newProbeClient(proxyURL string) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
-	if strings.TrimSpace(proxyURL) != "" {
-		u, err := url.Parse(proxyURL)
-		if err != nil {
-			return nil, err
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "http", "https":
-			transport.Proxy = http.ProxyURL(u)
-		case "socks5", "socks5h":
-			socks := *u
-			socks.Scheme = "socks5"
-			transport.Proxy = http.ProxyURL(&socks)
-		default:
-			return nil, fmt.Errorf("不支持的代理协议: %s", u.Scheme)
-		}
+	transport, err := proxy.TransportForTimeout(proxyURL, upstreamProbeTimeout)
+	if err != nil {
+		return nil, err
 	}
 	return &http.Client{Timeout: upstreamProbeTimeout, Transport: transport}, nil
 }
 
-// probeGet 发起探测用的 GET，带生产同款 UA：自造 UA 打在 z.ai 上可能被 WAF
-// 直接拦掉，那会把「线路通、只是 UA 不招人待见」误报成「线路不通」。
 func probeGet(client *http.Client, endpoint string) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	return probeGetContext(context.Background(), client, endpoint)
+}
+
+func probeGetContext(ctx context.Context, client *http.Client, endpoint string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}

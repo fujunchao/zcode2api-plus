@@ -83,6 +83,8 @@ type Pool struct {
 
 	mu      sync.Mutex
 	tickets map[string]*ticket
+	tasks   sync.WaitGroup
+	closed  bool
 }
 
 // NewPool 创建空闲池。
@@ -241,10 +243,28 @@ func (p *Pool) newTicket(body map[string]any) string {
 		shortID:   newShortID(),
 	}
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		cancel()
+		return ""
+	}
 	p.tickets[ticketID] = tk
+	p.tasks.Add(1)
 	p.mu.Unlock()
-	go p.processTicket(ctx, ticketID)
+	go func() { defer p.tasks.Done(); p.processTicket(ctx, ticketID) }()
 	return ticketID
+}
+
+// Close 禁止新票务，取消并等待后台生产者退出，防止关库后仍写入。
+func (p *Pool) Close() {
+	p.mu.Lock()
+	p.closed = true
+	for _, tk := range p.tickets {
+		tk.cancel()
+	}
+	clear(p.tickets)
+	p.mu.Unlock()
+	p.tasks.Wait()
 }
 
 // getTicket 读取票务（并发安全）。

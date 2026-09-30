@@ -8,6 +8,7 @@
 package adminapi
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -200,9 +201,17 @@ func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 		web.Ok("claim", fmt.Sprintf("账号 %s 仍在领取冷却期，跳过自动领取", name))
 		return
 	}
+	h.autoMu.Lock()
+	if h.autoClosed || h.backgroundContext().Err() != nil {
+		h.autoMu.Unlock()
+		return
+	}
+	h.autoTasks.Add(1)
 	autoClaimTasks.Add(1)
+	h.autoMu.Unlock()
 	go func() {
 		defer autoClaimTasks.Done()
+		defer h.autoTasks.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				web.Warn("claim", "自动领取任务异常（已兜底）")
@@ -218,19 +227,26 @@ func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 
 // claimUnderGate 在已持有串行闸门的前提下领取单个账号并落盘结果。
 // 调用方负责抢占闸门，释放由这里的 defer 兜底；返回是否至少领到一个套餐。
-func (h *Handler) claimUnderGate(acc *model.Account) (succeeded bool) {
+func (h *Handler) claimUnderGate(acc *model.Account) bool {
+	return h.claimUnderGateContext(h.backgroundContext(), acc)
+}
+
+func (h *Handler) claimUnderGateContext(ctx context.Context, acc *model.Account) (succeeded bool) {
 	defer claimSlot.release()
 	// 领取可能持续数十秒，期间后台仍在改账号（删除线路会改派 ProxyURL/ProxyID、
 	// 额度刷新会改 Status/Quota）。这里先取一份副本再开工——直接拿 store 的内部
 	// 指针会让整个领取过程与那些写入相撞（CI 的 -race 实测到过）。
 	// 副本上的改动不会进 store，故结果由 applyClaimOutcome 按 ID 回写。
 	snap := h.Store.SnapshotAccount(acc.Provider, acc.ID)
-	if snap == nil {
-		// 账号已被删除：不是错误，本轮无事可做。
+	if ctx.Err() != nil || snap == nil || !snap.IsAutoClaimTarget(time.Now()) || claimCooldownActive(snap, time.Now()) {
+		// 账号已删除、健康状态变更或进入领取冷却：跳过且不写失败状态。
 		return false
 	}
-	svc := claim.NewService(h.Captcha)
+	svc := claim.NewServiceContext(ctx, h.Captcha)
 	outcomes := svc.AutoClaimAllPlans(snap)
+	if ctx.Err() != nil {
+		return false
+	}
 	h.applyClaimOutcome(snap, outcomes, time.Now())
 	for _, o := range outcomes {
 		if ok, _ := o["ok"].(bool); ok {
@@ -256,18 +272,22 @@ const claimBatchGap = time.Second
 // JWT 账号领取一次。受「每日定時領取」开关约束；尊重账号的 claim.next_at
 // ——那是上游自己给的节奏，刚领过的账号会被跳过。
 type ClaimScheduler struct {
-	h     *Handler
-	start sync.Once
-	stop  chan struct{}
-	done  chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	h      *Handler
+	start  sync.Once
+	stop   <-chan struct{}
+	done   chan struct{}
 
 	lastFiredMu sync.Mutex
 	lastFired   string // 已触发过的日期（YYYY-MM-DD），防同一天重复触发
+	now         func() time.Time
 }
 
 // NewClaimScheduler 创建定时领取调度器（调用 Start 启动）。
 func NewClaimScheduler(h *Handler) *ClaimScheduler {
-	return &ClaimScheduler{h: h, stop: make(chan struct{}), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(h.backgroundContext())
+	return &ClaimScheduler{h: h, ctx: ctx, cancel: cancel, stop: ctx.Done(), done: make(chan struct{}), now: time.Now}
 }
 
 // Start 启动调度循环；重复调用无操作。
@@ -275,9 +295,10 @@ func (s *ClaimScheduler) Start() {
 	s.start.Do(func() { go s.loop() })
 }
 
-// Stop 停止调度循环并等待退出。正在进行的单个账号领取会先跑完（与额度监控一致）。
+// Stop 取消网络、槽位等待及账号间隔，并等待调度循环退出；重复调用安全。
 func (s *ClaimScheduler) Stop() {
-	close(s.stop)
+	s.cancel()
+	s.Start()
 	<-s.done
 }
 
@@ -305,7 +326,7 @@ func (s *ClaimScheduler) loop() {
 	case <-time.After(5 * time.Second):
 	}
 	for {
-		now := time.Now()
+		now := s.now()
 		s.lastFiredMu.Lock()
 		last := s.lastFired
 		s.lastFiredMu.Unlock()
@@ -320,7 +341,7 @@ func (s *ClaimScheduler) loop() {
 						web.Warn("claim", "定时领取任务异常（已兜底）")
 					}
 				}()
-				s.h.runScheduledClaims(now)
+				s.h.runScheduledClaimsContext(s.ctx, now)
 			}()
 		}
 		select {
@@ -337,6 +358,10 @@ func (s *ClaimScheduler) loop() {
 //   - 抢闸门限时等待而非丢账号——一天一次的批量，慢点没关系；
 //   - 错过不补跑：23:00 时进程没在跑就等下一天，避免用户无感知的补打上游。
 func (h *Handler) runScheduledClaims(now time.Time) {
+	h.runScheduledClaimsContext(h.backgroundContext(), now)
+}
+
+func (h *Handler) runScheduledClaimsContext(ctx context.Context, now time.Time) {
 	accounts := h.jwtAccounts(nil)
 	if len(accounts) == 0 {
 		web.Ok("claim", "定时领取：池内无 JWT 账号，跳过")
@@ -344,23 +369,35 @@ func (h *Handler) runScheduledClaims(now time.Time) {
 	}
 	var okCount, failCount, coolCount, busyCount int
 	for _, acc := range accounts {
+		if ctx.Err() != nil {
+			return
+		}
+		if !acc.IsAutoClaimTarget(time.Now()) {
+			continue
+		}
 		if claimCooldownActive(acc, now) {
 			coolCount++
 			continue
 		}
 		select {
 		case claimSlot <- struct{}{}:
+		case <-ctx.Done():
+			return
 		case <-time.After(claimSlotWait):
 			busyCount++
 			web.Warn("claim", fmt.Sprintf("账号 %s 等待领取闸门超时，本轮跳过", acc.Name))
 			continue
 		}
-		if h.claimUnderGate(acc) {
+		if h.claimUnderGateContext(ctx, acc) {
 			okCount++
 		} else {
 			failCount++
 		}
-		time.Sleep(claimBatchGap)
+		select {
+		case <-time.After(claimBatchGap):
+		case <-ctx.Done():
+			return
+		}
 	}
 	web.Ok("claim", fmt.Sprintf(
 		"定时领取完成：成功 %d，失败 %d，冷却跳过 %d，闸门占用跳过 %d",
@@ -374,7 +411,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 	if v := strings.TrimSpace(r.URL.Query().Get("account_id")); v != "" {
 		ids = []string{v}
 	}
-	svc := claim.NewService(h.Captcha)
+	svc := claim.NewServiceContext(h.backgroundContext(), h.Captcha)
 	now := time.Now()
 	_, _, previewSec := h.Store.ClaimCooldowns()
 	out := []map[string]any{}
@@ -442,7 +479,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	outcomes := []map[string]any{}
 	// 激活上报与 Claim 共用同一个 Service：两者的出站都经 clientFor(acc) 走账号
 	// 线路（此前事件是独立的裸直连客户端，同一 device_mid 两个出口 IP）。
-	svc := claim.NewService(h.Captcha)
+	svc := claim.NewServiceContext(h.backgroundContext(), h.Captcha)
 	for _, acc := range candidates {
 		// 用 claimBlockedByCooling 判断（与 preview 同一函数）：EffectiveStatus 把
 		// 「冷却已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、

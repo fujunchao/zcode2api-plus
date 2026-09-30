@@ -14,7 +14,30 @@ import (
 // 验证在途请求的收尾时序，而不需要启动完整账号池或发送进程级信号。
 // Shutdown 会先关监听，使 Serve 立即返回 ErrServerClosed；因此必须由当前
 // 协程等待 Shutdown，而不能把 Serve 返回误认为在途请求已全部结束。
-func serveHTTP(ctx context.Context, srv *http.Server, listener net.Listener, budget time.Duration) error {
+func serveHTTP(ctx context.Context, srv *http.Server, listener net.Listener, budget time.Duration, cleanup ...func()) error {
+	var deadline time.Time
+	defer func() {
+		if len(cleanup) == 0 {
+			return
+		}
+		if deadline.IsZero() {
+			deadline = time.Now().Add(budget)
+		}
+		cleanupCtx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for _, fn := range cleanup {
+				fn()
+			}
+		}()
+		select {
+		case <-done:
+		case <-cleanupCtx.Done():
+			web.Warn("main", "后台清理超过剩余停机预算，停止等待")
+		}
+	}()
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- srv.Serve(listener) }()
 	var err error
@@ -23,7 +46,8 @@ func serveHTTP(ctx context.Context, srv *http.Server, listener net.Listener, bud
 		// 监听失败等启动错误不需要等待信号，也不遗留等待退出信号的协程。
 	case <-ctx.Done():
 		web.Ok("main", "收到退出信号，开始优雅停机…")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), budget)
+		deadline = time.Now().Add(budget)
+		shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			web.Warn("main", "优雅停机未在限时内完成: "+err.Error())

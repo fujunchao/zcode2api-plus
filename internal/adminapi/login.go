@@ -29,7 +29,8 @@ type loginSession struct {
 	proxyID  string // 代理线路 ID（用于写入账号；空表示非线路）
 	// auto 表示这条线路是「自動」挑出来的、而非用户显式选定：命中既有账号时
 	// 保留它原本的指派，避免重登把老号的线路换掉。
-	auto bool
+	auto   bool
+	direct bool // 明确选择直连，与未指定线路区分；重新登录也须清除旧指派
 }
 
 var (
@@ -116,7 +117,8 @@ func (h *Handler) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loginFlowsMu.Lock()
-	loginFlows[flowID] = &loginSession{flow: flow, proxyURL: proxyURL, proxyID: proxyID, auto: proxyAuto}
+	loginFlows[flowID] = &loginSession{flow: flow, proxyURL: proxyURL, proxyID: proxyID, auto: proxyAuto,
+		direct: strings.TrimSpace(strOf(payload["proxy_id"])) == proxyIDDirect}
 	loginFlowsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"flow_id":       flowID,
@@ -216,13 +218,16 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 			return nil, apiErr
 		}
 	}
-	// 兜底：仍没有线路的新号（例如 /login/start 时池里还没有空閒线路）再试一次。
-	// AutoAssignProxies 改的是 store 里的同一个对象，account 立即反映新线路。
-	if isNew && account.ProxyURL == nil {
+	// 无会话的内部调用保留旧默认；真实登录会话不得在兑换后重新自动换出口。
+	if isNew && account.ProxyURL == nil && session == nil {
 		_, _ = h.Store.AutoAssignProxies([]string{account.ID})
 	}
-	// 出站地址一律以账号上落定的值为准：自动分配刚挑了线路时 session.proxyURL
-	// 是空的，若继续用它会让「兑换走直连、刷额度走线路」两条路不一致。
+	// 入口已锁定出口，不能在授权完成后重新自动挑线。后续操作读取最新快照。
+	account = h.Store.FindAny(account.ID)
+	if account == nil {
+		return nil, errNotFound("账号不存在")
+	}
+	// 出站地址一律以账号上落定的最新值为准。
 	accountProxy := ""
 	if account.ProxyURL != nil {
 		accountProxy = *account.ProxyURL
@@ -245,6 +250,12 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 // applyLoginProxy 把登录时选定的线路写到账号上；未指定时保持账号原有指派不动
 // （重新登录不该把已有线路清掉）。
 func (h *Handler) applyLoginProxy(account *model.Account, session *loginSession) *apiError {
+	if session != nil && session.direct {
+		if _, err := h.Store.AssignProxyProfile(account.ID, ""); err != nil {
+			return errUpstream(fmt.Sprintf("清除代理失败: %v", err))
+		}
+		return nil
+	}
 	if session == nil || (session.proxyID == "" && session.proxyURL == "") {
 		return nil
 	}

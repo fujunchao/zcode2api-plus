@@ -50,11 +50,14 @@ var ErrProxyNotFound = errors.New("代理配置不存在")
 
 // Store 线程安全的账号 / 设置存储，含轮询游标。
 type Store struct {
-	mu       sync.Mutex
-	db       *sql.DB
-	accounts map[string][]*model.Account
-	settings map[string]string
-	rotation map[string]int
+	mu          sync.Mutex
+	db          *sql.DB
+	processLock *os.File
+	closeOnce   sync.Once
+	closeErr    error
+	accounts    map[string][]*model.Account
+	settings    map[string]string
+	rotation    map[string]int
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -76,7 +79,8 @@ type Store struct {
 	GeneratedGatewayKey string
 }
 
-// New 打开（必要时创建）数据库并加载快照。
+// New 打开数据库并加载独立快照，用于隔离测试或调用方已保证独占的场景。
+// 服务和 CLI 入口必须使用 NewExclusive，不能在不同进程间共享陈旧快照。
 func New() (*Store, error) {
 	db, err := openDB(config.DBPath)
 	if err != nil {
@@ -98,7 +102,15 @@ func New() (*Store, error) {
 }
 
 // Close 关闭数据库连接。
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = s.db.Close()
+		if s.processLock != nil {
+			s.closeErr = errors.Join(s.closeErr, s.processLock.Close())
+		}
+	})
+	return s.closeErr
+}
 
 func openDB(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -717,13 +729,7 @@ func (s *Store) ProxyLabel(acc *model.Account) string {
 }
 
 func (s *Store) saveProxyProfilesLocked(profiles []ProxyProfile) error {
-	data, err := marshalJSON(profiles)
-	if err != nil {
-		return err
-	}
-	s.settings["proxy_profiles"] = string(data)
-	s.publishSettings()
-	return s.setMeta("proxy_profiles", string(data))
+	return s.commitProxyStateLocked(profiles, nil)
 }
 
 // AddProxyProfile 新增命名代理出口。
@@ -786,17 +792,18 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 	profiles[target].Name = name
 	profiles[target].URL = *normalized
 	profiles[target].Enabled = enabled
-	if err := s.saveProxyProfilesLocked(profiles); err != nil {
-		return ProxyProfile{}, err
-	}
+	var pending []*model.Account
 	for _, acc := range s.allAccountsLocked() {
 		if acc.ProxyID != nil && *acc.ProxyID == profileID {
-			acc.ProxyURL = normalized
-			if err := s.persistAccountLocked(acc); err != nil {
-				return ProxyProfile{}, err
-			}
+			copy := acc.Clone()
+			copy.ProxyURL = normalized
+			pending = append(pending, copy)
 		}
 	}
+	if err := s.commitProxyStateLocked(profiles, pending); err != nil {
+		return ProxyProfile{}, err
+	}
+
 	return profiles[target], nil
 }
 
@@ -815,63 +822,10 @@ type ProxyReassign struct {
 // 全程在同一把锁内完成：删除、指派与落库之间不存在「账号既没了线路又留着旧地址」
 // 的中间态。
 func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error) {
-	reassign := ProxyReassign{Assigned: map[string]string{}}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	profiles := s.listProxyProfilesLocked()
-	remaining := make([]ProxyProfile, 0, len(profiles))
-	removed := false
-	for _, p := range profiles {
-		if p.ID == profileID {
-			removed = true
-			continue
-		}
-		remaining = append(remaining, p)
-	}
-	if !removed {
-		return false, reassign, nil
-	}
-	if err := s.saveProxyProfilesLocked(remaining); err != nil {
-		return false, reassign, err
-	}
-	s.clearLineTruncateLocked(profileID)
-
-	// 第一步：摘掉失效指派。必须先做，补位时看到的才是干净的占用情况。
-	affected := []*model.Account{}
-	for _, acc := range s.allAccountsLocked() {
-		if acc.ProxyID != nil && *acc.ProxyID == profileID {
-			acc.ProxyID = nil
-			acc.ProxyURL = nil
-			affected = append(affected, acc)
-		}
-	}
-
-	// 第二步：按序补位；补不上才落回直连（此时 ProxyID/ProxyURL 已清空）。
-	free := s.freeProxyProfilesLocked()
-	for _, acc := range affected {
-		if len(free) == 0 {
-			reassign.Direct = append(reassign.Direct, acc.ID)
-			if err := s.persistAccountLocked(acc); err != nil {
-				return true, reassign, err
-			}
-			continue
-		}
-		p := free[0]
-		free = free[1:]
-		newID, newURL := p.ID, p.URL
-		acc.ProxyID = &newID
-		acc.ProxyURL = &newURL
-		if err := s.persistAccountLocked(acc); err != nil {
-			// 落库失败就退回直连，别把内存里的指针留成没写进去的状态。
-			acc.ProxyID = nil
-			acc.ProxyURL = nil
-			reassign.Direct = append(reassign.Direct, acc.ID)
-			continue
-		}
-		reassign.Assigned[acc.ID] = newID
-	}
-	return true, reassign, nil
+	removed, reassign, err := s.removeProxiesLocked(map[string]bool{profileID: true}, false)
+	return len(removed) > 0, reassign, err
 }
 
 // PurgeProxyProfiles 批量删除代理线路，并把「原本绑定它们的账号」统一改派。
@@ -886,100 +840,15 @@ func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error
 // 多个账号同时待改派时按 store 内顺序（即账号入池顺序）逐个分配，每分配一个
 // 就更新占用计数，批内也保持摊薄。不存在于线路表的 ID 静默跳过，不报错。
 func (s *Store) PurgeProxyProfiles(ids []string) ([]string, ProxyReassign, error) {
-	reassign := ProxyReassign{Assigned: map[string]string{}}
-	purgeSet := map[string]bool{}
-	for _, id := range ids {
-		if id != "" {
-			purgeSet[id] = true
-		}
-	}
-	if len(purgeSet) == 0 {
-		return nil, reassign, nil
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	profiles := s.listProxyProfilesLocked()
-	remaining := make([]ProxyProfile, 0, len(profiles))
-	purged := []string{}
-	for _, p := range profiles {
-		if purgeSet[p.ID] {
-			purged = append(purged, p.ID)
-			continue
-		}
-		remaining = append(remaining, p)
-	}
-	if len(purged) == 0 {
-		return nil, reassign, nil
-	}
-	if err := s.saveProxyProfilesLocked(remaining); err != nil {
-		return nil, reassign, err
-	}
-	for _, id := range purged {
-		s.clearLineTruncateLocked(id)
-	}
-
-	// 第一步：摘掉全部失效指派。必须先做，占用计数看到的才是干净状态
-	//（这一步同时保证了改派绝不会落到同批待删的线路上）。
-	accounts := s.allAccountsLocked()
-	affected := []*model.Account{}
-	for _, acc := range accounts {
-		if acc.ProxyID != nil && purgeSet[*acc.ProxyID] {
-			acc.ProxyID = nil
-			acc.ProxyURL = nil
-			affected = append(affected, acc)
+	wanted := map[string]bool{}
+	for _, id := range ids {
+		if id != "" {
+			wanted[id] = true
 		}
 	}
-
-	// 第二步：统计存活启用线路的占用数；「占用最少」天然涵盖空閒优先
-	//（空閒 = 占用 0 ≤ 任何其它线路），并列时取线路表顺序。
-	occupancy := map[string]int{}
-	candidates := []ProxyProfile{}
-	for _, p := range remaining {
-		if !p.Enabled {
-			continue
-		}
-		candidates = append(candidates, p)
-		occupancy[p.ID] = 0
-	}
-	for _, acc := range accounts {
-		if id := derefStr(acc.ProxyID); id != "" {
-			if _, ok := occupancy[id]; ok {
-				occupancy[id]++
-			}
-		}
-	}
-
-	// 第三步：逐个改派；没有候选才退回直连（此时 ProxyID/ProxyURL 已清空）。
-	for _, acc := range affected {
-		best := -1
-		for i, p := range candidates {
-			if best < 0 || occupancy[p.ID] < occupancy[candidates[best].ID] {
-				best = i
-			}
-		}
-		if best < 0 {
-			reassign.Direct = append(reassign.Direct, acc.ID)
-			if err := s.persistAccountLocked(acc); err != nil {
-				return purged, reassign, err
-			}
-			continue
-		}
-		p := candidates[best]
-		newID, newURL := p.ID, p.URL
-		acc.ProxyID = &newID
-		acc.ProxyURL = &newURL
-		if err := s.persistAccountLocked(acc); err != nil {
-			// 落库失败就退回直连，别把内存里的指针留成没写进去的状态。
-			acc.ProxyID = nil
-			acc.ProxyURL = nil
-			reassign.Direct = append(reassign.Direct, acc.ID)
-			continue
-		}
-		occupancy[p.ID]++
-		reassign.Assigned[acc.ID] = newID
-	}
-	return purged, reassign, nil
+	return s.removeProxiesLocked(wanted, true)
 }
 
 // ── 线路断流熔断 ─────────────────────────────────────────────────────────────
@@ -1052,7 +921,7 @@ func (s *Store) clearLineTruncateLocked(profileID string) {
 func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	acc := s.findAnyLocked(accountID)
+	acc := s.findAnyLocked(accountID).Clone()
 	if acc == nil {
 		return false, nil
 	}
@@ -1076,7 +945,10 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 		acc.ProxyID = nil
 		acc.ProxyURL = nil
 	}
-	return true, s.persistAccountLocked(acc)
+	if err := s.commitProxyStateLocked(nil, []*model.Account{acc}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // freeProxyProfilesLocked 列出「启用中且未被任何账号占用」的线路。
@@ -1121,15 +993,12 @@ func (s *Store) PickFreeProxyProfile() (ProxyProfile, bool) {
 func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]string, directFallback []string) {
 	assigned = map[string]string{}
 	directFallback = []string{}
-	if len(accountIDs) == 0 {
-		return assigned, directFallback
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	free := s.freeProxyProfilesLocked()
-	for _, id := range accountIDs {
-		acc := s.findAnyLocked(id)
+	var pending []*model.Account
+	for _, id := range dedupeIDs(accountIDs) {
+		acc := s.findAnyLocked(id).Clone()
 		if acc == nil {
 			continue
 		}
@@ -1140,13 +1009,16 @@ func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]stri
 		p := free[0]
 		free = free[1:]
 		profileID, profileURL := p.ID, p.URL
-		acc.ProxyID = &profileID
-		acc.ProxyURL = &profileURL
-		if err := s.persistAccountLocked(acc); err != nil {
-			directFallback = append(directFallback, id)
-			continue
-		}
+		acc.ProxyID, acc.ProxyURL = &profileID, &profileURL
+		pending = append(pending, acc)
 		assigned[id] = profileID
+	}
+	if err := s.commitProxyStateLocked(nil, pending); err != nil {
+		logPersistFailure("proxy-assign", "batch", err)
+		for _, acc := range pending {
+			directFallback = append(directFallback, acc.ID)
+		}
+		assigned = map[string]string{}
 	}
 	return assigned, directFallback
 }
@@ -1488,10 +1360,18 @@ func (s *Store) EditAccount(provider, idOrName string, edit AccountEdit) (bool, 
 
 // SetProxyURL 设置账号的手工出站地址并解除线路指派（url 为 nil 表示直连）。
 func (s *Store) SetProxyURL(provider, idOrName string, url *string) (bool, error) {
-	return s.Update(provider, idOrName, func(acc *model.Account) {
-		acc.ProxyID = nil
-		acc.ProxyURL = url
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := s.findLocked(provider, idOrName).Clone()
+	if acc == nil {
+		return false, nil
+	}
+	acc.ProxyID = nil
+	acc.ProxyURL = url
+	if err := s.commitProxyStateLocked(nil, []*model.Account{acc}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SetIdentity 补写账号身份（OAuth 登录后回填邮箱、或把 oauth-login 正名为邮箱）。
@@ -1638,24 +1518,6 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 			base = append(base, a)
 		}
 	}
-	// 断流短回避（软过滤）：刚被上游掐断的账号在回避期内暂不被选号，让紧接着的
-	// 客户端 TRANSPORT 重试自然落到别的线路（2026-09-22 事故里三次重试全撞同一条
-	// 带 ~300s 上限的线路，就是缺这一层）。只在池内还有其它可选账号时剔除；全部
-	// 被回避则不过滤——软过滤永远不能让 Select 选不出号。它不是冷却：不写状态、
-	// 到期自动失效，见 Account.TruncateAvoidUntil。
-	if len(base) > 1 {
-		nowF := float64(now.UnixNano()) / 1e9
-		var kept []*model.Account
-		for _, a := range base {
-			if a.TruncateAvoidUntil > nowF {
-				continue
-			}
-			kept = append(kept, a)
-		}
-		if len(kept) > 0 {
-			base = kept
-		}
-	}
 	pool := base
 	if modelName != "" {
 		var available, unknown []*model.Account
@@ -1671,6 +1533,20 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 			pool = available
 		} else {
 			pool = unknown
+		}
+	}
+	// 先形成目标模型候选池，再执行软回避；其他模型的账号不能充当兜底。
+	if len(pool) > 1 {
+		nowF := float64(now.UnixNano()) / 1e9
+		var kept []*model.Account
+		for _, a := range pool {
+			if a.TruncateAvoidUntil > nowF {
+				continue
+			}
+			kept = append(kept, a)
+		}
+		if len(kept) > 0 {
+			pool = kept
 		}
 	}
 	if len(pool) == 0 {

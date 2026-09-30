@@ -6,6 +6,7 @@ package claim
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -70,6 +71,7 @@ const (
 
 // Service 领取服务：captcha 求解 + billing HTTP（账号代理生效）。
 type Service struct {
+	Context context.Context
 	Captcha *captcha.Manager
 	// Client 测试注入；nil 时按账号代理构造（25s 超时，短请求语义）。
 	Client HTTPClient
@@ -82,7 +84,18 @@ type HTTPClient interface {
 
 // NewService 创建领取服务。
 func NewService(cm *captcha.Manager) *Service {
-	return &Service{Captcha: cm}
+	return NewServiceContext(context.Background(), cm)
+}
+
+// NewServiceContext 领取中的网络与验证码操作共享取消信号。
+func NewServiceContext(ctx context.Context, cm *captcha.Manager) *Service {
+	return &Service{Captcha: cm, Context: ctx}
+}
+func (s *Service) context() context.Context {
+	if s.Context != nil {
+		return s.Context
+	}
+	return context.Background()
 }
 
 // clientFor 账号出站客户端：有代理走代理（25s 超时），否则默认直连。
@@ -211,7 +224,7 @@ func normalizeEpoch(v float64) *float64 {
 
 // billingRequest 统一计费请求：网络错误/鉴权失败统一转 ClaimError。
 func (s *Service) billingRequest(acc *model.Account, method, path string, headers map[string]string, payload []byte) (map[string]any, error) {
-	req, err := http.NewRequest(method, config.ZcodeBillingBase+path, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(s.context(), method, config.ZcodeBillingBase+path, bytes.NewReader(payload))
 	if err != nil {
 		return nil, &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", err)}
 	}
@@ -271,7 +284,7 @@ func (s *Service) ReportActivationEvents(acc *model.Account) string {
 	deviceMid := acc.DeviceMidOr(config.DeviceMid())
 	client := s.clientFor(acc)
 	for _, element := range ActivationElements {
-		if err := PostActivationEvent(client, userID, element, deviceMid); err != nil {
+		if err := PostActivationEventContext(s.context(), client, userID, element, deviceMid); err != nil {
 			return fmt.Sprintf("激活事件 %s 上報失敗: %v", element, err)
 		}
 	}
@@ -343,7 +356,7 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
-		token, err := s.Captcha.GetVerifyParam(nil)
+		token, err := s.Captcha.GetVerifyParam(s.context())
 		if err != nil || token == nil {
 			return nil, &ClaimError{
 				msg:     "驗證碼求解失敗或已停用，請到後台驗證碼頁面回填參數",
@@ -424,6 +437,9 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 	}
 
 	for _, plan := range plans {
+		if s.context().Err() != nil {
+			break
+		}
 		planID, _ := plan["plan_id"].(string)
 		result, err := s.Claim(acc, planID)
 		if err != nil {

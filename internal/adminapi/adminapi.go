@@ -5,10 +5,12 @@ package adminapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"zcode2api/internal/auth"
@@ -20,16 +22,44 @@ import (
 
 // Handler 后台管理 HTTP 层。
 type Handler struct {
-	Store     *store.Store
-	Auth      *auth.Service
-	Captcha   *captcha.Manager
-	Quota     *quota.Service
-	StartedAt time.Time
+	ctx        context.Context
+	cancel     context.CancelFunc
+	autoMu     sync.Mutex
+	autoClosed bool
+	autoTasks  sync.WaitGroup
+	Store      *store.Store
+	Auth       *auth.Service
+	Captcha    *captcha.Manager
+	Quota      *quota.Service
+	StartedAt  time.Time
 }
 
 // New 创建后台管理处理器（StartedAt 对齐 Python 版模块导入时刻 _STARTED_AT）。
-func New(st *store.Store, au *auth.Service, cm *captcha.Manager, qs *quota.Service) *Handler {
-	return &Handler{Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now()}
+func New(st *store.Store, au *auth.Service, cm *captcha.Manager, qs *quota.Service, parents ...context.Context) *Handler {
+	parent := context.Background()
+	if len(parents) > 0 {
+		parent = parents[0]
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &Handler{ctx: ctx, cancel: cancel, Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now()}
+}
+
+func (h *Handler) backgroundContext() context.Context {
+	if h.ctx != nil {
+		return h.ctx
+	}
+	return context.Background()
+}
+
+// Close 不再接收入池任务，并等已启动的任务响应取消后退出。
+func (h *Handler) Close() {
+	h.autoMu.Lock()
+	h.autoClosed = true
+	if h.cancel != nil {
+		h.cancel()
+	}
+	h.autoMu.Unlock()
+	h.autoTasks.Wait()
 }
 
 // Register 在 mux 上注册全部 /admin/api/* 路由；每个端点先过后台密钥鉴权。

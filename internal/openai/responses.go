@@ -54,12 +54,50 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 		return nil, err
 	}
 
-	messages, err := convertResponsesInput(body["input"])
+	input, system, err := splitResponsesInstructions(body["input"])
+	if err != nil {
+		return nil, err
+	}
+	if len(system) > 0 {
+		existing, _ := out["system"].([]any)
+		out["system"] = append(existing, system...)
+	}
+	messages, err := convertResponsesInput(input)
 	if err != nil {
 		return nil, err
 	}
 	out["messages"] = messages
 	return out, nil
+}
+
+// 指令保留独立优先级；只复制输入列表，不改调用方的消息对象。
+func splitResponsesInstructions(input any) (any, []any, error) {
+	items, ok := input.([]any)
+	if !ok {
+		return input, nil, nil
+	}
+	ordinary := make([]any, 0, len(items))
+	var system []any
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		role := stringOf(item["role"])
+		kind := stringOf(item["type"])
+		if !ok || (kind != "" && kind != "message") || (role != "system" && role != "developer") {
+			ordinary = append(ordinary, raw)
+			continue
+		}
+		blocks, err := responsesContentToBlocks(item["content"])
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, rawBlock := range blocks {
+			if rawBlock.(map[string]any)["type"] != "text" {
+				return nil, nil, &convertError{"system/developer 指令只支持文本"}
+			}
+		}
+		system = append(system, blocks...)
+	}
+	return ordinary, system, nil
 }
 
 // convertResponsesInput 把 Responses input（字符串或 item 数组）转换为
@@ -93,8 +131,11 @@ func convertResponsesInput(input any) ([]any, error) {
 			switch itype, _ := item["type"].(string); itype {
 			case "", "message":
 				role, _ := item["role"].(string)
-				if role != "assistant" {
+				if role == "" {
 					role = "user"
+				}
+				if role != "user" && role != "assistant" {
+					return nil, &convertError{fmt.Sprintf("不支持的消息角色 %s", role)}
 				}
 				blocks, err := responsesContentToBlocks(item["content"])
 				if err != nil {

@@ -97,7 +97,7 @@ func indexOf(args []string, want string) int {
 
 // openStore CLI 公共入口：打开数据库，失败即退出。
 func openStore() *store.Store {
-	st, err := store.New()
+	st, err := store.NewExclusive()
 	if err != nil {
 		web.Err("cli", "存储初始化失败: "+err.Error())
 		os.Exit(1)
@@ -335,8 +335,17 @@ func cmdQuota() {
 	}
 	fmt.Println(web.Cyan + "\n正在拉取各账号实时额度..." + web.Reset)
 	qs := quota.NewService(st)
+	defer qs.Close()
 	for _, a := range jwtAccounts {
-		qs.FetchQuota(a)
+		result := qs.FetchQuota(a)
+		if failure, ok := result["error"]; ok {
+			fmt.Printf("账号 %s 额度刷新失败: %v\n", a.Name, failure)
+			continue
+		}
+		a = st.Find(a.Provider, a.ID)
+		if a == nil {
+			continue
+		}
 		fmt.Println(web.Bold + fmt.Sprintf("\n账号: %s (%s)", a.Name, a.EffectiveStatus(now)) + web.Reset)
 		if len(a.Quota) == 0 {
 			fmt.Println("  无额度数据")

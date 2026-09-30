@@ -12,6 +12,7 @@ package claim
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -86,11 +87,15 @@ func BuildActivationEventBody(element, userID, deviceMid string) map[string]any 
 // client 必须与 billing 请求同源（Service.clientFor），保证两者同 IP 出站。
 // HTTP >= 400 或业务码非 0 返回错误；调用方决定容错策略。
 func PostActivationEvent(client HTTPClient, userID, element, deviceMid string) error {
+	return PostActivationEventContext(context.Background(), client, userID, element, deviceMid)
+}
+
+func PostActivationEventContext(ctx context.Context, client HTTPClient, userID, element, deviceMid string) error {
 	body, err := json.Marshal(BuildActivationEventBody(element, userID, deviceMid))
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, EventReportURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, EventReportURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
