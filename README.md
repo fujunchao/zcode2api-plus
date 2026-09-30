@@ -44,6 +44,13 @@ ZCODE_CAPTCHA_BROWSER=true ./zcode2api serve
 首次啟動橫幅輸出後台密碼與網關 API Key（也可 CLI 設定）。
 瀏覽器求解不可用時自動回退人工回填（後台 `/admin/captcha`），功能不中斷。
 
+ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `true` 时，
+同步、异步及 OpenAI 兼容模型请求均跳过验证码，不依赖浏览器或人工回填；
+**套餐领取仍保留验证码**，因此自动领取场景不要关闭浏览器求解开关。
+该策略使用既有配置缓存（默认 10 分钟），字段缺失或配置获取失败时保留原验证要求。
+默认客户端版本已同步至 `3.14.4`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
+`UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。升级只需替换网关程序/镜像并重启，无数据库迁移。
+
 ## CLI
 
 ```

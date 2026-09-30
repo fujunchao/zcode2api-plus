@@ -43,6 +43,16 @@ func TestFetchConfigFromUpstream(t *testing.T) {
 	}
 }
 
+func TestFetchConfigModelSkipFlag(t *testing.T) {
+	setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":true}}}}`))
+	})
+	cfg := NewManager().FetchConfig(context.Background())
+	if !cfg.Enabled || !cfg.SkipModelRequest || cfg.SceneID != "sc" {
+		t.Fatalf("模型跳过标记应保留，且不能关闭全局验证码: %+v", cfg)
+	}
+}
+
 func TestFetchConfigMissingCaptchaFallsBack(t *testing.T) {
 	setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"code":0,"data":{"configs":{}}}`))

@@ -35,6 +35,7 @@ type fixture struct {
 	srv      *httptest.Server
 	upstream *httptest.Server
 	st       *store.Store
+	cm       *captcha.Manager // JWT 兼容性用例可替换策略；默认用例仍走 API Key。
 
 	mu      sync.Mutex
 	calls   []upstreamBody
@@ -87,6 +88,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 
 	cm := captcha.NewManager()
+	f.cm = cm
 	cm.SetConfigProvider(func(context.Context) (captcha.Config, error) {
 		return captcha.Config{Enabled: true, Prefix: "no8xfe", Region: "sgp", SceneID: "11xygtvd"}, nil
 	})

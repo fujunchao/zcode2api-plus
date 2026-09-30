@@ -214,7 +214,8 @@ var (
 	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐；
 	// 2026-09-23 由 3.11.2 升至 3.14.3（本机实装客户端版本，激活失效排查项之一，
 	// 见 docs/analysis-zcode-client-activation-diff.md）。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.14.3")
+	// 2026-09-30 同步 3.14.4；模型验证码按 skip_model_request 策略独立跳过。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.14.4")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。

@@ -31,6 +31,8 @@ type Config struct {
 	Prefix  string
 	Region  string
 	SceneID string
+	// SkipModelRequest 只跳过模型请求验证；套餐领取仍使用 Enabled 控制。
+	SkipModelRequest bool
 }
 
 // DefaultConfig 上游配置接口不可用时的兜底值（region 与线上实测一致）。
@@ -131,10 +133,11 @@ func fetchConfigHTTP(ctx context.Context) (Config, error) {
 		Data struct {
 			Configs struct {
 				Captcha *struct {
-					Enabled *bool  `json:"enabled"`
-					Prefix  string `json:"prefix"`
-					Region  string `json:"region"`
-					SceneID string `json:"sceneId"`
+					Enabled          *bool  `json:"enabled"`
+					Prefix           string `json:"prefix"`
+					Region           string `json:"region"`
+					SceneID          string `json:"sceneId"`
+					SkipModelRequest bool   `json:"skip_model_request"`
 				} `json:"captcha"`
 			} `json:"configs"`
 		} `json:"data"`
@@ -147,19 +150,38 @@ func fetchConfigHTTP(ctx context.Context) (Config, error) {
 		return Config{}, errors.New("上游配置缺少 captcha 对象")
 	}
 	return Config{
-		Enabled: c.Enabled == nil || *c.Enabled, // 对齐 Python：仅显式 false 才禁用
-		Prefix:  strings.TrimSpace(c.Prefix),
-		Region:  strings.TrimSpace(c.Region),
-		SceneID: strings.TrimSpace(c.SceneID),
+		Enabled:          c.Enabled == nil || *c.Enabled, // 对齐 Python：仅显式 false 才禁用
+		Prefix:           strings.TrimSpace(c.Prefix),
+		Region:           strings.TrimSpace(c.Region),
+		SceneID:          strings.TrimSpace(c.SceneID),
+		SkipModelRequest: c.SkipModelRequest,
 	}, nil
 }
 
-// GetVerifyParam 返回验证码令牌。
+// GetVerifyParam 返回领取等非模型操作的验证码令牌，不受 SkipModelRequest 影响。
 // 语义对齐 Python 版：缓存命中直接返回；配置禁用返回 (nil, nil)（无需验证码）；
 // 浏览器求解的令牌可能是一次性的，不写缓存；人工回填令牌按 TTL 复用。
 func (m *Manager) GetVerifyParam(ctx context.Context) (*Token, error) {
+	return m.getVerifyParam(ctx, false)
+}
+
+// GetModelVerifyParam 返回模型请求验证码；上游允许跳过时返回 (nil, nil)。
+// 必须先查模型策略再读人工缓存，避免跳过后仍携带旧 token。
+// 模型跳过不清空共享缓存：其中的人工 token 可能仍用于套餐领取。
+func (m *Manager) GetModelVerifyParam(ctx context.Context) (*Token, error) {
+	return m.getVerifyParam(ctx, true)
+}
+
+func (m *Manager) getVerifyParam(ctx context.Context, modelRequest bool) (*Token, error) {
 	if ctx == nil {
 		ctx = context.Background() // 允许 nil ctx（claim 等后台调用）
+	}
+	var cfg Config
+	if modelRequest {
+		cfg = m.FetchConfig(ctx)
+		if !cfg.Enabled || cfg.SkipModelRequest {
+			return nil, nil
+		}
 	}
 	m.mu.Lock()
 	if m.cached != nil && m.now().Sub(m.cachedAt) < m.cachedTTL {
@@ -169,7 +191,10 @@ func (m *Manager) GetVerifyParam(ctx context.Context) (*Token, error) {
 	}
 	m.mu.Unlock()
 
-	cfg := m.FetchConfig(ctx)
+	if !modelRequest {
+		// 保留领取的缓存优先语义；模型入口上面已获取配置，不重复请求。
+		cfg = m.FetchConfig(ctx)
+	}
 	if !cfg.Enabled {
 		m.Invalidate()
 		return nil, nil

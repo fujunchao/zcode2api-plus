@@ -250,7 +250,8 @@ func (e *Engine) tryAccount(
 	diag *ReqDiag,
 	scope *RiskScope,
 ) attemptResult {
-	needsCaptcha := acc.Mode == "jwt"
+	// JWT 决定鉴权、system 和错误分类；是否取验证码由模型专用入口独立判断。
+	isJWT := acc.Mode == "jwt"
 
 	// 记录出口身份：账号名与线路标签。账号在 Select 之后才可得，这正是起始行
 	// （web.Req）打不出它的原因。多次尝试时以最后一次为准，逐次明细仍在既有
@@ -269,8 +270,8 @@ func (e *Engine) tryAccount(
 		// 同样如此；session/trace/query 保持（轮次与会话连续）。
 		attr = attr.WithFreshRequestID()
 		var verifyParam, verifyRegion string
-		if needsCaptcha {
-			token, err := e.Captcha.GetVerifyParam(ctx)
+		if isJWT {
+			token, err := e.Captcha.GetModelVerifyParam(ctx)
 			if err != nil {
 				e.Captcha.Invalidate()
 				b.captcha++
@@ -288,7 +289,7 @@ func (e *Engine) tryAccount(
 
 		// 每个账号在副本上做 NormalizeBody（system 注入不幂等，见 body.go）
 		actualBody := shallowCopyBody(body)
-		NormalizeBody(actualBody, needsCaptcha)
+		NormalizeBody(actualBody, isJWT)
 		// 内容视图（= 下游内容 + 网关整形）在注入账号身份**之前**取：设备指纹每账号
 		// 一份，算进指纹会让同一份内容在换号后指纹不同，而 diag 的 bodyhash 正是用来
 		// 判读「这个 body 打过几个账号」的（见 ReqDiag.SetBody）。
@@ -355,7 +356,7 @@ func (e *Engine) tryAccount(
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, modelName, needsCaptcha, resp, &b, scope)
+			res := e.handleUpstreamError(ctx, reqID, acc, modelName, isJWT, resp, &b, scope)
 			if res.retrySame {
 				continue
 			}
@@ -388,7 +389,7 @@ func (e *Engine) tryAccount(
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_response_too_large",
 					fmt.Sprintf("上游 JSON 响应超过 %d 字节上限", limit))}
 			}
-			res := e.handleUpstreamJSON(ctx, reqID, acc, modelName, needsCaptcha, stream, contentType, buffered, &b, deliver, diag)
+			res := e.handleUpstreamJSON(ctx, reqID, acc, modelName, isJWT, stream, contentType, buffered, &b, deliver, diag)
 			if res.retrySame {
 				continue
 			}
@@ -400,7 +401,7 @@ func (e *Engine) tryAccount(
 	}
 
 	// 预算耗尽（防御分支：每个 continue 都已各自记账，正常路径不会走到这里）
-	if needsCaptcha {
+	if isJWT {
 		return attemptResult{final: e.captchaRequired(reqID, "验证码重试次数已耗尽")}
 	}
 	return attemptResult{switchAccount: true}
@@ -422,7 +423,7 @@ func (e *Engine) handleUpstreamError(
 	reqID string,
 	acc *model.Account,
 	modelName string,
-	needsCaptcha bool,
+	isJWT bool,
 	resp *http.Response,
 	b *attemptBudget,
 	scope *RiskScope,
@@ -443,7 +444,8 @@ func (e *Engine) handleUpstreamError(
 	text := string(body)
 
 	// 1) 验证码挑战（响应头 / code=3007 / F001 与文本仅限 400/403）
-	if needsCaptcha && IsCaptchaError(text, resp.StatusCode, resp.Header) {
+	// 即使配置允许跳过，真实挑战仍按验证码错误有界重试，不能误标账号鉴权失败。
+	if isJWT && IsCaptchaError(text, resp.StatusCode, resp.Header) {
 		e.Captcha.Invalidate()
 		b.captcha++
 		e.recordError(acc, model.ErrorKindCaptchaFailed, "上游拒绝验证码 HTTP "+fmt.Sprint(resp.StatusCode))
@@ -641,7 +643,7 @@ func (e *Engine) handleUpstreamJSON(
 	reqID string,
 	acc *model.Account,
 	modelName string,
-	needsCaptcha bool,
+	isJWT bool,
 	stream bool,
 	contentType string,
 	buffered []byte,
@@ -659,7 +661,7 @@ func (e *Engine) handleUpstreamJSON(
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
 
-	case needsCaptcha && code == "3007":
+	case isJWT && code == "3007":
 		e.Captcha.Invalidate()
 		b.captcha++
 		e.recordError(acc, model.ErrorKindCaptchaFailed, "上游拒絕驗證碼 code=3007")
