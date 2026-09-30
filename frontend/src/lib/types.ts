@@ -226,6 +226,22 @@ export interface UsageResponse {
   window: string
   summary: Stats
   ranking: UsageRankingRow[]
+  requests?: RequestStats
+}
+
+/** 本次服务进程的模型 HTTP 请求统计；与账号历史用量分开。 */
+export interface RequestStats {
+  scope: 'process'
+  started_at: number
+  total: number
+  succeeded: number
+  failed: number
+  canceled: number
+  active: number
+  upstream_attempts: number
+  retries: number
+  success_rate: number | null
+  average_qps: number
 }
 
 export interface LoginStartResponse {

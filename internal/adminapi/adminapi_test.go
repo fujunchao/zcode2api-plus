@@ -3,7 +3,6 @@ package adminapi
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -536,11 +535,12 @@ func TestMonitorAndUsage(t *testing.T) {
 		t.Fatalf("账号统计不符: %v", acct)
 	}
 	reqs := body["requests"].(map[string]any)
-	if num(t, reqs["total"]) != 8 || num(t, reqs["errors"]) != 2 {
+	// 历史账号计数不应冒充本次进程真实处理的 HTTP 请求。
+	if num(t, reqs["total"]) != 0 || num(t, reqs["errors"]) != 0 {
 		t.Fatalf("请求统计不符: %v", reqs)
 	}
-	if fmt.Sprint(reqs["success_rate"]) != "75" {
-		t.Fatalf("成功率应 75: %v", reqs["success_rate"])
+	if reqs["success_rate"] != nil || reqs["scope"] != "process" {
+		t.Fatalf("无新请求时成功率应为 null：%v", reqs)
 	}
 	if got := body["uptime_sec"].(float64); got < 0 {
 		t.Fatalf("uptime 应非负: %v", got)

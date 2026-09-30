@@ -1,5 +1,5 @@
 /* 系統設定頁：後台密碼、網關 API Key、額度刷新間隔與使用說明 */
-import { useEffect, useState, type FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { adminKey } from '@/lib/admin-key'
 import { api, errMsg } from '@/lib/api'
+import { useDraftGroup, type DraftLifecycle } from '@/hooks/use-draft-group'
 import type { SettingsResponse } from '@/lib/types'
 
 export function SettingsPage() {
@@ -19,63 +20,122 @@ export function SettingsPage() {
     queryFn: () => api<SettingsResponse>('GET', '/settings'),
   })
 
-  const [adminKeyInput, setAdminKeyInput] = useState('')
-  const [gatewayKey, setGatewayKey] = useState('')
-  const [quotaInterval, setQuotaInterval] = useState('60')
+  const authDraft = useDraftGroup(
+    data ? {
+      adminKeyInput: String(data.admin_key ?? ''),
+      gatewayKey: String(data.gateway_key ?? ''),
+      quotaInterval: String(data.quota_refresh_interval ?? '60'),
+    } : undefined,
+    {
+      adminKeyInput: '',
+      gatewayKey: '',
+      quotaInterval: '60',
+    },
+  )
+  const { adminKeyInput, gatewayKey, quotaInterval } = authDraft.value
+  const setAdminKeyInput = (value: string) => authDraft.edit({ adminKeyInput: value })
+  const setGatewayKey = (value: string) => authDraft.edit({ gatewayKey: value })
+  const setQuotaInterval = (value: string) => authDraft.edit({ quotaInterval: value })
+  const claimDraft = useDraftGroup(
+    data ? {
+      claimAuto: data.claim_auto_enabled ?? true,
+      claimSchedule: data.claim_schedule_enabled ?? false,
+      claimTime: String(data.claim_schedule_time ?? '23:00'),
+      claimCaptchaCooldown: String(data.claim_captcha_cooldown ?? '3600'),
+      claimRetryCooldown: String(data.claim_retry_cooldown ?? '600'),
+      claimPreviewCooldown: String(data.claim_preview_cooldown ?? '60'),
+    } : undefined,
+    {
+      claimAuto: true,
+      claimSchedule: false,
+      claimTime: '23:00',
+      claimCaptchaCooldown: '3600',
+      claimRetryCooldown: '600',
+      claimPreviewCooldown: '60',
+    },
+  )
+  const { claimAuto, claimSchedule, claimTime, claimCaptchaCooldown, claimRetryCooldown, claimPreviewCooldown } = claimDraft.value
+  const setClaimAuto = (value: boolean) => claimDraft.edit({ claimAuto: value })
+  const setClaimSchedule = (value: boolean) => claimDraft.edit({ claimSchedule: value })
+  const setClaimTime = (value: string) => claimDraft.edit({ claimTime: value })
+  const setClaimCaptchaCooldown = (value: string) => claimDraft.edit({ claimCaptchaCooldown: value })
+  const setClaimRetryCooldown = (value: string) => claimDraft.edit({ claimRetryCooldown: value })
+  const setClaimPreviewCooldown = (value: string) => claimDraft.edit({ claimPreviewCooldown: value })
+  const proxyDraft = useDraftGroup(
+    data ? {
+      proxyHealth: data.proxy_health_enabled ?? true,
+      proxyHealthInterval: String(data.proxy_health_interval ?? '30'),
+    } : undefined,
+    {
+      proxyHealth: true,
+      proxyHealthInterval: '30',
+    },
+  )
+  const { proxyHealth, proxyHealthInterval } = proxyDraft.value
+  const setProxyHealth = (value: boolean) => proxyDraft.edit({ proxyHealth: value })
+  const setProxyHealthInterval = (value: string) => proxyDraft.edit({ proxyHealthInterval: value })
+  const riskDraft = useDraftGroup(
+    data ? {
+      riskCoolingSteps: String(data.risk_cooling_steps ?? '300,900,3600'),
+    } : undefined,
+    {
+      riskCoolingSteps: '300,900,3600',
+    },
+  )
+  const { riskCoolingSteps } = riskDraft.value
+  const setRiskCoolingSteps = (value: string) => riskDraft.edit({ riskCoolingSteps: value })
+  const unavailableDraft = useDraftGroup(
+    data ? {
+      upstream503Steps: String(data.upstream_503_cooling_steps ?? '30,60,120'),
+    } : undefined,
+    {
+      upstream503Steps: '30,60,120',
+    },
+  )
+  const { upstream503Steps } = unavailableDraft.value
+  const setUpstream503Steps = (value: string) => unavailableDraft.edit({ upstream503Steps: value })
+  const asyncDraft = useDraftGroup(
+    data ? {
+      asyncForceDirect: data.async_force_direct ?? false,
+    } : undefined,
+    {
+      asyncForceDirect: false,
+    },
+  )
+  const { asyncForceDirect } = asyncDraft.value
+  const setAsyncForceDirect = (value: boolean) => asyncDraft.edit({ asyncForceDirect: value })
+  const lineDraft = useDraftGroup(
+    data ? {
+      lineStrikes: String(data.line_truncate_strikes ?? '3'),
+      lineAvoid: String(data.line_truncate_avoid_seconds ?? '60'),
+    } : undefined,
+    {
+      lineStrikes: '3',
+      lineAvoid: '60',
+    },
+  )
+  const { lineStrikes, lineAvoid } = lineDraft.value
+  const setLineStrikes = (value: string) => lineDraft.edit({ lineStrikes: value })
+  const setLineAvoid = (value: string) => lineDraft.edit({ lineAvoid: value })
   const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
-
-  /* ── 套餐自動領取 ── */
-  const [claimAuto, setClaimAuto] = useState(true)
-  const [claimSchedule, setClaimSchedule] = useState(false)
-  const [claimTime, setClaimTime] = useState('23:00')
-  const [claimCaptchaCooldown, setClaimCaptchaCooldown] = useState('3600')
-  const [claimRetryCooldown, setClaimRetryCooldown] = useState('600')
-  const [claimPreviewCooldown, setClaimPreviewCooldown] = useState('60')
   const [savingClaim, setSavingClaim] = useState(false)
-
-  /* ── 線路自動巡檢 ── */
-  const [proxyHealth, setProxyHealth] = useState(true)
-  const [proxyHealthInterval, setProxyHealthInterval] = useState('30')
   const [savingProxyHealth, setSavingProxyHealth] = useState(false)
-
-  /* ── 風控冷卻（上游 405 + 風控文案） ── */
-  const [riskCoolingSteps, setRiskCoolingSteps] = useState('300,900,3600')
   const [savingRiskCooling, setSavingRiskCooling] = useState(false)
-
-  /* ── 上游 503 冷卻 ── */
-  const [upstream503Steps, setUpstream503Steps] = useState('30,60,120')
   const [saving503Steps, setSaving503Steps] = useState(false)
-
-  /* ── Async 強制直連（排障控制開關） ── */
-  const [asyncForceDirect, setAsyncForceDirect] = useState(false)
   const [savingAsyncForceDirect, setSavingAsyncForceDirect] = useState(false)
-
-  /* ── 線路斷流熔斷 ── */
-  const [lineStrikes, setLineStrikes] = useState('3')
-  const [lineAvoid, setLineAvoid] = useState('60')
   const [savingLineTruncate, setSavingLineTruncate] = useState(false)
 
-  /* 載入完成後填入表單（僅在尚未編輯時同步） */
-  useEffect(() => {
-    if (!data) return
-    setAdminKeyInput(data.admin_key || '')
-    setGatewayKey(data.gateway_key || '')
-    setQuotaInterval(String(data.quota_refresh_interval ?? 60))
-    setClaimAuto(data.claim_auto_enabled)
-    setClaimSchedule(data.claim_schedule_enabled)
-    setClaimTime(data.claim_schedule_time || '23:00')
-    setClaimCaptchaCooldown(String(data.claim_captcha_cooldown ?? 3600))
-    setClaimRetryCooldown(String(data.claim_retry_cooldown ?? 600))
-    setClaimPreviewCooldown(String(data.claim_preview_cooldown ?? 60))
-    setProxyHealth(data.proxy_health_enabled)
-    setProxyHealthInterval(String(data.proxy_health_interval ?? 30))
-    setRiskCoolingSteps(data.risk_cooling_steps || '300,900,3600')
-    setUpstream503Steps(data.upstream_503_cooling_steps || '30,60,120')
-    setAsyncForceDirect(data.async_force_direct === true)
-    setLineStrikes(String(data.line_truncate_strikes ?? 3))
-    setLineAvoid(String(data.line_truncate_avoid_seconds ?? 60))
-  }, [data])
+  async function persistGroup(group: DraftLifecycle, updates: Partial<SettingsResponse>, afterSave?: () => Promise<void>) {
+    if (!data) throw new Error('設定尚未載入，請稍後再試')
+    const revision = group.beginSave()
+    await qc.cancelQueries({ queryKey: ['settings'] })
+    await api('PUT', '/settings', updates)
+    await afterSave?.()
+    qc.setQueryData<SettingsResponse>(['settings'], (previous) => previous ? { ...previous, ...updates } : previous)
+    group.accept(revision)
+    void qc.invalidateQueries({ queryKey: ['settings'] })
+  }
 
   async function save(e: FormEvent) {
     e.preventDefault()
@@ -94,13 +154,10 @@ export function SettingsPage() {
     }
     setSaving(true)
     try {
-      await api('PUT', '/settings', {
-        admin_key: adminKeyInput.trim(),
-        gateway_key: gatewayKey.trim(),
-        quota_refresh_interval: interval,
-      })
-      /* 同步本機儲存的密鑰，避免改密後被登出 */
-      await adminKey.set(adminKeyInput.trim())
+      const updates = {
+        admin_key: adminKeyInput.trim(), gateway_key: gatewayKey.trim(), quota_refresh_interval: interval,
+      }
+      await persistGroup(authDraft, updates, () => adminKey.set(updates.admin_key))
       toast.success('已儲存')
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
@@ -129,7 +186,7 @@ export function SettingsPage() {
     }
     setSavingClaim(true)
     try {
-      await api('PUT', '/settings', {
+      await persistGroup(claimDraft, {
         claim_auto_enabled: claimAuto,
         claim_schedule_enabled: claimSchedule,
         claim_schedule_time: claimTime,
@@ -138,7 +195,6 @@ export function SettingsPage() {
         claim_preview_cooldown: parseInt(claimPreviewCooldown, 10),
       })
       toast.success('已儲存')
-      void qc.invalidateQueries({ queryKey: ['settings'] })
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
@@ -156,12 +212,11 @@ export function SettingsPage() {
     }
     setSavingProxyHealth(true)
     try {
-      await api('PUT', '/settings', {
+      await persistGroup(proxyDraft, {
         proxy_health_enabled: proxyHealth,
         proxy_health_interval: interval,
       })
       toast.success('已儲存')
-      void qc.invalidateQueries({ queryKey: ['settings'] })
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
@@ -184,9 +239,8 @@ export function SettingsPage() {
     }
     setSavingRiskCooling(true)
     try {
-      await api('PUT', '/settings', { risk_cooling_steps: steps.join(',') })
+      await persistGroup(riskDraft, { risk_cooling_steps: steps.join(',') })
       toast.success('已儲存')
-      void qc.invalidateQueries({ queryKey: ['settings'] })
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
@@ -207,9 +261,8 @@ export function SettingsPage() {
     }
     setSaving503Steps(true)
     try {
-      await api('PUT', '/settings', { upstream_503_cooling_steps: steps.join(',') })
+      await persistGroup(unavailableDraft, { upstream_503_cooling_steps: steps.join(',') })
       toast.success('已儲存')
-      void qc.invalidateQueries({ queryKey: ['settings'] })
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
@@ -222,9 +275,8 @@ export function SettingsPage() {
     e.preventDefault()
     setSavingAsyncForceDirect(true)
     try {
-      await api('PUT', '/settings', { async_force_direct: asyncForceDirect })
+      await persistGroup(asyncDraft, { async_force_direct: asyncForceDirect })
       toast.success('已儲存')
-      void qc.invalidateQueries({ queryKey: ['settings'] })
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
@@ -247,12 +299,11 @@ export function SettingsPage() {
     }
     setSavingLineTruncate(true)
     try {
-      await api('PUT', '/settings', {
+      await persistGroup(lineDraft, {
         line_truncate_strikes: strikes,
         line_truncate_avoid_seconds: avoid,
       })
       toast.success('已儲存')
-      void qc.invalidateQueries({ queryKey: ['settings'] })
     } catch (err) {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {

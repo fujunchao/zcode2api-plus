@@ -17,18 +17,7 @@ import (
 func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 	_, stats := h.accountSnapshot()
 	uptime := math.Max(0, nowFloat()-float64(h.StartedAt.UnixNano())/1e9)
-	calls := stats["calls"].(int)
-	fail := stats["fail"].(int)
-
-	var successRate any
-	if calls > 0 {
-		// fail 与 calls 计数口径独立，失败数理论上可超过调用数，夹取防负值
-		successRate = roundN(max(0, float64(calls-fail)/float64(calls)*100), 2)
-	}
-	averageQPS := 0.0
-	if uptime > 0 {
-		averageQPS = roundN(float64(calls)/uptime, 3)
-	}
+	requests := h.Store.Requests.Snapshot()
 
 	cpuCount := runtime.NumCPU()
 	if cpuCount < 1 {
@@ -47,12 +36,7 @@ func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 			"load_1m":   loadAverage1m(),
 			"memory":    memorySnapshot(),
 		},
-		"requests": map[string]any{
-			"total":        calls,
-			"errors":       fail,
-			"success_rate": successRate,
-			"average_qps":  averageQPS,
-		},
+		"requests": requests,
 		"accounts": map[string]any{
 			"total":     stats["total"],
 			"active":    stats["active"],
@@ -98,10 +82,11 @@ func (h *Handler) handleUsage(w http.ResponseWriter, r *http.Request) {
 		ranking = ranking[:12]
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ts":      nowFloat(),
-		"window":  "累計",
-		"summary": stats,
-		"ranking": ranking,
+		"ts":       nowFloat(),
+		"window":   "累計",
+		"summary":  stats,
+		"ranking":  ranking,
+		"requests": h.Store.Requests.Snapshot(),
 	})
 }
 

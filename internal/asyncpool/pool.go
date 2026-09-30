@@ -25,6 +25,7 @@ import (
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/requeststats"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
@@ -106,7 +107,7 @@ func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
 // Register 在 mux 上注册异步路由（调用方按 config.AsyncEnabled 决定是否挂载，
 // 对齐 Python 的条件 include_router；端点内的 503 检查作为运行期兜底保留）。
 func (p *Pool) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /async/v1/messages", p.handleAsyncMessages)
+	mux.HandleFunc("POST /async/v1/messages", p.Store.Requests.Wrap(p.handleAsyncMessages))
 }
 
 // handleAsyncMessages 创建 async ticket 并 SSE 等待结果。
@@ -151,7 +152,7 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ticketID := p.newTicket(body)
+	ticketID := p.newTicketContext(r.Context(), body)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
@@ -170,6 +171,12 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 // streamTicket SSE keepalive + 等待结果；退出时（含客户端断开）释放 ticket
 // 并中止后台任务。write 负责写出并 flush；返回错误即视为连接已断开。
 func (p *Pool) streamTicket(ctx context.Context, write func(string) error, ticketID string) {
+	completed := false
+	defer func() {
+		if !completed {
+			requeststats.Fail(ctx)
+		}
+	}()
 	tk := p.getTicket(ticketID)
 	if tk == nil {
 		_ = write("event: error\ndata: " + sseJSON(map[string]any{"error": "ticket not found"}) + "\n\n")
@@ -207,7 +214,7 @@ func (p *Pool) streamTicket(ctx context.Context, write func(string) error, ticke
 					return
 				}
 			case "done":
-				_ = send("done", "{}")
+				completed = send("done", "{}") == nil
 				return
 			case "error":
 				_ = send("error", sseJSON(ev.Data))
@@ -231,9 +238,13 @@ func (p *Pool) streamTicket(ctx context.Context, write func(string) error, ticke
 
 // newTicket 创建 ticket 并启动后台任务，返回 ticket_id。
 func (p *Pool) newTicket(body map[string]any) string {
+	return p.newTicketContext(context.Background(), body)
+}
+
+func (p *Pool) newTicketContext(parent context.Context, body map[string]any) string {
 	p.sweepExpiredTickets()
 	ticketID := newUUID()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	tk := &ticket{
 		status:    "pending",
 		body:      body,
@@ -629,6 +640,7 @@ func (p *Pool) attemptUpstreamOnce(
 		// 出口不可能不一致。
 		diag.Route = route
 	}
+	requeststats.Attempt(ctx)
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return false, err

@@ -62,43 +62,63 @@ func cloakBinaryDir(version string) string {
 }
 
 // platformTag 返回 cloakbrowser 平台标签（不支持的平台报错，对齐 check_platform_available）。
-func platformTag() (string, error) {
-	switch runtime.GOOS {
+func platformTag() (string, error) { return platformTagFor(runtime.GOOS, runtime.GOARCH) }
+
+func platformTagFor(goos, goarch string) (string, error) {
+	switch goos {
 	case "linux":
-		if runtime.GOARCH == "amd64" {
+		if goarch == "amd64" {
 			return "linux-x64", nil
 		}
-		if runtime.GOARCH == "arm64" {
+		if goarch == "arm64" {
 			return "linux-arm64", nil
 		}
 	case "darwin":
-		if runtime.GOARCH == "arm64" || runtime.GOARCH == "amd64" {
-			return "darwin-" + runtime.GOARCH, nil
+		if goarch == "amd64" {
+			return "darwin-x64", nil
+		}
+		if goarch == "arm64" {
+			return "darwin-arm64", nil
 		}
 	case "windows":
-		if runtime.GOARCH == "amd64" {
+		if goarch == "amd64" {
 			return "windows-x64", nil
 		}
 	}
-	return "", fmt.Errorf("平台 %s/%s 无预构建 Chromium", runtime.GOOS, runtime.GOARCH)
+	return "", fmt.Errorf("平台 %s/%s 无预构建 Chromium", goos, goarch)
 }
 
 // cloakChromiumVersion 当前平台对应的补丁 Chromium 版本。
 func cloakChromiumVersion() (string, error) {
-	tag, err := platformTag()
+	_, version, _, err := browserReleaseFor(runtime.GOOS, runtime.GOARCH)
+	return version, err
+}
+
+// browserReleaseFor 将平台选择作为一个整体，供下载链和跨平台回归共用。
+func browserReleaseFor(goos, goarch string) (tag, version, archive string, err error) {
+	tag, err = platformTagFor(goos, goarch)
 	if err != nil {
-		return "", err
+		return
 	}
 	switch tag {
 	case "linux-x64":
-		return cloakVersionLinuxX64, nil
+		version = cloakVersionLinuxX64
 	case "linux-arm64":
-		return cloakVersionLinuxARM64, nil
+		version = cloakVersionLinuxARM64
 	case "darwin-arm64", "darwin-x64":
-		return cloakVersionDarwin, nil
+		version = cloakVersionDarwin
+	case "windows-x64":
+		version = cloakVersionWindowsX64
 	default:
-		return cloakVersionWindowsX64, nil
+		err = fmt.Errorf("平台 %s 未配置 Chromium 版本", tag)
+		return
 	}
+	ext := ".tar.gz"
+	if goos == "windows" {
+		ext = ".zip"
+	}
+	archive = "cloakbrowser-" + tag + ext
+	return
 }
 
 // downloadBaseURL 主站下载源（CLOAKBROWSER_DOWNLOAD_URL 可覆盖，对齐 cloakbrowser）。
@@ -160,18 +180,13 @@ func verifySHA256SUMS(sums, sigFile []byte) (map[string]string, error) {
 // EnsureBrowserBinary 保证缓存目录中存在补丁 Chromium，返回其版本号。
 // 已存在直接返回；否则下载 → 验签 → 校验哈希 → 原子解包。
 func EnsureBrowserBinary(ctx context.Context) (string, error) {
-	version, err := cloakChromiumVersion()
+	_, version, archive, err := browserReleaseFor(runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		return "", err
 	}
-	tag, err := platformTag()
-	if err != nil {
-		return "", err
-	}
-	return ensureVersion(ctx, version, "cloakbrowser-"+tag+archiveExt())
+	return ensureVersion(ctx, version, archive)
 }
 
-// ensureVersion 指定版本与包名的下载安装链路（测试可注入假源）。
 func ensureVersion(ctx context.Context, version, archiveName string) (string, error) {
 	downloadMutex.Lock()
 	defer downloadMutex.Unlock()

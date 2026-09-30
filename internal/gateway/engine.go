@@ -20,6 +20,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/requeststats"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
@@ -335,6 +336,7 @@ func (e *Engine) tryAccount(
 			// 首字节延迟与耗时的基准点：紧贴出站调用。
 			diag.UpstreamStart = diag.Now()
 		}
+		requeststats.Attempt(ctx)
 		resp, err := e.clientFor(acc).Do(httpReq)
 		if err != nil {
 			if isClientGone(ctx) {
@@ -725,6 +727,9 @@ func (e *Engine) deliverStream(ctx context.Context, reqID string, acc *model.Acc
 // （线上曾漏计一次 57,352 output token 的生成，详见
 // docs/analysis-flash-30min-stream-cut.md §5）。usage 不完整时仍旧不计入。
 func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Account, usage *UsageCollector, err error, diag *ReqDiag) attemptResult {
+	if err != nil {
+		requeststats.Fail(ctx)
+	}
 	if diag == nil {
 		// 防御：单测可以只关心状态机而不提供诊断容器。
 		diag = &ReqDiag{clock: e.now}

@@ -30,6 +30,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Test frontend behavior
+        working-directory: frontend
+        run: npm test
+      - name: Verify embedded frontend
+        working-directory: frontend
+        run: |
+          npm run build
+          git diff --exit-code -- dist
+          test -z "$(git ls-files --others --exclude-standard -- dist)"
+
   test:
     runs-on: ubuntu-latest
     steps:

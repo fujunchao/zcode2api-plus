@@ -29,6 +29,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/requeststats"
 	"zcode2api/internal/web"
 )
 
@@ -50,6 +51,7 @@ var ErrProxyNotFound = errors.New("代理配置不存在")
 
 // Store 线程安全的账号 / 设置存储，含轮询游标。
 type Store struct {
+	Requests    *requeststats.Tracker
 	mu          sync.Mutex
 	db          *sql.DB
 	processLock *os.File
@@ -87,6 +89,7 @@ func New() (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
+		Requests:         requeststats.New(),
 		db:               db,
 		accounts:         map[string][]*model.Account{model.ProviderZai: {}},
 		settings:         map[string]string{},

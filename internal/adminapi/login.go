@@ -187,29 +187,11 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 	}
 	// 邮箱必须在入池时就传入：每次登录的 token 都不同，只比凭据字节会把同一个号
 	// 建成两条记录（见 store.AddAccountWithIdentity 的三级判重）。
-	account, isNew, err := h.Store.AddAccountWithIdentity(model.ProviderZai, name, result.Token, email)
+	account, isNew, err := h.Store.SaveOAuthAccount(name, result.Token, email)
 	if err != nil {
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
-	if !isNew {
-		// 命中已有账号：必须换上本次授权的新令牌，否则旧令牌过期的账号重登也救不回来。
-		if _, err := h.Store.RenewJWT(account.Provider, account.ID, strings.TrimSpace(result.Token)); err != nil {
-			return nil, errUpstream(fmt.Sprintf("更新登录令牌失败: %v", err))
-		}
-	}
-	if email != "" {
-		var setEmail, setName *string
-		if account.Email == nil || *account.Email == "" {
-			// 命中的既有账号可能早于本次改造入库，尚无邮箱记录。
-			setEmail = &email
-		}
-		if account.Name == "oauth-login" {
-			setName = &email
-		}
-		if setEmail != nil || setName != nil {
-			_, _ = h.Store.SetIdentity(account.Provider, account.ID, setEmail, setName)
-		}
-	}
+
 	// 线路必须在兑换与刷新之前落到账号上：这三步都要出站。
 	// 「自動」挑出的线路命中既有账号时不覆盖原指派——重登不该换掉老号的线路；
 	// 此时 account.ProxyURL 保持老号原值，后续出站仍走它。

@@ -527,7 +527,12 @@ export function AccountsPage() {
     if (refreshing.has(a.id)) return
     setRefreshing((s) => new Set(s).add(a.id))
     try {
-      await api('POST', '/accounts/' + a.id + '/refresh')
+      const result = await api<{ ok: boolean; message?: string; result?: { error?: string } }>(
+        'POST', '/accounts/' + a.id + '/refresh',
+      )
+      if (result.ok !== true) {
+        throw new Error(result.result?.error || result.message || '額度刷新未成功')
+      }
       toast.success('額度已重新整理')
     } catch (e) {
       toast.error('重新整理失敗：' + errMsg(e))

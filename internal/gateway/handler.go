@@ -21,7 +21,7 @@ type Handler struct {
 
 // Register 在 mux 上注册网关路由（鉴权内建于每个端点）。
 func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/messages", h.handleMessages)
+	mux.HandleFunc("POST /v1/messages", h.Engine.Store.Requests.Wrap(h.handleMessages))
 	mux.HandleFunc("GET /v1/models", h.handleModels)
 }
 

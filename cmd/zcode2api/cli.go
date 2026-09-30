@@ -151,12 +151,8 @@ func cmdLogin(args []string) {
 	st := openStore()
 	defer func() { _ = st.Close() }()
 	if result.Token != "" {
-		email := ""
-		if result.Email != nil {
-			email = strings.TrimSpace(*result.Email)
-		}
 		// 邮箱在入池时就传入：每次登录 token 都不同，只比凭据字节会把同一个号建成两条。
-		acc, isNew, err := st.AddAccountWithIdentity(model.ProviderZai, "oauth-login", result.Token, email)
+		acc, isNew, err := saveCLILogin(st, result)
 		if err != nil {
 			fmt.Println(web.Red + "❌ 保存 JWT 账号失败: " + err.Error() + web.Reset)
 			return
@@ -178,9 +174,11 @@ func cmdLogin(args []string) {
 				fmt.Println(web.Dim + "  無空閒線路，已使用直連" + web.Reset)
 			}
 		}
-		// 命中的既有账号可能还叫 oauth-login，用邮箱正名。
-		if email != "" && acc.Name != email {
-			_, _ = st.SetIdentity(acc.Provider, acc.ID, nil, &email)
+		// 指派和凭据都从最新快照读取，避免克隆后的账号保留旧出口。
+		acc = st.FindAny(acc.ID)
+		if acc == nil {
+			fmt.Println("账号已被删除")
+			return
 		}
 		fmt.Println(web.Green + fmt.Sprintf("\n✔ 已保存 Coding Plan JWT 账号: %s (%s)", acc.Name, acc.ID) + web.Reset)
 		// 入池即激活上报 + 自动领取全部可领活动套餐（失败仅提示，不中断；
@@ -210,6 +208,15 @@ func cmdLogin(args []string) {
 			fmt.Println(web.Yellow + "⚠️ 兑换 API Key 失败: " + err.Error() + web.Reset)
 		}
 	}
+}
+
+// saveCLILogin 是 CLI 授权结果进入账号库的边界，不包含交互和外部网络。
+func saveCLILogin(st *store.Store, result *oauth.ExchangeResult) (*model.Account, bool, error) {
+	email := ""
+	if result.Email != nil {
+		email = strings.TrimSpace(*result.Email)
+	}
+	return st.SaveOAuthAccount("oauth-login", result.Token, email)
 }
 
 func min(a, b int) int {

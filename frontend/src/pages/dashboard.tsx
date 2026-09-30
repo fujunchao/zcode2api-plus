@@ -46,8 +46,9 @@ export function DashboardPage() {
   const usage = data?.usageData
   const usageCalls = Number(usage?.summary?.calls) || 0
 
-  const calls = Number(stats?.calls) || 0
-  const failed = Number(stats?.fail) || 0
+  const requests = usage?.requests
+  const calls = requests?.total ?? 0
+  const failed = requests?.failed ?? 0
   const input = Number(stats?.tokens_in) || 0
   const output = Number(stats?.tokens_out) || 0
   const cache = Number(stats?.tokens_cache) || 0
@@ -63,7 +64,7 @@ export function DashboardPage() {
     }),
   )
   const pool = Object.values(status?.quota_pool || {}).reduce((n, v) => n + (Number(v) || 0), 0)
-  const successRate = calls ? `${Math.max(0, ((calls - failed) / calls) * 100).toFixed(1)}%` : '--'
+  const successRate = typeof requests?.success_rate === 'number' ? `${requests.success_rate.toFixed(1)}%` : '--'
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6">
@@ -88,8 +89,8 @@ export function DashboardPage() {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
         <MetricCard icon={<Users />} tone="text-blue-600" label="帳號總數" value={fmt(stats?.total)} detail={`${fmt(stats?.active)} 個正常`} />
         <MetricCard icon={<Boxes />} tone="text-emerald-600" label="可用帳號池" value={fmt(pool)} detail={`${providers.length} 個提供商`} />
-        <MetricCard icon={<Zap />} tone="text-violet-600" label="累計呼叫" value={fmt(calls)} detail={`${fmt(failed)} 次失敗`} />
-        <MetricCard icon={<CircleCheck />} tone="text-amber-600" label="請求成功率" value={successRate} detail="按累計呼叫計算" />
+        <MetricCard icon={<Zap />} tone="text-violet-600" label="請求數（本次啟動）" value={fmt(calls)} detail={`${fmt(failed)} 次失敗 · ${fmt(requests?.active)} 進行中`} />
+        <MetricCard icon={<CircleCheck />} tone="text-amber-600" label="請求成功率" value={successRate} detail={`已完成請求 · 重試 ${fmt(requests?.retries)} 次`} />
         <MetricCard icon={<Database />} tone="text-cyan-600" label="累計 Token" value={fmtCompact(tokens)} detail={`輸入 ${fmtCompact(input)} · 輸出 ${fmtCompact(output)}`} />
         <MetricCard icon={<TrendingUp />} tone="text-rose-600" label="剩餘額度" value={fmtCompact(remaining)} detail={`${items} 個額度項目`} />
       </div>
@@ -210,11 +211,11 @@ export function DashboardPage() {
 
       {/* 帳號調度分布＋用量排行（原用量分析頁內容） */}
       <div className="grid gap-4 lg:grid-cols-5">
-        <PanelCard title="帳號調度分布" subtitle="依請求數排序" className="lg:col-span-2">
+        <PanelCard title="帳號調度分布" subtitle="依歷史帳號調用次數排序" className="lg:col-span-2">
           <Donut ranking={usage?.ranking ?? []} calls={usageCalls} />
         </PanelCard>
 
-        <PanelCard title="帳號用量排行" subtitle="目前服務程序啟動後的累計調度" badge={fmt(usageCalls)} className="lg:col-span-3">
+        <PanelCard title="帳號用量排行" subtitle="帳號歷史累計調度（非 HTTP 請求數）" badge={fmt(usageCalls)} className="lg:col-span-3">
           <Card className="overflow-x-auto py-0">
             <Table>
               <TableHeader>

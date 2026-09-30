@@ -214,6 +214,17 @@ Pi 专用配置见 [examples/pi-models.json](examples/pi-models.json)；字段�
 保留記錄（累計用量可查）；歸檔賬號不參與調度、套餐領取與額度刷新，恢復後
 保持停用狀態，需手動啟用才會重新入池。
 
+## 请求统计口径
+
+仪表板的请求数、成功率及管理 API 中的 `requests` 统计，仅覆盖**本次服务进程启动以来**
+的四个模型 POST 入口。每个入站 HTTP 请求计一次，内部重试单列；成功率按成功数除以
+已完成请求数计算，无已完成请求时为空。鉴权/参数失败、流内错误、断流和票务超时
+均计为失败，客户端取消另有 `canceled` 子计数，在途请求不参与成功率计算。
+
+账号页与用量排行的历史调用/Token 计数仍保留在数据库中，与这些进程级指标分开。
+接口 `GET /admin/api/usage` 增加 `requests` 字段；`GET /admin/api/monitor` 的
+`requests.errors` 与 `requests.failed` 同值，供既有调用方兼容。
+
 ## License
 
 AGPL-3.0（見 [LICENSE](LICENSE)），僅供學習研究與個人自部署使用；使用本項目產生的
