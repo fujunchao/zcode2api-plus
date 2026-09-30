@@ -7,3 +7,9 @@ deploy/zcode2api.env.example text eol=lf
 Dockerfile text eol=lf
 docker-compose.yml text eol=lf
 .dockerignore text eol=lf
+
+# Vite 处理 HTML 时保留模板换行；固定 LF，保证 Windows/Linux 的内嵌产物一致。
+frontend/index.html text eol=lf
+frontend/dist/*.html text eol=lf
+frontend/dist/assets/*.js text eol=lf
+frontend/dist/assets/*.css text eol=lf
