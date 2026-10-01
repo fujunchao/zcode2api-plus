@@ -61,6 +61,22 @@ const PROXY_LEGACY = '__legacy__'
 /* 「空闲优先、最少绑定自动分配」的哨兵值：新增帳號的預設；後端同樣認識這個值。 */
 const PROXY_AUTO = '__auto__'
 
+type ClaimOutcome = {
+  account_name?: string
+  ok: boolean
+  message?: string
+  proxy_removed?: string
+  proxy_reassigned?: number
+  proxy_direct_fallback?: number
+}
+type ClaimResponse = { outcomes: ClaimOutcome[]; summary: { ok: number; fail: number } }
+
+function claimFailureMessage(outcome: ClaimOutcome): string {
+  const message = outcome.message ?? '未知原因'
+  if (!outcome.proxy_removed) return message
+  return `${message}；已移除问题代理，${outcome.proxy_reassigned ?? 0} 个账号已改派，${outcome.proxy_direct_fallback ?? 0} 个无可用代理改为直连；保留领取冷却`
+}
+
 const STATUS_BADGE: Record<AccountStatus, string> = {
   active: 'bg-emerald-100 text-emerald-700',
   exhausted: 'bg-purple-100 text-purple-700',
@@ -559,9 +575,9 @@ export function AccountsPage() {
   /* ── 套餐領取 ── */
   const [claiming, setClaiming] = useState<Set<string>>(new Set())
 
-  function claimOutcomeToast(name: string, d: { outcomes: { ok: boolean; message?: string }[]; summary: { ok: number; fail: number } }) {
+  function claimOutcomeToast(name: string, d: ClaimResponse) {
     for (const o of d.outcomes.filter((x) => !x.ok)) {
-      toast.warning(`${name} 領取失敗：${o.message ?? '未知原因'}`)
+      toast.warning(`${name} 領取失敗：${claimFailureMessage(o)}`)
     }
     toast.success(`${name} 套餐領取完成：成功 ${d.summary.ok}，失敗 ${d.summary.fail}`)
     invalidate()
@@ -572,7 +588,7 @@ export function AccountsPage() {
     setClaiming((s) => new Set(s).add(a.id))
     toast.info(`${a.email || a.name || a.id} 正在領取套餐…`)
     try {
-      const d = await api<{ outcomes: { ok: boolean; message?: string }[]; summary: { ok: number; fail: number } }>(
+      const d = await api<ClaimResponse>(
         'POST', '/claim', { account_ids: [a.id] },
       )
       claimOutcomeToast(a.email || a.name || a.id, d)
@@ -594,9 +610,9 @@ export function AccountsPage() {
       onConfirm: async () => {
         toast.info('正在領取套餐…')
         try {
-          const d = await api<{ outcomes: { account_name?: string; ok: boolean; message?: string }[]; summary: { ok: number; fail: number } }>('POST', '/claim', {})
+          const d = await api<ClaimResponse>('POST', '/claim', {})
           for (const o of d.outcomes.filter((x) => !x.ok)) {
-            toast.warning(`${o.account_name ?? ''} 領取失敗：${o.message ?? '未知原因'}`)
+            toast.warning(`${o.account_name ?? ''} 領取失敗：${claimFailureMessage(o)}`)
           }
           toast.success(`套餐領取完成：成功 ${d.summary.ok}，失敗 ${d.summary.fail}`)
           invalidate()

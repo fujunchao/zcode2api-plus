@@ -827,7 +827,7 @@ type ProxyReassign struct {
 func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	removed, reassign, err := s.removeProxiesLocked(map[string]bool{profileID: true}, false)
+	removed, reassign, err := s.removeProxiesLocked(map[string]bool{profileID: true}, false, "")
 	return len(removed) > 0, reassign, err
 }
 
@@ -851,7 +851,7 @@ func (s *Store) PurgeProxyProfiles(ids []string) ([]string, ProxyReassign, error
 			wanted[id] = true
 		}
 	}
-	return s.removeProxiesLocked(wanted, true)
+	return s.removeProxiesLocked(wanted, true, "")
 }
 
 // ── 线路断流熔断 ─────────────────────────────────────────────────────────────

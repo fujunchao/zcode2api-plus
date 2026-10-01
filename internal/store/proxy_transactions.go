@@ -49,7 +49,7 @@ func (s *Store) commitProxyStateLocked(profiles []ProxyProfile, pending []*model
 }
 
 // removeProxiesLocked 在副本上计算改派。手动删除只用空闲线路；熔断允许共享。
-func (s *Store) removeProxiesLocked(ids map[string]bool, allowShared bool) ([]string, ProxyReassign, error) {
+func (s *Store) removeProxiesLocked(ids map[string]bool, allowShared bool, excludedURL string) ([]string, ProxyReassign, error) {
 	result := ProxyReassign{Assigned: map[string]string{}}
 	remaining := []ProxyProfile{}
 	var removed []string
@@ -66,7 +66,7 @@ func (s *Store) removeProxiesLocked(ids map[string]bool, allowShared bool) ([]st
 	occupancy := map[string]int{}
 	var candidates []ProxyProfile
 	for _, p := range remaining {
-		if p.Enabled {
+		if p.Enabled && (excludedURL == "" || p.URL != excludedURL) {
 			candidates = append(candidates, p)
 		}
 	}

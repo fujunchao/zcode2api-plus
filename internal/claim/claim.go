@@ -34,7 +34,9 @@ type ClaimError struct {
 	nextAt *float64
 	// captcha 标记失败源于本机验证码不可用（浏览器求解失败或人工参数缺失），
 	// 而非上游判定——这类失败等的是人工回填，冷却应取最长档。
-	captcha bool
+	captcha     bool
+	riskControl bool // 上游明确风控；不同于验证码缺失、名额耗尽或网络错误
+	httpStatus  int
 }
 
 func (e *ClaimError) Error() string { return e.msg }
@@ -47,6 +49,8 @@ func (e *ClaimError) NextAt() *float64 { return e.nextAt }
 
 // IsCaptchaFailure 失败是否源于本机验证码不可用。
 func (e *ClaimError) IsCaptchaFailure() bool { return e.captcha }
+
+func (e *ClaimError) IsRiskControl() bool { return e.riskControl }
 
 // businessError 构造带业务码与可领时间的失败；失败文案沿用 claimFail 映射。
 func businessError(code int, body map[string]any, nextAt *float64) *ClaimError {
@@ -237,20 +241,55 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 	}
 	defer res.Body.Close()
 	raw, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		return nil, &ClaimError{msg: fmt.Sprintf("上游回應讀取失敗: %v", readErr)}
+	}
+	var body map[string]any
+	parseErr := json.Unmarshal(raw, &body)
+	code := BusinessCode(body)
+	// 3012 可出现在 HTTP 200 业务错误里；纯文本/HTML 的 405/403 也须保留风控信号。
+	// 已知的验证码、资格与名额错误不按文案误判为风控，更不能触发删除代理。
+	_, knownFailure := claimFail[code]
+	riskText := string(raw)
+	if parseErr == nil {
+		riskText = billingErrorText(body)
+	}
+	if code == 3012 || (!knownFailure && (res.StatusCode >= 400 || code != 0) && model.IsRiskControlBody(riskText)) {
+		msg := failMessage(code, body)
+		if parseErr != nil || msg == "領取失敗" {
+			msg = fmt.Sprintf("领取被上游风控拦截 HTTP %d", res.StatusCode)
+		}
+		_, endsAt := parsePlanWindow(body)
+		return nil, &ClaimError{msg: msg, code: code, nextAt: endsAt, riskControl: true, httpStatus: res.StatusCode}
+	}
 	if res.StatusCode == 401 || res.StatusCode == 403 {
 		text := lower(raw)
 		if !containsAny(text, "captcha", "verify") {
 			return nil, &ClaimError{msg: fmt.Sprintf("鑑權失敗 HTTP %d", res.StatusCode)}
 		}
 	}
-	if readErr != nil {
-		return nil, &ClaimError{msg: fmt.Sprintf("上游回應讀取失敗: %v", readErr)}
-	}
-	var body map[string]any
-	if err := json.Unmarshal(raw, &body); err != nil {
+	if parseErr != nil {
 		return nil, &ClaimError{msg: fmt.Sprintf("上游回應非 JSON HTTP %d", res.StatusCode)}
 	}
 	return body, nil
+}
+
+// 只从错误消息取风控文案，不把 risk_control=false 等元数据键误判为删除信号。
+func billingErrorText(body map[string]any) string {
+	var parts []string
+	for _, key := range []string{"msg", "message", "error"} {
+		if message, ok := body[key].(string); ok {
+			parts = append(parts, message)
+		}
+	}
+	if nested, ok := body["error"].(map[string]any); ok {
+		for _, key := range []string{"msg", "message"} {
+			if message, ok := nested[key].(string); ok {
+				parts = append(parts, message)
+			}
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // authHeaders 计费端点鉴权头（与 quota._auth_headers 同源形态）。
@@ -445,6 +484,10 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 		if err != nil {
 			outcomes = append(outcomes, FailureOutcome(acc, planID, err))
 			web.Warn("claim", fmt.Sprintf("账号 %s 自动领取 %s 失败: %v", acc.Name, planID, err))
+			var ce *ClaimError
+			if errors.As(err, &ce) && ce.IsRiskControl() {
+				break // 本次出口已被拦截，不继续在同一线路领取其他套餐。
+			}
 			continue
 		}
 		outcome := map[string]any{
@@ -480,6 +523,10 @@ func FailureOutcome(acc *model.Account, planID string, err error) map[string]any
 			out["next_at"] = *next
 		}
 		out["captcha"] = ce.IsCaptchaFailure()
+		if ce.IsRiskControl() {
+			out["risk_control"] = true
+			out["http_status"] = ce.httpStatus
+		}
 	}
 	return out
 }

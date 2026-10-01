@@ -229,6 +229,11 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) map[st
 // 成功分支判断 LastErrorKind——否则先前的查询失败会覆盖原因，下一次成功就误解封。
 func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
 	_, _ = s.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		// 任何实际查询先废弃同出口的旧证据，只有完整成功响应才能重新建立。
+		// 出口已改变时不让迟到响应污染新线路的证据。
+		if model.NewStartPlanObservation(acc, 1, false).Matches(live) {
+			live.StartPlanObservation = model.StartPlanObservation{}
+		}
 		protectInvalid := isRiskControlInvalid(live)
 		protectCooling := live.Status == model.StatusCooling &&
 			(live.CoolingUntil == nil || *live.CoolingUntil > float64(s.now().UnixNano())/1e9)
@@ -475,6 +480,10 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 	s.apply(acc, func(live *model.Account) {
 		live.LastCheckedAt = &checkedAt
 		live.Plans = plans
+		if model.NewStartPlanObservation(acc, 1, false).Matches(live) {
+			confirmed := payload["code"] != nil && isZeroNumber(payload["code"]) && missingInitialQuota(data)
+			live.StartPlanObservation = model.NewStartPlanObservation(acc, checkedAt, confirmed)
+		}
 		if len(plans) > 0 {
 			live.Plan = plans[0]
 		} else {

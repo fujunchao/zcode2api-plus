@@ -174,6 +174,8 @@ type Account struct {
 	// 到期自动失效、成功不延长。写入点唯一（gateway.RecordUpstreamTruncate）。
 	// json:"-"：纯运行期状态，不新增 accounts.data 的键（34 键硬契约）。
 	TruncateAvoidUntil float64 `json:"-"`
+
+	StartPlanObservation StartPlanObservation `json:"-"` // 领取风控淘汰代理所需的有效空额度证据
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -331,11 +333,12 @@ func (a *Account) Clone() *Account {
 		VirtualDeviceMid: a.VirtualDeviceMid,
 		Claim:            a.ClaimView(),
 
-		RateLimitStreak:     a.RateLimitStreak,
-		RiskControlStreak:   a.RiskControlStreak,
-		Upstream503Streak:   a.Upstream503Streak,
-		StreamTruncateCount: a.StreamTruncateCount,
-		TruncateAvoidUntil:  a.TruncateAvoidUntil,
+		RateLimitStreak:      a.RateLimitStreak,
+		RiskControlStreak:    a.RiskControlStreak,
+		StartPlanObservation: a.StartPlanObservation,
+		Upstream503Streak:    a.Upstream503Streak,
+		StreamTruncateCount:  a.StreamTruncateCount,
+		TruncateAvoidUntil:   a.TruncateAvoidUntil,
 	}
 }
 

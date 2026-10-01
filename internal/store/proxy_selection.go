@@ -64,3 +64,26 @@ func (s *Store) RotateAccountProxy(expected *model.Account) (ProxyProfile, bool,
 	}
 	return p, true, nil
 }
+
+// PurgeUnprovisionedClaimProxy 原子淘汰「未获初始额度 + 领取风控」请求使用的线路。
+// 风控信号由调用方确认；锁内再次核对额度证据、凭据和绑定，防止迟到请求误删。
+// 全部关联账号按空闲优先/最少绑定改派，沿用熔断事务；不修改任何账号领取冷却。
+func (s *Store) PurgeUnprovisionedClaimProxy(expected *model.Account) (bool, ProxyReassign, error) {
+	empty := ProxyReassign{Assigned: map[string]string{}}
+	if !expected.MissingStartPlanEvidence() || derefStr(expected.ProxyID) == "" {
+		return false, empty, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := s.findLocked(expected.Provider, expected.ID)
+	if !live.MissingStartPlanEvidence() || !expected.StartPlanObservation.Matches(live) {
+		return false, empty, nil
+	}
+	for _, p := range s.listProxyProfilesLocked() {
+		if p.ID == *expected.ProxyID && p.URL == derefStr(expected.ProxyURL) {
+			removed, reassign, err := s.removeProxiesLocked(map[string]bool{p.ID: true}, true, p.URL)
+			return len(removed) > 0, reassign, err
+		}
+	}
+	return false, empty, nil
+}

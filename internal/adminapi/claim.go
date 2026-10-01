@@ -151,7 +151,10 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 		return &next
 	}); err != nil {
 		web.Warn("claim", "领取状态落库失败: "+err.Error())
+		return
 	}
+	// 先保存领取冷却，再按结构化风控信号淘汰代理；三个领取入口共用。
+	h.handleClaimProxyRisk(acc, outcomes)
 }
 
 // numberOf 宽松取数值（JSON 解析一律 float64，代码内构造的可能是 int）。
@@ -481,6 +484,11 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// 线路（此前事件是独立的裸直连客户端，同一 device_mid 两个出口 IP）。
 	svc := claim.NewServiceContext(h.backgroundContext(), h.Captcha)
 	for _, acc := range candidates {
+		// 前一个账号可能已淘汰共享线路；批量中的后续账号必须用改派后的出口。
+		acc = h.Store.SnapshotAccount(acc.Provider, acc.ID)
+		if acc == nil {
+			continue
+		}
 		// 用 claimBlockedByCooling 判断（与 preview 同一函数）：EffectiveStatus 把
 		// 「冷却已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、
 		// claim 被拒，用户看到自相矛盾的结果。
