@@ -71,7 +71,7 @@ func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 添加账号时 proxy_id 的两个保留值：前端用它区分「自动挑一条空闲线路」与「就要直连」。
+// 添加账号时 proxy_id 的两个保留值：前端用它区分「空闲优先、最少绑定自动分配」与「就要直连」。
 // 其余取值一律按代理配置 ID 处理；null / 键缺省同样按「自动」处理（兼容旧前端）。
 const (
 	proxyIDAuto   = "__auto__"
@@ -100,7 +100,7 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// proxy_id 三种语义：
-	//   __auto__ / null / 键缺省 → 建号后自动挑一条「未被占用的线路」；
+	//   __auto__ / null / 键缺省 → 建号后空闲优先，否则选绑定账号最少的线路；
 	//   __direct__ / 空串        → 显式直连（不分配）；
 	//   其余取值                 → 按代理配置 ID 指派。
 	// null 视作「自动」是为了兼容旧前端——它把「直連」编码成 null 发出来。
@@ -793,8 +793,8 @@ func (h *Handler) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeError500(w, err)
 		return
 	}
-	// 导入的账号同样自动分配未占用线路（只针对本次新建的，重复导入不会动老号）；
-	// 线路不足的部分保持直连并通过 direct_fallback 回报，供前端提示。
+	// 导入的账号同样按空闲优先、最少绑定自动分配线路（只针对本次新建的，重复导入不会动老号）；
+	// 无启用线路或分配失败时保持直连并通过 direct_fallback 回报，供前端提示。
 	assigned, fallback := h.Store.AutoAssignProxies(newIDs)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"count":    count,

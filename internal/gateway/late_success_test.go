@@ -19,7 +19,7 @@ func TestLateSuccessKeepsUnexpiredCooling(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	secs, _, _ := MarkRiskControl(st, model.ProviderZai, acc.ID, "风控拦截", now)
+	secs, _, _ := MarkRiskControl(st, acc, "风控拦截", now)
 	cooledUntil := *st.Find(model.ProviderZai, acc.ID).CoolingUntil
 
 	MarkSuccess(st, model.ProviderZai, acc.ID, now.Add(time.Second))
@@ -52,7 +52,7 @@ func TestLateSuccessKeepsInvalidStreak(t *testing.T) {
 	now := time.Now()
 	var streak int
 	for invalid := false; !invalid; {
-		_, streak, invalid = MarkRiskControl(st, model.ProviderZai, acc.ID, "风控拦截", now)
+		_, streak, invalid = MarkRiskControl(st, acc, "风控拦截", now)
 	}
 	MarkSuccess(st, model.ProviderZai, acc.ID, now.Add(time.Second))
 	got := st.Find(model.ProviderZai, acc.ID)

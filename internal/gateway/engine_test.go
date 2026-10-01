@@ -694,6 +694,10 @@ func Test405RequestLevelRiskKeepsCoolingAndGuardsReplay(t *testing.T) {
 	a1, _ := f.st.AddAccount(model.ProviderZai, "req-level-1", "sk-1")
 	a2, _ := f.st.AddAccount(model.ProviderZai, "req-level-2", "sk-2")
 	a3, _ := f.st.AddAccount(model.ProviderZai, "req-level-3", "sk-3")
+	line, err := f.st.AddProxyProfile("risk-fallback", f.upstream.URL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	status, raw := f.post(t, msgBody(), "sk-test")
 	if status != 405 || raw != upstreamBody {
@@ -711,10 +715,16 @@ func Test405RequestLevelRiskKeepsCoolingAndGuardsReplay(t *testing.T) {
 		if got.Status == model.StatusCooling && got.CoolingUntil != nil &&
 			got.RiskControlStreak == 1 &&
 			got.LastErrorKind != nil && *got.LastErrorKind == model.ErrorKindRiskControl {
+			if got.ProxyID == nil || *got.ProxyID != line.ID {
+				t.Fatal("请求级风控的两个被标记账号都应自动分配代理（无空闲时共享）")
+			}
 			cooled++
 			continue
 		}
 		if got.Status == model.StatusActive && got.RiskControlStreak == 0 && got.CoolingUntil == nil {
+			if got.ProxyID != nil {
+				t.Fatal("未尝试账号不应更换代理")
+			}
 			untouched++
 			continue
 		}

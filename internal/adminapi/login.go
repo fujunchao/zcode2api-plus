@@ -67,10 +67,10 @@ func errUpstream(msg string) *apiError { return &apiError{http.StatusBadGateway,
 // 线路不存在或地址非法一律提前 400——不要把坏代理带进会话，等兑换时才炸。
 func (h *Handler) resolveLoginProxy(payload map[string]any) (string, string, bool, *apiError) {
 	raw := strings.TrimSpace(strOf(firstTruthy(payload["proxy_id"])))
-	// 「自動」：当场挑一条空閒線路把出口定下来，保证「token 交換 → 兌換 → 刷新 →
-	// 領取」整条链路走同一个出口。挑不到就直連——不报错，与新增账号同口径。
+	// 「自動」：按空闲优先、最少绑定挑选线路并固定出口，保证「token 交換 → 兌換 → 刷新 →
+	// 領取」整条链路走同一个出口。没有启用线路就直连——不报错，与新增账号同口径。
 	if raw == proxyIDAuto {
-		if p, ok := h.Store.PickFreeProxyProfile(); ok {
+		if p, ok := h.Store.PickAvailableProxyProfile(); ok {
 			return p.URL, p.ID, true, nil
 		}
 		return "", "", true, nil

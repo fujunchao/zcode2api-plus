@@ -954,43 +954,10 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 	return true, nil
 }
 
-// freeProxyProfilesLocked 列出「启用中且未被任何账号占用」的线路。
-// 占用判定只看 ProxyID —— 手工填 proxy_url 的账号不占用命名线路。
-// 注意 listProxyProfilesLocked 不过滤 Enabled，这里必须自筛。
-func (s *Store) freeProxyProfilesLocked() []ProxyProfile {
-	taken := map[string]bool{}
-	for _, a := range s.allAccountsLocked() {
-		if id := derefStr(a.ProxyID); id != "" {
-			taken[id] = true
-		}
-	}
-	out := []ProxyProfile{}
-	for _, p := range s.listProxyProfilesLocked() {
-		if p.Enabled && !taken[p.ID] {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// PickFreeProxyProfile 挑一条空闲线路但不写入任何账号。
+// AutoAssignProxies 给未绑定代理的账号分配线路：空闲优先，其次绑定账号数最少。
 //
-// 登录会话需要在账号建立之前就把出口定下来（token 交换、API Key 兑换、额度刷新、
-// 活动领取是同一条出站链路），所以不能等到 AutoAssignProxies 那一步。
-func (s *Store) PickFreeProxyProfile() (ProxyProfile, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if free := s.freeProxyProfilesLocked(); len(free) > 0 {
-		return free[0], true
-	}
-	return ProxyProfile{}, false
-}
-
-// AutoAssignProxies 给一批账号分配「尚未被任何账号占用」的代理线路。
-//
-// 单锁内原子完成：先按当前占用情况选出可用候选，再按 accountIDs 顺序逐个分配，
-// 因此批量导入不会把同一条线路分给两个账号。候选不足时剩余账号保持直连
-// （ProxyID/ProxyURL 均为 nil），由第二个返回值回报，供调用方提示用户。
+// 单锁内按 accountIDs 顺序逐个分配并更新占用数，批量导入不会全部挤在同一条线路。
+// 无启用线路或持久化失败时保持直连，由第二个返回值回报。已有绑定/手工 URL 不覆盖。
 //
 // 注意：刻意不复用 AssignProxyProfile——它会自行加锁，在持锁上下文里调用会死锁。
 func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]string, directFallback []string) {
@@ -998,21 +965,22 @@ func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]stri
 	directFallback = []string{}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	free := s.freeProxyProfilesLocked()
+	profiles := s.listProxyProfilesLocked()
+	occupancy := s.proxyOccupancyLocked()
 	var pending []*model.Account
 	for _, id := range dedupeIDs(accountIDs) {
 		acc := s.findAnyLocked(id).Clone()
-		if acc == nil {
+		if acc == nil || derefStr(acc.ProxyID) != "" || derefStr(acc.ProxyURL) != "" {
 			continue
 		}
-		if len(free) == 0 {
+		p, ok := leastLoadedProxy(profiles, occupancy, "", "")
+		if !ok {
 			directFallback = append(directFallback, id)
 			continue
 		}
-		p := free[0]
-		free = free[1:]
 		profileID, profileURL := p.ID, p.URL
 		acc.ProxyID, acc.ProxyURL = &profileID, &profileURL
+		occupancy[profileID]++
 		pending = append(pending, acc)
 		assigned[id] = profileID
 	}

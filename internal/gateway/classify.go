@@ -163,9 +163,9 @@ func riskControlCoolingSeconds(st *store.Store, streak int) (secs int, invalid b
 // 冷却只会把失败摊到别的模型上、把暴露时间拖长。这条分支必须排在「其余错误」兜底
 // 之前，否则 405 会被当成未识别错误原样透传、账号状态一点不变（线上曾如此）。
 //
-// ⚠️ 本函数只处理**账号级**风控。「同一请求体在 ≥2 个不同账号上都被拒」属请求级，
-// 处置是停止换号 + 保留冷却 + 登记重放防护 —— 见 riskscope.go（MarkRiskControl
-// 的实现也住在那里：账号级与请求级的冷却动作相同，差别只在换号与扩散防护）。
+// 「同一请求体在 ≥2 个不同账号上都被拒」属请求级，处置是停止换号 + 保留冷却 +
+// 登记重放防护。MarkRiskControl 的实现位于 riskscope.go：两种范围都会施加冷却并
+// 尝试更换代理，差别只在换号与扩散防护；更换代理不复位冷却或失效状态。
 
 // ResetRiskControlStreak 成功调用后清零「连续命中风控」计数。
 // 与 ResetRateLimitStreak 同语义、同样必须对 store.Update 回调里的 live 对象调用。

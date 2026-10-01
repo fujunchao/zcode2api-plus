@@ -903,6 +903,10 @@ func Test405RequestLevelRiskInAsyncPool(t *testing.T) {
 	config.UpstreamZai = up.start(t).URL
 
 	tk := insertTicket(p, "ticket-req-level", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	line, err := st.AddProxyProfile("risk-fallback", config.UpstreamZai, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	p.processTicket(context.Background(), "ticket-req-level")
 
 	events := drainEvents(tk)
@@ -924,10 +928,16 @@ func Test405RequestLevelRiskInAsyncPool(t *testing.T) {
 	for _, acc := range st.ListAccounts(model.ProviderZai) {
 		if acc.Status == model.StatusCooling && acc.CoolingUntil != nil && acc.RiskControlStreak == 1 {
 			wantErrorKind(t, acc, model.ErrorKindRiskControl)
+			if acc.ProxyID == nil || *acc.ProxyID != line.ID {
+				t.Fatal("请求级风控的两个被标记账号都应自动分配代理（无空闲时共享）")
+			}
 			cooled++
 			continue
 		}
 		if acc.Status == model.StatusActive && acc.RiskControlStreak == 0 && acc.CoolingUntil == nil {
+			if acc.ProxyID != nil {
+				t.Fatal("未尝试账号不应更换代理")
+			}
 			untouched++
 			continue
 		}

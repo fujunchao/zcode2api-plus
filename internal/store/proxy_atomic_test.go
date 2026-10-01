@@ -9,13 +9,16 @@ import (
 )
 
 func TestProxyMutationFailureIsAtomic(t *testing.T) {
-	for _, op := range []string{"update", "delete", "purge", "assign", "custom", "auto"} {
+	for _, op := range []string{"update", "delete", "purge", "assign", "custom", "auto", "rotate"} {
 		t.Run(op, func(t *testing.T) {
 			s := newTestStore(t)
 			p, _ := s.AddProxyProfile("before", "http://127.0.0.1:11001", true)
 			other, _ := s.AddProxyProfile("other", "http://127.0.0.1:11002", true)
 			a, _ := s.AddAccount(model.ProviderZai, "account", "test-token")
 			_, _ = s.AssignProxyProfile(a.ID, p.ID)
+			if op == "auto" {
+				_, _ = s.AssignProxyProfile(a.ID, "")
+			}
 			profiles := s.ListProxyProfiles()
 			accounts, _ := json.Marshal(s.ListAccounts(""))
 			// 在账号写入处失败：必须连已写入的 meta 一起回滚。
@@ -35,6 +38,8 @@ func TestProxyMutationFailureIsAtomic(t *testing.T) {
 			case "custom":
 				url := "http://127.0.0.1:11004"
 				_, err = s.SetProxyURL(a.Provider, a.ID, &url)
+			case "rotate":
+				_, _, err = s.RotateAccountProxy(s.FindAny(a.ID))
 			case "auto":
 				assigned, _ := s.AutoAssignProxies([]string{a.ID})
 				if len(assigned) != 0 {

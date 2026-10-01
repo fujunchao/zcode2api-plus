@@ -58,7 +58,7 @@ import {
 /* 頂層「直連」的 Select 哨兵值：Radix Select 不允許空字串 value */
 const PROXY_DIRECT = '__direct__'
 const PROXY_LEGACY = '__legacy__'
-/* 「自動挑一條空閒線路」的哨兵值：新增帳號的預設；後端同樣認識這個值。 */
+/* 「空闲优先、最少绑定自动分配」的哨兵值：新增帳號的預設；後端同樣認識這個值。 */
 const PROXY_AUTO = '__auto__'
 
 const STATUS_BADGE: Record<AccountStatus, string> = {
@@ -123,10 +123,9 @@ export function AccountsPage() {
   const liveAccounts = allAccounts.filter((a) => a.archived_at == null)
   const proxies = data?.proxies ?? []
   const availableModels = data?.models ?? []
-  /* 「自動」選項顯示的空閒線路數：啟用中且未被任何帳號指派。
-     手工填 proxy_url 的帳號不佔用命名線路（與後端 AutoAssignProxies 的判定一致）。 */
+  /* 自动选项的空闲数包含归档账号绑定，与后端一致；手工 proxy_url 不占用命名线路。 */
   const usedProxyIds = new Set(
-    liveAccounts.map((a) => a.proxy_id).filter((id): id is string => Boolean(id)),
+    allAccounts.map((a) => a.proxy_id).filter((id): id is string => Boolean(id)),
   )
   const freeProxyCount = proxies.filter((p) => p.enabled && !usedProxyIds.has(p.id)).length
 
@@ -247,7 +246,7 @@ export function AccountsPage() {
       setAddOpen(false)
       toast.success(`新增 ${d.created ?? d.count} 個帳號${d.duplicated ? `，${d.duplicated} 個已存在（未更動）` : ''}`)
       if (d.direct_fallback) {
-        toast.warning(`其中 ${d.direct_fallback} 個沒有空閒線路，已使用直連`)
+        toast.warning(`其中 ${d.direct_fallback} 个未能分配可用代理，已使用直连`)
       }
       invalidate()
     } catch (e) {
@@ -1256,7 +1255,7 @@ function ProxySelect({
       <SelectContent>
         {freeCount !== undefined && (
           <SelectItem value={PROXY_AUTO}>
-            {freeCount > 0 ? `自動（${freeCount} 條空閒線路）` : '自動（無空閒線路，將直連）'}
+            {freeCount > 0 ? `自动（${freeCount} 条空闲，超出后按最少绑定共享）` : proxies.some((p) => p.enabled) ? '自动（无空闲，分配绑定最少的代理）' : '自动（无可用代理，将直连）'}
           </SelectItem>
         )}
         <SelectItem value={PROXY_DIRECT}>直連（不使用代理）</SelectItem>

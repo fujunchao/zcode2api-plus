@@ -747,7 +747,7 @@ func (p *Pool) attemptUpstreamOnce(
 			if scope.Verdict(acc) {
 				// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
 				// 相同，差别只在后续：停止换号 + 登记重放防护。
-				_, streak, invalid := gateway.MarkRiskControl(p.Store, acc.Provider, acc.ID,
+				_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,
 					"上游风控拦截 HTTP 405（請求級）: "+preview, time.Now())
 				p.replay.Record(scope.ContentKey())
 				if invalid {
@@ -759,7 +759,7 @@ func (p *Pool) attemptUpstreamOnce(
 				}
 				return false, errRequestLevelRisk{body: bodyText}
 			}
-			_, streak, invalid := gateway.MarkRiskControl(p.Store, acc.Provider, acc.ID,
+			_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,
 				"上游风控拦截 HTTP 405: "+preview, time.Now())
 			if invalid {
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",

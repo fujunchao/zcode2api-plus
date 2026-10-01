@@ -163,7 +163,7 @@ func TestMarkRiskControlLadder(t *testing.T) {
 		invalid bool
 	}{{300, false}, {900, false}, {3600, false}, {0, true}}
 	for i, w := range want {
-		secs, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "风控拦截", now)
+		secs, streak, invalid := MarkRiskControl(st, acc, "风控拦截", now)
 		if streak != i+1 || secs != w.secs || invalid != w.invalid {
 			t.Fatalf("第 %d 次: got (secs=%d streak=%d invalid=%v) want (secs=%d streak=%d invalid=%v)",
 				i+1, secs, streak, invalid, w.secs, i+1, w.invalid)
@@ -206,8 +206,8 @@ func TestResetRiskControlStreakReturnsToFirstRung(t *testing.T) {
 	acc, _ := st.AddAccount(model.ProviderZai, "risk-reset", "sk-1")
 	now := time.Unix(1700000000, 0)
 
-	MarkRiskControl(st, model.ProviderZai, acc.ID, "第一次", now)
-	if _, streak, _ := MarkRiskControl(st, model.ProviderZai, acc.ID, "第二次", now); streak != 2 {
+	MarkRiskControl(st, acc, "第一次", now)
+	if _, streak, _ := MarkRiskControl(st, acc, "第二次", now); streak != 2 {
 		t.Fatalf("连续计数应为 2: %d", streak)
 	}
 	if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
@@ -215,7 +215,7 @@ func TestResetRiskControlStreakReturnsToFirstRung(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	secs, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "清零后再来", now)
+	secs, streak, invalid := MarkRiskControl(st, acc, "清零后再来", now)
 	if streak != 1 || secs != 300 || invalid {
 		t.Fatalf("清零后应从最低档重来: secs=%d streak=%d invalid=%v", secs, streak, invalid)
 	}
@@ -230,14 +230,14 @@ func TestRiskCoolingStepsDriveEscalationPoint(t *testing.T) {
 	if err := st.SetSetting(store.RiskCoolingStepsKey, "60,120"); err != nil {
 		t.Fatal(err)
 	}
-	if secs, _, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "1", now); secs != 60 || invalid {
+	if secs, _, invalid := MarkRiskControl(st, acc, "1", now); secs != 60 || invalid {
 		t.Fatalf("第 1 档应为 60: %d %v", secs, invalid)
 	}
-	if secs, _, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "2", now); secs != 120 || invalid {
+	if secs, _, invalid := MarkRiskControl(st, acc, "2", now); secs != 120 || invalid {
 		t.Fatalf("第 2 档应为 120: %d %v", secs, invalid)
 	}
 	// 只有两档 ⇒ 第 3 次即失效（默认三档时是第 4 次）。
-	if _, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "3", now); !invalid || streak != 3 {
+	if _, streak, invalid := MarkRiskControl(st, acc, "3", now); !invalid || streak != 3 {
 		t.Fatalf("两档设定下第 3 次应失效: streak=%d invalid=%v", streak, invalid)
 	}
 	if got := st.Find(model.ProviderZai, acc.ID); got.Status != model.StatusInvalid {
@@ -261,7 +261,7 @@ func TestRiskCoolingStepsFallback(t *testing.T) {
 		}
 	}
 	// 默认设定下第 1 次命中仍是 300s（证明回退真的生效，而不是空阶梯直接判失效）。
-	if secs, _, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "x", now); secs != 300 || invalid {
+	if secs, _, invalid := MarkRiskControl(st, acc, "x", now); secs != 300 || invalid {
 		t.Fatalf("回退后应取默认首档: secs=%d invalid=%v", secs, invalid)
 	}
 }

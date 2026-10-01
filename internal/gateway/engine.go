@@ -597,7 +597,7 @@ func (e *Engine) handleUpstreamError(
 			// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
 			// 相同（MarkRiskControl 内部落证据章），差别只在后续：停止换号 + 登记
 			// 重放防护，让同内容请求在窗口内直接失败。
-			secs, streak, invalid := MarkRiskControl(e.Store, acc.Provider, acc.ID,
+			secs, streak, invalid := MarkRiskControl(e.Store, acc,
 				"上游风控拦截 HTTP 405（請求級）: "+preview, e.now())
 			if e.replay != nil {
 				e.replay.Record(scope.ContentKey())
@@ -614,7 +614,7 @@ func (e *Engine) handleUpstreamError(
 				Body:   passthroughBodyWithType(text, "upstream_error"),
 			}}
 		}
-		secs, streak, invalid := MarkRiskControl(e.Store, acc.Provider, acc.ID,
+		secs, streak, invalid := MarkRiskControl(e.Store, acc,
 			"上游风控拦截 HTTP 405: "+preview, e.now())
 		if invalid {
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",

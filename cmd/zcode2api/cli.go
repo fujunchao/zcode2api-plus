@@ -157,7 +157,7 @@ func cmdLogin(args []string) {
 			fmt.Println(web.Red + "❌ 保存 JWT 账号失败: " + err.Error() + web.Reset)
 			return
 		}
-		// 新号自动挑一条未被占用的线路（CLI 没有代理参数，与后台默认行为一致）；
+		// 新号按空闲优先、最少绑定自动挑选线路（CLI 没有代理参数，与后台默认行为一致）；
 		// 重登命中的老号保持原指派不动。
 		if isNew {
 			assigned, fallback := st.AutoAssignProxies([]string{acc.ID})
@@ -171,7 +171,7 @@ func cmdLogin(args []string) {
 				}
 				fmt.Println(web.Dim + "  已自動指派線路: " + label + web.Reset)
 			} else if len(fallback) > 0 {
-				fmt.Println(web.Dim + "  無空閒線路，已使用直連" + web.Reset)
+				fmt.Println(web.Dim + "  未能分配可用代理，已使用直连" + web.Reset)
 			}
 		}
 		// 指派和凭据都从最新快照读取，避免克隆后的账号保留旧出口。
@@ -423,7 +423,7 @@ func cmdImport(args []string) {
 		fmt.Println(web.Red + "❌ 导入失败: " + err.Error() + web.Reset)
 		return
 	}
-	// 导入的新号同样自动分配未占用线路（只针对本次新建，重复导入不动老号）。
+	// 导入的新号同样按空闲优先、最少绑定自动分配线路（只针对本次新建，重复导入不动老号）。
 	assigned, fallback := st.AutoAssignProxies(newIDs)
 	fmt.Println(web.Green + fmt.Sprintf("✔ 已导入 %d 个账号", count) + web.Reset)
 	if len(newIDs) > 0 {

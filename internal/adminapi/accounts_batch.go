@@ -81,7 +81,7 @@ func (h *Handler) handleBatchAddAccounts(w http.ResponseWriter, r *http.Request)
 	}
 
 	// proxy_id 三种语义（与 handleAddAccounts 逐字一致）：
-	//   __auto__ / null / 键缺省 → 自动挑一条「未被占用的线路」；
+	//   __auto__ / null / 键缺省 → 空闲优先，否则选绑定账号最少的线路；
 	//   __direct__ / 空串        → 显式直连（不分配）；
 	//   其余取值                 → 按代理配置 ID 指派。
 	autoAssign := true

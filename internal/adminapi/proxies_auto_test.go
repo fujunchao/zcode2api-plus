@@ -15,6 +15,7 @@ import (
 
 func TestAddAccountsAutoAssignsProxy(t *testing.T) {
 	mux, st, _ := setup(t)
+	_ = st.SetSetting("claim_auto_enabled", "false")
 	line, err := st.AddProxyProfile("line-1", "http://1.1.1.1:8080", true)
 	if err != nil {
 		t.Fatalf("建线路失败: %v", err)
@@ -58,18 +59,24 @@ func TestAddAccountsAutoAssignsProxy(t *testing.T) {
 		}
 	})
 
-	t.Run("线路用尽时回退直连并计数", func(t *testing.T) {
-		// line-1 已被上面的子测试占用，这两个账号都只能回退。
+	t.Run("线路用尽时共享并计数", func(t *testing.T) {
+		// line-1 已被上面的子测试占用，新账号仍应共享而非回退直连。
 		code, body := do(t, mux, st, http.MethodPost, "/admin/api/accounts",
 			map[string]any{"tokens": []any{jwtTokenFor("u-fb-1"), jwtTokenFor("u-fb-2")}})
 		if code != http.StatusOK {
 			t.Fatalf("应 200: %d %v", code, body)
 		}
-		if n, _ := body["assigned"].(float64); n != 0 {
-			t.Fatalf("已无空閒线路，不应分配: %v", body)
+		if n, _ := body["assigned"].(float64); n != 2 {
+			t.Fatalf("已无空闲线路，应共享分配: %v", body)
 		}
-		if n, _ := body["direct_fallback"].(float64); n != 2 {
-			t.Fatalf("应回报 2 个回退直连: %v", body)
+		if n, _ := body["direct_fallback"].(float64); n != 0 {
+			t.Fatalf("应没有直连回退: %v", body)
+		}
+		for _, id := range body["ids"].([]any) {
+			acc := st.FindAny(id.(string))
+			if acc.ProxyID == nil || *acc.ProxyID != line.ID || acc.ProxyURL == nil || *acc.ProxyURL != line.URL {
+				t.Fatal("共享分配必须写入 ID 与 URL")
+			}
 		}
 	})
 }

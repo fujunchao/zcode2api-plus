@@ -22,10 +22,12 @@
 package gateway
 
 import (
+	"fmt"
 	"time"
 
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
+	"zcode2api/internal/web"
 )
 
 // RiskControlRequestLevelThreshold 判定请求级风控所需的不同账号数。
@@ -78,14 +80,13 @@ func (s *RiskScope) Accounts() int {
 	return len(s.hit)
 }
 
-// MarkRiskControl 施加一次账号级风控冷却（连续命中次数递进，超阶梯置失效）。
+// MarkRiskControl 施加风控冷却（连续命中次数递进，超阶梯置失效），并自动换代理。
 //
-// 只动调度效果三个字段（Status / CoolingUntil / RiskControlStreak）并盖证据章；
 // last_error / last_error_kind 由 StampAccountError 统一处理。风控有「账号级」与
 // 「请求级」两种语义（本文件头注释），但冷却动作相同 —— 请求级时账号同样被上游标记，
-// 本地冷却必须保留。
-func MarkRiskControl(st *store.Store, provider, idOrName, errMsg string, now time.Time) (secs, streak int, invalid bool) {
-	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+// 本地冷却必须保留。snapshot 为本次请求的出口快照，避免迟到响应重复换线。
+func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, now time.Time) (secs, streak int, invalid bool) {
+	_, _ = st.Update(snapshot.Provider, snapshot.ID, func(acc *model.Account) {
 		acc.RiskControlStreak++
 		streak = acc.RiskControlStreak
 		secs, invalid = riskControlCoolingSeconds(st, streak)
@@ -103,6 +104,13 @@ func MarkRiskControl(st *store.Store, provider, idOrName, errMsg string, now tim
 	if streak == 0 {
 		// 账号已被删除（并发删除）：不落库，但仍给日志一个可用的档位。
 		secs, invalid = riskControlCoolingSeconds(st, 1)
+		return secs, streak, invalid
+	}
+	if next, changed, err := st.RotateAccountProxy(snapshot); err != nil {
+		web.Warn("risk-proxy", fmt.Sprintf("账号 %s 风控后更换代理失败，保留原绑定与冷却状态: %v", snapshot.ID, err))
+	} else if changed {
+		// 仅记录 ID，不输出可能携带认证信息的代理 URL。
+		web.Warn("risk-proxy", fmt.Sprintf("账号 %s 风控后已更换代理至 %s，保留风控冷却/失效状态", snapshot.ID, next.ID))
 	}
 	return secs, streak, invalid
 }

@@ -56,7 +56,7 @@ func TestMarkRiskControlAppliesCooling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	secs, streak, invalid := MarkRiskControl(st, model.ProviderZai, acc.ID, "上游风控拦截 HTTP 405: x", time.Now())
+	secs, streak, invalid := MarkRiskControl(st, acc, "上游风控拦截 HTTP 405: x", time.Now())
 	if streak != 1 || invalid {
 		t.Fatalf("首次命中应为 1 次、非失效: streak=%d invalid=%v", streak, invalid)
 	}
