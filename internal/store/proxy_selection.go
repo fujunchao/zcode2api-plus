@@ -1,6 +1,9 @@
 package store
 
-import "zcode2api/internal/model"
+import (
+	"time"
+	"zcode2api/internal/model"
+)
 
 // proxyOccupancyLocked 统计所有账号的线路绑定，包括停用和归档账号。
 // 手工 ProxyURL 不占用命名线路，与后台绑定数口径一致。
@@ -42,27 +45,8 @@ func (s *Store) PickAvailableProxyProfile() (ProxyProfile, bool) {
 // 若期间已改派或账号已删除则不覆盖；无替代线路时保留原出口。只提交代理字段，
 // 不复位风控状态，也不影响原线路绑定的其他账号。
 func (s *Store) RotateAccountProxy(expected *model.Account) (ProxyProfile, bool, error) {
-	if expected == nil {
-		return ProxyProfile{}, false, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	live := s.findLocked(expected.Provider, expected.ID)
-	if live == nil || derefStr(live.ProxyID) != derefStr(expected.ProxyID) ||
-		derefStr(live.ProxyURL) != derefStr(expected.ProxyURL) {
-		return ProxyProfile{}, false, nil
-	}
-	p, ok := leastLoadedProxy(s.listProxyProfilesLocked(), s.proxyOccupancyLocked(),
-		derefStr(live.ProxyID), derefStr(live.ProxyURL))
-	if !ok {
-		return ProxyProfile{}, false, nil
-	}
-	pending := live.Clone()
-	pending.ProxyID, pending.ProxyURL = &p.ID, &p.URL
-	if err := s.commitProxyStateLocked(nil, []*model.Account{pending}); err != nil {
-		return ProxyProfile{}, false, err
-	}
-	return p, true, nil
+	result, err := s.RotateAccountProxyAt(expected, time.Now())
+	return result.Next, result.Reason == "changed", err
 }
 
 // PurgeUnprovisionedClaimProxy 原子淘汰「未获初始额度 + 领取风控」请求使用的线路。

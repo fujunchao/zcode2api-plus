@@ -91,16 +91,17 @@ func (e *Engine) SetNow(fn func() time.Time) { e.now = fn }
 
 // clientFor 返回账号出站客户端：配置了代理（proxy_url，含代理线路指派）时
 // 走代理 Transport，否则用引擎默认客户端。代理构造失败回退直连并记日志。
-func (e *Engine) clientFor(acc *model.Account) *http.Client {
+func (e *Engine) clientFor(acc *model.Account) (*http.Client, store.ProxyEgress) {
+	egress := e.Store.ProxyEgress(acc)
 	if acc == nil || acc.ProxyURL == nil || *acc.ProxyURL == "" {
-		return e.Client
+		return e.Client, egress
 	}
 	t, err := proxy.TransportFor(*acc.ProxyURL)
 	if err != nil {
-		web.Warn("gateway", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
-		return e.Client
+		web.Warn("gateway", fmt.Sprintf("账号 %s 代理无效，回退直连", acc.Name))
+		return e.Client, store.ProxyEgress{Label: "direct", Endpoint: "direct", Mode: "direct_fallback"}
 	}
-	return &http.Client{Transport: t}
+	return &http.Client{Transport: t}, egress
 }
 
 // defaultUpstreamClient 对齐 Python 版超时语义：连接 30s、响应头最长 120s、
@@ -332,12 +333,22 @@ func (e *Engine) tryAccount(
 			httpReq.Header.Set(k, v)
 		}
 
+		client, egress := e.clientFor(acc)
 		if diag != nil {
 			// 首字节延迟与耗时的基准点：紧贴出站调用。
 			diag.UpstreamStart = diag.Now()
+			if egress.Mode != "proxy" {
+				diag.Route = "direct"
+			}
 		}
 		requeststats.Attempt(ctx)
-		resp, err := e.clientFor(acc).Do(httpReq)
+		finishAttempt := diag.BeginUpstreamAttempt(acc, egress)
+		resp, err := client.Do(httpReq)
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		finishAttempt(status, err)
 		if err != nil {
 			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
@@ -358,7 +369,7 @@ func (e *Engine) tryAccount(
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, modelName, isJWT, resp, &b, scope)
+			res := e.handleUpstreamError(ctx, reqID, acc, modelName, isJWT, resp, &b, scope, egress)
 			if res.retrySame {
 				continue
 			}
@@ -429,6 +440,7 @@ func (e *Engine) handleUpstreamError(
 	resp *http.Response,
 	b *attemptBudget,
 	scope *RiskScope,
+	egress store.ProxyEgress,
 ) attemptResult {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	_ = resp.Body.Close()
@@ -598,7 +610,7 @@ func (e *Engine) handleUpstreamError(
 			// 相同（MarkRiskControl 内部落证据章），差别只在后续：停止换号 + 登记
 			// 重放防护，让同内容请求在窗口内直接失败。
 			secs, streak, invalid := MarkRiskControl(e.Store, acc,
-				"上游风控拦截 HTTP 405（請求級）: "+preview, e.now())
+				"上游风控拦截 HTTP 405（請求級）: "+preview, e.now(), RiskAttempt{RequestID: reqID, Egress: egress})
 			if e.replay != nil {
 				e.replay.Record(scope.ContentKey())
 			}
@@ -615,7 +627,7 @@ func (e *Engine) handleUpstreamError(
 			}}
 		}
 		secs, streak, invalid := MarkRiskControl(e.Store, acc,
-			"上游风控拦截 HTTP 405: "+preview, e.now())
+			"上游风控拦截 HTTP 405: "+preview, e.now(), RiskAttempt{RequestID: reqID, Egress: egress})
 		if invalid {
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
 				acc.Name, streak, resp.StatusCode, preview))

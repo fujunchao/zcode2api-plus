@@ -133,3 +133,8 @@ func ReqErr(reqID, msg string) {
 func Diag(reqID, msg string) {
 	fmt.Fprintf(logW(), "  %s[#]%s %s%s%s %s\n", ansiDim, ansiReset, ansiDim, reqID, ansiReset, msg)
 }
+
+// Attempt 逐次 HTTP 出站事件，与请求收尾汇总分开，避免换号后丢失前次出口。
+func Attempt(reqID, msg string) {
+	fmt.Fprintf(logW(), "  %s[attempt]%s %s%s%s %s\n", ansiDim, ansiReset, ansiDim, reqID, ansiReset, msg)
+}

@@ -71,6 +71,10 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # 近期失败线路避让、逐次出站和并发改派使用真实本地 HTTP/SQLite 边界重复验证。
+      - name: Test risk proxy regression (repeat)
+        run: go test ./internal/store ./internal/gateway ./internal/asyncpool -run 'TestRiskProxy|TestAttemptLog|TestAsyncRiskProxy|TestAsyncForcedDirect|TestRotateAccountProxy|TestConcurrentRiskResponses|TestProxyMutationFailureIsAtomic' -count=20 -timeout=180s
+
       # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
       # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
       # 「这次真的跑过检测器」。编译缓存仍然生效，代价只是重跑一次测试。

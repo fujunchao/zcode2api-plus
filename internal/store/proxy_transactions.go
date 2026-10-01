@@ -8,7 +8,12 @@ import (
 // commitProxyStateLocked 将线路与关联账号作为一个事务提交，再发布内存状态。
 // profiles=nil 表示本次只修改账号指派；pending 都是尚未发布的副本。
 func (s *Store) commitProxyStateLocked(profiles []ProxyProfile, pending []*model.Account) error {
-	if profiles == nil && len(pending) == 0 {
+	return s.commitProxyStateWithHistoryLocked(profiles, pending, nil)
+}
+
+// history 非 nil 时和线路改派一起落库；失败时两者均不发布到内存。
+func (s *Store) commitProxyStateWithHistoryLocked(profiles []ProxyProfile, pending []*model.Account, history riskProxyHistory) error {
+	if profiles == nil && len(pending) == 0 && history == nil {
 		return nil
 	}
 	var raw []byte
@@ -24,6 +29,15 @@ func (s *Store) commitProxyStateLocked(profiles []ProxyProfile, pending []*model
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if history != nil {
+		data, err := marshalJSON(history)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", riskProxyHistoryKey, string(data)); err != nil {
+			return err
+		}
+	}
 	if profiles != nil {
 		if _, err = tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES ('proxy_profiles',?)", string(raw)); err != nil {
 			return err
@@ -36,6 +50,9 @@ func (s *Store) commitProxyStateLocked(profiles []ProxyProfile, pending []*model
 	}
 	if err = tx.Commit(); err != nil {
 		return err
+	}
+	if history != nil {
+		s.riskProxyHistory = history
 	}
 	if profiles != nil {
 		s.settings["proxy_profiles"] = string(raw)

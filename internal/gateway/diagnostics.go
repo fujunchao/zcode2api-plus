@@ -31,9 +31,10 @@ type ReqDiag struct {
 	MaxTokens string
 	Ticket    string // async 专用：同时带 36 字符 ticketID，保留既有检索习惯
 
-	BodyBytes int    // 真正发给上游的请求体字节数（注入 system 之后）
-	BodyHash  string // 请求体的 sha256 前 12 位十六进制；空串 = 未构建出请求体
-	Attempts  int    // 本次请求内的选号尝试次数（>1 说明发生过换号/重试）
+	BodyBytes        int    // 真正发给上游的请求体字节数（注入 system 之后）
+	BodyHash         string // 请求体的 sha256 前 12 位十六进制；空串 = 未构建出请求体
+	Attempts         int    // 本次请求内的选号尝试次数（>1 说明发生过换号/重试）
+	upstreamAttempts int    // 每次 client.Do 单独递增，包含同账号原地重试。
 
 	// RiskAccounts 本请求内给出风控信号的**不同账号数**（按账号 ID 去重）。
 	// 0 = 没出现过风控信号；≥2 即请求级（同一 body 换谁都被拒）。

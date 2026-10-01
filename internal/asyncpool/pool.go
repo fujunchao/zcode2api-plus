@@ -631,17 +631,28 @@ func (p *Pool) attemptUpstreamOnce(
 		httpReq.Header.Set(k, v)
 	}
 
-	client, route := p.clientFor(acc)
+	client, egress := p.clientFor(acc)
+	riskAttempt := gateway.RiskAttempt{Ticket: ticketID, Egress: egress}
 	if diag != nil {
+		riskAttempt.RequestID = diag.ReqID
 		// 首字节延迟与耗时的基准点：紧贴出站调用（与 sync 路径同）。
 		diag.UpstreamStart = diag.Now()
 		// 如实报本次实际出口（direct / 线路名 / proxy:掩码URL），与 sync 的
-		// Store.ProxyLabel 同口径。route 由 clientFor 一并交出，保证读数与实际
+		// Store.ProxyLabel 同口径。egress 由 clientFor 一并交出，保证读数与实际
 		// 出口不可能不一致。
-		diag.Route = route
+		diag.Route = "direct"
+		if egress.Mode == "proxy" {
+			diag.Route = p.Store.ProxyLabel(acc)
+		}
 	}
 	requeststats.Attempt(ctx)
+	finishAttempt := diag.BeginUpstreamAttempt(acc, egress)
 	resp, err := client.Do(httpReq)
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	finishAttempt(status, err)
 	if err != nil {
 		return false, err
 	}
@@ -748,7 +759,7 @@ func (p *Pool) attemptUpstreamOnce(
 				// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
 				// 相同，差别只在后续：停止换号 + 登记重放防护。
 				_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,
-					"上游风控拦截 HTTP 405（請求級）: "+preview, time.Now())
+					"上游风控拦截 HTTP 405（請求級）: "+preview, time.Now(), riskAttempt)
 				p.replay.Record(scope.ContentKey())
 				if invalid {
 					web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（請求級，HTTP %d，%s），已置為失效待人工處理；同內容 %d s 內直接拒絕",
@@ -760,7 +771,7 @@ func (p *Pool) attemptUpstreamOnce(
 				return false, errRequestLevelRisk{body: bodyText}
 			}
 			_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,
-				"上游风控拦截 HTTP 405: "+preview, time.Now())
+				"上游风控拦截 HTTP 405: "+preview, time.Now(), riskAttempt)
 			if invalid {
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
 					acc.Name, streak, resp.StatusCode, preview))
@@ -1072,31 +1083,36 @@ const asyncResponseHeaderTimeout = 180 * time.Second
 // 不能用 proxy.ClientFor——后者设的是 http.Client.Timeout（整体超时），
 // 对 SSE 长连接等于给流设了上限。
 //
-// 第二个返回值：raw 为空、代理无效回退、或被开关强制直连时均为 "direct"。
-func (p *Pool) clientFor(acc *model.Account) (*http.Client, string) {
+// 第二个返回值描述客户端实际使用的出口，区分直连、回退、强制直连和注入客户端。
+func (p *Pool) clientFor(acc *model.Account) (*http.Client, store.ProxyEgress) {
 	if p.Client != nil {
-		// 注入口（测试/调试）：出口由注入方决定，未知即如实报 direct。
-		return p.Client, "direct"
+		// 注入口（测试/调试）：出口由注入方决定，新日志如实报告 unknown。
+		return p.Client, store.ProxyEgress{Label: "custom", Endpoint: "unknown", Mode: "custom_client"}
 	}
 	// async_force_direct：排障用的控制开关，强制忽略账号代理直连。
 	// 用途是保留「线路 vs 直连」的归因对照组——修好代理路由后这根本可复现的控制臂
 	// 会消失，改由显式开关声明，而不是继续依赖实现缺陷。
 	raw := ""
-	if acc != nil && acc.ProxyURL != nil && !p.Store.AsyncForceDirect() {
+	forceDirect := p.Store.AsyncForceDirect()
+	if acc != nil && acc.ProxyURL != nil && !forceDirect {
 		raw = *acc.ProxyURL
 	}
 	t, err := proxy.TransportForTimeout(raw, asyncResponseHeaderTimeout)
 	if err != nil {
 		// 仅当账号配了非法代理才会失败；回退直连（TransportForTimeout 对空 URL
 		// 永不报错，故下面的 t 一定非 nil）。
-		web.Warn("async", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
+		web.Warn("async", fmt.Sprintf("账号 %s 代理无效，回退直连", acc.Name))
 		t, _ = proxy.TransportForTimeout("", asyncResponseHeaderTimeout)
-		return &http.Client{Transport: t}, "direct"
+		return &http.Client{Transport: t}, store.ProxyEgress{Label: "direct", Endpoint: "direct", Mode: "direct_fallback"}
 	}
 	if raw == "" {
-		return &http.Client{Transport: t}, "direct"
+		mode := "direct"
+		if forceDirect {
+			mode = "forced_direct"
+		}
+		return &http.Client{Transport: t}, store.ProxyEgress{Label: "direct", Endpoint: "direct", Mode: mode}
 	}
-	return &http.Client{Transport: t}, p.Store.ProxyLabel(acc)
+	return &http.Client{Transport: t}, p.Store.ProxyEgress(acc)
 }
 
 // marshalJSON 与网关一致（Python json.dumps(ensure_ascii=False) 形态）：

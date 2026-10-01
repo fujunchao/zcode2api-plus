@@ -51,15 +51,16 @@ var ErrProxyNotFound = errors.New("代理配置不存在")
 
 // Store 线程安全的账号 / 设置存储，含轮询游标。
 type Store struct {
-	Requests    *requeststats.Tracker
-	mu          sync.Mutex
-	db          *sql.DB
-	processLock *os.File
-	closeOnce   sync.Once
-	closeErr    error
-	accounts    map[string][]*model.Account
-	settings    map[string]string
-	rotation    map[string]int
+	Requests         *requeststats.Tracker
+	mu               sync.Mutex
+	db               *sql.DB
+	processLock      *os.File
+	closeOnce        sync.Once
+	closeErr         error
+	accounts         map[string][]*model.Account
+	settings         map[string]string
+	rotation         map[string]int
+	riskProxyHistory riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -234,6 +235,12 @@ func (s *Store) load() error {
 	}
 
 	settings := metaRows
+	if raw := settings[riskProxyHistoryKey]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &s.riskProxyHistory); err != nil {
+			return fmt.Errorf("读取风控线路历史失败: %w", err)
+		}
+	}
+	delete(settings, riskProxyHistoryKey)
 	// 密钥由 bootstrapAuthKeys 保证存在；此处缺省空值即拒绝鉴权（fail closed）
 	if _, ok := settings["admin_key"]; !ok {
 		settings["admin_key"] = ""
