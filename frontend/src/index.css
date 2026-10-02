@@ -1,4 +1,5 @@
-@import "tailwindcss";
+/* 只扫描前端源码，避免上次 dist 中已删除的类污染下一次构建。 */
+@import "tailwindcss" source("./");
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));

@@ -48,6 +48,8 @@ jobs:
       - name: Verify embedded frontend
         working-directory: frontend
         run: |
+          # 历史产物不应参与 Tailwind 扫描；残留类不能污染下一次构建。
+          printf '<div class="m-[12347px]"></div>\n' > dist/source-scan-probe.html
           npm run build
           git diff --exit-code -- dist
           test -z "$(git ls-files --others --exclude-standard -- dist)"
