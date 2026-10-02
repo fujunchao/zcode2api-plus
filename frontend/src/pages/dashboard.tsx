@@ -4,13 +4,13 @@ import {
   CircleCheck,
   Database,
   RefreshCw,
-  TrendingUp,
   Users,
   Zap,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Empty, MetricCard, PanelCard } from '@/components/panel'
+import { ModelQuotaCards } from '@/components/model-quota-cards'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -54,15 +54,6 @@ export function DashboardPage() {
   const cache = Number(stats?.tokens_cache) || 0
   const tokens = input + output + cache
 
-  /* 額度彙總 */
-  let remaining = 0
-  let items = 0
-  accounts.forEach((a) =>
-    Object.values(a.quota || {}).forEach((q) => {
-      remaining += Number(q.remaining) || 0
-      items++
-    }),
-  )
   const pool = Object.values(status?.quota_pool || {}).reduce((n, v) => n + (Number(v) || 0), 0)
   const successRate = typeof requests?.success_rate === 'number' ? `${requests.success_rate.toFixed(1)}%` : '--'
 
@@ -86,14 +77,15 @@ export function DashboardPage() {
       </div>
 
       {/* 網關指標卡 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
         <MetricCard icon={<Users />} tone="text-blue-600" label="帳號總數" value={fmt(stats?.total)} detail={`${fmt(stats?.active)} 個正常`} />
         <MetricCard icon={<Boxes />} tone="text-emerald-600" label="可用帳號池" value={fmt(pool)} detail={`${providers.length} 個提供商`} />
         <MetricCard icon={<Zap />} tone="text-violet-600" label="請求數（本次啟動）" value={fmt(calls)} detail={`${fmt(failed)} 次失敗 · ${fmt(requests?.active)} 進行中`} />
         <MetricCard icon={<CircleCheck />} tone="text-amber-600" label="請求成功率" value={successRate} detail={`已完成請求 · 重試 ${fmt(requests?.retries)} 次`} />
         <MetricCard icon={<Database />} tone="text-cyan-600" label="累計 Token" value={fmtCompact(tokens)} detail={`輸入 ${fmtCompact(input)} · 輸出 ${fmtCompact(output)}`} />
-        <MetricCard icon={<TrendingUp />} tone="text-rose-600" label="剩餘額度" value={fmtCompact(remaining)} detail={`${items} 個額度項目`} />
       </div>
+
+      <ModelQuotaCards quotas={status?.model_quotas ?? []} />
 
       {/* 提供商概況＋帳號健康 */}
       <div className="grid gap-4 lg:grid-cols-5">

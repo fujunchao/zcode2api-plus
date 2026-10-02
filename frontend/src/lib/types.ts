@@ -131,6 +131,18 @@ export interface StatusResponse {
   gateway_key_set: boolean
   quota_refresh_interval: number
   quota_pool: Record<string, number>
+  model_quotas: ModelQuotaSummary[]
+}
+
+/** 按模型汇总的上游快照；null 表示未知，不等同于额度为零。 */
+export interface ModelQuotaSummary {
+  model: string
+  total: number | null
+  used: number | null
+  remaining: number | null
+  accounts: number
+  items: number
+  partial: boolean
 }
 
 export interface SettingsResponse {

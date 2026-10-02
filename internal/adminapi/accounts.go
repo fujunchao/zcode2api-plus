@@ -25,10 +25,11 @@ func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	quotaPool := map[string]int{}
+	accounts := h.Store.ListAccounts("")
 	for _, p := range store.Providers {
 		n := 0
-		for _, a := range h.Store.ListAccounts(p) {
-			if a.IsSelectable(now) {
+		for _, a := range accounts {
+			if a.Provider == p && a.IsSelectable(now) {
 				n++
 			}
 		}
@@ -39,6 +40,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"gateway_key_set":        h.Store.GatewayKey() != "",
 		"quota_refresh_interval": h.Store.QuotaRefreshInterval(),
 		"quota_pool":             quotaPool,
+		"model_quotas":           model.SummarizeModelQuotas(accounts, gateway.AvailableModels),
 	})
 }
 
