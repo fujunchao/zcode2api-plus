@@ -2,11 +2,73 @@ package adminapi
 
 import (
 	"net/http"
+	"reflect"
 	"testing"
 
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
 )
+
+func TestAccountsModelQuotasMatchStatusAndIgnoreFilters(t *testing.T) {
+	mux, st, billing := setup(t)
+	for _, path := range []string{"/admin/api/accounts", "/admin/api/status"} {
+		_, body := do(t, mux, st, http.MethodGet, path, nil)
+		quotas, ok := body["model_quotas"].([]any)
+		if !ok || len(quotas) != len(gateway.AvailableModels) {
+			t.Fatalf("空池也应返回两个模型: %s %v", path, body)
+		}
+	}
+	var activeID string
+	for _, name := range []string{"active", "disabled", "archived"} {
+		acc, err := st.AddAccount(model.ProviderZai, name, "quota-"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "active" {
+			activeID = acc.ID
+		}
+		if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+			a.Quota = map[string]map[string]any{
+				"GLM-5.3":       {"total": 100, "used": 30, "remaining": 70},
+				"GLM-5.3-Flash": {"total": 1000, "used": 200, "remaining": 800},
+			}
+			if name == "disabled" {
+				a.Enabled = false
+				a.Status = model.StatusDisabled
+			}
+			if name == "archived" {
+				ts := 1.0
+				a.ArchivedAt = &ts
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, status := do(t, mux, st, http.MethodGet, "/admin/api/status", nil)
+	for _, query := range []string{"", "?status=disabled", "?archived=true", "?limit=1&offset=1", "?limit=1&offset=99"} {
+		code, body := do(t, mux, st, http.MethodGet, "/admin/api/accounts"+query, nil)
+		if code != http.StatusOK || !reflect.DeepEqual(body["model_quotas"], status["model_quotas"]) {
+			t.Fatalf("账号池汇总不应随筛选分页改变: %s %d %v", query, code, body)
+		}
+		quotas := body["model_quotas"].([]any)
+		if num(t, quotas[0].(map[string]any)["remaining"]) != 1600 || num(t, quotas[1].(map[string]any)["total"]) != 200 {
+			t.Fatalf("应包含停用账号但排除归档账号: %v", quotas)
+		}
+	}
+	if _, err := st.Update(model.ProviderZai, activeID, func(a *model.Account) {
+		a.Quota["GLM-5.3"]["remaining"] = 0
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, body := do(t, mux, st, http.MethodGet, "/admin/api/accounts", nil)
+	quotas := body["model_quotas"].([]any)
+	if num(t, quotas[1].(map[string]any)["remaining"]) != 70 || num(t, quotas[0].(map[string]any)["remaining"]) != 1600 {
+		t.Fatalf("额度快照更新后应独立更新模型汇总: %v", quotas)
+	}
+	if billing.callCount() != 0 {
+		t.Fatal("列表汇总不得额外查询上游")
+	}
+}
 
 func TestStatusModelQuotas(t *testing.T) {
 	mux, st, billing := setup(t)

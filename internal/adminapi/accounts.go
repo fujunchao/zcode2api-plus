@@ -46,7 +46,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	// 条件查询（additive 扩展）：不传任何参数时与旧版行为完全一致（全量返回）。
-	// stats/providers/models/proxies 保持全量口径，不受过滤影响（概览语义分离）。
+	// stats/model_quotas/providers/models/proxies 保持全量口径，不受过滤影响（概览语义分离）。
 	q, apiErr := parseAccountQuery(r)
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
@@ -58,14 +58,15 @@ func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	for _, a := range matched {
 		views = append(views, a.PublicView(now))
 	}
-	_, stats := h.accountSnapshot()
+	stats := h.poolStats(now)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":  views,
-		"stats":     stats,
-		"providers": store.Providers,
-		"models":    gateway.AvailableModels,
-		"proxies":   h.Store.ListProxyProfiles(),
-		"ts":        nowFloat(),
+		"accounts":     views,
+		"stats":        stats,
+		"model_quotas": model.SummarizeModelQuotas(h.Store.ListAccounts(""), gateway.AvailableModels),
+		"providers":    store.Providers,
+		"models":       gateway.AvailableModels,
+		"proxies":      h.Store.ListProxyProfiles(),
+		"ts":           nowFloat(),
 		// 过滤后总数与分页回显（limit=0 表示未启用分页）：供前端做分页器。
 		"total":  total,
 		"offset": q.Offset,

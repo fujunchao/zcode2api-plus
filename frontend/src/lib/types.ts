@@ -96,6 +96,8 @@ export interface ProxyProfile {
 export interface AccountsResponse {
   accounts: Account[]
   stats: Stats
+  /** 非归档账号全池额度，不受列表筛选或分页影响。 */
+  model_quotas: ModelQuotaSummary[]
   providers: string[]
   models: string[]
   proxies: ProxyProfile[]

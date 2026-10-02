@@ -21,6 +21,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
 import { PlanRows, QuotaRows, allPlansExpired } from '@/components/quota-rows'
+import { ModelQuotaCards } from '@/components/model-quota-cards'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -195,17 +196,6 @@ export function AccountsPage() {
     void qc.invalidateQueries({ queryKey: ['accounts'] })
   }
 
-  /* ── 統計計算（語義照搬舊版 renderStats） ── */
-  let totalRem = 0
-  let totalQuota = 0
-  liveAccounts.forEach((a) => {
-    Object.values(a.quota || {}).forEach((w) => {
-      totalRem += Number(w.remaining) || 0
-      totalQuota += Number(w.total) || 0
-    })
-  })
-  const quotaPct = totalQuota > 0 ? Math.max(0, Math.min(100, (totalRem / totalQuota) * 100)) : 0
-  const quotaColor = quotaPct <= 15 ? '#ef4444' : quotaPct <= 40 ? '#f59e0b' : '#22c55e'
   const stats = data?.stats
 
   /* ── 篩選（歸檔帳號不參與） ── */
@@ -716,27 +706,10 @@ export function AccountsPage() {
       <input ref={fileRef} type="file" accept=".json" hidden onChange={(e) => void onImportFile(e)} />
 
       {/* 帳號概覽 */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCell label="帳號總數" value={fmt(stats?.total)} icon={<Users className="size-4" />} />
         <StatCell label="正常" value={fmt(stats?.active)} color="#16a34a" icon={<span className="size-2 rounded-full bg-emerald-500" />} />
         <StatCell label="額度用完" value={fmt(stats?.exhausted)} color="#8d6bbd" icon={<span className="size-2 rounded-full bg-purple-500" />} />
-        <Card>
-          <CardContent className="flex flex-col gap-1">
-            <div className="flex items-center justify-between text-xs text-muted-foreground">
-              總額度（剩餘）
-              <span className="size-2 rounded-full" style={{ background: quotaColor }} />
-            </div>
-            <div className="text-2xl font-semibold tabular-nums" style={{ color: '#4c9168' }}>
-              {fmtCompact(totalRem)}
-            </div>
-            <div className="h-1.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuenow={quotaPct} aria-valuemin={0} aria-valuemax={100}>
-              <span className="block h-full rounded-full" style={{ width: `${quotaPct}%`, background: quotaColor }} />
-            </div>
-            <div className="text-[11px] text-muted-foreground">
-              {totalQuota ? `${fmtCompact(totalRem)} / ${fmtCompact(totalQuota)} · ${quotaPct.toFixed(1)}%` : '尚無額度資料'}
-            </div>
-          </CardContent>
-        </Card>
         <Card>
           <CardContent className="flex flex-col gap-1" title={`輸入 ${fmt(stats?.tokens_in)} · 輸出 ${fmt(stats?.tokens_out)} · 快取 ${fmt(stats?.tokens_cache)}`}>
             <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -750,6 +723,10 @@ export function AccountsPage() {
           </CardContent>
         </Card>
       </div>
+
+      {/* 全池模型额度与列表共用一次轮询；明细筛选不改变顶部统计口径。 */}
+      <ModelQuotaCards quotas={data?.model_quotas ?? []} />
+      <p className="-mt-4 text-xs text-muted-foreground">以上额度为全池汇总，不随下方明细筛选变化。</p>
 
       {/* 明細標題＋篩選 */}
       <div className="flex flex-wrap items-center justify-between gap-2">
