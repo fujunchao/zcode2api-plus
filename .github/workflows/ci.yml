@@ -1,11 +1,13 @@
-# CI：编译 + 静态检查 + 全量测试（含 -race）。
+# CI：工作流检查 + 编译 + 静态检查 + 全量测试（含 -race）。
 #
-# 为什么放 CI 而不只靠本机：
+# 自动化验证统一在 GitHub Actions 的 Ubuntu 环境执行，本机只做开发与格式化。
+# 分支提交和发布门禁复用本文件，不另维护一套发版测试脚本。
+# 为什么不再在本机重复测试：
 #   1. 冷缓存下首次本机构建要编译 modernc.org/libc（纯 Go 转译的 SQLite）与 rod，
 #      实测十余分钟；CI 有 go build cache，重复运行只需几分钟。
 #   2. `-race` 需要 gcc/cc，本机没有，CI 的 ubuntu-latest 自带——这正好解掉
 #      HANDOFF/PLAN 里「M5/M6 的 -race 验收本机做不了」这条欠账。
-#   3. 本仓库是公开仓库，Actions 分钟数不计费。
+#   3. 避免本机 Windows 临时目录清理等环境噪声，不降低测试覆盖率。
 #
 # 全量测试均为 httptest 本地环回或显式 t.Skip（真机用例需 ZCODE_REAL_BROWSER_TEST=1），
 # 故 test / cross-build 两个 job 不触网、不需要浏览器。docker job 需要联网
@@ -16,20 +18,42 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_call:
+    inputs:
+      platforms:
+        description: "验证镜像构建的平台（只构建，不推送）"
+        type: string
+        required: false
+        default: "linux/amd64"
   workflow_dispatch:
     inputs:
       # 手动触发时可指定多个平台，用来验证 release.yml 的多架构路径（含 QEMU 下的
-      # 运行阶段 apt），而不必真的推 tag 发版。默认只构建本机平台。
+      # 运行阶段 apt），而不必真的推 tag 发版。默认只构建 Ubuntu runner 的平台。
       platforms:
         description: "镜像构建平台（逗号分隔）"
+        type: string
         required: false
         default: "linux/amd64"
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.ref }}
+  # 被复用时 github.workflow 是调用方名称：隔离分支 CI 与发布验证，避免互相取消。
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+
   frontend:
     runs-on: ubuntu-latest
     steps:
@@ -42,6 +66,9 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint -- src test
       - name: Test frontend behavior
         working-directory: frontend
         run: npm test
@@ -76,6 +103,11 @@ jobs:
       # 近期失败线路避让、逐次出站和并发改派使用真实本地 HTTP/SQLite 边界重复验证。
       - name: Test risk proxy regression (repeat)
         run: go test ./internal/store ./internal/gateway ./internal/asyncpool -run 'TestRiskProxy|TestAttemptLog|TestAsyncRiskProxy|TestAsyncForcedDirect|TestRotateAccountProxy|TestConcurrentRiskResponses|TestProxyMutationFailureIsAtomic' -count=20 -timeout=180s
+
+      - name: Test proxy deletion regression (repeat)
+        run: |
+          go test ./internal/store -run 'TestDeleteProxy|TestConcurrentDeleteProxies' -count=20 -timeout=180s
+          go test ./internal/adminapi -run '^TestDeleteProxySharesOccupiedProxy$' -count=20 -timeout=60s
 
       # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
       # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
@@ -117,6 +149,7 @@ jobs:
         include:
           - { goos: linux,   goarch: amd64 }
           - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
           - { goos: darwin,  goarch: arm64 }
           - { goos: windows, goarch: amd64 }
     steps:
@@ -146,7 +179,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          # 常规运行只验本机平台（快）；手动触发可传多平台验 release.yml 的路径。
+          # 常规运行只验 Ubuntu runner 的平台（快）；手动触发可传多平台验发布路径。
           # 始终不推送——推 GHCR 只在 release.yml 推 tag 时发生。
           platforms: ${{ inputs.platforms || 'linux/amd64' }}
           push: false

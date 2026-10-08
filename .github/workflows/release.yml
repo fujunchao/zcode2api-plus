@@ -1,16 +1,31 @@
-# Release CI：推 tag（v*）时构建跨平台产物并上传到 GitHub Releases。
+# Release CI：推 tag（v*）时先验证同一提交，再构建并发布二进制与镜像。
+# 手动触发只验证，不上传附件或推送镜像，便于在不发版的情况下验收门禁。
 # 前端 dist 已提交且 go:embed，无需 node 构建；CGO 关闭纯静态编译。
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  validate:
+    # 本地相对路径复用保证 CI 定义与待发布代码来自同一提交。
+    # 任一验证任务失败或取消，下面的发布任务均不会执行。
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: validate
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
@@ -62,6 +77,8 @@ jobs:
   #
   # 实测（v2.0.2-go）：公开仓库的 package 默认即可匿名 pull，无需手动改可见性。
   image:
+    needs: validate
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read

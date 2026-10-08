@@ -236,11 +236,15 @@ GLM-5.3 / GLM-5.3-Flash 的原生思考档位为 `low/high/max`，默认且推�
 Pi 专用配置见 [examples/pi-models.json](examples/pi-models.json)；字段解释、测试命令和兼容边界见
 [客户端兼容说明](docs/client-compatibility.md)。已有 Pi 配置请合并条目，不要覆盖其它提供商。
 
-## 發佈與開發
+## 发布与开发
 
-- 推 `v*` tag → GitHub Actions 自動交叉編譯五平台產物並上傳 Releases。
-- 全量驗證：`go build ./... && go vet ./... && go test ./...`；併發檢查 `go test -race ./...`。
-- 行為契約與里程碑台账見 `PLAN.md`；交接注意事項見 `HANDOFF.md`。
+- **本地开发，远端验证**：本地修改代码、格式化和检查差异，不再重复执行 Go 或前端自动化测试。具体协作规则见 [AGENTS.md](AGENTS.md)。
+- 推送分支或提交拉取请求后，GitHub Actions 的 Ubuntu 环境执行工作流语法检查、前后端静态检查和测试、Go 竞态检测、重复回归、SDK 兼容性、五平台交叉编译及容器构建。
+- 修改前端时可在本地生成并提交 `frontend/dist`；是否通过测试、产物是否一致仍以当前提交的远端 CI 结果为准。
+- **发版强制门禁**：先等待当前提交的分支 CI 通过，再推 `v*` 标签。发布工作流会再次复用同一套完整 CI；只有全部成功，才上传二进制和推送镜像。失败或取消不能发布，不接受其他提交的通过记录。
+- **不发版验证**：手动运行 `release` 工作流只执行验证，二进制发布和镜像推送任务会跳过；可用 `gh workflow run release.yml --ref <工作分支>` 触发，无需创建测试版本标签。
+- Windows 二进制继续交叉编译；需要验证 Windows 特有行为时，在远端增加针对性测试，不恢复本机全量测试。
+- 行为契约与里程碑台账见 `PLAN.md`；`HANDOFF.md` 保留历史交接记录，当前开发验证流程以本节、`AGENTS.md` 和实际工作流为准。
 
 ## 賬號歸檔
 

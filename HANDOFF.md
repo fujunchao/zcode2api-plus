@@ -5,6 +5,8 @@
 > 最後更新：2026-09-11（M6/M7/M8 代码全部完成：OAuth+代理+CLI+Docker、/v1/responses、
 > 套餐自动领取；M5 真机验收与 -race 待做；全部真机验收合并执行）。
 
+> 当前流程补充（2026-10-08）：开发机只做代码修改、格式化和差异检查，自动化测试统一放在 GitHub Actions 的 Ubuntu 环境。发布必须通过同一提交的完整 CI；当前协作规则以 `AGENTS.md` 和 README 的“发布与开发”为准。下文旧仓库地址、里程碑和测试状态均为历史快照。
+
 ---
 
 ## 1. 當前狀態快照
@@ -22,18 +24,15 @@
 
 1. 讀 `PLAN.md` 全文（約 300 行）——範圍、§5.x 端點契約、里程碑勾選狀態都在那裡。
 2. 本文件 §4 紅線與 §6 踩坑記錄**必讀**。
-3. 驗證環境：在本倉庫根目錄執行 `go build ./... && go test ./...`。
+3. 验证流程：本地只做格式化和差异检查，推送工作分支后等待当前提交的 GitHub Actions 完整验证；不在本机重复跑测试。
 4. 從 `PLAN.md` 未勾選的第一項開工（當前是 M5）。
-5. 用戶母語溝通用**繁體中文**（CLAUDE.md 全局強制）；提交訊息用英文。
+5. 沟通、注释、提交信息和新增文档默认使用简体中文，具体规范见 `AGENTS.md`。
 
 ## 3. Git 與語言規範（每次提交都適用）
 
-- 提交訊息**英文**，`git commit -S`（強制 GPG 簽名），正文描述做了什麼與為什麼，附
-  `Co-Authored-By: Claude Code <noreply@anthropic.com>`。
-- 推送走本地代理：`HTTPS_PROXY=http://127.0.0.1:7890 git push origin master`。
-- **只推 origin（zcode2api-go）**。upstream（zcode2api-plus）是 Python 主倉庫，僅讀取參照。
-- 代碼註釋與文檔：本倉庫既有慣例為簡體中文（M0 起延續，已隨提交固化），新代碼註釋保持
-  簡體與周圍一致；**獨立新文檔**（如本文件）按 CLAUDE.md 用繁體。代碼標識符一律英文。
+- 当前规范统一见 `AGENTS.md`，不要继续套用历史仓库的分支名、代理地址或作者署名。
+- 提交前检查当前分支、远程地址和暂存范围；只向 `origin` 推送，`upstream` 保持只读。
+- 沟通、提交信息、代码注释和新增文档默认使用简体中文；代码标识符保持原有英文命名。
 
 ## 4. 安全紅線（逐字遵守，無例外）
 
@@ -111,11 +110,20 @@
 | `cmd/zcode2api` | main.go 入口接線 | — |
 | `internal/proxy` | 賬號級出站代理（M6 實現，現為空殼） | — |
 
-## 8. 驗證命令
+## 8. 验证与发布流程
 
 ```bash
-# 在本倉庫根目錄執行
-go build ./... && go vet ./... && go test ./...   # 全量驗證（當前全綠）
-go test ./internal/openai/ -v                     # M4 轉換層詳情
-HTTPS_PROXY=http://127.0.0.1:7890 git push origin master   # 推送
+# 本地只做格式化与差异检查；推送前先核对分支与改动范围。
+git diff --check
+git status --short --branch
+
+# 推送后查询当前提交对应的远端运行，并等待完成。
+gh run list --workflow ci.yml --commit <提交SHA>
+gh run watch <运行ID> --exit-status --interval 30
+gh run view <失败运行ID> --log-failed
+
+# 仅验证发布门禁，不创建版本、不上传附件、不推送镜像。
+gh workflow run release.yml --ref <工作分支>
 ```
+
+Go 构建、静态检查、全量测试、竞态检测及前端验证命令统一维护在 `.github/workflows/ci.yml`。需要发版时先等待分支 CI 通过；推送标签后，`.github/workflows/release.yml` 再复用该 CI 验证同一提交，通过后才执行发布。
