@@ -80,8 +80,8 @@ func (h *Handler) handleUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, profile)
 }
 
-// handleDeleteProxy 删除线路。原绑定该线路的账号会被自动改派到其它空閒线路，
-// 确实没有空閒线路时才退回直连；响应回报两种处置各覆盖多少个账号。
+// handleDeleteProxy 删除线路。原绑定账号按空闲优先、最少绑定改派到其他启用线路，
+// 无启用线路时才退回直连；响应回报两种处置各覆盖多少个账号。
 func (h *Handler) handleDeleteProxy(w http.ResponseWriter, r *http.Request) {
 	ok, reassign, err := h.Store.DeleteProxyProfile(r.PathValue("profile_id"))
 	if err != nil {

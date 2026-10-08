@@ -65,7 +65,7 @@ func (s *Store) PurgeUnprovisionedClaimProxy(expected *model.Account) (bool, Pro
 	}
 	for _, p := range s.listProxyProfilesLocked() {
 		if p.ID == *expected.ProxyID && p.URL == derefStr(expected.ProxyURL) {
-			removed, reassign, err := s.removeProxiesLocked(map[string]bool{p.ID: true}, true, p.URL)
+			removed, reassign, err := s.removeProxiesLocked(map[string]bool{p.ID: true}, p.URL)
 			return len(removed) > 0, reassign, err
 		}
 	}

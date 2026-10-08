@@ -1075,7 +1075,7 @@ func TestProxyProfiles(t *testing.T) {
 		t.Fatalf("线路更新应同步账号: %v", got.ProxyURL)
 	}
 
-	// 此时没有别的空閒线路，删掉唯一一条线后账号只能退回直连。
+	// 删掉唯一一条线路后，没有可用代理，账号只能退回直连。
 	if ok, _, err := s.DeleteProxyProfile(p.ID); !ok || err != nil {
 		t.Fatalf("删除失败: %v %v", ok, err)
 	}
@@ -1092,7 +1092,7 @@ func TestProxyProfiles(t *testing.T) {
 	}
 }
 
-// 删除线路时，原绑定账号应自动改派到其它空閒线路；确实没有空閒线路才退回直连。
+// 删除线路时优先改派到空闲线路；只有没有启用线路才退回直连。
 func TestDeleteProxyReassigns(t *testing.T) {
 	s := newTestStore(t)
 	lineA, err := s.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
@@ -1138,7 +1138,7 @@ func TestDeleteProxyReassigns(t *testing.T) {
 		}
 	})
 
-	t.Run("无空閒线路则退回直连且清掉旧地址", func(t *testing.T) {
+	t.Run("无启用线路则退回直连且清掉旧地址", func(t *testing.T) {
 		// 此刻只剩停用的 line-off，没有可补的线路。
 		ok, reassign, err := s.DeleteProxyProfile(lineB.ID)
 		if err != nil || !ok {

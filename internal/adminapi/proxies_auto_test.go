@@ -96,7 +96,7 @@ func probeStub(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	return srv
 }
 
-// 删除线路时，原绑定账号应被自动改派到空閒线路，接口回报两种处置的计数。
+// 删除线路时优先改派到空闲线路，接口回报改派和无可用代理时直连的计数。
 func TestDeleteProxyReassignsAccounts(t *testing.T) {
 	mux, st, _ := setup(t)
 	lineA, err := st.AddProxyProfile("line-a", "http://1.1.1.1:8080", true)
@@ -141,7 +141,7 @@ func TestDeleteProxyReassignsAccounts(t *testing.T) {
 		t.Fatalf("出站地址应同步为 line-b: %v", acc.ProxyURL)
 	}
 
-	// 再删 line-b：已无空閒线路，应退回直连。
+	// 再删 line-b：已无可用线路，应退回直连。
 	code, body = do(t, mux, st, http.MethodDelete, "/admin/api/proxies/"+lineB.ID, nil)
 	if code != http.StatusOK {
 		t.Fatalf("应 200: %d %v", code, body)

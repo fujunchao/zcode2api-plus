@@ -820,32 +820,29 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 // ProxyReassign 删除线路后对「原本绑定它的账号」的处置结果。
 type ProxyReassign struct {
 	Assigned map[string]string // accountID → 改派到的新线路 ID
-	Direct   []string          // 已无空閒线路可补、退回直连的 accountID
+	Direct   []string          // 已无可用候选、退回直连的 accountID
 }
 
 // DeleteProxyProfile 删除代理线路；不存在返回 false。
 //
-// 原本绑定该线路的账号不会被打成直连，而是先摘掉失效指派、再用「此刻仍然空閒」
-// 的线路补位，尽量让这些账号继续有代理可用；只有当确实没有空閒线路时才退回直连
-// ——退回时必须把过期的 ProxyURL 一并清掉，否则账号会继续用一条刚被删掉的线路。
+// 原绑定账号优先改派到空闲的启用线路；没有空闲线路时共享绑定账号数最少的线路，
+// 并列按线路列表顺序选择，每分配一个账号就更新计数。只有无启用线路时才退回
+// 直连，并清掉过期的 ProxyID 与 ProxyURL，避免继续使用已删除的线路。
 //
 // 全程在同一把锁内完成：删除、指派与落库之间不存在「账号既没了线路又留着旧地址」
 // 的中间态。
 func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	removed, reassign, err := s.removeProxiesLocked(map[string]bool{profileID: true}, false, "")
+	removed, reassign, err := s.removeProxiesLocked(map[string]bool{profileID: true}, "")
 	return len(removed) > 0, reassign, err
 }
 
 // PurgeProxyProfiles 批量删除代理线路，并把「原本绑定它们的账号」统一改派。
 //
-// 与单条 DeleteProxyProfile 的两点差别：
-//   - 先把整批线路一次性摘除、再统一改派——逐条删除会把 A 线路的账号补位到
-//     同样待删的 B 线路上，紧接着又被二次改派，白白产生抖动；
-//   - 补位规则多一层：没有空閒线路时改派到「当前绑定账号数最少」的线路
-//     （并列取线路表顺序，先创建者优先），让存活线路摊薄负载；只有连候选
-//     都没有（无启用线路）才退回直连，退回时同步清掉过期 ProxyURL。
+// 与单条 DeleteProxyProfile 共用空闲优先、最少绑定策略，但先把整批线路一次性
+// 摘除、再统一改派，避免把 A 线路的账号补位到同样待删的 B 线路后又二次改派。
+// 无启用线路时才退回直连，并同步清掉过期 ProxyURL。
 //
 // 多个账号同时待改派时按 store 内顺序（即账号入池顺序）逐个分配，每分配一个
 // 就更新占用计数，批内也保持摊薄。不存在于线路表的 ID 静默跳过，不报错。
@@ -858,7 +855,7 @@ func (s *Store) PurgeProxyProfiles(ids []string) ([]string, ProxyReassign, error
 			wanted[id] = true
 		}
 	}
-	return s.removeProxiesLocked(wanted, true, "")
+	return s.removeProxiesLocked(wanted, "")
 }
 
 // ── 线路断流熔断 ─────────────────────────────────────────────────────────────

@@ -70,14 +70,14 @@ function describeProbe(d: ProbeResult): RowResult {
   return { state: d.upstream?.blocked ? 'warn' : 'error', text }
 }
 
-/* 刪除線路後的提示：說明原本綁在這條線上的帳號被怎麼處置 */
+/* 删除线路后的提示：改派包含空闲分配与共享，只有无候选才直连 */
 function deletedMessage(reassigned: number, direct: number): string {
   if (reassigned && direct) {
-    return `代理已刪除：${reassigned} 個帳號已改派到空閒線路，${direct} 個無線路可補已改為直連`
+    return `代理已删除：${reassigned} 个账号已改派到其他代理，${direct} 个账号无可用代理，已改为直连`
   }
-  if (reassigned) return `代理已刪除：${reassigned} 個帳號已改派到空閒線路`
-  if (direct) return `代理已刪除：${direct} 個帳號無空閒線路可補，已改為直連`
-  return '代理已刪除'
+  if (reassigned) return `代理已删除：${reassigned} 个账号已改派到其他代理`
+  if (direct) return `代理已删除：${direct} 个账号无可用代理，已改为直连`
+  return '代理已删除'
 }
 
 export function ProxiesPage() {
@@ -138,12 +138,12 @@ export function ProxiesPage() {
 
   function deleteProxy(p: ProxyProfile) {
     confirm({
-      title: '刪除代理',
+      title: '删除代理',
       danger: true,
       description: (
         <>
-          確認刪除 <code className="rounded bg-muted px-1 py-0.5">{p.name}</code>？使用此線路的帳號會自動改派到其它空閒線路，
-          沒有空閒線路時才改為直連。
+          确认删除 <code className="rounded bg-muted px-1 py-0.5">{p.name}</code>？使用此线路的账号会优先改派到其他空闲代理；
+          没有空闲代理时，分配到绑定账号最少的启用代理。只有没有可用代理时才改为直连。
         </>
       ),
       onConfirm: async () => {

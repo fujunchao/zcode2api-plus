@@ -65,8 +65,9 @@ func (s *Store) commitProxyStateWithHistoryLocked(profiles []ProxyProfile, pendi
 	return nil
 }
 
-// removeProxiesLocked 在副本上计算改派。手动删除只用空闲线路；熔断允许共享。
-func (s *Store) removeProxiesLocked(ids map[string]bool, allowShared bool, excludedURL string) ([]string, ProxyReassign, error) {
+// removeProxiesLocked 在副本上统一按空闲优先、最少绑定计算改派。
+// excludedURL 用于领取风控清理时避开相同出口；所有删除入口共用同一选线策略。
+func (s *Store) removeProxiesLocked(ids map[string]bool, excludedURL string) ([]string, ProxyReassign, error) {
 	result := ProxyReassign{Assigned: map[string]string{}}
 	remaining := []ProxyProfile{}
 	var removed []string
@@ -80,38 +81,21 @@ func (s *Store) removeProxiesLocked(ids map[string]bool, allowShared bool, exclu
 	if len(removed) == 0 {
 		return nil, result, nil
 	}
-	occupancy := map[string]int{}
-	var candidates []ProxyProfile
-	for _, p := range remaining {
-		if p.Enabled && (excludedURL == "" || p.URL != excludedURL) {
-			candidates = append(candidates, p)
-		}
-	}
+	occupancy := s.proxyOccupancyLocked()
 	var pending []*model.Account
 	for _, a := range s.allAccountsLocked() {
 		if a.ProxyID != nil && ids[*a.ProxyID] {
 			copy := a.Clone()
 			copy.ProxyID, copy.ProxyURL = nil, nil
 			pending = append(pending, copy)
-		} else if a.ProxyID != nil {
-			occupancy[*a.ProxyID]++
 		}
 	}
 	for _, a := range pending {
-		best := -1
-		for i, p := range candidates {
-			if !allowShared && occupancy[p.ID] > 0 {
-				continue
-			}
-			if best < 0 || occupancy[p.ID] < occupancy[candidates[best].ID] {
-				best = i
-			}
-		}
-		if best < 0 {
+		p, ok := leastLoadedProxy(remaining, occupancy, "", excludedURL)
+		if !ok {
 			result.Direct = append(result.Direct, a.ID)
 			continue
 		}
-		p := candidates[best]
 		id, url := p.ID, p.URL
 		a.ProxyID, a.ProxyURL = &id, &url
 		occupancy[id]++
