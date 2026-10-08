@@ -148,6 +148,8 @@ func TestRefreshAccountsObservedUsesActualRequestIdentity(t *testing.T) {
 	svc, st, billing := setup(t)
 	t.Cleanup(svc.Close)
 	a, _ := st.AddAccount(model.ProviderZai, "new", "header.payload.sig")
+	// AddAccount 返回内部对象；显式读取独立快照，才能模拟持有旧凭据的调用方。
+	a = st.FindAny(a.ID)
 	billing.setStatus(http.StatusOK, observedEmptyBalance)
 	_, observations := svc.RefreshAccountsObserved([]*model.Account{a})
 	initial := observations[a.ID]
