@@ -189,8 +189,8 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// postAddAccounts 新账号入池的收尾链路：自动分配线路 → jwt 账号额度刷新 →
-// 入池自动领取。handleAddAccounts 与批量新增（handleBatchAddAccounts）共用。
+// postAddAccounts 新账号入池的收尾链路：自动分配线路 → 第一次额度查询 →
+// 后台领取、第二次真实查询及新号双次空额度检测。普通和批量新增共用。
 //
 // 自动分配必须排在额度刷新之前：刷新要出站，而 clientFor 只认账号上的 ProxyURL，
 // 线路得先落到账号上（与登录链路「先写线路再兑换/刷新」的约定一致）。
@@ -214,10 +214,10 @@ func (h *Handler) postAddAccounts(provider string, added []string, autoAssign bo
 		}
 	}
 	if len(fresh) > 0 {
-		h.Quota.RefreshAccounts(fresh)
-		// 入池即自动领取（后台 fire-and-forget；对齐 Python add_accounts 尾段）
+		_, observations := h.Quota.RefreshAccountsObserved(fresh)
+		// 只传递本轮真正新建的账号，重复添加不能授权双次空额度淘汰。
 		for _, acc := range fresh {
-			h.scheduleAutoClaim(acc)
+			h.scheduleNewAccountClaim(acc, observations[acc.ID])
 		}
 	}
 	return assignedCount, fallbackCount

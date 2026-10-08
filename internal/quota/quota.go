@@ -51,13 +51,15 @@ type Service struct {
 // 同一结果，对齐 Python 多协程 await 同一 task）；result 由 close 前的写入
 // 与 <-done 建立 happens-before，读取无需加锁。
 type inflightCall struct {
-	done   chan struct{}
-	result map[string]any
+	done        chan struct{}
+	result      map[string]any
+	observation model.StartPlanObservation
 }
 
 type cacheEntry struct {
-	at     time.Time
-	result map[string]any
+	at          time.Time
+	result      map[string]any
+	observation model.StartPlanObservation
 }
 
 // NewService 创建服务（inflight / cache 按账号 ID 索引，语义对齐模块级全局表）。
@@ -190,12 +192,12 @@ func mergeQuotaEntry(current map[string]any, incoming map[string]any) map[string
 // （凭据 / 设备指纹 / 代理都不是本次查询的权威来源），而**所有对账号的改动都经
 // s.apply 在 store 锁内落到「当前」对象上**。此前是"锁外改字段 → UpdateAccount"，
 // 读方（后台领取取快照）会与这里的写入相撞，CI 的 -race 实测抓到过。
-func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) map[string]any {
+func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) (map[string]any, model.StartPlanObservation) {
 	checkedAt := float64(s.now().UnixNano()) / 1e9
 	snap := s.Store.SnapshotAccount(acc.Provider, acc.ID)
 	if snap == nil {
 		// 账号已被删除：不是错误，直接不查。
-		return map[string]any{"error": "账号已不存在"}
+		return map[string]any{"error": "账号已不存在"}, model.StartPlanObservation{}
 	}
 
 	query := url.Values{}
@@ -210,15 +212,21 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) map[st
 		var resp *http.Response
 		resp, err = s.clientFor(snap).Do(req)
 		if err == nil {
-			return s.handleBillingResponse(snap, checkedAt, resp)
+			result := s.handleBillingResponse(snap, checkedAt, resp)
+			var observation model.StartPlanObservation
+			if resp.StatusCode == http.StatusOK {
+				payload, _ := result["balance"].(map[string]any)
+				observation = startPlanObservation(snap, checkedAt, payload)
+			}
+			return result, observation
 		}
 	}
 	if ctx.Err() != nil {
-		return map[string]any{"error": ctx.Err().Error()}
+		return map[string]any{"error": ctx.Err().Error()}, model.StartPlanObservation{}
 	}
 	msg := "额度查询网络错误: " + err.Error()
 	s.fail(snap, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
-	return map[string]any{"error": msg}
+	return map[string]any{"error": msg}, model.StartPlanObservation{}
 }
 
 // apply 在 store 锁内修改账号并落库。Service 对账号的**任何**改动都必须走这里，
@@ -481,8 +489,7 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 		live.LastCheckedAt = &checkedAt
 		live.Plans = plans
 		if model.NewStartPlanObservation(acc, 1, false).Matches(live) {
-			confirmed := payload["code"] != nil && isZeroNumber(payload["code"]) && missingInitialQuota(data)
-			live.StartPlanObservation = model.NewStartPlanObservation(acc, checkedAt, confirmed)
+			live.StartPlanObservation = startPlanObservation(acc, checkedAt, payload)
 		}
 		if len(plans) > 0 {
 			live.Plan = plans[0]
@@ -536,28 +543,47 @@ func (s *Service) FetchQuota(acc *model.Account) map[string]any {
 }
 
 func (s *Service) fetchQuotaContext(ctx context.Context, acc *model.Account) map[string]any {
-	s.mu.Lock()
-	if s.closed || ctx.Err() != nil || s.ctx.Err() != nil {
-		s.mu.Unlock()
-		return map[string]any{"error": "额度查询已取消"}
-	}
-	if call, ok := s.inflight[acc.ID]; ok {
-		s.mu.Unlock()
-		select {
-		case <-call.done:
-			return call.result
-		case <-ctx.Done():
-			return map[string]any{"error": ctx.Err().Error()}
-		}
-	}
-	if entry, ok := s.cache[acc.ID]; ok {
-		if s.now().Sub(entry.at) < QuotaCacheTTL {
+	result, _ := s.queryQuotaContext(ctx, acc, false)
+	return result
+}
+
+// FetchQuotaFresh 在调用后重新出站查询，既不读缓存，也不复用已经在途的旧查询。
+// 新账号领取后的第二次观测使用此入口；等待旧查询和新请求都响应调用方/服务取消。
+func (s *Service) FetchQuotaFresh(ctx context.Context, acc *model.Account) (map[string]any, model.StartPlanObservation) {
+	return s.queryQuotaContext(ctx, acc, true)
+}
+
+func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fresh bool) (map[string]any, model.StartPlanObservation) {
+	for {
+		s.mu.Lock()
+		if s.closed || ctx.Err() != nil || s.ctx.Err() != nil {
 			s.mu.Unlock()
-			out := maps.Clone(entry.result) // 对齐 {**result, "cached": True}
-			out["cached"] = true
-			return out
+			return map[string]any{"error": "额度查询已取消"}, model.StartPlanObservation{}
 		}
-		delete(s.cache, acc.ID)
+		if call, ok := s.inflight[acc.ID]; ok {
+			s.mu.Unlock()
+			select {
+			case <-call.done:
+				if fresh {
+					continue // 领取前开始的查询，不能充当领取后的第二次观测。
+				}
+				return call.result, call.observation
+			case <-ctx.Done():
+				return map[string]any{"error": ctx.Err().Error()}, model.StartPlanObservation{}
+			case <-s.ctx.Done():
+				return map[string]any{"error": s.ctx.Err().Error()}, model.StartPlanObservation{}
+			}
+		}
+		if entry, ok := s.cache[acc.ID]; ok {
+			if !fresh && s.now().Sub(entry.at) < QuotaCacheTTL {
+				s.mu.Unlock()
+				out := maps.Clone(entry.result)
+				out["cached"] = true
+				return out, entry.observation
+			}
+			delete(s.cache, acc.ID)
+		}
+		break // 保持锁：注册新查询，避免普通刷新和强制刷新同时出站。
 	}
 	call := &inflightCall{done: make(chan struct{})}
 	s.inflight[acc.ID] = call
@@ -576,29 +602,35 @@ func (s *Service) fetchQuotaContext(ctx context.Context, acc *model.Account) map
 		//
 		// 兜住之后仍要唤醒等待者并清理 inflight，否则调用方会永久阻塞在 <-call.done。
 		var result map[string]any
+		var observation model.StartPlanObservation
 		defer func() {
 			if r := recover(); r != nil {
 				web.Warn("quota", fmt.Sprintf("解析账号 %s 额度时 panic（已隔离）: %v", acc.Name, r))
 				result = map[string]any{"error": "额度解析失败"}
+				observation = model.StartPlanObservation{}
 			}
+			s.mu.Lock()
 			if _, hasErr := result["error"]; !hasErr {
-				s.mu.Lock()
-				s.cache[acc.ID] = cacheEntry{at: s.now(), result: result}
-				s.mu.Unlock()
+				s.cache[acc.ID] = cacheEntry{at: s.now(), result: result, observation: observation}
 			}
 			// 仅当仍是本查询时才清理（对齐 done_callback 的身份校验）
-			s.mu.Lock()
 			if cur, ok := s.inflight[acc.ID]; ok && cur == call {
 				delete(s.inflight, acc.ID)
 			}
-			s.mu.Unlock()
-			call.result = result
+			call.result, call.observation = result, observation
 			close(call.done)
+			s.mu.Unlock()
 		}()
-		result = s.fetchQuotaOnce(queryCtx, acc)
+		result, observation = s.fetchQuotaOnce(queryCtx, acc)
 	}()
-	<-call.done
-	return call.result
+	select {
+	case <-call.done:
+		return call.result, call.observation
+	case <-ctx.Done():
+		return map[string]any{"error": ctx.Err().Error()}, model.StartPlanObservation{}
+	case <-s.ctx.Done():
+		return map[string]any{"error": s.ctx.Err().Error()}, model.StartPlanObservation{}
+	}
 }
 
 // pruneCache 清理已删除账号的额度缓存，避免缓存无界增长（对齐 _prune_quota_cache）。
@@ -622,9 +654,21 @@ func (s *Service) RefreshAccounts(accounts []*model.Account) map[string]any {
 }
 
 func (s *Service) refreshAccountsContext(ctx context.Context, accounts []*model.Account) map[string]any {
+	summary, _ := s.refreshAccountsObserved(ctx, accounts)
+	return summary
+}
+
+// RefreshAccountsObserved 在刷新汇总之外返回每个账号本次查询的独立证据。
+// 入池流程保留第一次观测，不能事后重读可能已被后台监控替换的账号快照。
+func (s *Service) RefreshAccountsObserved(accounts []*model.Account) (map[string]any, map[string]model.StartPlanObservation) {
+	return s.refreshAccountsObserved(s.ctx, accounts)
+}
+
+func (s *Service) refreshAccountsObserved(ctx context.Context, accounts []*model.Account) (map[string]any, map[string]model.StartPlanObservation) {
 	s.pruneCache()
+	observations := map[string]model.StartPlanObservation{}
 	if len(accounts) == 0 {
-		return map[string]any{"ok": 0, "fail": 0}
+		return map[string]any{"ok": 0, "fail": 0}, observations
 	}
 	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
@@ -649,16 +693,17 @@ func (s *Service) refreshAccountsContext(ctx context.Context, accounts []*model.
 				return
 			}
 			defer func() { <-sem }()
-			res := s.fetchQuotaContext(ctx, acc)
+			res, observation := s.queryQuotaContext(ctx, acc, false)
+			mu.Lock()
+			observations[acc.ID] = observation
 			if _, hasErr := res["error"]; !hasErr {
-				mu.Lock()
 				okCount++
-				mu.Unlock()
 			}
+			mu.Unlock()
 		}(acc)
 	}
 	wg.Wait()
-	return map[string]any{"ok": okCount, "fail": len(accounts) - okCount}
+	return map[string]any{"ok": okCount, "fail": len(accounts) - okCount}, observations
 }
 
 // ── 后台监控 ────────────────────────────────────────────────────────────────

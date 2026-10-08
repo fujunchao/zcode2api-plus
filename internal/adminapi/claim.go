@@ -29,8 +29,8 @@ type claimGate chan struct{}
 
 func newClaimGate() claimGate { return make(claimGate, 1) }
 
-// acquire 非阻塞抢占闸门。抢不到返回 false：入池触发的领取本轮放弃即可，
-// 把 goroutine 堆在这儿等与并发并无区别，只是换了个地方排队。
+// acquire 供手动和既有账号自动路径非阻塞抢占，抢不到返回 false。
+// 真正新账号必须完成领取后补查，使用独立的可取消等待路径。
 func (g claimGate) acquire() bool {
 	select {
 	case g <- struct{}{}:
@@ -153,8 +153,7 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 		web.Warn("claim", "领取状态落库失败: "+err.Error())
 		return
 	}
-	// 先保存领取冷却，再按结构化风控信号淘汰代理；三个领取入口共用。
-	h.handleClaimProxyRisk(acc, outcomes)
+	// 单次空额度/领取风控不能删除代理；仅新账号专属收尾允许双次额度检测。
 }
 
 // numberOf 宽松取数值（JSON 解析一律 float64，代码内构造的可能是 int）。
@@ -190,12 +189,23 @@ func markPreview(id string, now time.Time) {
 
 // ── 触发点 ──────────────────────────────────────────────────────────────────
 
-// scheduleAutoClaim 入池后后台自动领取（fire-and-forget；对齐 _schedule_auto_claim）。
+// scheduleAutoClaim 既有账号授权后的后台自动领取，不带新账号代理检测。
 // 受后台「入池自動領取」开关约束——刻意只拦自动路径，手动按钮永远可用；
 // 冷却中直接跳过：上游已在响应里给出下次可领时间，到点前重试只是白打一次上游。
 func (h *Handler) scheduleAutoClaim(acc *model.Account) {
+	h.scheduleClaim(acc, nil)
+}
+
+// scheduleNewAccountClaim 只由真正新建账号的入口调用，保留首查证据并排队完成收尾。
+// 普通自动领取、重新登录及定时任务没有此证据，不能进入新号代理淘汰路径。
+func (h *Handler) scheduleNewAccountClaim(acc *model.Account, initial model.StartPlanObservation) {
+	h.scheduleClaim(acc, &initial)
+}
+
+func (h *Handler) scheduleClaim(acc *model.Account, initial *model.StartPlanObservation) {
 	// 只取走用得到的标量：后台 goroutine 不该再碰 store 的内部对象（见 claimUnderGate）。
 	name := acc.Name
+	target := &model.Account{Provider: acc.Provider, ID: acc.ID}
 	if !h.Store.ClaimAutoEnabled() {
 		web.Ok("claim", fmt.Sprintf("账号 %s 已关闭入池自动领取，跳过", name))
 		return
@@ -220,11 +230,18 @@ func (h *Handler) scheduleAutoClaim(acc *model.Account) {
 				web.Warn("claim", "自动领取任务异常（已兜底）")
 			}
 		}()
-		if !claimSlot.acquire() {
+		ctx := h.backgroundContext()
+		if initial != nil {
+			select {
+			case claimSlot <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+		} else if !claimSlot.acquire() {
 			web.Ok("claim", fmt.Sprintf("账号 %s 已有领取任务在跑，本轮跳过", name))
 			return
 		}
-		h.claimUnderGate(acc)
+		h.claimUnderGateWithInitial(ctx, target, initial)
 	}()
 }
 
@@ -234,14 +251,19 @@ func (h *Handler) claimUnderGate(acc *model.Account) bool {
 	return h.claimUnderGateContext(h.backgroundContext(), acc)
 }
 
-func (h *Handler) claimUnderGateContext(ctx context.Context, acc *model.Account) (succeeded bool) {
+func (h *Handler) claimUnderGateContext(ctx context.Context, acc *model.Account) bool {
+	return h.claimUnderGateWithInitial(ctx, acc, nil)
+}
+
+func (h *Handler) claimUnderGateWithInitial(ctx context.Context, acc *model.Account, initial *model.StartPlanObservation) bool {
 	defer claimSlot.release()
 	// 领取可能持续数十秒，期间后台仍在改账号（删除线路会改派 ProxyURL/ProxyID、
 	// 额度刷新会改 Status/Quota）。这里先取一份副本再开工——直接拿 store 的内部
 	// 指针会让整个领取过程与那些写入相撞（CI 的 -race 实测到过）。
 	// 副本上的改动不会进 store，故结果由 applyClaimOutcome 按 ID 回写。
 	snap := h.Store.SnapshotAccount(acc.Provider, acc.ID)
-	if ctx.Err() != nil || snap == nil || !snap.IsAutoClaimTarget(time.Now()) || claimCooldownActive(snap, time.Now()) {
+	if ctx.Err() != nil || snap == nil || !snap.IsAutoClaimTarget(time.Now()) || claimCooldownActive(snap, time.Now()) ||
+		(initial != nil && !h.Store.ClaimAutoEnabled()) {
 		// 账号已删除、健康状态变更或进入领取冷却：跳过且不写失败状态。
 		return false
 	}
@@ -251,6 +273,10 @@ func (h *Handler) claimUnderGateContext(ctx context.Context, acc *model.Account)
 		return false
 	}
 	h.applyClaimOutcome(snap, outcomes, time.Now())
+	if initial != nil {
+		// 本次领取结束后再真实出站；保留槽位至检测结束，下一新号再读取最新指派。
+		h.finishNewAccountQuotaCheck(ctx, snap, *initial)
+	}
 	for _, o := range outcomes {
 		if ok, _ := o["ok"].(bool); ok {
 			return true
@@ -265,7 +291,7 @@ func (h *Handler) claimUnderGateContext(ctx context.Context, acc *model.Account)
 const claimScheduleTick = 30 * time.Second
 
 // claimSlotWait 定时批量抢占闸门的等待上限。一天一次的批量宁可排队慢一点，
-// 也不该把账号静默丢掉（与入池路径"抢不到即放弃"刻意不同）。
+// 也不该把账号静默丢掉；新号入池则采用无固定超时、可随停机取消的等待。
 const claimSlotWait = 30 * time.Second
 
 // claimBatchGap 批量内相邻账号的间隔，避免把上游打得太密。
@@ -484,7 +510,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// 线路（此前事件是独立的裸直连客户端，同一 device_mid 两个出口 IP）。
 	svc := claim.NewServiceContext(h.backgroundContext(), h.Captcha)
 	for _, acc := range candidates {
-		// 前一个账号可能已淘汰共享线路；批量中的后续账号必须用改派后的出口。
+		// 新号检测或巡检可能已淘汰共享线路；批量后续账号必须用改派后的出口。
 		acc = h.Store.SnapshotAccount(acc.Provider, acc.ID)
 		if acc == nil {
 			continue

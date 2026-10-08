@@ -49,22 +49,27 @@ func (s *Store) RotateAccountProxy(expected *model.Account) (ProxyProfile, bool,
 	return result.Next, result.Reason == "changed", err
 }
 
-// PurgeUnprovisionedClaimProxy 原子淘汰「未获初始额度 + 领取风控」请求使用的线路。
-// 风控信号由调用方确认；锁内再次核对额度证据、凭据和绑定，防止迟到请求误删。
-// 全部关联账号按空闲优先/最少绑定改派，沿用熔断事务；不修改任何账号领取冷却。
-func (s *Store) PurgeUnprovisionedClaimProxy(expected *model.Account) (bool, ProxyReassign, error) {
+// PurgeEmptyNewAccountProxy 仅供本次真正新建账号的领取收尾调用。
+// initial/final 是领取前后的独立查询证据，expected 是领取开始前的账号快照。
+// 全部关联账号按空闲优先/最少绑定原子改派；不改领取状态，也不在新线路循环检测。
+func (s *Store) PurgeEmptyNewAccountProxy(expected *model.Account, initial, final model.StartPlanObservation) (bool, ProxyReassign, error) {
 	empty := ProxyReassign{Assigned: map[string]string{}}
-	if !expected.MissingStartPlanEvidence() || derefStr(expected.ProxyID) == "" {
+	if !expected.MissingStartPlanEvidence() || initial.ProxyID == "" || !initial.Missing || !final.Missing ||
+		!initial.Matches(expected) || !final.Matches(expected) || final.CheckedAt <= initial.CheckedAt ||
+		final.CheckedAt <= expected.StartPlanObservation.CheckedAt {
 		return false, empty, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	live := s.findLocked(expected.Provider, expected.ID)
-	if !live.MissingStartPlanEvidence() || !expected.StartPlanObservation.Matches(live) {
+	// 本次领取成功允许检测，但历史使用、并发新快照、凭据/出口变更都要保护。
+	// final 必须仍是最新观测；不能拿迟到的空回包覆盖后来的有效额度。
+	if live == nil || !live.IsAutoClaimTarget(time.Now()) || live.UseCount > 0 ||
+		len(live.Plans) > 0 || len(live.Plan) > 0 || live.StartPlanObservation != final || !final.Matches(live) {
 		return false, empty, nil
 	}
 	for _, p := range s.listProxyProfilesLocked() {
-		if p.ID == *expected.ProxyID && p.URL == derefStr(expected.ProxyURL) {
+		if p.ID == initial.ProxyID && p.URL == initial.ProxyURL && p.Enabled {
 			removed, reassign, err := s.removeProxiesLocked(map[string]bool{p.ID: true}, p.URL)
 			return len(removed) > 0, reassign, err
 		}

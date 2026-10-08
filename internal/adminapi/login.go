@@ -174,7 +174,7 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 }
 
 // saveOAuthAccount 落库登录凭证：JWT 入池（邮箱命名）→ 写入选定线路 →
-// 兑换 API Key 回填同账号 → 刷新额度 + 自动领取。
+// 兑换 API Key 回填同账号 → 首次额度查询 + 自动领取。真正新号领取后再补查一次。
 // 兑换/刷新失败不影响 JWT 已入池（对齐 Python _save_oauth_account）。
 func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginSession) (*model.Account, *apiError) {
 	email := ""
@@ -222,9 +222,14 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 		}
 	}
 	if account.Mode == "jwt" {
-		h.Quota.RefreshAccounts([]*model.Account{account})
-		// 授权完成即激活 + 自动领取（入池即吃满活动；对齐 Python _save_oauth_account）
-		h.scheduleAutoClaim(account)
+		if isNew {
+			_, observations := h.Quota.RefreshAccountsObserved([]*model.Account{account})
+			h.scheduleNewAccountClaim(account, observations[account.ID])
+		} else {
+			// 重登只沿用原刷新与领取行为，绝不把存量空额度当作新号代理问题。
+			h.Quota.RefreshAccounts([]*model.Account{account})
+			h.scheduleAutoClaim(account)
+		}
 	}
 	return account, nil
 }

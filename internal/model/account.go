@@ -175,7 +175,7 @@ type Account struct {
 	// json:"-"：纯运行期状态，不新增 accounts.data 的键（34 键硬契约）。
 	TruncateAvoidUntil float64 `json:"-"`
 
-	StartPlanObservation StartPlanObservation `json:"-"` // 领取风控淘汰代理所需的有效空额度证据
+	StartPlanObservation StartPlanObservation `json:"-"` // 新账号双次额度检测使用的运行期查询证据
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。

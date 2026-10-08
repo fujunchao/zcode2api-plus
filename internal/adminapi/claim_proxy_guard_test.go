@@ -72,16 +72,16 @@ func (f *claimGuardFixture) manual() *httptest.ResponseRecorder {
 	return w
 }
 
-// 重现日志中的组合信号，覆盖手动和入池/定时共用的自动领取入口。
-func TestMissingStartPlanClaimRiskPurgesProxy(t *testing.T) {
+// 没有“本次真正新建”上下文的手动/自动入口不能凭单次空额度淘汰代理。
+func TestExistingAccountClaimRiskKeepsProxy(t *testing.T) {
 	for _, mode := range []string{"manual", "auto"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newClaimGuardFixture(t, 200, `{"code":0,"data":{"plans":[],"balances":[]}}`)
 			f.h.Quota.FetchQuota(f.a)
 			if mode == "manual" {
 				w := f.manual()
-				if w.Code != 200 || !strings.Contains(w.Body.String(), "unusual activity") || !strings.Contains(w.Body.String(), "proxy_removed") {
-					t.Fatalf("应返回风控与代理移除信息: %d %s", w.Code, w.Body.String())
+				if w.Code != 200 || !strings.Contains(w.Body.String(), "unusual activity") || strings.Contains(w.Body.String(), "proxy_removed") {
+					t.Fatalf("应报告风控但不得删除老账号代理: %d %s", w.Code, w.Body.String())
 				}
 			} else {
 				if !claimSlot.acquire() {
@@ -91,14 +91,12 @@ func TestMissingStartPlanClaimRiskPurgesProxy(t *testing.T) {
 					t.Fatal("风控不得报告领取成功")
 				}
 			}
-			for _, p := range f.h.Store.ListProxyProfiles() {
-				if p.ID == f.bad.ID {
-					t.Fatal("无 Start plan 且领取风控后，问题代理仍留在代理池")
-				}
+			if len(f.h.Store.ListProxyProfiles()) != 2 {
+				t.Fatal("老账号即使没有 Start plan 且领取风控，也不能淘汰代理")
 			}
 			got := f.h.Store.FindAny(f.a.ID)
-			if got.ProxyID == nil || *got.ProxyID != f.good.ID || got.ProxyURL == nil || *got.ProxyURL != f.good.URL {
-				t.Fatal("问题代理移除后，应自动分配可用代理")
+			if got.ProxyID == nil || *got.ProxyID != f.bad.ID || got.ProxyURL == nil || *got.ProxyURL != f.bad.URL {
+				t.Fatal("老账号必须保持原代理绑定")
 			}
 			if got.Claim == nil || got.Claim.NextAt == nil || *got.Claim.NextAt <= float64(time.Now().Unix()) {
 				t.Fatal("换线应保留领取冷却")
@@ -135,7 +133,7 @@ func TestClaimRiskWithoutInitialQuotaEvidenceKeepsProxy(t *testing.T) {
 	}
 }
 
-func TestBatchClaimUsesReassignedProxy(t *testing.T) {
+func TestExistingBatchClaimDoesNotRemoveEmptyProxy(t *testing.T) {
 	f := newClaimGuardFixture(t, 200, `{"code":0,"data":{"plans":[],"balances":[]}}`)
 	peer, _ := f.h.Store.AddAccount(model.ProviderZai, "peer", "header.payload.other")
 	_, _ = f.h.Store.AssignProxyProfile(peer.ID, f.bad.ID)
@@ -143,10 +141,10 @@ func TestBatchClaimUsesReassignedProxy(t *testing.T) {
 		f.h.Quota.FetchQuota(a)
 	}
 	w := f.manual()
-	if w.Code != 200 || f.oldClaims.Load() != 1 || f.newClaims.Load() != 1 {
-		t.Fatalf("批量后续账号应立即使用已改派的出口: old=%d new=%d response=%s", f.oldClaims.Load(), f.newClaims.Load(), w.Body.String())
+	if w.Code != 200 || f.oldClaims.Load() != 2 || f.newClaims.Load() != 0 {
+		t.Fatalf("老账号批量领取不能因空额度更换出口: old=%d new=%d response=%s", f.oldClaims.Load(), f.newClaims.Load(), w.Body.String())
 	}
-	if len(f.h.Store.ListProxyProfiles()) != 1 {
-		t.Fatal("不能用原线路的空额度证据继续删除新代理")
+	if len(f.h.Store.ListProxyProfiles()) != 2 {
+		t.Fatal("存量账号批量领取必须保留代理池")
 	}
 }

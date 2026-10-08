@@ -2,7 +2,7 @@
 // 设计规格见 docs/plan-account-batch-management.md；与既有端点的关系：
 //   - 全部为新路由，旧端点（POST /admin/api/accounts、DELETE /admin/api/accounts、
 //     POST /admin/api/accounts/{id}/enabled）零改动；
-//   - 收尾链路（线路分配 → 额度刷新 → 自动领取）与单轮新增共用 postAddAccounts；
+//   - 收尾链路（线路分配 → 首查 → 领取 → 补查）与单轮新增共用 postAddAccounts；
 //   - 事务一致性由 store 层保证（单锁 + 单 SQLite 事务，commit 成功才动内存），
 //     本层负责请求校验、错误映射与逐条明细回传。
 package adminapi
