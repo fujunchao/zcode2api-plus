@@ -17,13 +17,18 @@ func TestClaimRiskClassification(t *testing.T) {
 		{"HTTP200业务风控", 200, `{"code":"3012","msg":"denied"}`, true},
 		{"嵌套错误文案", 405, `{"error":{"message":"unusual activity"}}`, true},
 		{"纯文本风控", 403, `request blocked due to unusual activity`, true},
+		{"英文可疑请求", 403, `Suspicious request detected`, true},
+		{"中文可疑请求", 200, `{"code":9001,"msg":"检测到可疑的请求"}`, true},
+		{"繁体可疑请求", 403, `檢測到可疑請求`, true},
 		{"普通405", 405, `method not allowed`, false},
 		{"鉴权失败", 401, `{"code":401,"msg":"unauthorized"}`, false},
 		{"验证码失败", 400, `{"code":3007,"msg":"captcha blocked"}`, false},
 		{"已领取", 200, `{"code":1003,"msg":"already claimed"}`, false},
 		{"额度耗尽", 200, `{"code":1005,"msg":"request blocked"}`, false},
+		{"已领取的可疑字样", 200, `{"code":1003,"msg":"suspicious request"}`, false},
 		{"成功文案不是风控", 200, `{"code":0,"data":{"note":"risk checked"}}`, false},
 		{"元数据键不是风控", 500, `{"code":0,"msg":"busy","risk_control":false}`, false},
+		{"伪造故障元数据", 200, `{"code":1003,"proxy_failure":"claim_suspicious"}`, false},
 		{"上游冷却时间", 405, `{"code":3012,"msg":"unusual activity","data":{"plan":{"ends_at":1700007200}}}`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

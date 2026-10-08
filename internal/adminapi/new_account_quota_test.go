@@ -212,12 +212,12 @@ func TestNewAccountFirstQuotaProtectsProxy(t *testing.T) {
 	}
 }
 
-func TestExistingAccountEmptyQuotaClaimRiskKeepsProxy(t *testing.T) {
+func TestExistingAccountEmptyQuotaClaimRiskPurgesProxy(t *testing.T) {
 	f := newClaimGuardFixture(t, http.StatusOK, `{"code":0,"data":{"plans":[],"balances":[]}}`)
 	f.h.Quota.FetchQuota(f.a)
 	w := f.manual()
-	if w.Code != http.StatusOK || len(f.h.Store.ListProxyProfiles()) != 2 || strings.Contains(w.Body.String(), "proxy_removed") {
-		t.Fatalf("老账号空额度和领取风控都不得触发新号代理淘汰：%s", w.Body.String())
+	if w.Code != http.StatusOK || len(f.h.Store.ListProxyProfiles()) != 1 || !strings.Contains(w.Body.String(), "proxy_removed") {
+		t.Fatalf("新规则下老账号也按明确领取风控淘汰，而不是按空额度淘汰：%s", w.Body.String())
 	}
 }
 
@@ -306,8 +306,12 @@ func TestNewAccountClaimFailureOrNoPlanStillRefreshes(t *testing.T) {
 				f.claimStatus, f.claimBody = http.StatusServiceUnavailable, `{"code":500,"msg":"temporarily unavailable"}`
 			}
 			f.onRequest = func(_ *http.Request, request newAccountRequest) {
-				if request.balanceNumber == 2 && len(f.h.Store.ListProxyProfiles()) != 2 {
-					t.Error("第二次额度响应前不能提前删除代理")
+				want := 2
+				if mode == "领取风控" {
+					want = 1 // 明确风控在领取结束时立即淘汰，不必等待第二次额度查询。
+				}
+				if request.balanceNumber == 2 && len(f.h.Store.ListProxyProfiles()) != want {
+					t.Error("仅明确风控允许在第二次额度查询前淘汰代理")
 				}
 			}
 			f.mu.Unlock()
@@ -379,12 +383,12 @@ func TestExistingAccountReloginNeverRunsNewAccountGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.claimStatus, f.claimBody = http.StatusMethodNotAllowed, `{"code":3012,"msg":"request has been blocked due to unusual activity."}`
+	f.claimStatus, f.claimBody = http.StatusOK, `{"code":1003,"msg":"already claimed"}`
 	f.mu.Unlock()
 	a := f.login(t, "existing-user")
 	f.wait(t)
 	if a.ID != old.ID || len(f.h.Store.ListProxyProfiles()) != 2 {
-		t.Fatal("已有账号重登即使空额度且风控也不能触发新号检测")
+		t.Fatal("已有账号重登时普通空额度/已领取仍不能触发新号检测")
 	}
 	balances := 0
 	for _, r := range f.accountRequests(a.Secret()) {

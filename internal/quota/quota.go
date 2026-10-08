@@ -19,6 +19,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/proxyguard"
 	"zcode2api/internal/store"
 	"zcode2api/internal/web"
 )
@@ -54,12 +55,14 @@ type inflightCall struct {
 	done        chan struct{}
 	result      map[string]any
 	observation model.StartPlanObservation
+	identity    model.StartPlanObservation // 与具体额度无关的请求身份，防止跨代理/凭据复用。
 }
 
 type cacheEntry struct {
 	at          time.Time
 	result      map[string]any
 	observation model.StartPlanObservation
+	identity    model.StartPlanObservation
 }
 
 // NewService 创建服务（inflight / cache 按账号 ID 索引，语义对齐模块级全局表）。
@@ -192,13 +195,10 @@ func mergeQuotaEntry(current map[string]any, incoming map[string]any) map[string
 // （凭据 / 设备指纹 / 代理都不是本次查询的权威来源），而**所有对账号的改动都经
 // s.apply 在 store 锁内落到「当前」对象上**。此前是"锁外改字段 → UpdateAccount"，
 // 读方（后台领取取快照）会与这里的写入相撞，CI 的 -race 实测抓到过。
-func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) (map[string]any, model.StartPlanObservation) {
+func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[string]any, model.StartPlanObservation) {
 	checkedAt := float64(s.now().UnixNano()) / 1e9
-	snap := s.Store.SnapshotAccount(acc.Provider, acc.ID)
-	if snap == nil {
-		// 账号已被删除：不是错误，直接不查。
-		return map[string]any{"error": "账号已不存在"}, model.StartPlanObservation{}
-	}
+	// queryQuotaContext 已将实际出站快照和合并/缓存身份一并固定，不能在这里再换快照。
+	proxied := s.Client == nil && snap.ProxyID != nil && *snap.ProxyID != "" && snap.ProxyURL != nil && *snap.ProxyURL != ""
 
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeClientVersion)
@@ -209,10 +209,14 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) (map[s
 		for k, v := range authHeaders(snap) {
 			req.Header.Set(k, v)
 		}
+		client, clientErr := s.clientFor(snap)
+		if clientErr != nil {
+			return s.quotaRequestFailure(ctx, snap, checkedAt, "账号代理配置无效，无法发起额度查询", proxied), model.StartPlanObservation{}
+		}
 		var resp *http.Response
-		resp, err = s.clientFor(snap).Do(req)
+		resp, err = client.Do(req)
 		if err == nil {
-			result := s.handleBillingResponse(snap, checkedAt, resp)
+			result := s.handleBillingResponseForRequest(ctx, snap, checkedAt, resp, proxied)
 			var observation model.StartPlanObservation
 			if resp.StatusCode == http.StatusOK {
 				payload, _ := result["balance"].(map[string]any)
@@ -225,8 +229,19 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, acc *model.Account) (map[s
 		return map[string]any{"error": ctx.Err().Error()}, model.StartPlanObservation{}
 	}
 	msg := "额度查询网络错误: " + err.Error()
-	s.fail(snap, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
-	return map[string]any{"error": msg}, model.StartPlanObservation{}
+	return s.quotaRequestFailure(ctx, snap, checkedAt, msg, proxied && proxy.IsEndpointUnreachable(ctx, err)), model.StartPlanObservation{}
+}
+
+func (s *Service) quotaRequestFailure(ctx context.Context, acc *model.Account, checkedAt float64, message string, proxyFailure bool) map[string]any {
+	if ctx.Err() != nil {
+		return map[string]any{"error": ctx.Err().Error()}
+	}
+	s.fail(acc, checkedAt, message, model.ErrorKindQuotaQueryFailed, "")
+	out := map[string]any{"error": message}
+	if proxyFailure {
+		maps.Copy(out, proxyguard.Purge(ctx, s.Store, acc, proxy.FailureEndpointUnreachable))
+	}
+	return out
 }
 
 // apply 在 store 锁内修改账号并落库。Service 对账号的**任何**改动都必须走这里，
@@ -304,19 +319,15 @@ func textPreview(text string) string {
 }
 
 // clientFor 返回账号出站客户端；配置了代理时走代理传输（20s 超时，短请求）。
-// 代理无效时回退直连并记日志（对齐 claim 包的同名行为）。
-func (s *Service) clientFor(acc *model.Account) HTTPClient {
+// 已配置代理无效时返回错误，不能悄悄直连后把结果归因到原代理。
+func (s *Service) clientFor(acc *model.Account) (HTTPClient, error) {
 	if s.Client != nil {
-		return s.Client
+		return s.Client, nil
 	}
 	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
-		client, err := proxy.ClientFor(*acc.ProxyURL, 20*time.Second)
-		if err == nil {
-			return client
-		}
-		web.Warn("quota", fmt.Sprintf("账号 %s 代理无效，回退直连: %v", acc.Name, err))
+		return proxy.ClientFor(*acc.ProxyURL, 20*time.Second)
 	}
-	return &http.Client{Timeout: 20 * time.Second}
+	return &http.Client{Timeout: 20 * time.Second}, nil
 }
 
 // handleBillingResponse 处理计费端点响应：错误分类、快照解析与状态回写。
@@ -325,7 +336,18 @@ func (s *Service) clientFor(acc *model.Account) HTTPClient {
 // 读取与写入一律在 s.apply 的锁内对「当前」对象进行，避免与其它写入方交错
 // （例如冷却标记、失效标记、另一路刷新）。checkedAt 与本次结果一并写入。
 func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, resp *http.Response) map[string]any {
+	// 仅处理响应的调用没有实际出站证明，不允许据此删除代理。
+	return s.handleBillingResponseForRequest(s.ctx, acc, checkedAt, resp, false)
+}
+
+func (s *Service) handleBillingResponseForRequest(ctx context.Context, acc *model.Account, checkedAt float64, resp *http.Response, proxied bool) map[string]any {
 	defer resp.Body.Close()
+	if ctx.Err() != nil {
+		return map[string]any{"error": ctx.Err().Error()}
+	}
+	if resp.StatusCode == http.StatusProxyAuthRequired {
+		return s.quotaRequestFailure(ctx, acc, checkedAt, "代理认证失败 HTTP 407", proxied)
+	}
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		msg := fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode)
@@ -334,6 +356,9 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBillingBodyBytes))
+		if ctx.Err() != nil {
+			return map[string]any{"error": ctx.Err().Error()}
+		}
 		text := string(body)
 		// 上游对重复查询返回 405：已有快照时视为幂等成功（清错误、不重建状态）。
 		// 「是否已有快照」必须在锁内判断，否则与并发写入方交错。
@@ -365,10 +390,12 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 	}
 
 	body, err := io.ReadAll(resp.Body)
+	if ctx.Err() != nil {
+		return map[string]any{"error": ctx.Err().Error()}
+	}
 	if err != nil {
 		msg := "额度查询网络错误: " + err.Error()
-		s.fail(acc, checkedAt, msg, model.ErrorKindQuotaQueryFailed, "")
-		return map[string]any{"error": msg}
+		return s.quotaRequestFailure(ctx, acc, checkedAt, msg, proxied && proxy.IsEndpointUnreachable(ctx, err))
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -554,7 +581,12 @@ func (s *Service) FetchQuotaFresh(ctx context.Context, acc *model.Account) (map[
 }
 
 func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fresh bool) (map[string]any, model.StartPlanObservation) {
+	var requestAccount *model.Account
 	for {
+		requestAccount = s.Store.SnapshotAccount(acc.Provider, acc.ID)
+		if requestAccount == nil {
+			return map[string]any{"error": "账号已不存在"}, model.StartPlanObservation{}
+		}
 		s.mu.Lock()
 		if s.closed || ctx.Err() != nil || s.ctx.Err() != nil {
 			s.mu.Unlock()
@@ -564,8 +596,8 @@ func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fre
 			s.mu.Unlock()
 			select {
 			case <-call.done:
-				if fresh {
-					continue // 领取前开始的查询，不能充当领取后的第二次观测。
+				if fresh || !call.identity.Matches(s.Store.SnapshotAccount(acc.Provider, acc.ID)) {
+					continue // 领取前或旧出口/旧凭据的查询，不能替代本次需要的观测。
 				}
 				return call.result, call.observation
 			case <-ctx.Done():
@@ -575,7 +607,7 @@ func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fre
 			}
 		}
 		if entry, ok := s.cache[acc.ID]; ok {
-			if !fresh && s.now().Sub(entry.at) < QuotaCacheTTL {
+			if !fresh && entry.identity.Matches(requestAccount) && s.now().Sub(entry.at) < QuotaCacheTTL {
 				s.mu.Unlock()
 				out := maps.Clone(entry.result)
 				out["cached"] = true
@@ -585,7 +617,7 @@ func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fre
 		}
 		break // 保持锁：注册新查询，避免普通刷新和强制刷新同时出站。
 	}
-	call := &inflightCall{done: make(chan struct{})}
+	call := &inflightCall{done: make(chan struct{}), identity: model.NewStartPlanObservation(requestAccount, 1, false)}
 	s.inflight[acc.ID] = call
 	s.tasks.Add(1)
 	s.mu.Unlock()
@@ -605,13 +637,13 @@ func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fre
 		var observation model.StartPlanObservation
 		defer func() {
 			if r := recover(); r != nil {
-				web.Warn("quota", fmt.Sprintf("解析账号 %s 额度时 panic（已隔离）: %v", acc.Name, r))
+				web.Warn("quota", fmt.Sprintf("解析账号 %s 额度时 panic（已隔离）: %v", requestAccount.Name, r))
 				result = map[string]any{"error": "额度解析失败"}
 				observation = model.StartPlanObservation{}
 			}
 			s.mu.Lock()
 			if _, hasErr := result["error"]; !hasErr {
-				s.cache[acc.ID] = cacheEntry{at: s.now(), result: result, observation: observation}
+				s.cache[acc.ID] = cacheEntry{at: s.now(), result: result, observation: observation, identity: call.identity}
 			}
 			// 仅当仍是本查询时才清理（对齐 done_callback 的身份校验）
 			if cur, ok := s.inflight[acc.ID]; ok && cur == call {
@@ -621,7 +653,7 @@ func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fre
 			close(call.done)
 			s.mu.Unlock()
 		}()
-		result, observation = s.fetchQuotaOnce(queryCtx, acc)
+		result, observation = s.fetchQuotaOnce(queryCtx, requestAccount)
 	}()
 	select {
 	case <-call.done:

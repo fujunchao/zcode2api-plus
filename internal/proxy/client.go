@@ -109,7 +109,7 @@ func socksDialer(u *url.URL, v4 bool) func(ctx context.Context, network, addr st
 		}
 		conn, err := forward.DialContext(ctx, "tcp", proxyAddr)
 		if err != nil {
-			return nil, fmt.Errorf("连接代理失败: %v", err)
+			return nil, fmt.Errorf("%w: 连接代理失败: %w", ErrEndpointUnreachable, err)
 		}
 		defer func() {
 			if err != nil {
@@ -122,7 +122,7 @@ func socksDialer(u *url.URL, v4 bool) func(ctx context.Context, network, addr st
 			err = socks5Handshake(ctx, conn, u, addr, remoteResolve)
 		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrEndpointUnreachable, err)
 		}
 		return conn, nil
 	}

@@ -34,9 +34,11 @@ type ClaimError struct {
 	nextAt *float64
 	// captcha 标记失败源于本机验证码不可用（浏览器求解失败或人工参数缺失），
 	// 而非上游判定——这类失败等的是人工回填，冷却应取最长档。
-	captcha     bool
-	riskControl bool // 上游明确风控；不同于验证码缺失、名额耗尽或网络错误
-	httpStatus  int
+	captcha             bool
+	riskControl         bool // 上游明确风控；不同于验证码缺失、名额耗尽或网络错误
+	httpStatus          int
+	endpointUnreachable bool
+	proxyFailure        string // 只由实际使用命名代理的出站路径设置，不能由上游元数据提供。
 }
 
 func (e *ClaimError) Error() string { return e.msg }
@@ -51,6 +53,8 @@ func (e *ClaimError) NextAt() *float64 { return e.nextAt }
 func (e *ClaimError) IsCaptchaFailure() bool { return e.captcha }
 
 func (e *ClaimError) IsRiskControl() bool { return e.riskControl }
+
+func (e *ClaimError) IsEndpointUnreachable() bool { return e.endpointUnreachable }
 
 // businessError 构造带业务码与可领时间的失败；失败文案沿用 claimFail 映射。
 func businessError(code int, body map[string]any, nextAt *float64) *ClaimError {
@@ -102,18 +106,22 @@ func (s *Service) context() context.Context {
 	return context.Background()
 }
 
-// clientFor 账号出站客户端：有代理走代理（25s 超时），否则默认直连。
-func (s *Service) clientFor(acc *model.Account) HTTPClient {
+// clientFor 账号出站客户端：已配置代理无效时返回错误，不静默换成直连。
+func (s *Service) clientFor(acc *model.Account) (HTTPClient, error) {
 	if s.Client != nil {
-		return s.Client
+		return s.Client, nil
 	}
 	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
-		if c, err := proxy.ClientFor(*acc.ProxyURL, 25*time.Second); err == nil {
-			return c
-		}
-		web.Warn("claim", fmt.Sprintf("账号 %s 代理无效，回退直连", acc.Name))
+		return proxy.ClientFor(*acc.ProxyURL, 25*time.Second)
 	}
-	return &http.Client{Timeout: 25 * time.Second}
+	return &http.Client{Timeout: 25 * time.Second}, nil
+}
+
+func (s *Service) proxyFailureError(acc *model.Account, err *ClaimError, reason string) *ClaimError {
+	if s.context().Err() == nil && s.Client == nil && acc != nil && acc.ProxyID != nil && *acc.ProxyID != "" && acc.ProxyURL != nil && *acc.ProxyURL != "" {
+		err.proxyFailure = reason
+	}
+	return err
 }
 
 // failMessage 业务码 → 使用者文案（带上游 msg 补充）。
@@ -235,14 +243,36 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	res, err := s.clientFor(acc).Do(req)
+	client, err := s.clientFor(acc)
 	if err != nil {
-		return nil, &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", err)}
+		return nil, s.proxyFailureError(acc, &ClaimError{msg: "账号代理配置无效，无法发起领取请求", endpointUnreachable: true}, proxy.FailureEndpointUnreachable)
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		failure := &ClaimError{msg: fmt.Sprintf("上游網路錯誤: %v", err), endpointUnreachable: proxy.IsEndpointUnreachable(s.context(), err)}
+		if failure.endpointUnreachable {
+			return nil, s.proxyFailureError(acc, failure, proxy.FailureEndpointUnreachable)
+		}
+		return nil, failure
 	}
 	defer res.Body.Close()
+	if s.context().Err() != nil {
+		return nil, &ClaimError{msg: s.context().Err().Error()}
+	}
+	if res.StatusCode == http.StatusProxyAuthRequired {
+		return nil, s.proxyFailureError(acc, &ClaimError{msg: "代理认证失败 HTTP 407", httpStatus: res.StatusCode, endpointUnreachable: true}, proxy.FailureEndpointUnreachable)
+	}
 	raw, readErr := io.ReadAll(res.Body)
+	if s.context().Err() != nil {
+		return nil, &ClaimError{msg: s.context().Err().Error()}
+	}
 	if readErr != nil {
-		return nil, &ClaimError{msg: fmt.Sprintf("上游回應讀取失敗: %v", readErr)}
+		failure := &ClaimError{msg: fmt.Sprintf("上游回應讀取失敗: %v", readErr), httpStatus: res.StatusCode,
+			endpointUnreachable: res.StatusCode == http.StatusOK && proxy.IsEndpointUnreachable(s.context(), readErr)}
+		if failure.endpointUnreachable {
+			return nil, s.proxyFailureError(acc, failure, proxy.FailureEndpointUnreachable)
+		}
+		return nil, failure
 	}
 	var body map[string]any
 	parseErr := json.Unmarshal(raw, &body)
@@ -254,13 +284,13 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 	if parseErr == nil {
 		riskText = billingErrorText(body)
 	}
-	if code == 3012 || (!knownFailure && (res.StatusCode >= 400 || code != 0) && model.IsRiskControlBody(riskText)) {
+	if code == 3012 || (!knownFailure && (res.StatusCode >= 400 || code != 0) && isSuspiciousClaimResponse(riskText)) {
 		msg := failMessage(code, body)
 		if parseErr != nil || msg == "領取失敗" {
 			msg = fmt.Sprintf("领取被上游风控拦截 HTTP %d", res.StatusCode)
 		}
 		_, endsAt := parsePlanWindow(body)
-		return nil, &ClaimError{msg: msg, code: code, nextAt: endsAt, riskControl: true, httpStatus: res.StatusCode}
+		return nil, s.proxyFailureError(acc, &ClaimError{msg: msg, code: code, nextAt: endsAt, riskControl: true, httpStatus: res.StatusCode}, proxy.FailureClaimSuspicious)
 	}
 	if res.StatusCode == 401 || res.StatusCode == 403 {
 		text := lower(raw)
@@ -272,6 +302,13 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 		return nil, &ClaimError{msg: fmt.Sprintf("上游回應非 JSON HTTP %d", res.StatusCode)}
 	}
 	return body, nil
+}
+
+// isSuspiciousClaimResponse 补充领取接口的中英文可疑请求文案，不改变模型请求的风控规则。
+func isSuspiciousClaimResponse(text string) bool {
+	low := strings.ToLower(text)
+	return model.IsRiskControlBody(text) || containsAny(low,
+		"suspicious request", "suspicious activity", "可疑请求", "可疑的请求", "可疑請求", "可疑的請求")
 }
 
 // 只从错误消息取风控文案，不把 risk_control=false 等元数据键误判为删除信号。
@@ -321,7 +358,10 @@ func (s *Service) ReportActivationEvents(acc *model.Account) string {
 		return "JWT 無 user_id，跳過激活上報"
 	}
 	deviceMid := acc.DeviceMidOr(config.DeviceMid())
-	client := s.clientFor(acc)
+	client, err := s.clientFor(acc)
+	if err != nil {
+		return "账号代理配置无效，无法上报激活事件"
+	}
 	for _, element := range ActivationElements {
 		if err := PostActivationEventContext(s.context(), client, userID, element, deviceMid); err != nil {
 			return fmt.Sprintf("激活事件 %s 上報失敗: %v", element, err)
@@ -485,8 +525,8 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 			outcomes = append(outcomes, FailureOutcome(acc, planID, err))
 			web.Warn("claim", fmt.Sprintf("账号 %s 自动领取 %s 失败: %v", acc.Name, planID, err))
 			var ce *ClaimError
-			if errors.As(err, &ce) && ce.IsRiskControl() {
-				break // 本次出口已被拦截，不继续在同一线路领取其他套餐。
+			if errors.As(err, &ce) && (ce.IsRiskControl() || ce.IsEndpointUnreachable()) {
+				break // 本次出口已不可达或被拦截，不继续使用失败快照领取其他套餐。
 			}
 			continue
 		}
@@ -523,6 +563,12 @@ func FailureOutcome(acc *model.Account, planID string, err error) map[string]any
 			out["next_at"] = *next
 		}
 		out["captcha"] = ce.IsCaptchaFailure()
+		if ce.IsEndpointUnreachable() {
+			out["endpoint_unreachable"] = true
+		}
+		if ce.proxyFailure != "" {
+			out["proxy_failure"] = ce.proxyFailure
+		}
 		if ce.IsRiskControl() {
 			out["risk_control"] = true
 			out["http_status"] = ce.httpStatus

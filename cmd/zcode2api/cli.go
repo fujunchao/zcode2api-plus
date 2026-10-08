@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/oauth"
+	"zcode2api/internal/proxyguard"
 	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
 	"zcode2api/internal/web"
@@ -187,7 +189,7 @@ func cmdLogin(args []string) {
 		if config.CaptchaBrowserEnabled {
 			cm.SetSolver(captcha.NewBrowserSolver())
 		}
-		outcomes := claim.NewService(cm).AutoClaimAllPlans(acc)
+		outcomes := claimCLIAccount(st, acc, cm)
 		for _, o := range outcomes {
 			if ok, _ := o["ok"].(bool); ok {
 				planName, _ := o["plan_name"].(string)
@@ -208,6 +210,13 @@ func cmdLogin(args []string) {
 			fmt.Println(web.Yellow + "⚠️ 兑换 API Key 失败: " + err.Error() + web.Reset)
 		}
 	}
+}
+
+// claimCLIAccount 将 CLI 领取与后台相同的代理故障收尾绑定，便于离线验证真实调用边界。
+func claimCLIAccount(st *store.Store, acc *model.Account, cm *captcha.Manager) []map[string]any {
+	outcomes := claim.NewService(cm).AutoClaimAllPlans(acc)
+	proxyguard.ApplyClaimFailures(context.Background(), st, acc, outcomes)
+	return outcomes
 }
 
 // saveCLILogin 是 CLI 授权结果进入账号库的边界，不包含交互和外部网络。

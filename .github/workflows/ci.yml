@@ -113,6 +113,10 @@ jobs:
       - name: Test new account quota regression (repeat)
         run: go test ./internal/adminapi ./internal/quota ./internal/store -run 'TestNewAccount|TestExistingAccount.*(ClaimRisk|EmptyQuota|Relogin)|TestExistingBatchClaim|TestImportedAccounts|TestFetchQuotaFresh|TestRefreshAccountsObserved' -count=20 -timeout=180s
 
+      # 真实本地代理覆盖断连、响应中断、代理鉴权、超时与可疑请求；普通错误不得误删。
+      - name: Test proxy endpoint failure regression (repeat)
+        run: go test ./internal/adminapi ./internal/claim ./internal/quota ./internal/proxy ./internal/store ./cmd/zcode2api -run 'TestProxyEndpoint|TestCLIProxyEndpoint|TestClaimRisk' -count=20 -timeout=180s
+
       # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
       # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
       # 「这次真的跑过检测器」。编译缓存仍然生效，代价只是重跑一次测试。

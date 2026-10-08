@@ -17,6 +17,7 @@ import (
 
 	"zcode2api/internal/claim"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxyguard"
 	"zcode2api/internal/store"
 	"zcode2api/internal/web"
 )
@@ -153,7 +154,8 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 		web.Warn("claim", "领取状态落库失败: "+err.Error())
 		return
 	}
-	// 单次空额度/领取风控不能删除代理；仅新账号专属收尾允许双次额度检测。
+	// 单次空额度仍不能淘汰老号代理；实际连接故障/可疑请求则适用于新老账号。
+	proxyguard.ApplyClaimFailures(h.backgroundContext(), h.Store, acc, outcomes)
 }
 
 // numberOf 宽松取数值（JSON 解析一律 float64，代码内构造的可能是 int）。
@@ -445,6 +447,11 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 	_, _, previewSec := h.Store.ClaimCooldowns()
 	out := []map[string]any{}
 	for _, acc := range h.jwtAccounts(ids) {
+		// 前一个账号的端点故障可能已经移除共享代理，必须读取新的实际出站地址。
+		acc = h.Store.SnapshotAccount(acc.Provider, acc.ID)
+		if acc == nil {
+			continue
+		}
 		if claimBlockedByCooling(acc, now) {
 			out = append(out, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "plans": []any{},
@@ -453,7 +460,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
-		// 这是纯只读探测，但每次都要打两次上游（激活上报 + preview），
+		// 资格预览本身不领取，但明确的代理故障仍会触发删除和改派；
 		// 页面反复加载时会累积成无谓流量，故加一层短节流。
 		if previewCooling(acc.ID, now, previewSec) {
 			out = append(out, map[string]any{
@@ -477,6 +484,13 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 		plans, err := svc.PreviewPlans(acc)
 		if err != nil {
 			entry["error"] = err.Error()
+			failure := claim.FailureOutcome(acc, "", err)
+			proxyguard.ApplyClaimFailures(h.backgroundContext(), h.Store, acc, []map[string]any{failure})
+			for _, key := range []string{"proxy_failure", "proxy_removed", "proxy_reassigned", "proxy_direct_fallback", "proxy_remove_error"} {
+				if value, ok := failure[key]; ok {
+					entry[key] = value
+				}
+			}
 		} else {
 			entry["plans"] = plans
 		}
