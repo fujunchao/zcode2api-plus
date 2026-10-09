@@ -129,9 +129,10 @@ type runResult struct {
 // attemptResult 单次账号尝试的出路：retrySame（同账号再试一次）、
 // switchAccount（换下一个账号）、final（终止并返回）。
 type attemptResult struct {
-	retrySame     bool
-	switchAccount bool
-	final         runResult
+	retrySame      bool
+	switchAccount  bool
+	final          runResult
+	quotaRecovered bool // 完整成功交付，供独占 API Key 恢复探测确认使用。
 }
 
 // attemptBudget 单账号内的三类重试预算，各自独立计数。
@@ -189,14 +190,37 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	attr := upstream.NewAttribution(incomingHeaders, upstream.MetadataSessionID(body))
 
 	tried := map[string]bool{}
+	probeTried := false
 	for range MaxAccountAttempts {
 		acc := e.Store.Select(model.ProviderZai, tried, modelName)
+		var probe *store.QuotaProbe
+		if acc == nil && !probeTried && ctx.Err() == nil {
+			var err error
+			probe, err = e.Store.AcquireQuotaProbe(model.ProviderZai, tried, modelName, e.now())
+			if err != nil {
+				web.Warn(reqID, "保存模型恢复探测状态失败: "+err.Error())
+			}
+			if probe != nil {
+				probeTried, acc = true, probe.Account
+				web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 等待期已过，独占探测额度恢复", acc.Name, modelName))
+			}
+		}
 		if acc == nil {
 			break
 		}
 		tried[acc.ID] = true
 		diag.Attempts++
-		res := e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, attr, deliver, diag, scope)
+		res := func() (result attemptResult) {
+			if probe != nil {
+				defer func() {
+					_, err := e.Store.FinishQuotaProbe(probe, result.quotaRecovered, e.now())
+					if err != nil {
+						web.Warn(reqID, "保存模型恢复结果失败: "+err.Error())
+					}
+				}()
+			}
+			return e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, attr, deliver, diag, scope)
+		}()
 		if res.retrySame {
 			continue
 		}
@@ -484,7 +508,7 @@ func (e *Engine) handleUpstreamError(
 
 	// 3) 402 → 该模型耗尽
 	if resp.StatusCode == http.StatusPaymentRequired {
-		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", orCurrent(modelName)))
+		e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度已用完", orCurrent(modelName)), quotaMinimumWait(UpstreamBusinessCode(text)))
 		web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個%s", acc.Name, orCurrent(modelName), ErrorDetail(text)))
 		e.fireRefresh(acc)
 		return attemptResult{switchAccount: true}
@@ -549,7 +573,7 @@ func (e *Engine) handleUpstreamError(
 	// 6) 429：官方用量上限码族 → 该模型耗尽；其余瞬时限流 → 先原地重试，用尽才冷却换号
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaExhaustedCodes[UpstreamBusinessCode(text)] {
-			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)))
+			e.markModelExhausted(acc, modelName, fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)), quotaMinimumWait(UpstreamBusinessCode(text)))
 			web.Warn(reqID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個%s", acc.Name, orCurrent(modelName), ErrorDetail(text)))
 			e.fireRefresh(acc)
 			return attemptResult{switchAccount: true}
@@ -788,7 +812,7 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 	// 为判据）。必须在这里而不是 MarkSuccess——后者在流开始读取前被调用。
 	ResetLineTruncate(e.Store, acc)
 	web.ReqOk(reqID, got.Output)
-	return attemptResult{final: runResult{Delivered: true}}
+	return attemptResult{final: runResult{Delivered: true}, quotaRecovered: usage.UsageComplete() && usage.StreamError() == nil}
 }
 
 // accumulateUsage 把一次交付的 token 用量累加到账号上，返回本次用量。
@@ -867,48 +891,31 @@ func isClientGone(ctx context.Context) bool {
 // 错误归类固定为 quota_exhausted：本函数的全部调用点（402、429 上限码族、200+1005）
 // 都是额度/用量上限这一件事，kind 由函数语义唯一确定，故不开放成参数。
 func MarkModelExhausted(st *store.Store, provider, idOrName string, modelName any, errMsg string, now time.Time) {
-	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
-		// 先记额度事实（与账号状态无关，任何情况下都要落库）。
-		marked := acc.MarkModelExhausted(modelName)
-		strong := isStrongStatus(acc.Status)
-		if !marked {
-			if !strong {
-				acc.Status = model.StatusExhausted
-			}
-			StampAccountError(acc, model.ErrorKindQuotaExhausted, errMsg, now)
-			return
-		}
-		anyState := false
-		allExhausted := true
-		for name, quota := range acc.Quota {
-			entryModel, _ := quota["model"].(string)
-			if entryModel == "" {
-				entryModel = name
-			}
-			anyState = true
-			if acc.ModelAvailability(entryModel) != "exhausted" {
-				allExhausted = false
-				break
-			}
-		}
-		if !strong {
-			if anyState && allExhausted {
-				acc.Status = model.StatusExhausted
-			} else {
-				acc.Status = model.StatusActive
-			}
-			acc.CoolingUntil = nil
-		}
-		StampAccountError(acc, model.ErrorKindQuotaExhausted, errMsg, now)
-	})
+	if err := st.MarkQuotaExhausted(st.SnapshotAccount(provider, idOrName), model.NormalizeModelName(modelName), errMsg, now, 0); err != nil {
+		web.Warn("gateway", "保存模型耗尽状态失败: "+err.Error())
+	}
 }
 
 func (e *Engine) mark(acc *model.Account, status, kind, errMsg string) {
 	MarkAccount(e.Store, acc.Provider, acc.ID, status, kind, errMsg, e.now())
 }
 
-func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string) {
-	MarkModelExhausted(e.Store, acc.Provider, acc.ID, modelName, errMsg, e.now())
+func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string, minimum ...time.Duration) {
+	var wait time.Duration
+	if len(minimum) > 0 {
+		wait = minimum[0]
+	}
+	if err := e.Store.MarkQuotaExhausted(acc, model.NormalizeModelName(modelName), errMsg, e.now(), wait); err != nil {
+		web.Warn("gateway", "保存模型耗尽状态失败: "+err.Error())
+	}
+}
+
+func quotaMinimumWait(code string) time.Duration {
+	switch code {
+	case "1113", "1309", "1311": // 欠费、套餐过期、不包含模型，不按短时窗口频繁重试。
+		return store.APIKeyQuotaLongWait
+	}
+	return 0
 }
 
 // recordError 写一次「最近错误」，不改账号状态、不计失败次数。

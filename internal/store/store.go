@@ -61,6 +61,8 @@ type Store struct {
 	settings         map[string]string
 	rotation         map[string]int
 	riskProxyHistory riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
+	quotaRecovery    quotaRecovery    // API Key 模型恢复退避，保存在内部 meta，不进入账号 JSON。
+	quotaProbes      map[quotaProbeKey]*QuotaProbe
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -241,6 +243,12 @@ func (s *Store) load() error {
 		}
 	}
 	delete(settings, riskProxyHistoryKey)
+	if raw := settings[quotaRecoveryKey]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &s.quotaRecovery); err != nil {
+			return fmt.Errorf("读取 API Key 模型恢复状态失败: %w", err)
+		}
+	}
+	delete(settings, quotaRecoveryKey)
 	// 密钥由 bootstrapAuthKeys 保证存在；此处缺省空值即拒绝鉴权（fail closed）
 	if _, ok := settings["admin_key"]; !ok {
 		settings["admin_key"] = ""
