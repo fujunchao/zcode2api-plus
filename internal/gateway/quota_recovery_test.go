@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"zcode2api/internal/model"
-	"zcode2api/internal/store"
 )
 
 const quotaRecoveryMessage = `{"id":"msg_recovered","type":"message","role":"assistant","model":"GLM-5.3","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
@@ -189,5 +188,4 @@ func TestAPIKeyQuotaRecoveryDoesNotUseJWTQuotaProbe(t *testing.T) {
 	if probe != nil || err != nil {
 		t.Fatalf("JWT 仍只经余额刷新恢复: %v %v", probe, err)
 	}
-	_ = store.APIKeyQuotaLongWait // 长等待由 Store 模块统一定义，不在网关复制另一套。
 }

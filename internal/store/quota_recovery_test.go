@@ -94,7 +94,7 @@ func TestQuotaProbeBackoffSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	s = openAt(t, path)
-	if got := s.GetSetting(quotaRecoveryKey); got != "" {
+	if got, exists := s.GetSetting(quotaRecoveryKey); exists || got != "" {
 		t.Fatal("内部恢复元数据不得成为公开设置")
 	}
 	// 首次等待 5 分钟，探测后分别等待 15 分钟、1 小时、6 小时，之后封顶。
@@ -269,7 +269,8 @@ func TestQuotaProbePersistenceFailureIsAtomic(t *testing.T) {
 }
 
 func TestQuotaProbeHandlesLegacyNullQuotaEntry(t *testing.T) {
-	s := newTestStore(t)
+	path := filepath.Join(t.TempDir(), "accounts.db")
+	s := openAt(t, path)
 	now := time.Unix(1_790_000_000, 0)
 	a := quotaTestAccount(t, s, now)
 	if _, err := s.Update(a.Provider, a.ID, func(live *model.Account) {
@@ -277,11 +278,48 @@ func TestQuotaProbeHandlesLegacyNullQuotaEntry(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = openAt(t, path)
 	probe := requireQuotaProbe(t, s, recoveryModel, now.Add(5*time.Minute), true)
 	if ok, err := s.FinishQuotaProbe(probe, true, now.Add(5*time.Minute)); !ok || err != nil {
 		t.Fatalf("旧空额度列应可恢复成未知值: %v, %v", ok, err)
 	}
 	if s.Select(a.Provider, nil, recoveryModel) == nil {
 		t.Fatal("旧空列成功恢复后仍不可调度")
+	}
+}
+
+func TestQuotaProbeRejectsRebuiltGeneration(t *testing.T) {
+	s := newTestStore(t)
+	base := time.Unix(1_790_000_000, 0)
+	a := quotaTestAccount(t, s, base)
+	now := base.Add(5 * time.Minute)
+	probe := requireQuotaProbe(t, s, recoveryModel, now, true)
+	if _, err := s.EditAccount(a.Provider, a.ID, AccountEdit{SetSecret: true, SecretMode: "jwt", Secret: "synthetic.payload.signature"}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.AddAccount(a.Provider, "other", "sk-synthetic-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkQuotaExhausted(b, recoveryModel, "触发过期元数据清理", now, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EditAccount(a.Provider, a.ID, AccountEdit{SetSecret: true, SecretMode: "apiKey", Secret: a.Secret()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkQuotaExhausted(a, recoveryModel, "原凭据上的新失败", now, 0); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.FinishQuotaProbe(probe, true, now); ok || err != nil {
+		t.Fatalf("元数据重建不能令旧租约代次碰撞: %v, %v", ok, err)
+	}
+	if got := s.SnapshotAccount(a.Provider, a.ID); got.ModelAvailability(recoveryModel) != "exhausted" {
+		t.Fatal("旧成功清除了新的额度耗尽事实")
+	}
+	if p, err := s.AcquireQuotaProbe(a.Provider, map[string]bool{b.ID: true}, recoveryModel, now); p != nil || err != nil {
+		t.Fatalf("新失败的等待窗口应保留: %v %v", p != nil, err)
 	}
 }

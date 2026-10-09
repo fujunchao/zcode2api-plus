@@ -35,6 +35,7 @@ type fixture struct {
 	srv      *httptest.Server
 	upstream *httptest.Server
 	st       *store.Store
+	eng      *gateway.Engine  // 复用公开时钟注入，验证适配层共享同一恢复状态机。
 	cm       *captcha.Manager // JWT 兼容性用例可替换策略；默认用例仍走 API Key。
 
 	mu      sync.Mutex
@@ -94,6 +95,7 @@ func newFixture(t *testing.T) *fixture {
 	})
 
 	eng := gateway.NewEngine(st, cm, nil)
+	f.eng = eng
 	eng.BusyRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
 	mux := http.NewServeMux()
 	gw := gateway.Handler{Engine: eng, Auth: auth.New(st)}
