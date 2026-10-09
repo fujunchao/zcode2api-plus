@@ -213,7 +213,7 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		res := func() (result attemptResult) {
 			if probe != nil {
 				defer func() {
-					_, err := e.Store.FinishQuotaProbe(probe, result.quotaRecovered, e.now())
+					_, err := e.Store.FinishQuotaProbe(probe, result.quotaRecovered && ctx.Err() == nil, e.now())
 					if err != nil {
 						web.Warn(reqID, "保存模型恢复结果失败: "+err.Error())
 					}
@@ -812,7 +812,7 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 	// 为判据）。必须在这里而不是 MarkSuccess——后者在流开始读取前被调用。
 	ResetLineTruncate(e.Store, acc)
 	web.ReqOk(reqID, got.Output)
-	return attemptResult{final: runResult{Delivered: true}, quotaRecovered: usage.UsageComplete() && usage.StreamError() == nil}
+	return attemptResult{final: runResult{Delivered: true}, quotaRecovered: ctx.Err() == nil && usage.responseComplete()}
 }
 
 // accumulateUsage 把一次交付的 token 用量累加到账号上，返回本次用量。

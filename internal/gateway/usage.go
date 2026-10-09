@@ -30,6 +30,7 @@ type UsageCollector struct {
 	cacheCreation int
 	cacheRead     int
 	final         bool // 上游已交出最终 usage（见 UsageComplete）
+	jsonMessage   bool // JSON 是否为完整 Messages 响应；仅供恢复探测确认，不改变用量统计。
 }
 
 // NewUsageCollector 创建收集器；isSSE 决定逐行解析还是缓冲到 Finish 一次解析。
@@ -130,6 +131,18 @@ func (u *UsageCollector) StreamError() error {
 	return nil
 }
 
+// responseComplete 区分真正的完整消息与只有 HTTP 200/usage 的异常对象。
+// 它不改变原有转发行为，只限制何时可以解除 API Key 模型的耗尽标记。
+func (u *UsageCollector) responseComplete() bool {
+	if !u.final {
+		return false
+	}
+	if u.isSSE {
+		return u.StreamError() == nil
+	}
+	return u.jsonMessage
+}
+
 // Finish 回應结束后收尾：非 SSE 模式在此解析缓冲的完整 JSON，并标记 usage 为终值。
 func (u *UsageCollector) Finish() {
 	if u.isSSE {
@@ -142,6 +155,10 @@ func (u *UsageCollector) Finish() {
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(u.buf, &payload); err == nil {
+		_, contentOK := payload["content"].([]any)
+		stopReason, _ := payload["stop_reason"].(string)
+		u.jsonMessage = payload["type"] == "message" && payload["role"] == "assistant" &&
+			contentOK && stopReason != "" && payload["error"] == nil
 		usage, _ := payload["usage"].(map[string]any)
 		if usage != nil {
 			u.input = max(u.input, toInt(usage["input_tokens"]))

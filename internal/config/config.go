@@ -215,7 +215,8 @@ var (
 	// 2026-09-23 由 3.11.2 升至 3.14.3（本机实装客户端版本，激活失效排查项之一，
 	// 见 docs/analysis-zcode-client-activation-diff.md）。
 	// 2026-09-30 同步 3.14.4；模型验证码按 skip_model_request 策略独立跳过。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.14.4")
+	// 2026-10-09 同步本机确认的 3.14.5；此次客户端修复不改变模型/重置协议。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.14.5")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
@@ -227,7 +228,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.9.8-go"
+	AppVersion = "2.9.9-go"
 )
 
 // ── 遥测设备伪装 ────────────────────────────────────────────────────────────

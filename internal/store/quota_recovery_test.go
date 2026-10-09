@@ -20,7 +20,7 @@ func quotaTestAccount(t *testing.T, s *Store, now time.Time) *model.Account {
 	if err := s.MarkQuotaExhausted(a, recoveryModel, "合成额度耗尽", now, 0); err != nil {
 		t.Fatal(err)
 	}
-	return a
+	return s.SnapshotAccount(a.Provider, a.ID)
 }
 
 func requireQuotaProbe(t *testing.T, s *Store, name string, now time.Time, want bool) *QuotaProbe {

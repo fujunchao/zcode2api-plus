@@ -155,6 +155,10 @@ func (s *Store) MarkQuotaExhausted(expected *model.Account, name, detail string,
 			state = quotaRetryState{Generation: state.Generation}
 		}
 		state.CredentialHash = hash
+		// 切换模式会清理旧元数据，但旧请求仍可能在途；新代次不得撞回旧租约。
+		if inFlight := s.quotaProbes[quotaProbeKey{pending.ID, name}]; inFlight != nil {
+			state.Generation = max(state.Generation, inFlight.generation)
+		}
 		state.Generation++
 		state.MinimumSeconds = int64(max(0, min(minimumWait, APIKeyQuotaLongWait)) / time.Second)
 		state.NextAt = max(state.NextAt, quotaSeconds(now.Add(quotaDelay(state))))
@@ -271,7 +275,18 @@ func (s *Store) FinishQuotaProbe(probe *QuotaProbe, confirmed bool, now time.Tim
 	}
 	// API Key 不查询 Start Plan 数值余额。成功证明可调用，却不能编造余额；
 	// 仅令目标模型的旧数值变为未知，保留其他模型的快照与耗尽标记。
-	for _, entry := range pending.QuotaEntriesForModel(probe.model) {
+	for key, entry := range pending.Quota {
+		entryModel, _ := entry["model"].(string)
+		if entryModel == "" {
+			entryModel = key
+		}
+		if model.NormalizeModelName(entryModel) != probe.model {
+			continue
+		}
+		if entry == nil {
+			entry = map[string]any{"model": probe.model}
+			pending.Quota[key] = entry
+		}
 		entry["remaining"], entry["available"] = nil, nil
 	}
 	if len(pending.Quota) > 0 && len(pending.QuotaEntriesForModel(probe.model)) == 0 {

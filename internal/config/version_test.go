@@ -26,6 +26,13 @@ func TestClientVersionShape(t *testing.T) {
 	}
 }
 
+// 默认声明必须与本次核验的桌面补丁版本一致；显式环境覆盖仍由既有配置入口接管。
+func TestDefaultClientVersionMatches3145(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.14.5" {
+		t.Fatalf("默认客户端声明未同步: %q", ZcodeClientVersion)
+	}
+}
+
 // TestNoHardcodedClientVersion 三段式版本字面量只允许出现在**定义处**（本包的
 // config.go 与 profile.go）；生产代码其它位置必须引用常量——这是「升版本必全量生效」
 // 的静态保证。

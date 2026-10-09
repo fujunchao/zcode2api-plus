@@ -121,6 +121,10 @@ jobs:
       - name: Test login proxy failover regression (repeat)
         run: go test ./internal/adminapi ./internal/oauth ./internal/store -run 'TestLoginProxy|TestExchangeCodeRunsThroughProxy' -count=20 -timeout=180s
 
+      # 恢复探测使用合成凭据、受控时钟、隔离 SQLite 和本地 HTTP，不访问真实套餐。
+      - name: Test API key quota recovery regression (repeat)
+        run: go test ./internal/store ./internal/gateway ./internal/openai -run 'TestQuotaProbe|TestAPIKeyQuota' -count=20 -timeout=180s
+
       # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
       # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
       # 「这次真的跑过检测器」。编译缓存仍然生效，代价只是重跑一次测试。
