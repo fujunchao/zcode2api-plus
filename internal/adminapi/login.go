@@ -3,6 +3,8 @@
 package adminapi
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"strings"
@@ -20,17 +22,24 @@ const loginFlowTTL = 600 * time.Second
 
 // loginSession 一次登录会话：OAuth flow + 本次登录选定的出口线路。
 //
-// 代理必须在**建立会话时**定下来：token 交换、API Key 兑换、随后的额度刷新与
-// 自动领取属于同一条出站链路，中途换出口没有意义。只在登录本身走代理、后续直连，
-// 等于拿真实 IP 去打上游——那正是需要代理的人最不想要的。
+// 建立会话时预选出口；确认不可达才删除并换线。新账号以最终可用的登录出口入池，
+// 不能只在授权时使用代理，保存账号后又丢失绑定。
 type loginSession struct {
+	mu       sync.Mutex // 完成请求持有；重复/并发提交不能同时消费一次性授权码。
 	flow     *oauth.Flow
 	proxyURL string // 已解析的代理地址（空 = 直连）
 	proxyID  string // 代理线路 ID（用于写入账号；空表示非线路）
 	// auto 表示这条线路是「自動」挑出来的、而非用户显式选定：命中既有账号时
 	// 保留它原本的指派，避免重登把老号的线路换掉。
-	auto   bool
-	direct bool // 明确选择直连，与未指定线路区分；重新登录也须清除旧指派
+	auto             bool
+	direct           bool // 明确选择直连，与未指定线路区分；重新登录也须清除旧指派
+	retryProxies     bool
+	failedURLs       map[string]bool
+	proxySwitches    int
+	callbackDigest   [32]byte
+	exchanged        *oauth.ExchangeResult // 只保留到账号保存成功，避免保存失败后重复兑换。
+	accountID        string
+	createdAccountID string // 同一会话先建号后保存失败时，重试仍执行新号初始化。
 }
 
 var (
@@ -118,7 +127,8 @@ func (h *Handler) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	}
 	loginFlowsMu.Lock()
 	loginFlows[flowID] = &loginSession{flow: flow, proxyURL: proxyURL, proxyID: proxyID, auto: proxyAuto,
-		direct: strings.TrimSpace(strOf(payload["proxy_id"])) == proxyIDDirect}
+		direct:       strings.TrimSpace(strOf(payload["proxy_id"])) == proxyIDDirect,
+		retryProxies: proxyAuto || proxyID != ""}
 	loginFlowsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"flow_id":       flowID,
@@ -136,6 +146,11 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("登录会话不存在或已过期"))
 		return
 	}
+	if !session.mu.TryLock() {
+		writeAPIError(w, &apiError{http.StatusConflict, "当前回调正在处理或自动换线，请等待本次登录完成"})
+		return
+	}
+	defer session.mu.Unlock()
 
 	payload, apiErr := decodeBody(r)
 	if apiErr != nil {
@@ -156,21 +171,57 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errBadRequest("回调地址与当前登录会话不匹配"))
 		return
 	}
-
-	result, err := session.flow.ExchangeCode(code, state, session.proxyURL)
-	if err != nil {
-		writeAPIError(w, errBadRequest(err.Error()))
+	digest := sha256.Sum256([]byte(code))
+	if (session.exchanged != nil || session.accountID != "") && session.callbackDigest != digest {
+		writeAPIError(w, errBadRequest("当前会话已处理另一份回调，请使用原回调或重新开始授权"))
 		return
 	}
-	account, apiErr := h.saveOAuthAccount(result, session)
+	session.callbackDigest = digest
+	if session.accountID != "" {
+		h.writeCompletedLogin(w, session)
+		return
+	}
+	ctx, cancel := context.WithDeadline(r.Context(), session.flow.CreatedAt.Add(loginFlowTTL))
+	stop := context.AfterFunc(h.backgroundContext(), cancel)
+	defer func() { stop(); cancel() }()
+	if session.exchanged == nil {
+		result, err := h.exchangeLoginWithFailover(ctx, session, code, state)
+		if err != nil {
+			if ctx.Err() != nil || proxy.IsEndpointUnreachable(ctx, err) {
+				writeAPIError(w, errUpstream(err.Error()))
+			} else {
+				writeAPIError(w, errBadRequest(err.Error()))
+			}
+			return
+		}
+		session.exchanged = result
+	}
+	if ctx.Err() != nil {
+		writeAPIError(w, errUpstream("登录请求已取消；尚在有效期内时可重新提交原回调"))
+		return
+	}
+	// 保存失败后可直接复用已兑换凭据；命名线路若已删除则改派，但不重新改变已成功的直连出口。
+	if session.proxyID != "" {
+		h.refreshLoginProxy(session)
+	}
+	account, apiErr := h.saveOAuthAccount(session.exchanged, session)
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
 		return
 	}
-	loginFlowsMu.Lock()
-	delete(loginFlows, flowID)
-	loginFlowsMu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "account": account.PublicView(time.Now())})
+	session.accountID, session.exchanged = account.ID, nil
+	h.writeCompletedLogin(w, session)
+}
+
+// 成功会话只保留账号 ID/回调摘要到原 TTL，重复提交不再次兑换、刷新或领取。
+func (h *Handler) writeCompletedLogin(w http.ResponseWriter, session *loginSession) {
+	account := h.Store.FindAny(session.accountID)
+	if account == nil {
+		writeAPIError(w, errNotFound("登录对应账号已被删除，请重新开始授权"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "account": account.PublicView(time.Now()),
+		"proxy": proxy.MaskURL(session.proxyURL), "proxy_retries": session.proxySwitches})
 }
 
 // saveOAuthAccount 落库登录凭证：JWT 入池（邮箱命名）→ 写入选定线路 →
@@ -190,6 +241,12 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 	account, isNew, err := h.Store.SaveOAuthAccount(name, result.Token, email)
 	if err != nil {
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
+	}
+	if session != nil {
+		if isNew {
+			session.createdAccountID = account.ID
+		}
+		isNew = isNew || session.createdAccountID == account.ID
 	}
 
 	// 线路必须在兑换与刷新之前落到账号上：这三步都要出站。
@@ -230,6 +287,9 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 			h.Quota.RefreshAccounts([]*model.Account{account})
 			h.scheduleAutoClaim(account)
 		}
+	}
+	if session != nil {
+		session.createdAccountID = ""
 	}
 	return account, nil
 }

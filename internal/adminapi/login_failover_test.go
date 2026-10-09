@@ -1,15 +1,19 @@
 package adminapi
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +21,7 @@ import (
 
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/quota"
@@ -33,6 +38,7 @@ type loginFailoverFixture struct {
 	payloads  []map[string]string
 	status    int
 	body      string
+	onToken   func(*http.Request)
 }
 
 // 本地 CONNECT 隧道只允许转发到指定的本地 TLS 服务，绝不解析/连接外部目标。
@@ -123,8 +129,11 @@ func newLoginFailoverFixture(t *testing.T) *loginFailoverFixture {
 		}
 		f.mu.Lock()
 		f.payloads = append(f.payloads, payload)
-		status, body := f.status, f.body
+		status, body, onToken := f.status, f.body, f.onToken
 		f.mu.Unlock()
+		if onToken != nil {
+			onToken(r)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
@@ -152,6 +161,223 @@ func newLoginFailoverFixture(t *testing.T) *loginFailoverFixture {
 	f.mux = http.NewServeMux()
 	f.h.Register(f.mux)
 	return f
+}
+
+type loginRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f loginRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func (f *loginFailoverFixture) fakeDirect(t *testing.T, succeeds bool) *atomic.Int32 {
+	t.Helper()
+	old := http.DefaultTransport
+	var calls atomic.Int32
+	http.DefaultTransport = loginRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "zcode.z.ai" || r.URL.Path != "/api/v1/oauth/token" {
+			t.Error("非预期的直连请求")
+			return nil, errors.New("unexpected request")
+		}
+		calls.Add(1)
+		if !succeeds {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("synthetic direct failure")}
+		}
+		f.mu.Lock()
+		body := f.body
+		f.mu.Unlock()
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = old })
+	return &calls
+}
+
+func TestLoginProxyFailoverExhaustedResumesOriginalCallback(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	_, err := f.h.Store.UpdateProxyProfile(f.good.ID, f.good.Name, f.good.URL, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := f.fakeDirect(t, false)
+	id, callback := f.start(t, proxyIDAuto)
+	code, _ := f.complete(t, id, callback)
+	if code == http.StatusOK || getLoginFlow(id) == nil || direct.Load() != 1 || len(f.h.Store.ListProxyProfiles()) != 1 {
+		t.Fatal("代理耗尽后只直连一次并保留原会话")
+	}
+	if _, err := f.h.Store.UpdateProxyProfile(f.good.ID, f.good.Name, f.good.URL, true); err != nil {
+		t.Fatal(err)
+	}
+	code, body := f.complete(t, id, callback)
+	if code != http.StatusOK || body["status"] != "ready" || body["account"].(map[string]any)["proxy_id"] != f.good.ID {
+		t.Fatalf("恢复线路后应直接续用原回调：%d %v", code, body)
+	}
+	if f.badCalls.Load() != 1 || direct.Load() != 1 {
+		t.Fatal("续用会话不能重试已经失败的出口")
+	}
+}
+
+func TestLoginProxyFailoverFallsBackDirectOnce(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	_, _ = f.h.Store.UpdateProxyProfile(f.good.ID, f.good.Name, f.good.URL, false)
+	direct := f.fakeDirect(t, true)
+	id, callback := f.start(t, proxyIDAuto)
+	code, body := f.complete(t, id, callback)
+	if code != http.StatusOK || direct.Load() != 1 || body["account"].(map[string]any)["proxy_id"] != nil {
+		t.Fatalf("无可用线路应沿用直连回退：%d %v", code, body)
+	}
+}
+
+func TestLoginProxyFailoverConcurrentCompletion(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	f.mu.Lock()
+	f.onToken = func(r *http.Request) {
+		close(entered)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}
+	f.mu.Unlock()
+	id, callback := f.start(t, f.good.ID)
+	done := make(chan int, 1)
+	go func() { code, _ := f.complete(t, id, callback); done <- code }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("兑换请求没有开始")
+	}
+	code, _ := f.complete(t, id, callback)
+	if code != http.StatusConflict {
+		t.Fatal("并发提交应提示处理中，不能再次兑换授权码")
+	}
+	once.Do(func() { close(release) })
+	select {
+	case code = <-done:
+		if code != http.StatusOK {
+			t.Fatal("首次请求应正常完成")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("首次请求未完成")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.payloads) != 1 || f.billing.callCount() != 1 {
+		t.Fatal("并发提交只能兑换并初始化一次")
+	}
+}
+
+func TestLoginProxyFailoverCancellationKeepsProxy(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	f.mu.Lock()
+	f.onToken = func(r *http.Request) {
+		close(entered)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}
+	f.mu.Unlock()
+	id, callback := f.start(t, f.good.ID)
+	raw, _ := json.Marshal(map[string]any{"callback_url": callback})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/login/complete/"+id, strings.NewReader(string(raw))).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+f.h.Store.AdminKey())
+	done := make(chan struct{})
+	go func() { defer close(done); f.mux.ServeHTTP(httptest.NewRecorder(), req) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("兑换请求没有开始")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("取消未终止登录请求")
+	}
+	if len(f.h.Store.ListProxyProfiles()) != 2 || getLoginFlow(id) == nil || len(f.h.Store.ListAccounts("")) != 0 {
+		t.Fatal("取消不能删除代理、丢弃会话或创建账号")
+	}
+}
+
+func TestLoginProxyFailoverCachesCredentialsAcrossSaveFailure(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	db, err := sql.Open("sqlite", config.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	_, err = db.Exec(`CREATE TRIGGER reject_login_binding BEFORE INSERT ON accounts WHEN json_extract(NEW.data, '$.proxy_id') IS NOT NULL BEGIN SELECT RAISE(ABORT,'test login binding failure'); END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, callback := f.start(t, f.good.ID)
+	code, _ := f.complete(t, id, callback)
+	if code == http.StatusOK || len(f.h.Store.ListAccounts("")) != 1 || f.billing.callCount() != 0 {
+		t.Fatal("测试应停在已建号但代理指派落库失败的边界")
+	}
+	if _, err := db.Exec("DROP TRIGGER reject_login_binding"); err != nil {
+		t.Fatal(err)
+	}
+	code, body := f.complete(t, id, callback)
+	if code != http.StatusOK || body["account"].(map[string]any)["proxy_id"] != f.good.ID || len(f.h.Store.ListAccounts("")) != 1 || f.billing.callCount() != 1 {
+		t.Fatalf("保存重试必须续用凭据并补完新号初始化：%d %v", code, body)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.payloads) != 1 {
+		t.Fatal("保存失败不能导致一次性授权码再次兑换")
+	}
+}
+
+func TestLoginProxyFailoverRejectsDifferentCallbackAfterSuccess(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	id, callback := f.start(t, f.good.ID)
+	code, _ := f.complete(t, id, callback)
+	if code != http.StatusOK {
+		t.Fatal("首次登录失败")
+	}
+	code, _ = f.complete(t, id, strings.Replace(callback, "synthetic-code", "other-code", 1))
+	if code != http.StatusBadRequest {
+		t.Fatal("不能用另一份回调复用缓存凭据")
+	}
+}
+
+func TestLoginProxyFailoverDeletedOrUpdatedProfileBeforeCallback(t *testing.T) {
+	for _, mode := range []string{"deleted", "updated"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newLoginFailoverFixture(t)
+			id, callback := f.start(t, proxyIDAuto)
+			want := f.good.ID
+			if mode == "deleted" {
+				_, _, _ = f.h.Store.DeleteProxyProfile(f.bad.ID)
+			} else {
+				_, _ = f.h.Store.UpdateProxyProfile(f.bad.ID, f.bad.Name, f.good.URL, true)
+				want = f.bad.ID
+			}
+			code, body := f.complete(t, id, callback)
+			if code != http.StatusOK || body["account"].(map[string]any)["proxy_id"] != want || f.badCalls.Load() != 0 {
+				t.Fatalf("不能锁定已删除或已更新的旧出口：%d %v", code, body)
+			}
+		})
+	}
+}
+
+func TestLoginProxyFailoverRespectsExpiryAndState(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	id, callback := f.start(t, proxyIDAuto)
+	code, _ := f.complete(t, id, "zcode://oauth/callback?code=synthetic-code&state=wrong")
+	if code != http.StatusBadRequest || f.badCalls.Load() != 0 {
+		t.Fatal("错误 state 不能发起代理请求")
+	}
+	getLoginFlow(id).flow.CreatedAt = time.Now().Add(-loginFlowTTL - time.Second)
+	code, _ = f.complete(t, id, callback)
+	if code != http.StatusNotFound || len(f.h.Store.ListProxyProfiles()) != 2 {
+		t.Fatal("过期会话不能继续重试或删除代理")
+	}
 }
 
 func (f *loginFailoverFixture) start(t *testing.T, proxyID string) (string, string) {
@@ -230,5 +456,28 @@ func TestLoginProxyFailoverBusinessErrorKeepsProxy(t *testing.T) {
 	code, _ := f.complete(t, id, callback)
 	if code == http.StatusOK || len(f.h.Store.ListProxyProfiles()) != 2 || getLoginFlow(id) == nil {
 		t.Fatal("授权码业务错误不能删除健康代理或丢弃会话")
+	}
+}
+
+func TestLoginProxyFailoverTriesSeveralLinesWithoutRepeatingAlias(t *testing.T) {
+	f := newLoginFailoverFixture(t)
+	id, callback := f.start(t, proxyIDAuto)
+	peer, _ := f.h.Store.AddAccount(model.ProviderZai, "busy-good", jwtTokenFor("busy-good"))
+	_, _ = f.h.Store.AssignProxyProfile(peer.ID, f.good.ID)
+	var secondCalls atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { secondCalls.Add(1); w.WriteHeader(http.StatusBadGateway) }))
+	t.Cleanup(second.Close)
+	if _, err := f.h.Store.AddProxyProfile("second-bad", second.URL, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.Store.AddProxyProfile("old-alias", f.bad.URL, true); err != nil {
+		t.Fatal(err)
+	}
+	code, body := f.complete(t, id, callback)
+	if code != http.StatusOK || body["account"].(map[string]any)["proxy_id"] != f.good.ID || body["proxy_retries"] != float64(2) {
+		t.Fatalf("应连续换线直至可用线路：%d %v", code, body)
+	}
+	if f.badCalls.Load() != 1 || secondCalls.Load() != 1 || len(f.h.Store.ListProxyProfiles()) != 2 {
+		t.Fatal("已失败地址的别名不能再次尝试，也不能扩大删除范围")
 	}
 }

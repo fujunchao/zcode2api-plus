@@ -117,6 +117,10 @@ jobs:
       - name: Test proxy endpoint failure regression (repeat)
         run: go test ./internal/adminapi ./internal/claim ./internal/quota ./internal/proxy ./internal/store ./cmd/zcode2api -run 'TestProxyEndpoint|TestCLIProxyEndpoint|TestClaimRisk' -count=20 -timeout=180s
 
+      # 同一回调经本地 CONNECT/TLS 链路换线、续用会话、并发提交和保存失败重试。
+      - name: Test login proxy failover regression (repeat)
+        run: go test ./internal/adminapi ./internal/oauth ./internal/store -run 'TestLoginProxy|TestExchangeCodeRunsThroughProxy' -count=20 -timeout=180s
+
       # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
       # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
       # 「这次真的跑过检测器」。编译缓存仍然生效，代价只是重跑一次测试。

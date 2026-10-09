@@ -68,6 +68,14 @@ func (s *Store) commitProxyStateWithHistoryLocked(profiles []ProxyProfile, pendi
 // removeProxiesLocked 在副本上统一按空闲优先、最少绑定计算改派。
 // excludedURL 用于空额度/端点故障清理时避开相同出口；所有删除入口共用同一选线策略。
 func (s *Store) removeProxiesLocked(ids map[string]bool, excludedURL string) ([]string, ProxyReassign, error) {
+	excluded := map[string]bool{}
+	if excludedURL != "" {
+		excluded[excludedURL] = true
+	}
+	return s.removeProxiesAvoidingLocked(ids, excluded)
+}
+
+func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[string]bool) ([]string, ProxyReassign, error) {
 	result := ProxyReassign{Assigned: map[string]string{}}
 	remaining := []ProxyProfile{}
 	var removed []string
@@ -81,6 +89,7 @@ func (s *Store) removeProxiesLocked(ids map[string]bool, excludedURL string) ([]
 	if len(removed) == 0 {
 		return nil, result, nil
 	}
+	assignable := proxyProfilesExcluding(remaining, excluded)
 	occupancy := s.proxyOccupancyLocked()
 	var pending []*model.Account
 	for _, a := range s.allAccountsLocked() {
@@ -91,7 +100,7 @@ func (s *Store) removeProxiesLocked(ids map[string]bool, excludedURL string) ([]
 		}
 	}
 	for _, a := range pending {
-		p, ok := leastLoadedProxy(remaining, occupancy, "", excludedURL)
+		p, ok := leastLoadedProxy(assignable, occupancy, "", "")
 		if !ok {
 			result.Direct = append(result.Direct, a.ID)
 			continue

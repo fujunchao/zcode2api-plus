@@ -65,6 +65,15 @@ func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		MaxIdleConnsPerHost:   8,
 		IdleConnTimeout:       90 * time.Second,
+		OnProxyConnectResponse: func(ctx context.Context, _ *url.URL, _ *http.Request, response *http.Response) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if response.StatusCode != http.StatusOK {
+				return fmt.Errorf("%w: CONNECT HTTP %d", ErrEndpointUnreachable, response.StatusCode)
+			}
+			return nil
+		},
 	}
 	if normalized != nil {
 		u, err := url.Parse(*normalized)

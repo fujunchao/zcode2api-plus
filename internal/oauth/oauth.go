@@ -5,6 +5,7 @@ package oauth
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -44,9 +45,9 @@ func clientFor(proxyURL string, timeout time.Duration) (*http.Client, error) {
 // 否则使用者分不清"上游挂了"和"代理不通"。
 func requestError(proxyURL string, err error) error {
 	if strings.TrimSpace(proxyURL) == "" {
-		return fmt.Errorf("上游请求失败: %v", err)
+		return fmt.Errorf("上游请求失败: %w", err)
 	}
-	return fmt.Errorf("上游请求失败（经代理 %s）: %v", proxy.MaskURL(proxyURL), err)
+	return fmt.Errorf("上游请求失败（经代理 %s）: %w", proxy.MaskURL(proxyURL), err)
 }
 
 // Flow 一次登录会话（对应 Python ZaiAuthFlow）。
@@ -176,6 +177,11 @@ type ExchangeResult struct {
 // proxyURL 非空时经该代理出站（登录链路必须与账号日常出站同一出口，
 // 否则会出现"登录走代理、用的时候直连"这种自相矛盾的状态）。
 func (f *Flow) ExchangeCode(code, state, proxyURL string) (*ExchangeResult, error) {
+	return f.ExchangeCodeContext(context.Background(), code, state, proxyURL)
+}
+
+// ExchangeCodeContext 保留回调身份并让网络请求响应调用方/登录会话取消。
+func (f *Flow) ExchangeCodeContext(ctx context.Context, code, state, proxyURL string) (*ExchangeResult, error) {
 	if code == "" {
 		return nil, errors.New("OAuth 回调缺少授权码")
 	}
@@ -187,7 +193,7 @@ func (f *Flow) ExchangeCode(code, state, proxyURL string) (*ExchangeResult, erro
 		"redirect_uri": f.RedirectURI,
 		"state":        state,
 	}
-	body, err := postJSON(tokenURL, payload, proxyURL)
+	body, err := postJSONContext(ctx, tokenURL, payload, proxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -368,22 +374,40 @@ func findNamed(items []any, name string) map[string]any {
 // postJSON POST JSON 并返回响应体（非 2xx 或业务码非 0 视为失败）。
 // proxyURL 为空即直连。
 func postJSON(endpoint string, payload any, proxyURL string) ([]byte, error) {
+	return postJSONContext(context.Background(), endpoint, payload, proxyURL)
+}
+
+func postJSONContext(ctx context.Context, endpoint string, payload any, proxyURL string) ([]byte, error) {
 	client, err := clientFor(proxyURL, exchangeTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("登录代理配置无效: %w", proxy.ErrEndpointUnreachable)
+	}
+	data, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
-	data, _ := json.Marshal(payload)
-	res, err := client.Post(endpoint, "application/json", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, requestError(proxyURL, err)
 	}
 	defer res.Body.Close()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if res.StatusCode == http.StatusProxyAuthRequired && strings.TrimSpace(proxyURL) != "" {
+		return nil, fmt.Errorf("代理认证失败 HTTP 407: %w", proxy.ErrEndpointUnreachable)
+	}
 	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取上游响应失败: %v", err)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, truncate(string(body), 200))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读取上游响应失败: %w", err)
 	}
 	return body, nil
 }

@@ -36,9 +36,27 @@ func leastLoadedProxy(profiles []ProxyProfile, occupancy map[string]int, exclude
 // PickAvailableProxyProfile 为登录预选出口：空闲优先，否则共享绑定最少的线路。
 // 不预占、不写账号；登录会话在建号前就需要固定兑换、刷新等出站请求的出口。
 func (s *Store) PickAvailableProxyProfile() (ProxyProfile, bool) {
+	return s.PickAvailableProxyProfileExcluding(nil)
+}
+
+// PickAvailableProxyProfileExcluding 沿用现有负载策略，只额外跳过会话已失败的 URL。
+func (s *Store) PickAvailableProxyProfileExcluding(excluded map[string]bool) (ProxyProfile, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return leastLoadedProxy(s.listProxyProfilesLocked(), s.proxyOccupancyLocked(), "", "")
+	return leastLoadedProxy(proxyProfilesExcluding(s.listProxyProfilesLocked(), excluded), s.proxyOccupancyLocked(), "", "")
+}
+
+func proxyProfilesExcluding(profiles []ProxyProfile, excluded map[string]bool) []ProxyProfile {
+	if len(excluded) == 0 {
+		return profiles
+	}
+	allowed := make([]ProxyProfile, 0, len(profiles))
+	for _, profile := range profiles {
+		if !excluded[profile.URL] {
+			allowed = append(allowed, profile)
+		}
+	}
+	return allowed
 }
 
 // RotateAccountProxy 为风控账号换一条线路。expected 必须是本次上游请求使用的快照。

@@ -4,13 +4,17 @@
 package oauth
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+
+	"zcode2api/internal/proxy"
 )
 
 func TestExchangeCodeRunsThroughProxy(t *testing.T) {
@@ -30,8 +34,8 @@ func TestExchangeCodeRunsThroughProxy(t *testing.T) {
 	if _, _, err := flow.Init(); err != nil {
 		t.Fatalf("Init 失败: %v", err)
 	}
-	if _, err := flow.ExchangeCode("code", flow.State, fake.URL); err == nil {
-		t.Fatal("代理拒绝后应报错")
+	if _, err := flow.ExchangeCode("code", flow.State, fake.URL); err == nil || !proxy.IsEndpointUnreachable(context.Background(), err) {
+		t.Fatalf("代理拒绝 CONNECT 后应保留可识别的故障类型: %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -40,6 +44,20 @@ func TestExchangeCodeRunsThroughProxy(t *testing.T) {
 	}
 	if !strings.HasPrefix(seen[0], http.MethodConnect) {
 		t.Fatalf("https 目标应经 CONNECT 隧道: %v", seen)
+	}
+}
+
+func TestLoginProxyExchangeCancellationDoesNotReachProxy(t *testing.T) {
+	var calls atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(502) }))
+	defer fake.Close()
+	flow := NewFlow()
+	_, _, _ = flow.Init()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := flow.ExchangeCodeContext(ctx, "code", flow.State, fake.URL)
+	if !errors.Is(err, context.Canceled) || calls.Load() != 0 || proxy.IsEndpointUnreachable(ctx, err) {
+		t.Fatalf("取消不得发送请求或指认为代理故障：%v", err)
 	}
 }
 
