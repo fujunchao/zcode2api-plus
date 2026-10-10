@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -11,6 +12,22 @@ import (
 func jwtAccount() *model.Account  { return model.Create(model.ProviderZai, "t", "header.payload.sig") }
 func keyAccount() *model.Account  { return model.Create(model.ProviderZai, "t", "sk-secret") }
 func bareAccount() *model.Account { return &model.Account{Provider: model.ProviderZai, Mode: "jwt"} }
+
+// 默认模型 UA 对齐已核实的 ZCode 3.14.5 随包运行时；显式配置仍优先。
+// 只检查请求构造结果，不启动客户端或访问真实账号。
+func TestDefaultModelRequestUsesVerifiedNodeRuntime(t *testing.T) {
+	wantMajor := "24"
+	if override := os.Getenv("ZCODE_CLIENT_NODE_MAJOR"); override != "" {
+		wantMajor = override
+	}
+	req, err := BuildRequest(jwtAccount(), "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ua := req.Headers["User-Agent"]; !strings.HasSuffix(ua, " runtime/node.js/"+wantMajor) {
+		t.Fatalf("模型请求运行时声明应为 Node %s，实际 UA=%q", wantMajor, ua)
+	}
+}
 
 func TestBuildRequestJWT(t *testing.T) {
 	req, err := BuildRequest(jwtAccount(), "server-token", "sgp", nil)
