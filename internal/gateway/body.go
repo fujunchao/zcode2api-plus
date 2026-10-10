@@ -3,6 +3,8 @@ package gateway
 
 import (
 	"maps"
+	"reflect"
+	"slices"
 	"strings"
 
 	"zcode2api/internal/upstream"
@@ -14,8 +16,8 @@ import (
 //  3. needsZcodeSystem（JWT 账号）时把 zcode_system.json 注入顶层 system
 //     —— 否则上游返回 405。
 //
-// 注意：system 注入**不幂等**（重复调用会重复拼接 blocks），调用方须保证
-// 对同一个 body 只注入一次（Python 版同样是入口一次 + 账号副本一次）。
+// system 注入只去重与网关标准块完整相同的对象；调用者的文本、缓存策略或附加字段
+// 有差异时原样保留，不按关键词推断身份，也不合并任意重复的用户段落。
 func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	if raw, ok := body["model"].(string); ok {
 		m := raw
@@ -63,7 +65,14 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 		case []any:
 			merged := make([]any, 0, len(blocks)+len(existing))
 			merged = append(merged, blocks...)
-			merged = append(merged, existing...)
+			for _, block := range existing {
+				if slices.ContainsFunc(blocks, func(standard any) bool {
+					return reflect.DeepEqual(block, standard)
+				}) {
+					continue
+				}
+				merged = append(merged, block)
+			}
 			body["system"] = merged
 		default:
 			// 其余类型保持原样（对齐 Python 版的 elif 链）

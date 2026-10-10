@@ -136,7 +136,7 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 	// 缺了它，`anthropic/GLM-5.3` 这类写法在前者能过、在这里 400，
 	// 与「模型白名单与 /v1/messages 一致」的承诺不符；票内 model 名若不归一，
 	// Select 的模型分档与额度比对也会用错键。
-	// 传 false：system 注入不幂等，必须留在每账号副本上（见 processTicket）。
+	// 此时尚未选号，system 留到每账号副本上按凭据模式处理（见 processTicket）。
 	gateway.NormalizeBody(body, false)
 
 	// 模型白名單與 /v1/messages 一致：僅開放清單內模型，其餘在建票前一律拒絕

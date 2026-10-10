@@ -313,7 +313,7 @@ func (e *Engine) tryAccount(
 			}
 		}
 
-		// 每个账号在副本上做 NormalizeBody（system 注入不幂等，见 body.go）
+		// 每个账号在副本上整形；后续设备注入不得污染原始请求或其它账号的副本。
 		actualBody := shallowCopyBody(body)
 		NormalizeBody(actualBody, isJWT)
 		// 内容视图（= 下游内容 + 网关整形）在注入账号身份**之前**取：设备指纹每账号
