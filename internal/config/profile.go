@@ -97,6 +97,14 @@ func ZcodeClientProfile() ZcodeProfile {
 	}
 }
 
+// ZcodeClientQueryPlatform 将配置的复合平台串转换成客户端配置接口的查询格式。
+// 保留 ZCODE_CLIENT_PLATFORM 的历史覆盖入口，只复用已有的平台/架构别名映射；
+// 已规范化或自定义的值不需要再另设一份配置。
+func ZcodeClientQueryPlatform() string {
+	bare, arch, _ := strings.Cut(ZcodeClientPlatform, "-")
+	return (ZcodeProfile{BarePlatform: bare, Arch: arch}).QueryPlatform()
+}
+
 // Platform 请求头 X-Platform 的取值：`${platform}-${arch}`，如 win32-x64。
 // 架构为空时退化为裸平台名，不产出带尾连字符的畸形值。
 func (p ZcodeProfile) Platform() string {

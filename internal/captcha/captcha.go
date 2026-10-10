@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -113,9 +114,15 @@ func (m *Manager) FetchConfig(ctx context.Context) Config {
 }
 
 func fetchConfigHTTP(ctx context.Context) (Config, error) {
-	query := fmt.Sprintf("app_version=%s&platform=%s",
-		config.ZcodeClientVersion, config.ZcodeClientPlatform)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL+"?"+query, nil)
+	endpoint, err := url.Parse(configURL)
+	if err != nil {
+		return Config{}, err
+	}
+	query := endpoint.Query()
+	query.Set("app_version", config.ZcodeClientVersion)
+	query.Set("platform", config.ZcodeClientQueryPlatform())
+	endpoint.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
 		return Config{}, err
 	}
