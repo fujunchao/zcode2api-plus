@@ -23,23 +23,37 @@ func setCaptchaServer(t *testing.T, handler http.HandlerFunc) {
 }
 
 func TestFetchConfigFromUpstream(t *testing.T) {
-	setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
-		// 引用 config 变量而非字面量：版本号升级时此处不应再跟着改
-		// （与 quota_test / request_test 的写法一致）。
-		if r.URL.Query().Get("app_version") != config.ZcodeClientVersion || r.URL.Query().Get("platform") != config.ZcodeClientPlatform {
-			t.Errorf("应携带客户端版本与平台参数: %v", r.URL.Query())
-		}
-		_, _ = w.Write([]byte(`{"code":0,"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc"}}}}`))
-	})
-	m := NewManager()
-	cfg := m.FetchConfig(context.Background())
-	if !cfg.Enabled || cfg.Prefix != "px" || cfg.Region != "cn" || cfg.SceneID != "sc" {
-		t.Fatalf("配置解析不符: %+v", cfg)
-	}
+	for _, tc := range []struct {
+		name, configuredPlatform, queryPlatform string
+	}{
+		{"windows-x64", "win32-x64", "windows-x86_64"},
+		{"windows-arm64", "win32-arm64", "windows-aarch64"},
+		{"macos-override", "darwin-arm64", "darwin-aarch64"},
+		{"already-normalized", "windows-x86_64", "windows-x86_64"},
+		{"custom-override", "custom-platform", "custom-platform"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldPlatform := config.ZcodeClientPlatform
+			config.ZcodeClientPlatform = tc.configuredPlatform
+			t.Cleanup(func() { config.ZcodeClientPlatform = oldPlatform })
+			setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
+				// 查询协议不是 X-Platform 的表示；期望值来自已核实的客户端协议。
+				if r.URL.Query().Get("app_version") != config.ZcodeClientVersion || r.URL.Query().Get("platform") != tc.queryPlatform {
+					t.Errorf("配置查询 platform 应为 %q，实际参数: %v", tc.queryPlatform, r.URL.Query())
+				}
+				_, _ = w.Write([]byte(`{"code":0,"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc"}}}}`))
+			})
+			m := NewManager()
+			cfg := m.FetchConfig(context.Background())
+			if !cfg.Enabled || cfg.Prefix != "px" || cfg.Region != "cn" || cfg.SceneID != "sc" {
+				t.Fatalf("配置解析不符: %+v", cfg)
+			}
 
-	// 二次调用走 10 分钟缓存（服务已关闭仍应成功）
-	if cfg2 := m.FetchConfig(context.Background()); cfg2 != cfg {
-		t.Fatalf("应命中配置缓存: %+v", cfg2)
+			// 二次读取保留原有的配置缓存语义。
+			if cfg2 := m.FetchConfig(context.Background()); cfg2 != cfg {
+				t.Fatalf("应命中配置缓存: %+v", cfg2)
+			}
+		})
 	}
 }
 

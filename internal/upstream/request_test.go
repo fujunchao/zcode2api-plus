@@ -17,7 +17,7 @@ func bareAccount() *model.Account { return &model.Account{Provider: model.Provid
 // 只检查请求构造结果，不启动客户端或访问真实账号。
 func TestDefaultModelRequestUsesVerifiedNodeRuntime(t *testing.T) {
 	wantMajor := "24"
-	if override := os.Getenv("ZCODE_CLIENT_NODE_MAJOR"); override != "" {
+	if override := strings.TrimSpace(os.Getenv("ZCODE_CLIENT_NODE_MAJOR")); override != "" {
 		wantMajor = override
 	}
 	req, err := BuildRequest(jwtAccount(), "", "", nil)
