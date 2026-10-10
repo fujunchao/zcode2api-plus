@@ -649,7 +649,7 @@ func (p *Pool) attemptUpstreamOnce(
 		}
 	}
 	requeststats.Attempt(ctx)
-	finishAttempt := diag.BeginUpstreamAttempt(acc, egress)
+	finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq)
 	resp, err := client.Do(httpReq)
 	status := 0
 	if resp != nil {
