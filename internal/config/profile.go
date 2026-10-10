@@ -54,8 +54,9 @@ var (
 	// 2026-09-24 由 golden 抓包实测（见 docs/analysis-client-golden-diff-20260924.md）。
 	ZcodeClientAISDKVersion = env("ZCODE_CLIENT_AISDK_VERSION", "4.0.27")
 	// ZcodeClientNodeMajor 官方模型请求 User-Agent 里的 runtime/node.js 主版本。
-	// 取自实测抓包的运行时（客户端由 Electron 内置 Node 启动）。
-	ZcodeClientNodeMajor = env("ZCODE_CLIENT_NODE_MAJOR", "22")
+	// 2026-10-10 核实 ZCode 3.14.5 随包 Node v24.14.0，navigator UA 为 Node.js/24。
+	// 这里只维护兼容声明，不改变网关的 Go 运行时；显式环境覆盖仍然优先。
+	ZcodeClientNodeMajor = env("ZCODE_CLIENT_NODE_MAJOR", "24")
 )
 
 // ZcodeProfile 伪装身份的运行时快照。
@@ -65,13 +66,13 @@ type ZcodeProfile struct {
 	OSRelease      string // 10.0.26100
 	Shell          string // cmd.exe
 	CWD            string // 伪装工作目录
-	AppVersion     string // 3.14.3
+	AppVersion     string // 3.14.5
 	SourceTitle    string // electron | cli
 	ReleaseChannel string // production
 	Language       string // zh-CN
 	Timezone       string // Asia/Shanghai
 	AISDKVersion   string // 4.0.27
-	NodeMajor      string // 22
+	NodeMajor      string // 24
 }
 
 // ZcodeClientProfile 按当前配置组装档案。
@@ -152,9 +153,9 @@ func (p ZcodeProfile) Title() string { return "Z Code@" + p.SourceTitle }
 // ModelUserAgent 模型请求的 User-Agent。
 //
 // 与 `UserAgent`（裸 `ZCode/<版本>`）不同：模型请求由 ai-sdk 发出，UA 是 ai-sdk 拼的，
-// 实测形态为
+// 当前随包运行时与 SDK 构造链对应的形态为
 //
-//	ZCode/0.16.9 ai-sdk/provider-utils/4.0.27 runtime/node.js/22
+//	ZCode/3.14.5 ai-sdk/provider-utils/4.0.27 runtime/node.js/24
 //
 // 而非模型接口（`/api/v1/agent/configs`、额度、领取）用的是裸串——所以这两处**必须分开**，
 // 用一个常量两处用会留下「模型请求少了 ai-sdk 后缀」这个可被上游识别的差异。
