@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -97,5 +98,57 @@ func TestNormalizeBodySystemInjection(t *testing.T) {
 	NormalizeBody(body5, false)
 	if _, ok := body5["system"]; ok {
 		t.Fatal("非 JWT 账号不应注入 system")
+	}
+}
+
+// 已有网关标准块只保留一份；同文但缓存策略/附加字段不同的调用者块不能被误删。
+// 通过 JSON 往返模拟下游重新提交同一请求，不依赖 Go 对象的指针身份。
+func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
+	const prefix = "You are ZCode, an interactive coding agent"
+	known := map[string]any{
+		"type": "text", "text": prefix,
+		"cache_control": map[string]any{"type": "ephemeral"},
+	}
+	user := map[string]any{"type": "text", "text": "保留调用者的原始指令"}
+	tail := []any{
+		user, user, // 不对任意相同用户段落去重。
+		map[string]any{
+			"type": "text", "text": prefix,
+			"cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"},
+		},
+		map[string]any{
+			"type": "text", "text": prefix,
+			"cache_control":   map[string]any{"type": "ephemeral"},
+			"caller_metadata": "必须保留",
+		},
+		map[string]any{"type": "text", "text": prefix + "，这是调用者扩展的身份。"},
+	}
+	incoming := append([]any{known, known}, tail...)
+	before, err := json.Marshal(incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{"model": "GLM-5.3", "system": incoming}
+	NormalizeBody(body, true)
+	system := body["system"].([]any)
+	if len(system) != 3+len(tail) || !reflect.DeepEqual(system[3:], tail) {
+		t.Fatalf("只应前置一份三个标准块并原样保留调用者段落，实际共 %d 块", len(system))
+	}
+	after, err := json.Marshal(incoming)
+	if err != nil || string(after) != string(before) {
+		t.Fatal("规范化不得改写调用者持有的原始 system 切片或块")
+	}
+	first, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repeated map[string]any
+	if err := json.Unmarshal(first, &repeated); err != nil {
+		t.Fatal(err)
+	}
+	NormalizeBody(repeated, true)
+	second, err := json.Marshal(repeated)
+	if err != nil || string(second) != string(first) {
+		t.Fatal("重新提交已有标准块的请求，不应重复注入或改变调用者内容")
 	}
 }
