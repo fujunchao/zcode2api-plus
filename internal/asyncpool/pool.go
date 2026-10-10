@@ -406,7 +406,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		// async_force_direct 强制置空），此处不另起判据——两套判据必然漂移，
 		// 而「线路侧 vs 上游侧」的归因正是靠 route 读数判定的，读反即结论反。
 
-		// 每个账号在副本上注入 zcode_system（NormalizeBody 的 system 注入不幂等）
+		// 每个账号在副本上处理 system，后续设备注入不得污染原始请求。
 		actualBody := shallowCopyBody(body)
 		gateway.NormalizeBody(actualBody, true)
 		// 内容视图先取（注入账号身份之前）：与 sync 路径同口径，见 ReqDiag.SetBody。
@@ -630,6 +630,9 @@ func (p *Pool) attemptUpstreamOnce(
 	for k, v := range req.Headers {
 		httpReq.Header.Set(k, v)
 	}
+	// 限流/过载的原地重试会复用 req 模板；请求 ID 必须在每次实际 HTTP 构造时更新。
+	// 只改本次 httpReq，不污染重试模板，也不改变会话/轮次标识或已序列化的正文。
+	httpReq.Header.Set("X-Request-Id", config.NewUUIDv4())
 
 	client, egress := p.clientFor(acc)
 	riskAttempt := gateway.RiskAttempt{Ticket: ticketID, Egress: egress}
