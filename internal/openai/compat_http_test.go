@@ -2,6 +2,7 @@ package openai
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"reflect"
 	"strings"
@@ -190,9 +191,11 @@ func TestThinkingControlsOverHTTP(t *testing.T) {
 						t.Fatal("不得擅自提高调用方的输出上限")
 					}
 					explicit, _ := tc.explicit.(map[string]any)
-					if explicit["budget_tokens"] != nil {
-						if !reflect.DeepEqual(up["thinking"], explicit) {
-							t.Fatalf("显式预算必须独立于 effort 保留: %v", up["thinking"])
+					if explicit != nil {
+						wantThinking := maps.Clone(explicit)
+						delete(wantThinking, "clear_thinking")
+						if !reflect.DeepEqual(up["thinking"], wantThinking) {
+							t.Fatalf("显式开关与预算必须独立于 effort 保留: %v", up["thinking"])
 						}
 					} else if _, invented := up["thinking"]; invented {
 						t.Fatalf("不能用虚构的固定 thinking 预算代替原生 effort: %v", up["thinking"])
@@ -301,8 +304,8 @@ func TestPiZaiThinkingSwitchOverHTTP(t *testing.T) {
 				t.Fatalf("Pi ZAI 开关式请求应转换后接收: %d %s", status, raw)
 			}
 			up := f.lastUpstream().Body
-			if _, invented := up["thinking"]; invented {
-				t.Fatal("强制思考模型的 enabled 开关不应被换成猜测的 token 预算")
+			if !reflect.DeepEqual(up["thinking"], map[string]any{"type": "enabled"}) {
+				t.Fatal("Pi 的显式 enabled 应保留，但不添加猜测的 token 预算")
 			}
 			config, _ := up["output_config"].(map[string]any)
 			if tc.effort != "" && config["effort"] != tc.effort {

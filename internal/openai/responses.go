@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 )
 
@@ -41,9 +42,12 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 		out["stream"] = stream
 	}
 
-	// instructions → system 文本块（归并交给引擎 NormalizeBody）
-	if inst, ok := body["instructions"].(string); ok && inst != "" {
-		out["system"] = []any{map[string]any{"type": "text", "text": inst}}
+	if inst, ok := body["instructions"].(string); ok {
+		if inst != "" {
+			out["system"] = []any{map[string]any{"type": "text", "text": inst}}
+		} else if config.PreserveClientContext {
+			out["system"] = []any{}
+		}
 	}
 
 	if err := applyGLM53Reasoning(body, out); err != nil {
@@ -58,8 +62,11 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(system) > 0 {
+	if len(system) > 0 || config.PreserveClientContext && system != nil {
 		existing, _ := out["system"].([]any)
+		if existing == nil {
+			existing = []any{}
+		}
 		out["system"] = append(existing, system...)
 	}
 	messages, err := convertResponsesInput(input)
@@ -78,12 +85,16 @@ func splitResponsesInstructions(input any) (any, []any, error) {
 	}
 	ordinary := make([]any, 0, len(items))
 	var system []any
+	conversationStarted := false
 	for _, raw := range items {
 		item, ok := raw.(map[string]any)
 		role := stringOf(item["role"])
 		kind := stringOf(item["type"])
 		if !ok || (kind != "" && kind != "message") || (role != "system" && role != "developer") {
 			ordinary = append(ordinary, raw)
+			if ok && (kind == "" || kind == "message" || kind == "function_call" || kind == "function_call_output") {
+				conversationStarted = true
+			}
 			continue
 		}
 		blocks, err := responsesContentToBlocks(item["content"])
@@ -95,7 +106,16 @@ func splitResponsesInstructions(input any) (any, []any, error) {
 				return nil, nil, &convertError{"system/developer 指令只支持文本"}
 			}
 		}
-		system = append(system, blocks...)
+		if config.PreserveClientContext && system == nil {
+			system = []any{}
+		}
+		if config.PreserveClientContext && conversationStarted {
+			if len(blocks) > 0 {
+				ordinary = append(ordinary, raw)
+			}
+		} else {
+			system = append(system, blocks...)
+		}
 	}
 	return ordinary, system, nil
 }
@@ -134,7 +154,10 @@ func convertResponsesInput(input any) ([]any, error) {
 				if role == "" {
 					role = "user"
 				}
-				if role != "user" && role != "assistant" {
+				if role == "developer" {
+					role = "system"
+				}
+				if role != "user" && role != "assistant" && role != "system" {
 					return nil, &convertError{fmt.Sprintf("不支持的消息角色 %s", role)}
 				}
 				blocks, err := responsesContentToBlocks(item["content"])

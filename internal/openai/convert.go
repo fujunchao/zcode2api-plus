@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"zcode2api/internal/config"
 )
 
 // convertError 请求转换失败（对应 HTTP 400，OpenAI 错误形态）。
@@ -69,10 +71,11 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 		return nil, err
 	}
 
-	// messages：system/developer 归并到顶层 system；user/assistant/tool 映射
+	// 初始指令进入顶层；会话开始后的指令保持相对位置和独立优先级。
 	rawMessages, _ := body["messages"].([]any)
 	messages := make([]any, 0, len(rawMessages))
-	var systemBlocks []any
+	systemBlocks := make([]any, 0)
+	hasInstructions := false
 	for _, item := range rawMessages {
 		msg, ok := item.(map[string]any)
 		if !ok {
@@ -81,11 +84,18 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 		role, _ := msg["role"].(string)
 		switch role {
 		case "system", "developer":
+			hasInstructions = true
 			blocks, err := contentToTextBlocks(msg["content"])
 			if err != nil {
 				return nil, err
 			}
-			systemBlocks = append(systemBlocks, blocks...)
+			if config.PreserveClientContext && len(messages) > 0 {
+				if len(blocks) > 0 {
+					messages = appendAnthropicMessage(messages, map[string]any{"role": "system", "content": blocks})
+				}
+			} else {
+				systemBlocks = append(systemBlocks, blocks...)
+			}
 		default:
 			converted, err := convertMessage(msg, role)
 			if err != nil {
@@ -94,9 +104,8 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 			messages = appendAnthropicMessage(messages, converted)
 		}
 	}
-	if len(systemBlocks) > 0 {
-		// 归并后的 system 交给引擎 NormalizeBody 注入 zcode_system 块时
-		// 追加在其后（见 gateway/body.go：blocks 在前、existing 在后）
+	if len(systemBlocks) > 0 || config.PreserveClientContext && hasInstructions {
+		// 显式空指令不是缺省，不能在后续账号整形中被另一份上下文替代。
 		out["system"] = systemBlocks
 	}
 	out["messages"] = messages

@@ -189,6 +189,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate Compose context override
+        run: |
+          docker compose config --quiet
+          ZCODE_PRESERVE_CLIENT_CONTEXT=false docker compose config --format json > "$RUNNER_TEMP/compose-context.json"
+          python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["services"]["zcode2api"]["environment"]["ZCODE_PRESERVE_CLIENT_CONTEXT"] == "false"' "$RUNNER_TEMP/compose-context.json"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Build image

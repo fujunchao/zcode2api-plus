@@ -45,12 +45,13 @@ func applyGLM53Reasoning(body, out map[string]any) error {
 				if budget < 1024 || budget >= maxTokens || math.Trunc(budget) != budget || math.IsNaN(budget) {
 					return &convertError{"thinking.budget_tokens 必须是至少 1024 且小于 max_tokens / max_output_tokens 的整数"}
 				}
-				// 显式 Anthropic 预算是独立约束，不覆盖客户端同时请求的原生 effort。
-				thinking := maps.Clone(explicit)
-				delete(thinking, "clear_thinking")
-				out["thinking"] = thinking
 			}
-			// Pi ZAI 的无预算 enabled 开关与强制思考一致，不伪造 Anthropic 预算。
+			thinking := maps.Clone(explicit)
+			delete(thinking, "clear_thinking")
+			if thinking["budget_tokens"] == nil {
+				delete(thinking, "budget_tokens")
+			}
+			out["thinking"] = thinking
 		default:
 			return &convertError{"GLM-5.3 / GLM-5.3-Flash 的 thinking.type 仅支持 enabled"}
 		}

@@ -445,6 +445,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				p.emitError(ctx, ticketID, err.Error(), "build_error")
 				return
 			}
+			upstream.ApplyMessageCapabilities(&req, actualBody)
 
 			if !announcedReady {
 				if !p.emit(ctx, ticketID, ticketEvent{Type: "ready"}) {

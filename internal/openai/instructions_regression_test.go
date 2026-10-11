@@ -1,8 +1,15 @@
 package openai
 
-import "testing"
+import (
+	"testing"
 
-func TestResponsesPreservesInstructionRoles(t *testing.T) {
+	"zcode2api/internal/config"
+)
+
+func TestResponsesLegacyPreservesInstructionRoles(t *testing.T) {
+	old := config.PreserveClientContext
+	config.PreserveClientContext = false
+	t.Cleanup(func() { config.PreserveClientContext = old })
 	input := []any{
 		map[string]any{"role": "system", "content": "系统规则"},
 		map[string]any{"role": "user", "content": "问题"},

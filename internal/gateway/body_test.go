@@ -193,3 +193,15 @@ func TestNormalizeBodyCallerSystemIsIdempotent(t *testing.T) {
 		t.Fatal("JSON 往返并重复规范化不得增加或丢失上下文")
 	}
 }
+
+func TestInlineSystemOwnsContextWithoutTopLevelSystem(t *testing.T) {
+	message := map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": "客户端后续规则"}}}
+	body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "问题"}, message}}
+	NormalizeBody(body, true)
+	if _, injected := body["system"]; injected {
+		t.Fatal("已有消息内系统指令时不能再补一份网关环境")
+	}
+	if _, ok := message["content"].([]any); !ok {
+		t.Fatal("MCS 规范化不能改写调用者持有的原消息")
+	}
+}

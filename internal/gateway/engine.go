@@ -343,6 +343,7 @@ func (e *Engine) tryAccount(
 			web.Warn(reqID, fmt.Sprintf("账号 %s 凭证无效，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
 		}
+		upstream.ApplyMessageCapabilities(&req, actualBody)
 
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, req.URL, bytes.NewReader(payload))
 		if err != nil {

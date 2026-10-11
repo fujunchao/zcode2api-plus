@@ -231,3 +231,55 @@ func TestExplicitThinkingSwitchReachesUpstream(t *testing.T) {
 		})
 	}
 }
+
+func TestClientToolHistoryAcrossMidInstructions(t *testing.T) {
+	for _, api := range []string{"chat", "responses"} {
+		t.Run(api, func(t *testing.T) {
+			f := newClientContextFixture(t, true)
+			body := compatRequest(api)
+			if api == "chat" {
+				body["messages"] = mustJSON(t, `[
+					{"role":"system","content":"使用客户端工具"},
+					{"role":"user","content":"查询两个城市"},
+					{"role":"assistant","tool_calls":[
+						{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"A\"}"}},
+						{"id":"call_2","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"B\"}"}}
+					]},
+					{"role":"tool","tool_call_id":"call_1","content":"晴"},
+					{"role":"tool","tool_call_id":"call_2","content":"雨"},
+					{"role":"developer","content":"之后只读"},
+					{"role":"user","content":"汇总"}
+				]`)
+			} else {
+				body["instructions"] = "使用客户端工具"
+				body["input"] = mustJSON(t, `[
+					{"role":"user","content":"查询两个城市"},
+					{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"A\"}"},
+					{"type":"function_call","call_id":"call_2","name":"get_weather","arguments":"{\"city\":\"B\"}"},
+					{"type":"function_call_output","call_id":"call_1","output":"晴"},
+					{"type":"function_call_output","call_id":"call_2","output":"雨"},
+					{"role":"developer","content":"之后只读"},
+					{"role":"user","content":"汇总"}
+				]`)
+			}
+			status, raw := postCompat(t, f, api, body)
+			if status != http.StatusOK {
+				t.Fatalf("带工具历史的请求失败: %d %s", status, raw)
+			}
+			msgs := assertClientContextRoles(t, f.lastUpstream().Body, []string{"user", "assistant", "user", "system", "user"})
+			calls := msgs[1].(map[string]any)["content"].([]any)
+			results := msgs[2].(map[string]any)["content"].([]any)
+			if len(calls) != 2 || len(results) != 2 {
+				t.Fatal("并行工具调用及结果必须完整保留")
+			}
+			for i, id := range []string{"call_1", "call_2"} {
+				if calls[i].(map[string]any)["id"] != id || results[i].(map[string]any)["tool_use_id"] != id {
+					t.Fatal("指令转换不能破坏工具调用与结果的绑定")
+				}
+			}
+			if msgs[3].(map[string]any)["content"] != "之后只读" {
+				t.Fatal("后续指令不能跨过已完成的工具轮次")
+			}
+		})
+	}
+}

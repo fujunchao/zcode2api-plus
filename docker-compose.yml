@@ -44,6 +44,8 @@ services:
       # 密钥初始值：留空 → 首次启动随机生成并打到日志；写入数据库后以库为准
       ZCODE_ADMIN_KEY: ${ZCODE_ADMIN_KEY:-}
       ZCODE_GATEWAY_KEY: ${ZCODE_GATEWAY_KEY:-}
+      # 默认保留本地客户端上下文；false 恢复旧版指令注入/提升，修改后重建容器。
+      ZCODE_PRESERVE_CLIENT_CONTEXT: ${ZCODE_PRESERVE_CLIENT_CONTEXT:-true}
       # 验证码浏览器池：JWT 账号自动过验证码必需。首次用到时自动下载约 200MB
       # 补丁 Chromium 到 /data/cloakbrowser（只需一次，走卷持久化）。
       # 只用 API Key 账号、或打算后台人工回填，可设 "false" 免掉这 200MB。
