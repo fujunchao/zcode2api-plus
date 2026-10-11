@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -64,8 +65,12 @@ func TestClientSDKCompatibility(t *testing.T) {
 			if len(calls) < 2 {
 				t.Fatalf("至少应有工具请求和工具结果回传两轮: %d", len(calls))
 			}
+			// Pi 夹具固定覆盖 2 个模型、2 个档位、2 种格式，每种格式各两轮。
+			if client == "pi" && len(calls) != 16 {
+				t.Fatalf("Pi 的全部格式及工具往返都必须实际执行: %d", len(calls))
+			}
 			seenEfforts := map[string]bool{}
-			for _, call := range calls {
+			for i, call := range calls {
 				if _, leaked := call.Body["include_usage"]; leaked {
 					t.Fatal("客户端的 include_usage 不能泄漏到上游")
 				}
@@ -75,8 +80,13 @@ func TestClientSDKCompatibility(t *testing.T) {
 					t.Fatalf("客户端原生 effort 未实际到达上游: %v", config)
 				}
 				seenEfforts[effort] = true
-				if _, invented := call.Body["thinking"]; invented {
-					t.Fatal("SDK 没有请求预算时不应伪造 thinking.budget_tokens")
+				// 夹具每四次调用依次为 OpenAI 两轮、ZAI 两轮；只后者显式发送 enabled。
+				if client == "pi" && i%4 >= 2 {
+					if !reflect.DeepEqual(call.Body["thinking"], map[string]any{"type": "enabled"}) {
+						t.Fatalf("第 %d 次 ZAI 请求必须保留显式开关且不能补预算: %v", i+1, call.Body["thinking"])
+					}
+				} else if _, invented := call.Body["thinking"]; invented {
+					t.Fatalf("第 %d 次 OpenAI 请求未提供 thinking，不能自动补入: %v", i+1, call.Body["thinking"])
 				}
 			}
 			if !seenEfforts["high"] || !seenEfforts["max"] {
