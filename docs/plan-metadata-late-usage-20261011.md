@@ -51,6 +51,8 @@ go test ./internal/upstream ./internal/gateway ./internal/asyncpool ./internal/o
 - 不估算正文 token、不将缓存读写混入 Anthropic 原始输入值，不改上游 SSE 内容。
 - 检查 Messages、Async、Chat Completions、Responses 的实际交付、诊断和账号用量；
   OpenAI 兼容响应按已有契约把缓存计入总输入，不改变字段形态。
+- Chat/Responses 必须累积多次 delta，而非只保存最后一个 delta；复用其已有 max 合并规则，
+  防止最后的输出更新/零占位再次覆盖此前补报的输入与缓存。
 
 ## 回归矩阵
 
@@ -72,3 +74,11 @@ go test ./internal/upstream ./internal/gateway ./internal/asyncpool ./internal/o
 - 标签发布必须再次通过 release.yml 复用的完整 CI；完成后核对五个二进制、
   linux/amd64 与 linux/arm64 镜像的版本/revision，并核对 latest digest。
 - 无数据库迁移；只修复升级后的新请求，不伪造或回填历史用量。
+
+## 执行记录
+
+- `3431750aee3fdd6ca17027689c074d83826d4022` 的
+  [CI 38149717745](https://github.com/fujunchao/zcode2api-plus/actions/runs/38149717745)
+  已复现共享 metadata 被后续身份覆盖，以及 SSE 输入/cache 仍为零而同值 JSON 正确。
+- 补足 FeedLine 测试的 SSE 空行边界，避免不合法夹具影响终态断言；保留并加强终态检查。
+- 进一步加入引擎/异步票的实际 HTTP 重试及四种入口的用量落账/交付回归，不用单元测试替代调用点验证。

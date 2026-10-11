@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -15,16 +17,17 @@ func TestLateUsageCollectorAccumulatesInputAndCache(t *testing.T) {
 	} {
 		t.Run(initial, func(t *testing.T) {
 			u := NewUsageCollector(true)
-			u.FeedLine(`data: {"type":"message_start","message":` + initial + `}`)
-			u.FeedLine(`data: {"type":"message_delta","usage":{"input_tokens":11,"cache_read_input_tokens":90,"cache_creation_input_tokens":2,"output_tokens":3}}`)
+			feedEvent := func(line string) { u.FeedLine(line); u.FeedLine("") }
+			feedEvent(`data: {"type":"message_start","message":` + initial + `}`)
+			feedEvent(`data: {"type":"message_delta","usage":{"input_tokens":11,"cache_read_input_tokens":90,"cache_creation_input_tokens":2,"output_tokens":3}}`)
 			if u.UsageComplete() {
 				t.Fatal("有中间用量不等于上游已交付终值")
 			}
 			final := `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":17,"cache_read_input_tokens":101,"cache_creation_input_tokens":5,"output_tokens":7}}`
-			u.FeedLine(final)
-			u.FeedLine(final)
-			u.FeedLine(`data: {"type":"message_delta","usage":{"input_tokens":0,"cache_read_input_tokens":-1,"cache_creation_input_tokens":null,"output_tokens":6}}`)
-			u.FeedLine(`data: {"type":"message_stop"}`)
+			feedEvent(final)
+			feedEvent(final)
+			feedEvent(`data: {"type":"message_delta","usage":{"input_tokens":0,"cache_read_input_tokens":-1,"cache_creation_input_tokens":null,"output_tokens":6}}`)
+			feedEvent(`data: {"type":"message_stop"}`)
 			u.Finish()
 			want := model.Usage{Input: 17, Output: 7, CacheRead: 101, CacheCreation: 5}
 			if got := u.AsDict(); got != want {
@@ -61,12 +64,14 @@ func TestLateUsageCollectorFragmentedAndPreservesCounters(t *testing.T) {
 func TestLateUsageWithoutOutputDoesNotBecomeComplete(t *testing.T) {
 	u := NewUsageCollector(true)
 	u.FeedLine(`data: {"type":"message_start","message":{}}`)
+	u.FeedLine("")
 	u.FeedLine(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":17,"cache_read_input_tokens":101,"cache_creation_input_tokens":5}}`)
+	u.FeedLine("")
 	u.Finish()
 	if got := u.AsDict(); got.Input != 17 || got.CacheRead != 101 || got.CacheCreation != 5 {
 		t.Errorf("观测到的输入/cache 应保留：%+v", got)
 	}
-	if u.UsageComplete() || u.StreamError() == nil {
+	if u.UsageComplete() || !errors.Is(u.StreamError(), io.ErrUnexpectedEOF) {
 		t.Fatal("没有最终 output 和 message_stop，不能因输入补报判为完整成功")
 	}
 }
