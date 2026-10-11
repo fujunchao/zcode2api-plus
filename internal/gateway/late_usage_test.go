@@ -90,3 +90,14 @@ func TestLateUsageMatchesJSONAccounting(t *testing.T) {
 		t.Fatalf("同一用量在 SSE/JSON 不应不同：sse=%+v json=%+v", sse.AsDict(), buffered.AsDict())
 	}
 }
+
+func TestLateUsageUsesSSEEventNameWhenTypeMissing(t *testing.T) {
+	u := NewUsageCollector(true)
+	u.Feed([]byte("event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":4}}}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":17,\"cache_read_input_tokens\":101,\"cache_creation_input_tokens\":5,\"output_tokens\":7}}\n\n" +
+		"event: message_stop\ndata: {}\n\n"))
+	u.Finish()
+	if u.AsDict() != (model.Usage{Input: 17, Output: 7, CacheRead: 101, CacheCreation: 5}) || !u.UsageComplete() || u.StreamError() != nil {
+		t.Fatalf("event: 与 JSON type 的合法类型声明都应被识别：%+v", u.AsDict())
+	}
+}

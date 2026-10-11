@@ -16,6 +16,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"maps"
 	"strings"
 )
 
@@ -52,10 +53,12 @@ func MetadataSessionID(body map[string]any) string {
 // 按设备关联，与账号隔离的目的相反。sessionID 应取自同一次请求的 Attribution.SessionID
 // ——官方这两个值恒等，分叉即差异。
 //
-// 只覆盖 user_id 这一个键：metadata 里的其它键（下游可能带的）原样保留，官方形态
-// 也只有一个 user_id，不做删改。
+// 只覆盖 user_id 这一个键：metadata 里的其它键（下游可能带的）原样保留。
+// 调用方通常只复制了 body 顶层，已有 metadata 可能仍与入口/先前尝试共享。
+// 因此先复制实际要写的容器，不反向污染入口，也不深拷贝整段长历史。
 func InjectDeviceMetadata(body map[string]any, deviceID, sessionID string) {
 	metadata, _ := body["metadata"].(map[string]any)
+	metadata = maps.Clone(metadata)
 	if metadata == nil {
 		metadata = make(map[string]any, 1)
 	}

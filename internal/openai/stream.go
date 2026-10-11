@@ -220,7 +220,8 @@ func (e *sseEncoder) onContentBlockDelta(payload map[string]any) error {
 
 func (e *sseEncoder) onMessageDelta(payload map[string]any) error {
 	if u, ok := payload["usage"].(map[string]any); ok {
-		e.outputUsage = u
+		// 输入/cache 可在更早的 delta 补报，最后一次更新未必带齐所有累计值。
+		e.outputUsage = mergeRawUsage(e.outputUsage, u)
 	}
 	deltaObj, _ := payload["delta"].(map[string]any)
 	if stringOf(deltaObj["stop_reason"]) == "" {

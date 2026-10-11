@@ -45,6 +45,7 @@ go test ./internal/upstream ./internal/gateway ./internal/asyncpool ./internal/o
 ### B. 用量统一累积
 
 - message_start、message_delta 及非流式 JSON 共用四类用量字段累积规则。
+- 对 JSON 未带 type、但 SSE event 已声明类型的合法事件，沿用现有事件状态补足类型识别。
 - 输入、输出、缓存读取、缓存创建都是累计观测值，取最大，不重复相加；
   缺失、零、负数或较小的重复值不得抹掉已记录的值。
 - 保留 UsageComplete 和流完整性/取消判据：输入/cache 补报不自动变成成功，也不增加重试。
@@ -82,3 +83,9 @@ go test ./internal/upstream ./internal/gateway ./internal/asyncpool ./internal/o
   已复现共享 metadata 被后续身份覆盖，以及 SSE 输入/cache 仍为零而同值 JSON 正确。
 - 补足 FeedLine 测试的 SSE 空行边界，避免不合法夹具影响终态断言；保留并加强终态检查。
 - 进一步加入引擎/异步票的实际 HTTP 重试及四种入口的用量落账/交付回归，不用单元测试替代调用点验证。
+- `ee1e7a7a4a0fef10e07d9bdd19c26efb19ac6720` 的
+  [CI 38150446103](https://github.com/fujunchao/zcode2api-plus/actions/runs/38150446103)
+  确认真实同步重试的入口/bodyhash 污染、四个入口的输入/cache 落账遗漏，
+  以及 Chat/Responses 多段 delta 仅保留末段导致客户端用量为 0/较小值。
+- 同时补齐手工异步票夹具的 cancel 生命周期，避免 Close 因不完整夹具产生额外空指针失败；
+  未放宽生产票务或流完整性检查。后续完整 CI 必须重新运行。

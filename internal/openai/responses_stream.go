@@ -128,7 +128,8 @@ func (e *responsesEncoder) dispatch(event, data string) error {
 		return e.onContentBlockDelta(payload)
 	case "message_delta":
 		if usage, ok := payload["usage"].(map[string]any); ok {
-			e.outputUsage = usage
+			// 与 Chat/网关一致，保留多次 delta 的累计用量，而不是只看最后一段。
+			e.outputUsage = mergeRawUsage(e.outputUsage, usage)
 		}
 		if delta, ok := payload["delta"].(map[string]any); ok {
 			if reason := stringOf(delta["stop_reason"]); reason != "" {

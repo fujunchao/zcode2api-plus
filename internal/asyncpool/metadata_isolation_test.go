@@ -79,7 +79,10 @@ func TestMetadataIsolationAsyncRetries(t *testing.T) {
 			web.SetOut(buf)
 			t.Cleanup(func() { web.SetOut(nil) })
 			ticket := insertTicket(p, "metadata-ticket", body)
-			p.processTicket(context.Background(), "metadata-ticket")
+			ctx, cancel := context.WithCancel(context.Background())
+			ticket.cancel = cancel // 手工建票也补齐真实票务的取消能力，保证 Close 的生命周期契约。
+			t.Cleanup(cancel)
+			p.processTicket(ctx, "metadata-ticket")
 			events := drainEvents(ticket)
 			done := 0
 			for _, e := range events {

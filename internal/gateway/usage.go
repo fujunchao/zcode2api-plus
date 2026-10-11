@@ -2,8 +2,8 @@
 // 对应 Python 版 app/usage.py。
 //
 // 上游回应有两种形态：
-//   - SSE（text/event-stream）：message_start 携带输入侧（input / cache），
-//     message_delta 的 usage.output_tokens 为累计值（取最大，不可累加）。
+//   - SSE（text/event-stream）：message_start 通常携带输入侧（input / cache），
+//     message_delta 也可能补报输入与缓存；四类字段均按累计值取最大，不重复相加。
 //   - JSON：顶层 usage 一次带齐全部字段。
 //
 // 收集器以「块」为单位餵入，内部缓冲不完整行，对上游分块边界不敏感；
@@ -76,20 +76,30 @@ func (u *UsageCollector) FeedLine(line string) {
 	if err := json.Unmarshal([]byte(payloadText), &payload); err != nil {
 		return
 	}
-	switch payload["type"] {
+	event, _ := payload["type"].(string)
+	if event == "" && u.stream != nil {
+		// 合法 SSE 也可只在 event: 声明类型；不能因 JSON 缺 type 而漏记用量。
+		event = u.stream.event
+	}
+	switch event {
 	case "message_start":
 		msg, _ := payload["message"].(map[string]any)
 		usage, _ := msg["usage"].(map[string]any)
-		u.input = max(u.input, toInt(usage["input_tokens"]))
-		u.output = max(u.output, toInt(usage["output_tokens"]))
-		u.cacheCreation = max(u.cacheCreation, toInt(usage["cache_creation_input_tokens"]))
-		u.cacheRead = max(u.cacheRead, toInt(usage["cache_read_input_tokens"]))
+		u.observeUsage(usage)
 	case "message_delta":
-		// output_tokens 为累计值，取最大避免重复累加
 		usage, _ := payload["usage"].(map[string]any)
-		u.output = max(u.output, toInt(usage["output_tokens"]))
+		u.observeUsage(usage)
 		u.markFinalIfComplete(payload, usage)
 	}
+}
+
+// observeUsage 只合并明确收到的累计值，不推算缺失 token，也不决定交付是否成功。
+// max 同时防止重复相加及后续零/负数/非法占位清掉已知值。
+func (u *UsageCollector) observeUsage(usage map[string]any) {
+	u.input = max(u.input, toInt(usage["input_tokens"]))
+	u.output = max(u.output, toInt(usage["output_tokens"]))
+	u.cacheCreation = max(u.cacheCreation, toInt(usage["cache_creation_input_tokens"]))
+	u.cacheRead = max(u.cacheRead, toInt(usage["cache_read_input_tokens"]))
 }
 
 // markFinalIfComplete 记录「上游已交出最终 usage」。
@@ -161,10 +171,7 @@ func (u *UsageCollector) Finish() {
 			contentOK && stopReason != "" && payload["error"] == nil
 		usage, _ := payload["usage"].(map[string]any)
 		if usage != nil {
-			u.input = max(u.input, toInt(usage["input_tokens"]))
-			u.output = max(u.output, toInt(usage["output_tokens"]))
-			u.cacheCreation = max(u.cacheCreation, toInt(usage["cache_creation_input_tokens"]))
-			u.cacheRead = max(u.cacheRead, toInt(usage["cache_read_input_tokens"]))
+			u.observeUsage(usage)
 			// 非 SSE 回應是整体到达后解析的，解析出 usage 即终值
 			u.final = true
 		}

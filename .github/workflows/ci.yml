@@ -104,6 +104,10 @@ jobs:
       - name: Test request diagnostics regression (repeat)
         run: go test ./internal/gateway ./internal/asyncpool ./internal/upstream -run '^TestDiagnostic' -count=20 -timeout=180s
 
+      # 已有 metadata 的真实重试/并行隔离，以及迟到用量在四种 API 入口的落账和交付。
+      - name: Test metadata and late usage regression (repeat)
+        run: go test ./internal/upstream ./internal/gateway ./internal/asyncpool ./internal/openai -run 'TestMetadataIsolation|TestLateUsage' -count=20 -timeout=180s
+
       # 近期失败线路避让、逐次出站和并发改派使用真实本地 HTTP/SQLite 边界重复验证。
       - name: Test risk proxy regression (repeat)
         run: go test ./internal/store ./internal/gateway ./internal/asyncpool -run 'TestRiskProxy|TestAttemptLog|TestAsyncRiskProxy|TestAsyncForcedDirect|TestRotateAccountProxy|TestConcurrentRiskResponses|TestProxyMutationFailureIsAtomic' -count=20 -timeout=180s
