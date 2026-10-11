@@ -205,6 +205,9 @@ var (
 	// 不发的头，与少发一样是可交叉比对的差异。见 docs/plan-client-format-parity.md GAP-7。
 	UpstreamSendDeviceMid = envBool("ZCODE_UPSTREAM_SEND_DEVICE_MID", false)
 
+	// 调用者拥有自己的指令与本地工具上下文；关闭时恢复旧版注入/指令提升行为。
+	PreserveClientContext = envBool("ZCODE_PRESERVE_CLIENT_CONTEXT", true)
+
 	// ReplayGuardTTLSeconds 重放防护窗口（秒，P1-3）：同一份请求内容被判定「请求级
 	// 风控」后，该窗口内同内容+同模型的请求直接快速失败，不再消耗任何账号 —— 阻止
 	// 上游账号标记随换号重试扩散（2026-09-24 整池雪崩的直接机制）。0 = 禁用（应急回退）。

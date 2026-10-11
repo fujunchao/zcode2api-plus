@@ -7,17 +7,16 @@ import (
 	"slices"
 	"strings"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/upstream"
 )
 
-// NormalizeBody 对请求体做三件事（与 Python 版一致）：
+// NormalizeBody 在不改写调用者嵌套对象的前提下规范请求体：
 //  1. 模型名去 "provider/" 前缀，并按 MODEL_NAME_MAP 做大小写映射（幂等）；
 //  2. 字符串 content 桥接为 [{type:"text"}]（不改写原始消息 map，幂等）；
-//  3. needsZcodeSystem（JWT 账号）时把 zcode_system.json 注入顶层 system
-//     —— 否则上游返回 405。
+//  3. JWT 缺少 system 时提供兼容兜底；已有指令由调用者拥有，包括显式空值。
 //
-// system 注入只去重与网关标准块完整相同的对象；调用者的文本、缓存策略或附加字段
-// 有差异时原样保留，不按关键词推断身份，也不合并任意重复的用户段落。
+// 回退模式保留旧版标准块前置与精确去重，不通过关键词删除调用者内容。
 func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	if raw, ok := body["model"].(string); ok {
 		m := raw
@@ -52,6 +51,9 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	}
 
 	if needsZcodeSystem {
+		if config.PreserveClientContext && body["system"] != nil {
+			return body
+		}
 		blocks := upstream.ZcodeSystemBlocks()
 		switch existing := body["system"].(type) {
 		case nil:

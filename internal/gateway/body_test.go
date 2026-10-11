@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"testing"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/upstream"
 )
 
@@ -52,6 +53,7 @@ func TestNormalizeBodyContentBridge(t *testing.T) {
 }
 
 func TestNormalizeBodySystemInjection(t *testing.T) {
+	useLegacyClientContext(t)
 	blocks := upstream.ZcodeSystemBlocks()
 
 	// 键不存在 → 注入 blocks
@@ -104,6 +106,7 @@ func TestNormalizeBodySystemInjection(t *testing.T) {
 // 已有网关标准块只保留一份；同文但缓存策略/附加字段不同的调用者块不能被误删。
 // 通过 JSON 往返模拟下游重新提交同一请求，不依赖 Go 对象的指针身份。
 func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
+	useLegacyClientContext(t)
 	const prefix = "You are ZCode, an interactive coding agent"
 	known := map[string]any{
 		"type": "text", "text": prefix,
@@ -150,5 +153,43 @@ func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
 	second, err := json.Marshal(repeated)
 	if err != nil || string(second) != string(first) {
 		t.Fatal("重新提交已有标准块的请求，不应重复注入或改变调用者内容")
+	}
+}
+
+func useLegacyClientContext(t *testing.T) {
+	t.Helper()
+	old := config.PreserveClientContext
+	config.PreserveClientContext = false
+	t.Cleanup(func() { config.PreserveClientContext = old })
+}
+
+func TestNormalizeBodyCallerSystemIsIdempotent(t *testing.T) {
+	const payload = `{"model":"GLM-5.3","system":[
+		{"type":"text","text":"调用者身份","cache_control":{"type":"ephemeral","ttl":"1h"}},
+		{"type":"text","text":"重复但有意保留"},
+		{"type":"text","text":"重复但有意保留","caller_metadata":"保留"}
+	],"messages":[{"role":"user","content":"问题"}]}`
+	var body map[string]any
+	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		t.Fatal(err)
+	}
+	originalSystem, _ := json.Marshal(body["system"])
+	NormalizeBody(body, true)
+	gotSystem, _ := json.Marshal(body["system"])
+	if string(gotSystem) != string(originalSystem) {
+		t.Fatal("不得改写调用者的指令、缓存策略、顺序或扩展字段")
+	}
+	first, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repeated map[string]any
+	if err := json.Unmarshal(first, &repeated); err != nil {
+		t.Fatal(err)
+	}
+	NormalizeBody(repeated, true)
+	second, err := json.Marshal(repeated)
+	if err != nil || string(first) != string(second) {
+		t.Fatal("JSON 往返并重复规范化不得增加或丢失上下文")
 	}
 }
