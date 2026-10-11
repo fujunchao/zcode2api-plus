@@ -80,10 +80,14 @@ func attemptRequestSummary(acc *model.Account, request *http.Request) string {
 
 // 会话/追踪/轮次值可能来自下游，不把原值写日志；短哈希只用于同轮诊断关联。
 func attemptIDRef(value string) string {
-	if value == "" {
+	return diagnosticBytesRef([]byte(value))
+}
+
+func diagnosticBytesRef(value []byte) string {
+	if len(value) == 0 {
 		return "-"
 	}
-	sum := sha256.Sum256([]byte(value))
+	sum := sha256.Sum256(value)
 	return hex.EncodeToString(sum[:6])
 }
 

@@ -447,7 +447,7 @@ func TestDiagRiskScopeDistinctAccounts(t *testing.T) {
 // TestDiagNewFieldsAppendedAtTail 新增字段一律追加在行尾。
 //
 // 这不是审美问题：外部分析脚本可能按位置切分诊断行，把新字段插进既有字段之间会让它们
-// 既有的下标全部错位。本用例锁住「err= 之后才是新字段」这个顺序。
+// 既有的下标全部错位。本用例锁住旧字段顺序，以及每轮新增字段只能接在旧尾部之后。
 func TestDiagNewFieldsAppendedAtTail(t *testing.T) {
 	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -470,8 +470,25 @@ func TestDiagNewFieldsAppendedAtTail(t *testing.T) {
 		t.Errorf("新增字段必须排在 err= 之后（bodyhash < riskscope），实际下标 err=%d bodyhash=%d riskscope=%d\n行=%s",
 			idxErr, idxHash, idxScope, line)
 	}
-	if !regexp.MustCompile(`riskscope=\d+$`).MatchString(line) {
-		t.Errorf("riskscope 应是行尾的裸整数：%s", line)
+	if !regexp.MustCompile(` riskscope=\d+ ts=`).MatchString(line) {
+		t.Errorf("riskscope 仍须为裸整数，新扩展只能从它之后开始：%s", line)
+	}
+	last := idxScope
+	for _, field := range []string{
+		"ts", "started_at", "gateway_request_id", "protocol", "input_ref", "upstream_attempts", "replay_blocked", "replay_wait_ms",
+		"preserve_context", "shape_stage", "system_source", "system_form", "system_blocks", "messages",
+		"roles_user", "roles_assistant", "roles_system", "roles_developer", "roles_tool", "roles_other", "tools",
+		"tool_use_blocks", "tool_result_blocks", "mcs_declared",
+	} {
+		key := " " + field + "="
+		index := strings.Index(line, key)
+		if index <= last || strings.Count(line, key) != 1 {
+			t.Fatalf("新增字段 %s 必须唯一、按序追加到旧尾部之后：%s", field, line)
+		}
+		last = index
+	}
+	if !strings.HasSuffix(line, " mcs_declared=false") {
+		t.Fatalf("最终追加字段或实际能力声明不符：%s", line)
 	}
 }
 

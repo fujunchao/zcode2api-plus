@@ -56,7 +56,14 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 默认客户端版本已同步至 `3.14.5`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。升级只需替换网关程序/镜像并重启，无数据库迁移。
 
-`v2.9.11-go` 优先保证“本地客户端 → Docker 网关 → 上游”的上下文兼容：
+`v2.9.12-go` 补齐 New API 分发链路的诊断：四种模型入口返回网关 UUID，
+New API rc.41 可将其保存到日志的 `upstream_request_id`，无需透传最终用户身份或新增配置。
+新增带 UTC 时间戳的入口/出站事件、错误体读取原因、受限响应追踪信息和请求结构计数；
+重放早退也有零出站汇总与剩余窗口。新诊断不记录请求正文、工具参数或响应全文，
+不调整上下文、重试/换号和风险阈值。见 [请求诊断说明](docs/request-diagnostics.md) 与
+[发布说明](docs/releases/v2.9.12-go.md)。
+
+`v2.9.11-go` 起优先保证“本地客户端 → Docker 网关 → 上游”的上下文兼容：
 - 默认 `ZCODE_PRESERVE_CLIENT_CONTEXT=true`：已有 system/instructions 由调用者拥有，
   包括显式空指令，不再叠加另一份网关身份或环境；完全没有系统指令的 JWT 请求仍使用既有兼容兜底。
 - Chat/Responses 会话开始后的 system/developer 保留原位置，作为中途系统消息（MCS）转发；

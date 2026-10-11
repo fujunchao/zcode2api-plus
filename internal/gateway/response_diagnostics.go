@@ -99,7 +99,7 @@ func (d *ReqDiag) ObserveResponseBody(resp *http.Response, raw []byte, readErr e
 	metadata, _ := json.Marshal(meta)
 	web.Attempt(d.ReqID, fmt.Sprintf("event=response_body %s ts=%s phase=%s status=%d content_type=%s declared_bytes=%d body_read_bytes=%d body_truncated=%t read_err_kind=%s error_json=%t response_body_ref=%q error_meta=%s",
 		base, diagnosticTime(d.Now()), phase, status, contentType, declaredLength, len(raw), truncated,
-		diagnosticReadError(readErr), valid, attemptIDRef(string(raw)), metadata))
+		diagnosticReadError(readErr), valid, diagnosticBytesRef(raw), metadata))
 }
 
 func diagnosticReadError(err error) string {
