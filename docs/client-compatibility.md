@@ -15,6 +15,41 @@
 必须读取完整流，并实际向模型声明工具；思考输出由模型生成，网关不会凭空补出字段。
 发送给 Anthropic 的消息外层通常仍只有 role/content，工具和结果位于 content 数组内。
 
+## 调用者上下文（v2.9.11-go）
+
+默认 `ZCODE_PRESERVE_CLIENT_CONTEXT=true`。本地客户端拥有自己的指令、工作目录和工具；
+网关不复制官方桌面的 Memory、技能表或完整桌面提示，不替本地客户端执行函数。
+
+| 输入 | 默认上游处理 |
+| --- | --- |
+| 原生顶层 system（包括空字符串、空数组） | 原样保留，不前置另一份系统上下文 |
+| 完全缺少系统指令的 JWT 请求 | 沿用既有兼容兜底，不新增桌面内容 |
+| Chat 初始连续 system/developer | 转为顶层 Anthropic system |
+| Responses instructions 与 input 初始指令 | 保留初始顺序；显式空 instructions 不视为缺省 |
+| 会话开始后的 system/developer | 保留相对位置，转换为消息序列内的 system |
+| 仅有消息内 system、没有顶层 system | 不再补一份网关环境 |
+
+消息序列中实际出现 system 时，同步与异步才合并
+`anthropic-beta: mid-conversation-system-2026-04-07`，保留其它客户端 beta。
+只有顶层指令的请求不自动添加该头，也不生成官方技能轮次来凑形态。
+原生 system 的字符串保持字符串；单个纯文本块可压成字符串，带 cache_control、
+扩展字段或多个文本块的内容保持列表，避免信息损失。
+
+配置为 false 并重启可恢复旧版：JWT 前置标准三块并精确去重，OpenAI 指令统一提升，
+不自动补 MCS 头。调用方显式传入的 beta 仍按既有规则透传。
+两个默认 ZAI Anthropic 上游均支持此消息能力；若覆盖上游为不支持 MCS 的实现，
+可用该回退开关恢复旧行为，不应只加头却发送不匹配的消息。
+
+Docker Compose 必须显式传入环境变量；仓库模板已包含该项。旧模板可加入：
+
+```yaml
+environment:
+  ZCODE_PRESERVE_CLIENT_CONTEXT: ${ZCODE_PRESERVE_CLIENT_CONTEXT:-true}
+```
+
+不改变现有 API 路径、认证方式、流终态或工具执行位置。不增加跨 HTTP 请求的隐式会话：
+调用者仍需发送完整历史，并通过既有会话/追踪标识维持关联。
+
 ## 工具控制
 
 - auto：由模型选择；required：要求使用工具；none：禁止；也可指定已声明的函数。
@@ -53,8 +88,8 @@ max 与 max_tokens / max_output_tokens 是两个独立控制：前者是推理�
 
 显式 Anthropic thinking.budget_tokens 仍校验并保留（整数、至少 1024 且小于总上限），
 但不会替代或覆盖同时请求的原生 effort。
-Pi ZAI 的无预算 enabled 开关等同于模型的强制思考默认行为，不会被换成猜测的预算；
-clear_thinking 不是 Anthropic thinking 参数，不上行。
+Pi ZAI 的无预算 enabled 开关显式保留为 `{"type":"enabled"}`，不会被换成猜测的预算；
+未传 thinking 时仍不主动补字段。clear_thinking 不是 Anthropic thinking 参数，不上行。
 thinking.type=disabled 明确返回 400，建议用 low 降低开销；真正未知的档位仍报错。
 
 历史中的 reasoning_content / reasoning item 不会转换成缺签名的 Anthropic thinking；
@@ -100,6 +135,7 @@ SSE 的项目 done 统一在最终 response 之前发送；文本与思考不会
 
 ## 回归测试
 
+以下自动化检查统一在 GitHub Actions 的 Ubuntu 环境执行，本地不重复运行。
 普通 Go 测试不要求安装 SDK：
 
     go test ./internal/openai

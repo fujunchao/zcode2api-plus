@@ -56,14 +56,17 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 默认客户端版本已同步至 `3.14.5`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。升级只需替换网关程序/镜像并重启，无数据库迁移。
 
-`v2.9.10-go` 改善现有请求的一致性，不扩展官方 API Key 套餐适配：
-- 模型 UA 默认声明 Node `24`，与已核实的 ZCode 3.14.5 随包运行时基线一致；
-  网关仍为 Go 单二进制，不因此增加 Node 运行依赖。显式 `ZCODE_CLIENT_NODE_MAJOR` 仍优先。
-- 客户端配置查询使用查询平台格式（如 `windows-x86_64`），保留 `ZCODE_CLIENT_PLATFORM` 覆盖并转换已知别名；不改动余额和领取查询。
-- JWT 的标准 system 块精确去重；调用者段落、不同缓存策略及附加字段原样保留。
-- 异步限流/过载原地重试逐次生成新的上游请求 ID，会话/轮次标识与正文保持一致，原有重试策略不变。
-- `[attempt]` 日志末尾追加账号模式、目标 origin、上游请求 ID，以及会话/追踪/轮次的短哈希引用；
-  新摘要不记录正文、认证头、URL 用户信息、路径、查询参数或片段。详见 [发布说明](docs/releases/v2.9.10-go.md)。
+`v2.9.11-go` 优先保证“本地客户端 → Docker 网关 → 上游”的上下文兼容：
+- 默认 `ZCODE_PRESERVE_CLIENT_CONTEXT=true`：已有 system/instructions 由调用者拥有，
+  包括显式空指令，不再叠加另一份网关身份或环境；完全没有系统指令的 JWT 请求仍使用既有兼容兜底。
+- Chat/Responses 会话开始后的 system/developer 保留原位置，作为中途系统消息（MCS）转发；
+  同步、异步只在实际使用该能力时合并相应 beta 头，不额外生成技能清单或工具。
+- 显式 `thinking=enabled` 即使没有预算也会保留，不猜测预算、不提高默认 8192 输出上限，
+  不强制 max 档位；本地工具定义、调用结果以及下游 JSON/SSE 协议保持原有契约。
+- 需要旧行为时设置 `ZCODE_PRESERVE_CLIENT_CONTEXT=false` 并重启，恢复旧版指令注入/提升。
+  使用旧 Compose 文件时须把此变量加入 `environment`，仅写 `.env` 不会自动传入容器。
+- 不改变鉴权、签名、OS 档案、账号选择及原有逐次请求归因；不添加服务端工具执行器。
+  详见 [发布说明](docs/releases/v2.9.11-go.md) 和 [客户端兼容说明](docs/client-compatibility.md)。
 
 上游 API Key 账号的模型额度耗尽后，普通网关会在**正常候选用尽**时进行有界恢复探测：
 等待 5 分钟后借一次真实请求检查，未成功则依次等待 15 分钟、1 小时、6 小时（封顶）；

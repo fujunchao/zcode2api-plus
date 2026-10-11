@@ -25,7 +25,7 @@ var (
 )
 
 // ZcodeSystemBlocks 返回 ZCode 官方系统提示词块（JSON 解析失败时为空，对齐 Python 版）。
-// JWT 账号请求必须注入到顶层 system，否则上游返回 405。
+// 用于 JWT 缺省上下文及旧行为回退；调用者已有指令时由网关保留其内容。
 //
 // 只解析一次静态段（CLI Prefix / Agent Identity，内容是固定的），
 // 但**每次都重新生成** # Environment 段：它必须跟随当前伪装档案
