@@ -151,21 +151,18 @@ type attemptBudget struct {
 func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingHeaders map[string]string, deliver DeliverFunc) runResult {
 	modelName, _ := body["model"].(string)
 	stream := bodyBool(body, "stream")
-	reqID := randomHex(3)
+	reqID := RequestShortID(ctx)
 	// 观测诊断行：每请求恰好一条，收尾期输出（defer 保证早退路径也发）。
 	// 刻意不改 web.Req/ReqOk/ReqErr 的形态，也不改本函数的导出签名
 	//（reqID 本就在函数内生成，三个外部调用点无需改动）。
 	diag := NewReqDiag(reqID, orDash(modelName), stream, body, e.now)
+	diag.SetTrace(ctx)
 	// 重放防护（P1-3）：同一份内容刚刚被判定请求级风控 ⇒ TTL 内直接快速失败。
 	// 上游 405 是两段式（内容触发 + 账号标记），请求级判定成立时每个被尝试的账号都
 	// 已被服务端标记；窗口期内继续接同内容请求只会把下一个健康账号再标记一个
 	//（09-24 凌晨 14 次重放冷却 67 号、整池清空的直接机制）。见 replayguard.go。
 	contentKey := ContentKey(orDash(modelName), body)
-	if e.replay.Blocked(contentKey) {
-		web.ReqErr(reqID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
-		return errResult(http.StatusServiceUnavailable, "risk_control_cooldown",
-			"相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容")
-	}
+	diag.SetContentKey(contentKey)
 	// 风控判定范围：**必须按请求创建**（Engine 跨请求共享，挂上去会让并发请求互相误判）。
 	// 用于把「账号级风控」（换号即成功）与「请求级风控」（同一 body 换谁都被拒）分开。
 	// 请求级处置：停止换号、保留冷却（上游已标记账号）、登记重放防护。见 riskscope.go。
@@ -182,6 +179,14 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		diag.SetRiskAccounts(scope.Accounts())
 		web.Diag(diag.ReqID, diag.Format())
 	}()
+	// 先安装收尾再判断重放；零出站的调用也必须可关联、可计时。
+	if remaining := e.replay.Remaining(contentKey); remaining > 0 {
+		diag.ReplayBlocked, diag.ReplayWait = true, remaining
+		diag.ErrText = "risk_control_cooldown"
+		web.ReqErr(reqID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
+		return errResult(http.StatusServiceUnavailable, "risk_control_cooldown",
+			"相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容")
+	}
 	web.Req(reqID, orDash(modelName), stream)
 
 	// 归因标识**按请求算一次**：出站头与 body 的 metadata.user_id.session_id 必须
@@ -316,6 +321,7 @@ func (e *Engine) tryAccount(
 		// 每个账号在副本上整形；后续设备注入不得污染原始请求或其它账号的副本。
 		actualBody := shallowCopyBody(body)
 		NormalizeBody(actualBody, isJWT)
+		diag.SetPreparedBody(body, actualBody, isJWT)
 		// 内容视图（= 下游内容 + 网关整形）在注入账号身份**之前**取：设备指纹每账号
 		// 一份，算进指纹会让同一份内容在换号后指纹不同，而 diag 的 bodyhash 正是用来
 		// 判读「这个 body 打过几个账号」的（见 ReqDiag.SetBody）。
@@ -369,11 +375,7 @@ func (e *Engine) tryAccount(
 		requeststats.Attempt(ctx)
 		finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq)
 		resp, err := client.Do(httpReq)
-		status := 0
-		if resp != nil {
-			status = resp.StatusCode
-		}
-		finishAttempt(status, err)
+		finishAttempt(resp, err)
 		if err != nil {
 			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
@@ -394,7 +396,7 @@ func (e *Engine) tryAccount(
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, modelName, isJWT, resp, &b, scope, egress)
+			res := e.handleUpstreamError(ctx, reqID, acc, modelName, isJWT, resp, &b, scope, egress, diag)
 			if res.retrySame {
 				continue
 			}
@@ -417,17 +419,19 @@ func (e *Engine) tryAccount(
 			buffered, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 			_ = resp.Body.Close()
 			if err != nil {
+				diag.ObserveResponseBody(resp, buffered, err, len(buffered) > limit, "json_body")
 				e.bumpFail(acc, model.ErrorKindConnectionFailed)
 				web.ReqErr(reqID, fmt.Sprintf("上游 JSON 响应读取失败（账号 %s）", acc.Name))
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_error", textPreview(err.Error()))}
 			}
 			if len(buffered) > limit {
+				diag.ObserveResponseBody(resp, buffered, nil, true, "json_body")
 				e.bumpFail(acc, model.ErrorKindInvalidResponse)
 				web.ReqErr(reqID, fmt.Sprintf("上游 JSON 响应超过 %d 字节（账号 %s）", limit, acc.Name))
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_response_too_large",
 					fmt.Sprintf("上游 JSON 响应超过 %d 字节上限", limit))}
 			}
-			res := e.handleUpstreamJSON(ctx, reqID, acc, modelName, isJWT, stream, contentType, buffered, &b, deliver, diag)
+			res := e.handleUpstreamJSON(ctx, reqID, acc, modelName, isJWT, stream, resp, buffered, &b, deliver, diag)
 			if res.retrySame {
 				continue
 			}
@@ -466,8 +470,9 @@ func (e *Engine) handleUpstreamError(
 	b *attemptBudget,
 	scope *RiskScope,
 	egress store.ProxyEgress,
+	diag *ReqDiag,
 ) attemptResult {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	body, err := ReadErrorResponse(resp, diag, "error_body")
 	_ = resp.Body.Close()
 	if err != nil {
 		if isClientGone(ctx) {
@@ -615,7 +620,7 @@ func (e *Engine) handleUpstreamError(
 	// → 整号冷却（按连续命中次数递进，超阶梯置失效）并换号，与既有行为一致。
 	//
 	// 请求级（同一 body 在 ≥2 个不同账号上都吃同一风控信号——2026-09-24 当日 67/67）
-	// → 身份已不是变量，剩下的只有请求体：换号是把健康账号一个个送出去挨打。处置
+	// → 达到本地停止继续换号的保护阈值；不据此断言提示词是服务端触发原因。处置
 	// （账号级标记模型，见 riskscope.go 头注释）：停止换号、**保留**本请求已施加的
 	// 风控冷却（每个被尝试的账号都已被上游标记，本地冷却防止它们立即被再次选中）、
 	// 登记重放防护（同内容 TTL 内直接快速失败，阻止标记扩散）。
@@ -684,14 +689,18 @@ func (e *Engine) handleUpstreamJSON(
 	modelName string,
 	isJWT bool,
 	stream bool,
-	contentType string,
+	resp *http.Response,
 	buffered []byte,
 	b *attemptBudget,
 	deliver DeliverFunc,
 	diag *ReqDiag,
 ) attemptResult {
+	contentType := resp.Header.Get("Content-Type")
 	text := string(buffered)
 	code := UpstreamBusinessCode(text)
+	if stream || (code != "" && code != "0") {
+		diag.ObserveResponseBody(resp, buffered, nil, false, "json_body")
+	}
 
 	switch {
 	case code == "1005":

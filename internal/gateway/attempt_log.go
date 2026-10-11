@@ -18,16 +18,24 @@ import (
 // BeginUpstreamAttempt 紧贴 client.Do 调用。返回回调仅记录响应头/连接结果，不把 HTTP
 // 200 当作完整调用成功，也不记录可能包含代理凭据的原始网络错误。
 // request 是实际发出的请求；只提取安全摘要，不保留请求或读取正文。nil 表示未提供摘要。
-func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgress, request *http.Request) func(int, error) {
+func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgress, request *http.Request) func(*http.Response, error) {
 	if d == nil {
-		return func(int, error) {}
+		return func(*http.Response, error) {}
 	}
 	d.upstreamAttempts++
 	base := fmt.Sprintf("req=%q ticket=%q attempt=%d selection=%d acc_id=%q route_id=%q route=%q endpoint=%q mode=%s",
 		d.ReqID, d.Ticket, d.upstreamAttempts, d.Attempts, acc.ID, egress.ID, egress.Label, egress.Endpoint, egress.Mode)
+	trace := fmt.Sprintf(" gateway_request_id=%q protocol=%s", d.GatewayRequestID, d.Protocol)
+	d.lastAttemptBase = base + trace
+	d.shape.mcsDeclared = request != nil && hasMCSDeclaration(request.Header.Get("Anthropic-Beta"))
 	summary := attemptRequestSummary(acc, request)
-	web.Attempt(d.ReqID, "event=start "+base+summary)
-	return func(status int, err error) {
+	extra := trace + d.shape.format(d.preserveContext)
+	web.Attempt(d.ReqID, "event=start "+base+summary+extra+" ts="+diagnosticTime(d.Now()))
+	return func(resp *http.Response, err error) {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
 		kind := "-"
 		event := "headers"
 		if err != nil {
@@ -40,7 +48,7 @@ func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgr
 			}
 		}
 		// 新字段始终追加，不挪动原有日志字段；开始与结果使用同一份请求快照。
-		web.Attempt(d.ReqID, fmt.Sprintf("event=%s %s status=%d err_kind=%s%s", event, base, status, kind, summary))
+		web.Attempt(d.ReqID, fmt.Sprintf("event=%s %s status=%d err_kind=%s%s%s%s ts=%s", event, base, status, kind, summary, extra, responseHeaderSummary(resp), diagnosticTime(d.Now())))
 	}
 }
 

@@ -70,6 +70,11 @@ var dropHeaders = map[string]bool{
 	"x-client-pow":           true,
 	"x-client-sign-verified": true,
 	"x-app-id":               true,
+
+	// 中继诊断只在下游响应/本地日志中使用，不把内部关联发给模型上游。
+	"x-oneapi-request-id":   true,
+	"x-upstream-request-id": true,
+	"x-new-api-request-id":  true,
 }
 
 // Attribution 一次请求内共享的归因标识，对应官方的

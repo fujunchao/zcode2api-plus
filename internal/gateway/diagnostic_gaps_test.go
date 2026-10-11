@@ -7,11 +7,15 @@ import (
 	"strings"
 	"testing"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 )
 
 // 在真实 HTTP 边界复现“已有 405 响应头，错误体却没读完”的日志盲区。
 func TestDiagnosticErrorBodyReadFailureVisible(t *testing.T) {
+	oldData := config.DataDir
+	config.DataDir = t.TempDir()
+	t.Cleanup(func() { config.DataDir = oldData })
 	f := newDiagFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "application/json")
@@ -39,6 +43,9 @@ func TestDiagnosticErrorBodyReadFailureVisible(t *testing.T) {
 
 // 重放早退也属于独立入站调用，必须有收尾；不得再次访问上游或续期窗口。
 func TestDiagnosticReplayEarlyReturnHasSummary(t *testing.T) {
+	oldData := config.DataDir
+	config.DataDir = t.TempDir()
+	t.Cleanup(func() { config.DataDir = oldData })
 	f := newDiagFixture(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Error("重放防护不应访问上游")
 		w.WriteHeader(http.StatusInternalServerError)

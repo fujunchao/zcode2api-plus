@@ -55,7 +55,7 @@ func TestAttemptLogRedactsCredentialsAndClassifiesErrors(t *testing.T) {
 	diag := NewReqDiag("abcdef", "model", true, nil, nil)
 	diag.Attempts = 1
 	finish := diag.BeginUpstreamAttempt(s.FindAny(a.ID), s.ProxyEgress(s.FindAny(a.ID)), nil)
-	finish(0, context.Canceled)
+	finish(nil, context.Canceled)
 	logs := buf.String()
 	for _, secret := range []string{"user-sentinel", "password-sentinel", "private-sentinel", "query-sentinel", "fragment-sentinel", "sk-token-sentinel"} {
 		if strings.Contains(logs, secret) {

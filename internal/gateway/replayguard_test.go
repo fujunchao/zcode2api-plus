@@ -29,6 +29,25 @@ func TestReplayGuardBlocksWithinTTL(t *testing.T) {
 	}
 }
 
+func TestDiagnosticReplayRemainingDoesNotExtendWindow(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	g := NewReplayGuard(time.Minute, func() time.Time { return now })
+	g.Record("content")
+	for i := range 60 {
+		if got := g.Remaining("content"); got != time.Duration(60-i)*time.Second || !g.Blocked("content") {
+			t.Fatalf("读取剩余时间不得续期，i=%d remaining=%s", i, got)
+		}
+		now = now.Add(time.Second)
+	}
+	if g.Remaining("content") != 0 || g.Blocked("content") || len(g.entries) != 0 {
+		t.Fatal("边界到期必须清理，与原 Blocked 契约相同")
+	}
+	var disabled *ReplayGuard
+	if disabled.Remaining("content") != 0 || g.Remaining("") != 0 {
+		t.Fatal("禁用/空键不应报告保护窗口")
+	}
+}
+
 // 不同的内容指纹互不影响；空键安全跳过。
 func TestReplayGuardKeysAreIndependent(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)

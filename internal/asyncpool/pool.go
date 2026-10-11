@@ -107,7 +107,7 @@ func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
 // Register 在 mux 上注册异步路由（调用方按 config.AsyncEnabled 决定是否挂载，
 // 对齐 Python 的条件 include_router；端点内的 503 检查作为运行期兜底保留）。
 func (p *Pool) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /async/v1/messages", p.Store.Requests.Wrap(p.handleAsyncMessages))
+	mux.HandleFunc("POST /async/v1/messages", p.Store.Requests.Wrap(gateway.ObserveRequests("async_messages", p.handleAsyncMessages)))
 }
 
 // handleAsyncMessages 创建 async ticket 并 SSE 等待结果。
@@ -251,7 +251,7 @@ func (p *Pool) newTicketContext(parent context.Context, body map[string]any) str
 		queue:     make(chan ticketEvent, 256),
 		createdAt: time.Now(),
 		cancel:    cancel,
-		shortID:   newShortID(),
+		shortID:   gateway.RequestShortID(parent),
 	}
 	p.mu.Lock()
 	if p.closed {
@@ -345,6 +345,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	// 账号/线路要等 Select 之后才可得，故数据集中在收尾期输出。
 	diag := gateway.NewReqDiag(tk.shortID, modelName, true, body, time.Now)
 	diag.Ticket = ticketID
+	diag.SetTrace(ctx)
 	// 风控判定范围：**必须按票创建**（Pool 跨票共享，挂上去会让并发票务互相误判）。
 	// 与 sync 路径共用 gateway.RiskScope：同一份 body 在两条路径上必须得到同一判定。
 	// 请求级处置：停止换号、保留冷却（上游已标记账号）、登记重放防护。见 riskscope.go。
@@ -352,11 +353,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	// 刻意与 diag 一起声明在 defer 之前：诊断行要排印本票的风控范围，而 defer 里的
 	// 闭包只能引用它之前已声明的变量。
 	contentKey := gateway.ContentKey(modelName, body)
-	if p.replay.Blocked(contentKey) {
-		web.ReqErr(ticketID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
-		p.emitError(ctx, ticketID, "相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容", "risk_control_cooldown")
-		return
-	}
+	diag.SetContentKey(contentKey)
 	scope := gateway.NewRiskScope(contentKey)
 	defer func() {
 		diag.Finish(time.Now())
@@ -364,6 +361,13 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		diag.SetRiskAccounts(scope.Accounts())
 		web.Diag(diag.ReqID, diag.Format())
 	}()
+	if remaining := p.replay.Remaining(contentKey); remaining > 0 {
+		diag.ReplayBlocked, diag.ReplayWait = true, remaining
+		diag.ErrText = "risk_control_cooldown"
+		web.ReqErr(ticketID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
+		p.emitError(ctx, ticketID, "相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容", "risk_control_cooldown")
+		return
+	}
 	// 归因标识**按票算一次**：出站头与 body 的 metadata.user_id.session_id 必须共享
 	// 同一个会话 id（官方恒等），两处各算一次必然分叉。换号重试沿用同一份 ——
 	// 它仍是同一张票。async 没有下游头可沿用，会话 id 只能合成（见 NewAttribution）。
@@ -409,6 +413,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		// 每个账号在副本上处理 system，后续设备注入不得污染原始请求。
 		actualBody := shallowCopyBody(body)
 		gateway.NormalizeBody(actualBody, true)
+		diag.SetPreparedBody(body, actualBody, true)
 		// 内容视图先取（注入账号身份之前）：与 sync 路径同口径，见 ReqDiag.SetBody。
 		contentView, _ := marshalJSON(actualBody)
 		// 与 sync 路径同口径：设备身份走 body 的 metadata.user_id（本账号指纹）。
@@ -652,11 +657,7 @@ func (p *Pool) attemptUpstreamOnce(
 	requeststats.Attempt(ctx)
 	finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq)
 	resp, err := client.Do(httpReq)
-	status := 0
-	if resp != nil {
-		status = resp.StatusCode
-	}
-	finishAttempt(status, err)
+	finishAttempt(resp, err)
 	if err != nil {
 		return false, err
 	}
@@ -668,7 +669,7 @@ func (p *Pool) attemptUpstreamOnce(
 	if resp.StatusCode != http.StatusOK {
 		// 限长：错误体要整段读进内存做分类，上游或代理异常时可能回一个任意大的
 		// body。正常路径是流式转发，不受此限。
-		text, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		text, readErr := gateway.ReadErrorResponse(resp, diag, "error_body")
 		if readErr != nil {
 			return false, readErr
 		}
@@ -750,7 +751,8 @@ func (p *Pool) attemptUpstreamOnce(
 		// 两条路径不得对同一份 body 给出不同判定）。
 		//
 		// 账号级（换号即成功）→ 整号冷却（按连续命中递进，超限置失效）并换号。
-		// 请求级（同一 body 在 ≥2 个不同账号上都被拒）→ 身份不是变量、剩下的只有请求体。
+		// 请求级（同一 body 在 ≥2 个不同账号上都被拒）→ 达到本地停止换号的保护阈值，
+		// 不是服务端给出的触发原因，不能据此确定为正文问题。
 		// 处置（账号级标记模型，见 gateway.RiskScope 头注释）：停止换号、**保留**本票
 		// 已施加的风控冷却（每个被尝试的账号都已被上游标记）、登记重放防护，把上游原文
 		// 终止性投递给客户端。
@@ -803,7 +805,7 @@ func (p *Pool) attemptUpstreamOnce(
 	// 真正的流式响应是 text/event-stream，命中 JSON 说明这不是流——此时若直接
 	// 转发 SSE，客户端拿到的是空流，账号也不会被标任何状态、下次仍会被选中。
 	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-		return p.handleUpstreamJSON(ctx, ticketID, acc, modelName, resp)
+		return p.handleUpstreamJSON(ctx, ticketID, acc, modelName, resp, diag)
 	}
 
 	// 200：转发 SSE；转发开始后中断按 chunk 计数区分两种出路
@@ -819,9 +821,10 @@ func (p *Pool) handleUpstreamJSON(
 	acc *model.Account,
 	modelName string,
 	resp *http.Response,
+	diag *gateway.ReqDiag,
 ) (bool, error) {
 	// 同样限长：这是「200 但为 JSON」的异常分支，不是正常流式响应。
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	raw, err := gateway.ReadErrorResponse(resp, diag, "json_body")
 	if err != nil {
 		return false, errNetwork{err.Error()}
 	}
@@ -921,13 +924,6 @@ func (p *Pool) bumpFail(acc *model.Account, kind string) {
 		gateway.StampAccountError(live, kind, "", now)
 	})
 }
-
-// maxErrorBodyBytes 异常响应的读取上限。
-//
-// 正常路径是流式转发（边读边发），只有错误分支与「200 但为 JSON」的异常分支要整段
-// 读进内存做分类，而上游或代理异常时可能回一个任意大的 body。64KB 足够容纳业务码
-// 与错误消息。
-const maxErrorBodyBytes = 64 << 10
 
 // forwardSSE 把上游 SSE 行转成 ticket chunk 事件，并累计账号 token 用量。
 // 完整结束时投递 done 并返回 (false, nil)；转发开始后中断时返回

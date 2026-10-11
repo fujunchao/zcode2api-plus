@@ -138,3 +138,8 @@ func Diag(reqID, msg string) {
 func Attempt(reqID, msg string) {
 	fmt.Fprintf(logW(), "  %s[attempt]%s %s%s%s %s\n", ansiDim, ansiReset, ansiDim, reqID, ansiReset, msg)
 }
+
+// Ingress 模型 HTTP 入口事件；时间戳由调用方提供，旧日志形态保持不变。
+func Ingress(reqID, msg string) {
+	fmt.Fprintf(logW(), "  %s[ingress]%s %s%s%s %s\n", ansiDim, ansiReset, ansiDim, reqID, ansiReset, msg)
+}

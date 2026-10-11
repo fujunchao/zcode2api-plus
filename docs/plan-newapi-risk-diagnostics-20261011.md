@@ -74,3 +74,11 @@ New API 没有可保存的网关响应 ID。先新增会在旧实现上失败的
    `latest` 与版本标签的 digest/revision。推送成功不等于发版完成。
 
 不提交现有未跟踪的分析报告、`.zcode/` 或 `.zcodeignore`。
+
+## 五、执行记录
+
+- 红灯提交：`3c4f6eeb75518d3ec107bca32d97b97aed353967`。
+- [远端 CI 38135349653](https://github.com/fujunchao/zcode2api-plus/actions/runs/38135349653)
+  的 `go test ./...` 按预期失败：四个入口响应 ID 为空、405 读断缺少
+  `read_err_kind=unexpected_eof`、重放早退没有 `[#]`。其余 CI 作业成功。
+- 这些失败直接覆盖原观测缺口，不是构建/依赖问题；后续实现保持同一批断言。

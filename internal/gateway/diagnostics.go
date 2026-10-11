@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 )
 
@@ -31,13 +33,22 @@ type ReqDiag struct {
 	MaxTokens string
 	Ticket    string // async 专用：同时带 36 字符 ticketID，保留既有检索习惯
 
+	GatewayRequestID string // 网关生成的完整 UUID，与 New API upstream_request_id 对接。
+	Protocol         string // 本网关接收的协议；不推断 New API 转换前的客户端协议。
+	InputRef         string // 入口内容引用，与重放保护键一致；不等于整形后的 BodyHash。
+	ReplayBlocked    bool
+	ReplayWait       time.Duration
+	preserveContext  bool
+	shape            requestShape
+	lastAttemptBase  string
+
 	BodyBytes        int    // 真正发给上游的请求体字节数（注入 system 之后）
 	BodyHash         string // 请求体的 sha256 前 12 位十六进制；空串 = 未构建出请求体
 	Attempts         int    // 本次请求内的选号尝试次数（>1 说明发生过换号/重试）
 	upstreamAttempts int    // 每次 client.Do 单独递增，包含同账号原地重试。
 
 	// RiskAccounts 本请求内给出风控信号的**不同账号数**（按账号 ID 去重）。
-	// 0 = 没出现过风控信号；≥2 即请求级（同一 body 换谁都被拒）。
+	// 0 = 没出现过风控信号；≥2 默认达到本地保护阈值，不证明正文是触发原因。
 	//
 	// 存在的理由：`body=` 只有字节数，**字节数相同 ≠ 内容相同**，所以线上无法直接
 	// 回答「这个 body 打过几个账号」。2026-09-24 那次整池冷却事故只能靠「14 条
@@ -73,13 +84,26 @@ func NewReqDiag(reqID, modelName string, stream bool, body map[string]any, clock
 		clock = time.Now
 	}
 	return &ReqDiag{
-		ReqID:     reqID,
-		Model:     modelName,
-		Stream:    stream,
-		Effort:    diagEffort(body),
-		MaxTokens: diagMaxTokens(body),
-		startedAt: clock(),
-		clock:     clock,
+		ReqID:            reqID,
+		Model:            modelName,
+		Stream:           stream,
+		Effort:           diagEffort(body),
+		MaxTokens:        diagMaxTokens(body),
+		GatewayRequestID: config.NewUUIDv4(),
+		Protocol:         "internal",
+		preserveContext:  config.PreserveClientContext,
+		shape:            inspectRequestShape(body),
+		startedAt:        clock(),
+		clock:            clock,
+	}
+}
+
+// SetContentKey 仅提取现有重放键的内容摘要，不改变键或记录/续期保护窗口。
+func (d *ReqDiag) SetContentKey(key string) {
+	if d != nil {
+		if _, ref, ok := strings.Cut(key, "|"); ok {
+			d.InputRef = ref
+		}
 	}
 }
 
@@ -179,6 +203,10 @@ func (d *ReqDiag) Format() string {
 	// 与 bodyhash 的「空串 = 没构建出请求体」是两回事。
 	msg += fmt.Sprintf(" bodyhash=%s riskscope=%d",
 		dashText(d.BodyHash), d.RiskAccounts)
+	msg += fmt.Sprintf(" ts=%s started_at=%s gateway_request_id=%q protocol=%s input_ref=%s upstream_attempts=%d replay_blocked=%d replay_wait_ms=%d",
+		diagnosticTime(d.startedAt.Add(d.total)), diagnosticTime(d.startedAt), d.GatewayRequestID, d.Protocol,
+		dashText(d.InputRef), d.upstreamAttempts, boolToInt(d.ReplayBlocked), d.ReplayWait.Milliseconds())
+	msg += d.shape.format(d.preserveContext)
 	return msg
 }
 

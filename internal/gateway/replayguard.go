@@ -47,20 +47,27 @@ func NewReplayGuard(ttl time.Duration, now func() time.Time) *ReplayGuard {
 
 // Blocked 该内容指纹是否仍在防护窗口内。
 func (g *ReplayGuard) Blocked(key string) bool {
+	return g.Remaining(key) > 0
+}
+
+// Remaining 返回防护剩余时间，只读命中项；连续重放不会延长窗口。
+// 过期清理与 Blocked 的原行为一致。
+func (g *ReplayGuard) Remaining(key string) time.Duration {
 	if g == nil || key == "" {
-		return false
+		return 0
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	at, ok := g.entries[key]
 	if !ok {
-		return false
+		return 0
 	}
-	if g.now().Sub(at) >= g.ttl {
+	remaining := g.ttl - g.now().Sub(at)
+	if remaining <= 0 {
 		delete(g.entries, key)
-		return false
+		return 0
 	}
-	return true
+	return remaining
 }
 
 // Record 登记一次请求级风控判定；顺带懒清理过期项。
