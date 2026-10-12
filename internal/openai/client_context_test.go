@@ -12,6 +12,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/upstream"
 )
 
 func newClientContextFixture(t *testing.T, jwt bool) *fixture {
@@ -104,8 +105,13 @@ func TestClientContextAcrossCompatibleAPIs(t *testing.T) {
 					}
 					up := f.lastUpstream()
 					wantSystem := mustJSON(t, `[{"type":"text","text":"客户端基础指令"},{"type":"text","text":"客户端补充指令"}]`)
+					if jwt {
+						// JWT 通道上非官方前缀的调用者系统会回退「官方块前置」：上游从
+						// 第 0 字节校验到身份段末尾，缺前缀必然被 3012 拦截（v2.9.16 起）。
+						wantSystem = append(upstream.ZcodeSystemBlocks(), wantSystem.([]any)...)
+					}
 					if !reflect.DeepEqual(up.Body["system"], wantSystem) {
-						t.Fatalf("仅初始指令进入顶层，不追加另一份环境: %v", up.Body["system"])
+						t.Fatalf("初始指令与官方前缀的顶层形态不符: %v", up.Body["system"])
 					}
 					msgs := assertClientContextRoles(t, up.Body, []string{"user", "assistant", "system", "user"})
 					if msgs[2].(map[string]any)["content"] != "仅使用客户端提供的 get_weather 工具" {

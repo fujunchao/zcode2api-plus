@@ -184,12 +184,12 @@ func TestEmbeddedSystemJSONHasNoEnvBlock(t *testing.T) {
 	}
 }
 
-// TestIdentityBlockMatchesInstalledClient # Harness 的措辞必须与已实装的客户端版本一致。
+// TestIdentityBlockMatchesInstalledClient 块 1 快照必须与已实装客户端（3.14.5）一致。
 //
-// 3.14.3 的第 3 条是「The system may send updates, reminders, or modifications to rules
-// via mid-conversation system turns…」；更早的版本是「`<system-reminder>` tags …
-// injected by the harness」。提示词文案本身就是版本指纹：留着旧措辞，等于一边声称
-// X-ZCode-App-Version=3.14.3、一边交出一份 3.14.3 永远不会产生的 system。
+// 3.14.5 的块 1 = 基础 identity + # Harness + # ZCode Desktop Context（本机 model-io
+// 实录 2313 字符）；旧快照只有前两节（1211 字符）。提示词文案与段落结构本身就是版本
+// 指纹：留旧措辞/缺桌面段，等于一边声称 X-ZCode-App-Version=3.14.5、一边交出一份
+// 3.14.5 永远不会产生的 system（也令「完整官方输入按块去重」失效）。
 func TestIdentityBlockMatchesInstalledClient(t *testing.T) {
 	blocks := ZcodeSystemBlocks()
 	if len(blocks) < 2 {
@@ -199,21 +199,24 @@ func TestIdentityBlockMatchesInstalledClient(t *testing.T) {
 	text, _ := m["text"].(string)
 
 	if !strings.Contains(text, "via mid-conversation system turns") {
-		t.Errorf("# Harness 第 3 条应为 3.14.3 的措辞（via mid-conversation system turns）：\n%s", text)
+		t.Errorf("# Harness 应保留 3.14.x 的措辞（via mid-conversation system turns）：\n%s", text)
 	}
 	if strings.Contains(text, "<system-reminder>") {
-		t.Errorf("# Harness 仍含旧版措辞（3.14.3 已替换）：\n%s", text)
+		t.Errorf("# Harness 仍含旧版措辞（3.14.x 已替换）：\n%s", text)
 	}
-	// 另外两条 3.14.3 也带的 bullet，顺手钉住存在性。
 	for _, want := range []string{
 		"# Harness",
 		"Github-flavored markdown in a terminal",
 		"user-selected permission mode",
 		"dedicated file/search tools",
 		"file_path:line_number",
+		// 3.14.5 增补的桌面段（旧 1211 字符快照缺这一节）。
+		"# ZCode Desktop Context",
+		"### Files & URLs",
+		"### Inline Code Comments",
 	} {
 		if !strings.Contains(text, want) {
-			t.Errorf("# Harness 缺少 %q：\n%s", want, text)
+			t.Errorf("块 1 缺少 %q：\n%s", want, text)
 		}
 	}
 }

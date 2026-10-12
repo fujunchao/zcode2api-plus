@@ -221,7 +221,8 @@ var (
 	// 设 true 重启即可回退。
 	UpstreamInjectEnvironment = envBool("ZCODE_UPSTREAM_INJECT_ENVIRONMENT", false)
 
-	// 调用者拥有自己的指令与本地工具上下文；关闭时恢复旧版注入/指令提升行为。
+	// 调用者自带官方前缀（或显式空值 / 消息内 system）时原样保留其指令上下文，
+	// 非官方前缀回退前置合并；关闭时恢复旧版「一律前置」的注入/指令提升行为。
 	PreserveClientContext = envBool("ZCODE_PRESERVE_CLIENT_CONTEXT", true)
 
 	// ReplayGuardTTLSeconds 重放防护窗口（秒，P1-3）：同一份请求内容被判定「请求级

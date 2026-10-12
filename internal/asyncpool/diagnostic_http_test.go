@@ -3,6 +3,7 @@ package asyncpool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/openai"
+	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
 )
 
@@ -107,7 +109,10 @@ func TestDiagnosticStructureAcrossHTTPProtocols(t *testing.T) {
 			}
 			logs := buf.String()
 			for _, want := range []string{
-				"shape_stage=prepared", "preserve_context=true", "system_source=input", "system_form=blocks", "system_blocks=2",
+				// 四条协议路径的非官方前缀 system 都回退「官方块前置」（2026-10-12 起）；
+				// 期望块数按实际注入块数派生，避免与注入开关互相打架。
+				"shape_stage=prepared", "preserve_context=true", "system_source=legacy_merge", "system_form=blocks",
+				fmt.Sprintf("system_blocks=%d", len(upstream.ZcodeSystemBlocks())+2),
 				"messages=4", "roles_user=2", "roles_assistant=1", "roles_system=1", "tools=1", "mcs_declared=true",
 				`gateway_request_id="` + header.Get(gateway.GatewayRequestIDHeader) + `"`,
 				`upstream_request_id="` + up.Get("X-Request-Id") + `"`,

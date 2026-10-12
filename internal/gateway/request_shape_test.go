@@ -32,8 +32,11 @@ func TestDiagnosticShapeSourcesAndCounts(t *testing.T) {
 		{"empty_text", true, true, "", true, false, "input", "string", 1},
 		{"empty_blocks", true, true, []any{}, true, false, "input", "blocks", 0},
 		{"mid_only", true, true, nil, false, true, "input_messages", "missing", 0},
-		// legacy_merge 会把调用者的字符串 system 并成一块，排在注入块之后。
+		// legacy_merge（含 preserve 下非官方前缀的回退）会把调用者的字符串
+		// system 并成一块，排在注入块之后。
 		{"legacy", false, true, "private-system-sentinel", true, true, "legacy_merge", "blocks", injected + 1},
+		// preserve=true 但首段非官方前缀：同样回退合并（2026-10-12 DSH 回归守卫）。
+		{"foreign_preserve", true, true, "private-system-sentinel", true, false, "legacy_merge", "blocks", injected + 1},
 		{"other", false, true, false, true, false, "input", "other", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

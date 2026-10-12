@@ -437,6 +437,22 @@ func (p ZcodeProfile) EnvironOSVersion() string {
 
 完整第三方对照记录见本机 `docs/analysis-zcode-pool-parity-20261012.md`（按现行约定未入库）。
 
+**2026-10-12 修复：preserve 边界收窄为「前缀感知」（v2.9.16-go）**
+
+v2.9.11 的 preserve 让「带自有 system 的客户端」原样透传，把 DeepSeek Harness 桌面版
+（`POST /v1/messages?beta=true`）的自身提示词直接送到上游首段 ⇒ 逐字节校验在字节 0 失败、
+必然 3012（10-12 实测 21 次入站全败；同一消息走 ZCode 客户端 200，完整取证见
+`docs/analysis-riskcontrol-dsh-405-root-cause-20261012.md`）。修复：
+
+- 保留条件收窄为「首段自带官方固定前缀（或显式空值 / 消息内 system）」；非官方前缀回退
+  旧版「官方块前置 + 精确去重」（`upstream.ShouldPreserveCallerSystem`，body.go 与
+  request_shape.go 共用同一判定）。
+- `zcode_system.json` 块 1 更新为 3.14.5 实发字节（2313 字符，补 `# ZCode Desktop Context`）——
+  1211 字符快照会让「完整官方输入」在合并去重时多留一份扩展 identity；更新后官方三块
+  输入在回退模式重新收敛为原样三块。
+- 回归：`gateway/body_test.go` 的 ForeignSystem 两用例、`request_shape_test.go` 的
+  `foreign_preserve`、asyncpool 四协议诊断与 openai 兼容入口断言同步更新。
+
 ## 第九轮执行记录（2026-09-24 傍晚，调用机制逐项对齐）
 
 依据官方 CLI 日志（重试语义）与 golden 抓包（传输层头），完成第三批对齐：

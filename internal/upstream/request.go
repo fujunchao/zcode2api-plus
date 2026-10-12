@@ -25,7 +25,8 @@ var (
 )
 
 // ZcodeSystemBlocks 返回 ZCode 官方系统提示词块（JSON 解析失败时为空，对齐 Python 版）。
-// 用于 JWT 缺省上下文及旧行为回退；调用者已有指令时由网关保留其内容。
+// 用于 JWT 缺省上下文、回退合并与官方前缀判定；调用者自带官方前缀（或显式空值 /
+// 消息内 system）时由网关原样保留其内容，其余走合并路径前置标准块。
 //
 // 只解析一次静态段（CLI Prefix / Agent Identity，内容是固定的）。
 // # Environment 段是否追加由 config.UpstreamInjectEnvironment 决定，默认**不注入**：

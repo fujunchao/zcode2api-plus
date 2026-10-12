@@ -81,7 +81,7 @@ func (d *ReqDiag) SetPreparedBody(input, prepared map[string]any, isJWT bool) {
 	} else if upstream.HasSystemMessages(input) {
 		s.systemSource = "input_messages"
 	}
-	if isJWT && !(config.PreserveClientContext && (input["system"] != nil || upstream.HasSystemMessages(input))) {
+	if isJWT && !(config.PreserveClientContext && upstream.ShouldPreserveCallerSystem(input)) {
 		switch input["system"].(type) {
 		case nil:
 			s.systemSource = "gateway_fallback"

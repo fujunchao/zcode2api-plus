@@ -14,7 +14,9 @@ import (
 // NormalizeBody 在不改写调用者嵌套对象的前提下规范请求体：
 //  1. 模型名去 "provider/" 前缀，并按 MODEL_NAME_MAP 做大小写映射（幂等）；
 //  2. 普通字符串 content 桥接为文本块；system 保留上游要求的文本形态；
-//  3. JWT 缺少 system 时提供兼容兜底；已有指令由调用者拥有，包括显式空值。
+//  3. JWT 账号上保证上游从第 0 字节起的「固定前缀 + 身份段」成立：自带官方前缀的
+//     调用者（含显式空值与消息内 system）原样保留，其余回退下方的前置合并——
+//     上游逐字节校验首段，非官方前缀必然 3012（2026-10-12 DeepSeek Harness 实证）。
 //
 // 回退模式保留旧版标准块前置与精确去重，不通过关键词删除调用者内容。
 func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
@@ -55,7 +57,9 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	}
 
 	if needsZcodeSystem {
-		if config.PreserveClientContext && (body["system"] != nil || upstream.HasSystemMessages(body)) {
+		// 仅当调用者的 system 自带官方前缀（或显式空值 / 消息内 system）时才原样保留；
+		// 第三方 harness 的首段不是官方前缀，透传即被上游以 3012 拦截，必须合并前置。
+		if config.PreserveClientContext && upstream.ShouldPreserveCallerSystem(body) {
 			return body
 		}
 		blocks := upstream.ZcodeSystemBlocks()

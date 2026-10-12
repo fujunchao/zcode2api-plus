@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"zcode2api/internal/config"
@@ -164,9 +165,11 @@ func useLegacyClientContext(t *testing.T) {
 	t.Cleanup(func() { config.PreserveClientContext = old })
 }
 
-func TestNormalizeBodyCallerSystemIsIdempotent(t *testing.T) {
+// 首段自带官方前缀的调用者（官方系客户端）已拥有完整上下文：原样保留，
+// 不改写其指令、缓存策略、顺序或扩展字段。
+func TestNormalizeBodyOfficialSystemIsIdempotent(t *testing.T) {
 	const payload = `{"model":"GLM-5.3","system":[
-		{"type":"text","text":"调用者身份","cache_control":{"type":"ephemeral","ttl":"1h"}},
+		{"type":"text","text":"You are ZCode, an interactive coding agent","cache_control":{"type":"ephemeral","ttl":"1h"}},
 		{"type":"text","text":"重复但有意保留"},
 		{"type":"text","text":"重复但有意保留","caller_metadata":"保留"}
 	],"messages":[{"role":"user","content":"问题"}]}`
@@ -192,6 +195,63 @@ func TestNormalizeBodyCallerSystemIsIdempotent(t *testing.T) {
 	second, err := json.Marshal(repeated)
 	if err != nil || string(first) != string(second) {
 		t.Fatal("JSON 往返并重复规范化不得增加或丢失上下文")
+	}
+}
+
+// 第三方 harness（如 DeepSeek Harness）的首段不是官方前缀：必须回退旧版
+// 「官方块前置 + 精确去重」——上游从第 0 字节逐字节校验到身份段末尾，缺前缀
+// 必然 3012。2026-10-12 事件回归守卫：把保留条件放宽回「有 system 就保留」即变红。
+func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
+	blocks := upstream.ZcodeSystemBlocks()
+	foreign := []any{
+		map[string]any{"type": "text", "text": "You are an AI agent powered by DeepSeek Harness."},
+		map[string]any{"type": "text", "text": "第三方补充指令"},
+	}
+	body := map[string]any{"model": "GLM-5.3", "system": foreign}
+	NormalizeBody(body, true)
+	system := body["system"].([]any)
+	if len(system) != len(blocks)+len(foreign) {
+		t.Fatalf("第三方 system 应前置官方块并原样保留，实际 %d 块", len(system))
+	}
+	for i := range blocks {
+		if !reflect.DeepEqual(system[i], blocks[i]) {
+			t.Fatalf("第 %d 块应为官方标准块: %v", i, system[i])
+		}
+	}
+	if !reflect.DeepEqual(system[len(blocks):], foreign) {
+		t.Fatal("第三方内容必须原样保留在官方块之后，不得被删除或改写")
+	}
+	first, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var repeated map[string]any
+	if err := json.Unmarshal(first, &repeated); err != nil {
+		t.Fatal(err)
+	}
+	NormalizeBody(repeated, true)
+	second, err := json.Marshal(repeated)
+	if err != nil || string(first) != string(second) {
+		t.Fatal("重复提交不得重复前置官方块（此时首段已是官方前缀，走保留分支）")
+	}
+}
+
+// 字符串形态的第三方 system 同样回退前置合并，并排在官方块之后。
+func TestNormalizeBodyForeignStringSystemGetsOfficialPrefix(t *testing.T) {
+	blocks := upstream.ZcodeSystemBlocks()
+	body := map[string]any{"model": "GLM-5.3", "system": "第三方指令"}
+	NormalizeBody(body, true)
+	system := body["system"].([]any)
+	if len(system) != len(blocks)+1 {
+		t.Fatalf("字符串 system 应并成一块排在官方块之后，实际 %d 块", len(system))
+	}
+	last := system[len(system)-1].(map[string]any)
+	if last["text"] != "第三方指令" {
+		t.Fatalf("第三方文本必须原样保留: %v", last)
+	}
+	firstText, _ := system[0].(map[string]any)["text"].(string)
+	if !strings.HasPrefix(firstText, "You are ZCode, an interactive coding agent") {
+		t.Fatalf("首段必须是官方固定前缀: %q", firstText)
 	}
 }
 
