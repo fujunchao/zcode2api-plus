@@ -55,7 +55,13 @@
 
 同一套「来源头」，但**差异两处**：**含 `X-Device-Mid`**、**不含 `X-ZCode-Agent`**。
 用于 CLI 自己的非模型调用（额度 / 领取 / 激活遥测 / 配置）。
-我方 `quota.authHeaders` 与 `claim.authHeaders` 目前**同时**缺 `X-Release-Channel` / `X-Client-Language` / `X-Client-Timezone` / `X-Os-Category` / `X-Os-Version` / `X-Title`，且**多发**了 `X-ZCode-Agent`。
+
+✅ **GAP-9 已修（2026-10-12）**：`quota.authHeaders` 与 `claim.authHeaders` 曾缺
+`X-Release-Channel` / `X-Client-Language` / `X-Client-Timezone` / `X-Os-Category` /
+`X-Os-Version` / `X-Title` 六项，现统一走 `config.ZcodeSourceHeaders()` 补齐。
+
+⚠️ 更正一处历史记载：本表原写我方「**多发** `X-ZCode-Agent`」，实测当时非模型路径
+**根本没有**该头——属误记。本次也未新增它（该头只属模型端点）。
 
 ### 1.4 请求归因头 = 5 个（每个模型请求必带）
 
@@ -180,8 +186,8 @@ You have been invoked in the following environment:
 | **GAP-5** | `# Environment` 是占位+删减 | `unknown` / `no` / 缺可选行 | 真实值、含可选行 | 高（与 GAP-3 同源） |
 | **GAP-6** | `HTTP-Referer` 多尾斜杠 | `https://zcode.z.ai/` | `https://zcode.z.ai` | 低但零成本 |
 | **GAP-7** | **多发** `X-Device-Mid` | 推理路径发 | 官方模型请求**不发**（仅非模型接口发） | **已修**（阶段 2b）：默认不再发送，开关保留作应急回滚 |
-| **GAP-8** | 一个常量当两种 platform 格式用 | `X-Platform: win32-x64` 与 `platform=win32-x64` 同值 | 头 `win32-x64`、查询 `windows-x86_64` | **golden 实测确认**查询用 `windows-x86_64` |
-| **GAP-9** | 非模型端点头不齐 | quota/claim 缺 6 头、多 `X-ZCode-Agent` | 见 §1.3 | 中 |
+| **GAP-8** | 一个常量当两种 platform 格式用 | `X-Platform: win32-x64` 与 `platform=win32-x64` 同值 | 头 `win32-x64`、查询 `windows-x86_64` | **已修**（2026-10-12，阶段 4）：三处查询点统一走 `config.ZcodeQueryPlatform()`；`ZCODE_QUERY_PLATFORM` 可免重编回退 |
+| **GAP-9** | 非模型端点头不齐 | quota/claim 缺 6 头（原先记的「多 `X-ZCode-Agent`」是误记，见 §1.3） | 见 §1.3 | **已修**（2026-10-12，阶段 4）：统一走 `config.ZcodeSourceHeaders()` |
 | **GAP-10** | 从不查询签名开关 | 无 | `GET /api/v1/agent/configs` | 低（可观测性）；golden 显示开关为 true 但客户端仍发未签名 |
 | **GAP-11** | 模型请求 `User-Agent` 缺 ai-sdk 后缀 | 裸 `ZCode/<ver>` | `ZCode/<ver> ai-sdk/provider-utils/<v> runtime/node.js/<major>` | **已修**（golden 实测） |
 | **GAP-12** | `x-query-id` 仅在透传时发送 | 缺失即不发 | **恒发**（官方每轮次生成） | **已修**（golden 实测） |
@@ -284,6 +290,25 @@ func (p ZcodeProfile) EnvironOSVersion() string {
   - 补齐 §1.3 的缺失头；`X-ZCode-Agent` 从非模型路径**移除**
 - `telemetry.go` 的 `device_os_category` 与 `os_version` 同源化。
 - ⚠️ `quota` / `claim` 目前**是工作的**（能领到套餐）。改 `platform=` 前必须先在预发用真实账号验证一次，或保留 `ZCODE_QUERY_PLATFORM` 覆盖位；一旦领取失败即刻回退。
+
+#### ✅ 已执行（2026-10-12，提交 `4667aca` + `4578980`）
+
+| 项 | 落地方式 |
+|---|---|
+| 查询参数 | 三个查询点（`quota.go` / `claim.go` / `captcha.go`）统一走 `config.ZcodeQueryPlatform()` |
+| 回退位 | `ZCODE_QUERY_PLATFORM`（定义在 `config.go`）；**只覆盖查询参数，不碰 `X-Platform` 头**——两者本是两种格式，一个开关同时改两处只会制造新的头体矛盾 |
+| 来源头 | `config.ZcodeSourceHeaders()` 单一产出 10 项；`quota` / `claim` 的 `authHeaders` 以它为底，再补 `Content-Type` / `X-Device-Mid` / `Authorization` |
+| `claimHeaders` | 不再重复写 `X-ZCode-App-Version` / `X-Platform`（已由来源头提供）；「缺版本/平台头会 3007」的语义不变 |
+| `device_os_category` | 维持既有实现（`DeviceOSCategory(config.ZcodeClientPlatform)`），本次未改动 |
+
+**关键实测补充（2026-10-12）**：改动前我方**内部本就不一致**——`captcha.go` 用
+`windows-x86_64`（工作正常），而 `quota.go` / `claim.go` 用 `win32-x64`（也工作正常）。
+⇒ 上游对这两种形态**都接受**，`platform=` 并非严格校验字段。因此本次改动是**消除「同一
+客户端对不同端点自称不同平台」这一破绽**，而不是修一个功能故障。第三方实现
+（zcode-pool）在生产版本里对 `billing/preview` 用的也是 `win32-x64`，构成旁证。
+
+⚠️ 仍需真实账号预发跑一遍（额度刷新 + 领取）；失败即 `ZCODE_QUERY_PLATFORM=win32-x64` 重启回退。
+完整第三方对照记录见本机 `docs/analysis-zcode-pool-parity-20261012.md`（按现行约定未入库）。
 
 ### 阶段 5：可观测性
 
@@ -392,9 +417,25 @@ func (p ZcodeProfile) EnvironOSVersion() string {
 **建议的第一次交付**：阶段 1 + 阶段 3 的 Environment 部分（不含 Harness 文案改动）。
 理由：这两步直接消掉「头说 Windows、body 说 Linux」这个最硬的矛盾，且不触碰任何正在工作的额度/领取链路。
 
-**当前进度（2026-09-24）**：阶段 1、3a、3b、2、2b、5、6 **已完成**（改动未提交）；
-阶段 4（`platform=` 查询参数格式）**未做** —— 额度/领取链路现在是工作的，改前必须用真实账号
-验证一次。阶段 2b 的四条路径（sync / async / 线路探测 / 归因头合成）已全部覆盖。
+**当前进度（2026-10-12 更新）**：阶段 1、2、2b、3、5、6 **已完成并入库**；
+**阶段 4 已完成**（GAP-8 / GAP-9，提交 `4667aca` + `4578980`），待真实账号预发验证。
+阶段 2b 的四条路径（sync / async / 线路探测 / 归因头合成）已全部覆盖。
+
+**2026-10-12 新增：`# Environment` 段默认不注入（提交 `7b38c5c`）**
+
+上游只从第 0 个字节逐字节校验到**身份段末尾**，之后的段落可有可无（实测整段删掉仍返回
+200，而改动身份段里任意一个字符即 `3012`）。据此模型请求默认只发「固定前缀 + 身份段」两块；
+`config.UpstreamInjectEnvironment=true`（环境变量 `ZCODE_UPSTREAM_INJECT_ENVIRONMENT`）
+可恢复三段形态。
+
+- ⚠️ 这是**主动偏离 golden 形态**——官方客户端确实发送该段，改后请求在**段数与长度结构**上
+  与官方可区分。故：默认关闭 + 保留开关 + 必须真号验证 + 可一键回退。
+- 📌 边界：「删掉不报错（200）」**不等于**「与官方不可区分」，不要把前者当作后者的证据。
+- 副作用（正向）：GAP-3 / GAP-5 的「body 与请求头平台互相矛盾」面随之消失——该段不存在，
+  也就无从矛盾。`headers_test.go` 的头体同源守卫改为**显式打开开关**（它守的是「该段一旦
+  存在就必须与头同源」，不是「该段必须存在」）。
+
+完整第三方对照记录见本机 `docs/analysis-zcode-pool-parity-20261012.md`（按现行约定未入库）。
 
 ## 第九轮执行记录（2026-09-24 傍晚，调用机制逐项对齐）
 
