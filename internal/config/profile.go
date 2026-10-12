@@ -105,6 +105,20 @@ func ZcodeClientQueryPlatform() string {
 	return (ZcodeProfile{BarePlatform: bare, Arch: arch}).QueryPlatform()
 }
 
+// ZcodeQueryPlatform 查询参数 `platform=` 的最终取值——**所有查询点都必须走它**。
+//
+// 正常路径 = ZcodeClientQueryPlatform()（官方格式，如 windows-x86_64）；
+// ZCODE_QUERY_PLATFORM 非空时整体覆盖，供格式变脸时免重编回退。
+//
+// 覆盖位只作用于查询参数，**不碰请求头 X-Platform**：官方这两处本身就是两种
+// 格式，用一个开关同时改两处只会制造新的头体矛盾。
+func ZcodeQueryPlatform() string {
+	if v := strings.TrimSpace(ZcodeQueryPlatformOverride); v != "" {
+		return v
+	}
+	return ZcodeClientQueryPlatform()
+}
+
 // Platform 请求头 X-Platform 的取值：`${platform}-${arch}`，如 win32-x64。
 // 架构为空时退化为裸平台名，不产出带尾连字符的畸形值。
 func (p ZcodeProfile) Platform() string {

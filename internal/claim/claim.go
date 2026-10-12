@@ -373,7 +373,7 @@ func (s *Service) ReportActivationEvents(acc *model.Account) string {
 func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
 	headers := authHeaders(acc)
 	body, err := s.billingRequest(acc, http.MethodGet,
-		"/billing/preview?app_version="+config.ZcodeClientVersion+"&platform="+config.ZcodeClientPlatform,
+		"/billing/preview?app_version="+config.ZcodeClientVersion+"&platform="+config.ZcodeQueryPlatform(),
 		headers, nil)
 	if err != nil {
 		return nil, err

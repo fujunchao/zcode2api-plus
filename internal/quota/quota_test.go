@@ -120,7 +120,7 @@ func TestDailyQuotaUsesDeviceIdentityAndPreservesPeriod(t *testing.T) {
 	if !strings.Contains(url, "/billing/balance") {
 		t.Fatalf("应请求计费余额端点: %s", url)
 	}
-	if !strings.Contains(url, "platform="+config.ZcodeClientPlatform) ||
+	if !strings.Contains(url, "platform="+config.ZcodeQueryPlatform()) ||
 		!strings.Contains(url, "app_version="+config.ZcodeClientVersion) {
 		t.Fatalf("查询参数应携带客户端标识: %s", url)
 	}

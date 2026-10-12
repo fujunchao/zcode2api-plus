@@ -120,7 +120,7 @@ func fetchConfigHTTP(ctx context.Context) (Config, error) {
 	}
 	query := endpoint.Query()
 	query.Set("app_version", config.ZcodeClientVersion)
-	query.Set("platform", config.ZcodeClientQueryPlatform())
+	query.Set("platform", config.ZcodeQueryPlatform())
 	endpoint.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {

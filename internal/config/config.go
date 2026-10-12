@@ -228,6 +228,17 @@ var (
 	// 即 windows-x86_64），必须走 ZcodeProfile.QueryPlatform()，不要复用本变量。
 	ZcodeClientPlatform = env("ZCODE_CLIENT_PLATFORM", ZcodeClientBarePlatform+"-"+ZcodeClientArch)
 
+	// ZcodeQueryPlatformOverride 查询参数 `platform=` 的应急覆盖位。
+	//
+	// 留空（默认）走 profile.go 的 ZcodeQueryPlatform() 按官方形态派生；一旦上游
+	// 对格式变脸，把它设成旧形态即可**免重编**回退，例如：
+	//
+	//	ZCODE_QUERY_PLATFORM=win32-x64
+	//
+	// 只为应急保留，正常部署不要设置。它只影响查询参数，不碰请求头 X-Platform——
+	// 两者本来就是两种格式，一个开关同时改两处只会制造新的头体矛盾。
+	ZcodeQueryPlatformOverride = env("ZCODE_QUERY_PLATFORM", "")
+
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。

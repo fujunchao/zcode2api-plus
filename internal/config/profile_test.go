@@ -151,3 +151,29 @@ func TestZcodeSourceHeadersShape(t *testing.T) {
 		t.Error("ZcodeSourceHeaders 返回了共享 map，一个请求会污染后续所有请求")
 	}
 }
+
+// TestZcodeQueryPlatformDefaultAndOverride 查询参数 `platform=` 的默认取值是官方
+// 形态；ZCODE_QUERY_PLATFORM 非空时整体覆盖（免重编回退），且**不影响请求头**。
+func TestZcodeQueryPlatformDefaultAndOverride(t *testing.T) {
+	old := ZcodeQueryPlatformOverride
+	t.Cleanup(func() { ZcodeQueryPlatformOverride = old })
+
+	ZcodeQueryPlatformOverride = ""
+	if got, want := ZcodeQueryPlatform(), ZcodeClientQueryPlatform(); got != want {
+		t.Fatalf("默认应走官方形态派生：got %q, want %q", got, want)
+	}
+	// 默认值不得等于请求头形态——官方这两处本就是两种格式（见 profile.go 顶部）。
+	if got := ZcodeQueryPlatform(); got == ZcodeClientProfile().Platform() {
+		t.Fatalf("查询 platform= 与请求头 X-Platform 不应同值：%q", got)
+	}
+
+	// 覆盖位首尾空白要去掉，避免运维粘贴出多余空格。
+	ZcodeQueryPlatformOverride = "  legacy-form  "
+	if got := ZcodeQueryPlatform(); got != "legacy-form" {
+		t.Fatalf("覆盖位应生效并去除首尾空白，实得 %q", got)
+	}
+	// 覆盖位只作用于查询参数：请求头形态必须原样不变，否则会制造新的头体矛盾。
+	if got := ZcodeClientProfile().Platform(); got != ZcodeClientPlatform {
+		t.Fatalf("覆盖查询参数不得改动请求头 X-Platform，实得 %q", got)
+	}
+}

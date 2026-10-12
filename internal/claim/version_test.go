@@ -60,7 +60,7 @@ func TestClientVersionSingleSource(t *testing.T) {
 	if got := rec.queries[0].Get("app_version"); got != sentinel {
 		t.Fatalf("preview 的 app_version 未取自常量: %q", got)
 	}
-	if got := rec.queries[0].Get("platform"); got != config.ZcodeClientPlatform {
+	if got := rec.queries[0].Get("platform"); got != config.ZcodeQueryPlatform() {
 		t.Fatalf("preview 的 platform 不符: %q", got)
 	}
 }

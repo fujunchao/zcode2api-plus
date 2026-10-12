@@ -201,7 +201,7 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[
 
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeClientVersion)
-	query.Set("platform", config.ZcodeClientPlatform)
+	query.Set("platform", config.ZcodeQueryPlatform())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		strings.TrimRight(config.ZcodeBillingBase, "/")+"/billing/balance?"+query.Encode(), nil)
 	if err == nil {
