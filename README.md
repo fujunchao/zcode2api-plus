@@ -56,6 +56,14 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 默认客户端版本已同步至 `3.14.5`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。升级只需替换网关程序/镜像并重启，无数据库迁移。
 
+`v2.9.14-go` 收斂偽裝客戶端在不同端點之間的格式差異：補齊領取前的第三個啟用事件
+（`app_login_success`）、讓額度與領取端點攜帶完整的來源頭集合、把查詢參數 `platform=`
+統一為官方形態，並預設不再注入模型請求的 `# Environment` 段（上游只從第 0 個位元組
+校驗到身份段末尾）。後兩項各有一個免重編的回退開關（`ZCODE_QUERY_PLATFORM`、
+`ZCODE_UPSTREAM_INJECT_ENVIRONMENT`），預設值即當前行為，留空即可。
+不改變帳號選擇、重試預算、風控閾值，也不改變額度與領取的業務語義。
+詳見 [發布說明](docs/releases/v2.9.14-go.md)。
+
 `v2.9.13-go` 修复两类独立问题：已有 metadata 在重试/换号时不再被共享写入，
 入口内容引用与 bodyhash 不再因身份注入意外漂移；同步/异步补齐后续 SSE 事件中的输入与
 缓存用量，Chat/Responses 也保留多次 delta 的累计值。不会估算或回填历史用量，不改变
