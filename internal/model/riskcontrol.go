@@ -44,16 +44,8 @@ func IsRiskControlInvalid(acc *Account) bool {
 		acc.LastErrorKind != nil && *acc.LastErrorKind == ErrorKindRiskControl
 }
 
-// InRiskControlSilentWindow 账号是否处于「风控静默期」：距最近一次上游风控命中
-// 不足 window（window 由调用方传入，model 包刻意不依赖 config）。
-//
-// 语义：命中过风控意味着该账号已被上游打上服务端标记，标记期内它对**任何**内容
-// 都回 405（2026-10-12 晚实测 28/28 热账号 vs 干净账号 0/9；规格见
-// docs/plan-riskcontrol-silent-window-20261012.md）。因此静默期内：
-//   - 选号硬闸门直接跳过它（区别于 ladder 冷却：冷却到期 ≠ 标记解除）；
-//   - 请求级风控判定不把它计入（它的 405 只反映账号自身状态，与内容无关）。
-//
-// window <= 0 视为关闭（应急回退，见 config.RiskSilentHours）；无命中记录为 false。
+// InRiskControlSilentWindow 判断管理员是否显式开启了额外本地隔离且尚未到期。
+// 这是本地计时器，不查询上游、不证明其仍被封禁。window<=0 时仅记录历史。
 func (a *Account) InRiskControlSilentWindow(now time.Time, window time.Duration) bool {
 	if a == nil || window <= 0 || a.LastRiskControlAt == nil {
 		return false

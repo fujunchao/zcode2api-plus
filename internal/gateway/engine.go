@@ -75,7 +75,7 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		Store:               st,
 		Captcha:             cm,
 		Client:              client,
-		BusyRetryDelays:     defaultBusyRetryDelays,
+		BusyRetryDelays:     NewBusyRetryDelays(),
 		RateLimitRetryDelay: RateLimitRetryDelay,
 		OverloadRetryDelays: OverloadRetryDelays,
 		now:                 time.Now,
@@ -165,7 +165,7 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	diag.SetContentKey(contentKey)
 	// 风控判定范围：**必须按请求创建**（Engine 跨请求共享，挂上去会让并发请求互相误判）。
 	// 用于把「账号级风控」（换号即成功）与「请求级风控」（同一 body 换谁都被拒）分开。
-	// 请求级处置：停止换号、保留冷却（上游已标记账号）、登记重放防护。见 riskscope.go。
+	// 请求级处置：停止换号、保留本地阶梯冷却、登记重放防护。见 riskscope.go。
 	//
 	// 刻意与 diag 一起声明在 defer 之前：诊断行要排印本请求的风控范围，而 defer 里的
 	// 闭包只能引用它之前已声明的变量。
@@ -321,7 +321,6 @@ func (e *Engine) tryAccount(
 		// 每个账号在副本上整形；后续设备注入不得污染原始请求或其它账号的副本。
 		actualBody := shallowCopyBody(body)
 		NormalizeBody(actualBody, isJWT)
-		diag.SetPreparedBody(body, actualBody, isJWT)
 		// 内容视图（= 下游内容 + 网关整形）在注入账号身份**之前**取：设备指纹每账号
 		// 一份，算进指纹会让同一份内容在换号后指纹不同，而 diag 的 bodyhash 正是用来
 		// 判读「这个 body 打过几个账号」的（见 ReqDiag.SetBody）。
@@ -333,6 +332,7 @@ func (e *Engine) tryAccount(
 		// 放在 metadata.user_id.device_id 里。这里取**本账号**的指纹 —— 每账号一份，
 		// 账号隔离因此不依赖请求头（见 upstream.InjectDeviceMetadata / config 的开关）。
 		upstream.InjectDeviceMetadata(actualBody, acc.DeviceMidOr(config.DeviceMid()), attr.SessionID)
+		diag.SetPreparedBody(body, actualBody, isJWT)
 		payload, err := marshalJSON(actualBody)
 		if err != nil {
 			web.Err(reqID, fmt.Sprintf("请求体序列化失败: %v", err))
@@ -373,7 +373,7 @@ func (e *Engine) tryAccount(
 			}
 		}
 		requeststats.Attempt(ctx)
-		finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq)
+		finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq, e.Store.FindAny(acc.ID))
 		resp, err := client.Do(httpReq)
 		finishAttempt(resp, err)
 		if err != nil {
@@ -520,10 +520,10 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 
-	// 4) 429 且 code=3010：模型并发准入限制，账号仍可用，按原版客户端延迟重试
+	// 4) 3008/3009/3010：并发准入限制，使用独立有限预算，不冷却或换号。
 	if IsModelConcurrencyLimit(resp.StatusCode, text) {
 		// 账号状态不变，但这次失败要留痕（并发准入是模型级限制，与账号健康无关）。
-		e.recordError(acc, model.ErrorKindModelBusy, "模型并发准入受限 HTTP 429 code=3010")
+		e.recordError(acc, model.ErrorKindModelBusy, "模型并发准入受限 HTTP 429 code="+ModelConcurrencyCode(resp.StatusCode, text))
 		if b.busy < len(e.BusyRetryDelays) {
 			delay := e.BusyRetryDelays[b.busy]
 			b.busy++
@@ -650,7 +650,7 @@ func (e *Engine) handleUpstreamError(
 				web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（請求級，HTTP %d，%s），已置為失效待人工處理；同內容 %d s 內直接拒絕",
 					acc.Name, streak, resp.StatusCode, preview, ReplayGuardTTL))
 			} else {
-				web.Warn(reqID, fmt.Sprintf("风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（上游已標記帳號，%d s），同內容 %d s 內直接拒絕",
+				web.Warn(reqID, fmt.Sprintf("已達本地風控重試保護閾值（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（本地階梯保護，%d s），同內容 %d s 內直接拒絕",
 					scope.Accounts(), resp.StatusCode, preview, secs, ReplayGuardTTL))
 			}
 			return attemptResult{final: runResult{

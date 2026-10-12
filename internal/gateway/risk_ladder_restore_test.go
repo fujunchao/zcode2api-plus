@@ -47,3 +47,36 @@ func TestRiskLadderDefaultReturnsAfterCooling(t *testing.T) {
 		t.Fatal("成功应清连续计数，保留观测历史")
 	}
 }
+
+func TestRiskLadderDefaultEscalatesAndStopsAtInvalid(t *testing.T) {
+	f := newFixture(t)
+	f.respond = jsonResp(405, `{"code":3012,"msg":"request has been blocked due to unusual activity."}`)
+	a, err := f.st.AddAccount(model.ProviderZai, "ladder-escalate", "synthetic-escalate-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for hit, seconds := range []int{300, 900, 3600, 0} {
+		before := float64(time.Now().Unix())
+		_, _ = f.post(t, msgBody(), "sk-test")
+		got := f.st.FindAny(a.ID)
+		if f.callCount() != hit+1 || got.RiskControlStreak != hit+1 {
+			t.Fatal("每档到期应允许下一次独立尝试")
+		}
+		if seconds == 0 {
+			if got.Status != model.StatusInvalid || got.CoolingUntil != nil {
+				t.Fatal("超出三档必须失效，不能无限重试")
+			}
+			if f.st.Select(a.Provider, nil, "GLM-5.3") != nil {
+				t.Fatal("失效不能自动重入池")
+			}
+			break
+		}
+		if got.Status != model.StatusCooling || got.CoolingUntil == nil || *got.CoolingUntil < before+float64(seconds) || *got.CoolingUntil > before+float64(seconds)+5 {
+			t.Fatalf("第%d档应冷却%d秒", hit+1, seconds)
+		}
+		_, err = f.st.Update(a.Provider, a.ID, func(a *model.Account) { expired := before - 1; a.CoolingUntil = &expired })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}

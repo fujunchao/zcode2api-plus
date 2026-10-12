@@ -163,6 +163,7 @@ func newTestPool(t *testing.T) (*Pool, *store.Store, *captcha.Manager, *fakeSolv
 	})
 	p := NewPool(st, auth.New(st), cm)
 	p.RateLimitRetryDelay = 0 // 与 config.AsyncMaxRetries=0 同理：避免退避等待
+	p.BusyRetryDelays = []time.Duration{0, 0}
 	return p, st, cm, solver
 }
 

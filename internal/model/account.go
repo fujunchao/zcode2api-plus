@@ -98,18 +98,9 @@ type Account struct {
 	// LastErrorAt 最近一次失败的时间（Unix 秒，与其它时间字段同口径）。
 	LastErrorAt *float64 `json:"last_error_at"`
 
-	// LastRiskControlAt 最近一次被上游风控拦截（HTTP 405 + 风控文案）的时刻
-	// （Unix 秒，与其它时间字段同口径）。
-	//
-	// 与 RiskControlStreak 的区别：streak 只记「连续几次」且成功即清零，回答不了
-	// 「上次是多久前」；而风控静默期判定要的正是时刻——上游给触发风控的账号打的是
-	// **服务端标记**，标记期内该账号对任何请求都回 405（实测 ≥14h），本地阶梯冷却
-	// （分钟级）到期远早于标记解除。选号硬闸门（Select）与手动恢复护栏都读本字段；
-	// 没有它时「冷却到期即再入池」会循环踩雷（2026-10-12 晚池卫生事故）。
-	//
-	// 刻意持久化（对比三个 streak 的 json:"-"）：它衡量的是上游侧、跨重启存续的
-	// 状态，进程重启不得把静默期内的账号重新放回轮转。升级迁移见 normalize：
-	// 旧数据没有本键时，按 last_error_at（仅当错误归类仍是风控）回填一次。
+	// LastRiskControlAt 最近一次405风控响应时间（Unix秒），持久化观测字段。
+	// 默认不影响冷却到期调度；只有显式启用额外隔离窗口时才作为其计时依据。
+	// 不能把本地历史等同于上游封禁状态。
 	LastRiskControlAt *float64 `json:"last_risk_control_at"`
 
 	ProxyURL   *string  `json:"proxy_url"`

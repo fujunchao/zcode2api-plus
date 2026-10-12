@@ -40,6 +40,7 @@ type ReqDiag struct {
 	ReplayWait       time.Duration
 	preserveContext  bool
 	shape            requestShape
+	outbound         outboundSnapshot
 	lastAttemptBase  string
 
 	BodyBytes        int    // 真正发给上游的请求体字节数（注入 system 之后）
@@ -270,15 +271,15 @@ func boolToInt(b bool) int {
 func diagEffort(body map[string]any) string {
 	if oc, ok := body["output_config"].(map[string]any); ok {
 		if s, ok := oc["effort"].(string); ok && s != "" {
-			return s
+			return diagnosticChoice(s, "low", "high", "max", "medium", "none", "minimal", "xhigh")
 		}
 	}
 	if s, ok := body["reasoning_effort"].(string); ok && s != "" {
-		return s
+		return diagnosticChoice(s, "low", "high", "max", "medium", "none", "minimal", "xhigh")
 	}
 	if th, ok := body["thinking"].(map[string]any); ok {
 		if s, ok := th["type"].(string); ok && s != "" {
-			return "thinking:" + s
+			return "thinking:" + diagnosticChoice(s, "enabled", "disabled", "adaptive")
 		}
 	}
 	return ""
@@ -294,7 +295,9 @@ func diagMaxTokens(body map[string]any) string {
 	case int64:
 		return strconv.FormatInt(v, 10)
 	case string:
-		return v
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return strconv.FormatInt(n, 10)
+		}
 	}
 	return ""
 }

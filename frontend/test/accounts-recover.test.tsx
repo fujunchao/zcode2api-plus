@@ -51,7 +51,7 @@ test('手動恢復按鈕僅對風控失效帳號顯示', async () => {
   client.clear()
 })
 
-test('單號手動恢復：確認框提示上游標記限制，確認後調用 recover 端點', async () => {
+test('单号恢复只说明本地策略，不声称上游封禁期限', async () => {
   const data = fixture()
   mock.api.mockReset().mockImplementation(async (method: string, path: string) => {
     if (method === 'GET' && path === '/accounts') return structuredClone(data)
@@ -61,7 +61,9 @@ test('單號手動恢復：確認框提示上游標記限制，確認後調用 r
   const client = mount()
   fireEvent.click(await screen.findByTitle('手動恢復（風控失效）'))
   const dialog = await screen.findByRole('alertdialog')
-  expect(dialog.textContent).toContain('不會解除上游仍生效的風控標記')
+  expect(dialog.textContent).toContain('仅修改本地状态，不保证上游接受请求')
+  expect(dialog.textContent).not.toContain('預設 24 小時')
+  expect(dialog.textContent).not.toContain('≥14 小時')
   expect(dialog.textContent).toContain('最近風控')
   fireEvent.click(within(dialog).getByRole('button', { name: '確認恢復', exact: true }))
   await waitFor(() => expect(mock.api).toHaveBeenCalledWith('POST', '/accounts/risk/recover'))
@@ -92,5 +94,17 @@ test('批量恢復：勾選後對所選集合調用批量端點', async () => {
     expect(mock.api).toHaveBeenCalledWith('POST', '/accounts/batch/recover', { ids: ['risk'], missing_ok: true }),
   )
   await waitFor(() => expect(mock.success).toHaveBeenCalledWith('批量恢復完成：成功 1'))
+  client.clear()
+})
+
+test('状态列显示本地隔离和重新评估时间，不把阶梯倒计时当作解封', async () => {
+  const data = fixture()
+  data.accounts[0] = account({ id: 'risk', name: '額外隔離號', status: 'active', last_error_kind: 'risk_control',
+    local_scheduling_reason: 'risk_isolation', local_recheck_at: Date.now() / 1000 + 3600 })
+  mock.api.mockReset().mockResolvedValue(data)
+  const client = mount()
+  await screen.findByText('額外隔離號')
+  expect(screen.getByText('本地隔离')).toBeTruthy()
+  expect(screen.getByText(/重新评估：/)).toBeTruthy()
   client.clear()
 })

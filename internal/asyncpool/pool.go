@@ -70,6 +70,8 @@ type Pool struct {
 	// 默认 gateway.OverloadRetryDelays（1s/3s；测试可缩短）。与 RateLimitRetryDelay
 	// 分开配置：过载与账号无关，既不冷却也不换号。
 	OverloadRetryDelays []time.Duration
+	// BusyRetryDelays 与同步共用默认 1s/2s；并发限制不触发整号冷却或换号。
+	BusyRetryDelays []time.Duration
 
 	// OnQuotaRefresh 上游侧断流后的额度刷新钩子（main 接 qs.FetchQuota，与
 	// gateway.Engine.OnQuotaRefresh 同形）。断流账号的额度快照停在旧值，会以
@@ -96,6 +98,7 @@ func NewPool(st *store.Store, au *auth.Service, cm *captcha.Manager) *Pool {
 		Captcha:             cm,
 		RateLimitRetryDelay: gateway.RateLimitRetryDelay,
 		OverloadRetryDelays: gateway.OverloadRetryDelays,
+		BusyRetryDelays:     gateway.NewBusyRetryDelays(),
 		tickets:             map[string]*ticket{},
 	}
 	if gateway.ReplayGuardTTL > 0 {
@@ -348,7 +351,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	diag.SetTrace(ctx)
 	// 风控判定范围：**必须按票创建**（Pool 跨票共享，挂上去会让并发票务互相误判）。
 	// 与 sync 路径共用 gateway.RiskScope：同一份 body 在两条路径上必须得到同一判定。
-	// 请求级处置：停止换号、保留冷却（上游已标记账号）、登记重放防护。见 riskscope.go。
+	// 请求级处置：停止换号、保留本地阶梯冷却、登记重放防护。见 riskscope.go。
 	//
 	// 刻意与 diag 一起声明在 defer 之前：诊断行要排印本票的风控范围，而 defer 里的
 	// 闭包只能引用它之前已声明的变量。
@@ -413,11 +416,11 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		// 每个账号在副本上处理 system，后续设备注入不得污染原始请求。
 		actualBody := shallowCopyBody(body)
 		gateway.NormalizeBody(actualBody, true)
-		diag.SetPreparedBody(body, actualBody, true)
 		// 内容视图先取（注入账号身份之前）：与 sync 路径同口径，见 ReqDiag.SetBody。
 		contentView, _ := marshalJSON(actualBody)
 		// 与 sync 路径同口径：设备身份走 body 的 metadata.user_id（本账号指纹）。
 		upstream.InjectDeviceMetadata(actualBody, acc.DeviceMidOr(config.DeviceMid()), attr.SessionID)
+		diag.SetPreparedBody(body, actualBody, true)
 		payload, err := marshalJSON(actualBody)
 		if err != nil {
 			p.emitError(ctx, ticketID, "请求体序列化失败", "build_error")
@@ -564,11 +567,27 @@ func (p *Pool) attemptUpstream(
 	diag *gateway.ReqDiag,
 	scope *gateway.RiskScope,
 ) (bool, error) {
-	rateAttempt, overloadAttempt := 0, 0
+	rateAttempt, overloadAttempt, busyAttempt := 0, 0, 0
 	for {
 		midStream, err := p.attemptUpstreamOnce(ctx, ticketID, acc, modelName, req, payload, diag, scope)
 		if err == nil || midStream {
 			return midStream, err
+		}
+		var busy errModelBusy
+		if errors.As(err, &busy) {
+			if busyAttempt >= len(p.BusyRetryDelays) {
+				p.emitError(ctx, ticketID, busy.body, "upstream_rate_limit")
+				return false, errDelivered
+			}
+			delay := p.BusyRetryDelays[busyAttempt]
+			busyAttempt++
+			web.Warn(ticketID, fmt.Sprintf("模型并发准入受限 code=%s，%g s 后原地重试（账号状态不变）", gateway.ModelConcurrencyCode(429, busy.body), delay.Seconds()))
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
 		}
 
 		// 平台过载：与账号无关，既不标状态也不换号。换号救不了过载，只会在平台
@@ -655,7 +674,7 @@ func (p *Pool) attemptUpstreamOnce(
 		}
 	}
 	requeststats.Attempt(ctx)
-	finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq)
+	finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq, p.Store.FindAny(acc.ID))
 	resp, err := client.Do(httpReq)
 	finishAttempt(resp, err)
 	if err != nil {
@@ -701,12 +720,12 @@ func (p *Pool) attemptUpstreamOnce(
 			return false, errNetwork{bodyText}
 		}
 
-		// 429 且 code=3010：模型并发准入限制，账号仍可用，不标状态
+		// 3008/3009/3010：交由独立有限预算处理，不按普通429冷却账号。
 		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
 			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindModelBusy,
-				"模型并发准入受限 HTTP 429 code=3010", time.Now())
+				"模型并发准入受限 HTTP 429 code="+gateway.ModelConcurrencyCode(resp.StatusCode, bodyText), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态%s", acc.Name, gateway.ErrorDetail(bodyText)))
-			return false, errNetwork{bodyText}
+			return false, errModelBusy{bodyText}
 		}
 
 		// 529 / 业务码 1305：平台服务过载，与账号无关。必须排在 429 分支之前——官方
@@ -772,7 +791,7 @@ func (p *Pool) attemptUpstreamOnce(
 					web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（請求級，HTTP %d，%s），已置為失效待人工處理；同內容 %d s 內直接拒絕",
 						acc.Name, streak, resp.StatusCode, preview, gateway.ReplayGuardTTL))
 				} else {
-					web.Warn(ticketID, fmt.Sprintf("风控判定為請求級（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（上游已標記帳號），同內容 %d s 內直接拒絕",
+					web.Warn(ticketID, fmt.Sprintf("已達本地風控重試保護閾值（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（本地階梯保護），同內容 %d s 內直接拒絕",
 						scope.Accounts(), resp.StatusCode, preview, gateway.ReplayGuardTTL))
 				}
 				return false, errRequestLevelRisk{body: bodyText}
@@ -902,6 +921,10 @@ func (e errRequestLevelRisk) Error() string { return "request-level risk control
 // errRateLimited 瞬时限流（非额度码族的 429）：账号尚未标任何状态，
 // 由 attemptUpstream 决定是原地重试还是递进冷却后换号。
 type errRateLimited struct{ body string }
+
+type errModelBusy struct{ body string }
+
+func (e errModelBusy) Error() string { return e.body }
 
 func (e errRateLimited) Error() string { return e.body }
 

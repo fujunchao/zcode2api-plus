@@ -1424,12 +1424,8 @@ func (s *Store) ResetTokenStats(provider, idOrName string) (bool, error) {
 // 清冷却、清错误证据并清零风控连续计数——不春风控计数，救回来的账号下一次命中
 // 就是老计数 + 1，会立刻又判失效，等于人工修复无效。
 //
-// 恢复护栏（2026-10-12 晚事故补上）：账号仍在风控静默期时**不得直接回 active**——
-// 上游标记未过期，放回轮转只会重演「批量恢复 51 个账号 → 二次烧伤」。此时转入
-// **保护冷却**：Status=cooling、CoolingUntil=静默期终点（与选号闸门的放行时刻
-// 重合），期满自动重新参与调度；错误证据写明成因（kind 保持 risk_control，供
-// 池状态与列表如实展示），不再是「已恢复健康」的假象。历史字段（LastRiskControlAt）
-// 刻意保留：它是上游侧状态，恢复≠解除。静默期已过或关闭时回退旧的直接恢复语义。
+// 默认恢复直接解除本地失效与冷却，保留历史观测时间。
+// 只有管理员显式开启额外隔离且窗口未过时才转保护冷却；不是上游解封判定。
 //
 // 调用方必须已确认 model.IsRiskControlInvalid(acc)：本函数只做字段转移、不做守卫，
 // 守卫在各自入口的锁内完成（单账号 RecoverAccount / 批量 BatchRecoverAccounts）。
@@ -1450,7 +1446,7 @@ func applyRecovered(acc *model.Account, now time.Time) {
 	acc.Status = model.StatusCooling
 	acc.CoolingUntil = until
 	kind := model.ErrorKindRiskControl
-	note := "已手动恢复；上游风控静默期未过，保护冷却中，期满自动重新参与调度"
+	note := "已手动恢复；已启用额外本地隔离，保护冷却中，到期重新评估调度"
 	ts := float64(now.UnixNano()) / 1e9
 	acc.LastErrorKind = &kind
 	acc.LastError = &note
@@ -1571,13 +1567,8 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 // Select 按模型额度优先、并列时轮询的方式选择账号。
 //
 // 选号分五层，前一层筛出的池子决定后一层的作用范围：
-//  1. 可选：状态可调度（IsSelectable）、未被本次请求跳过（skipIDs），且不在风控
-//     静默期（InRiskControlSilentWindow）。静默期是**硬闸门**：被上游标记的账号
-//     在标记期内对任何请求都 405，本地 ladder 冷却（分钟级）到期远早于标记解除，
-//     照常入池只会反复踩雷并污染请求级判定（2026-10-12 晚 33 分钟全池风暴）。
-//     池内账号全在静默期时宁可走 no_available_account 出口（池状态会如实报出
-//     「风控静默期」分桶），也不把必然被拒的账号喂给请求。ZCODE_RISK_SILENT_HOURS=0
-//     可整体关闭（应急回退）。
+//  1. 可选：状态可调度、未被本请求跳过；显式配置的额外本地隔离为附加门槛。
+//     默认额外窗口为0，原阶梯冷却到期即重新候选；历史时间本身不排除账号。
 //  2. 模型分档：该模型 available 者优先，其次 unknown；absent/exhausted 一律排除；
 //  3. 优惠优先：持有未耗尽的一次性优惠额度（one_time）者优先——这类额度不用就过期，
 //     与「谁剩得多」是两回事，故独立成层；

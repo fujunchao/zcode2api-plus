@@ -90,6 +90,7 @@ func (d *ReqDiag) SetPreparedBody(input, prepared map[string]any, isJWT bool) {
 		}
 	}
 	d.shape = s
+	d.outbound = inspectOutboundBody(prepared)
 }
 
 func (s requestShape) format(preserve bool) string {

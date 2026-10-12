@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
@@ -58,7 +59,11 @@ func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	views := make([]map[string]any, 0, len(matched))
 	for _, a := range matched {
-		views = append(views, a.PublicView(now))
+		view := a.PublicView(now)
+		barrier, recheck := a.LocalSchedulingBarrier(now, config.RiskSilentWindow())
+		view["local_scheduling_reason"], view["local_recheck_at"] = barrier, recheck
+		view["risk_extra_window_hours"] = max(0, config.RiskSilentHours)
+		views = append(views, view)
 	}
 	stats := h.poolStats(now)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -564,7 +569,7 @@ func (h *Handler) handleRecoverAccount(w http.ResponseWriter, r *http.Request) {
 		if updated.LastRiskControlAt != nil {
 			hours = time.Since(time.Unix(0, int64(*updated.LastRiskControlAt*1e9))).Hours()
 		}
-		msg = fmt.Sprintf("账号 %s 已手动恢复；距上次风控 %.1f 小时（静默期内），已转入保护冷却至 %s，期满自动重新参与调度",
+		msg = fmt.Sprintf("账号 %s 已手动恢复；距上次风控 %.1f 小时；已启用额外本地隔离，保护冷却至 %s，到期重新评估调度",
 			updated.ID, hours, time.Unix(int64(*updated.CoolingUntil), 0).Format("01-02 15:04"))
 	}
 	web.Ok("account", msg)

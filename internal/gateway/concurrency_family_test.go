@@ -39,3 +39,24 @@ func TestModelConcurrencyFamilyKeepsAccountUsable(t *testing.T) {
 		})
 	}
 }
+
+func TestModelConcurrencyClassificationKeepsExplicitCodes(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{`{"error":{"code":"3009","message":"busy"}}`, true},
+		{`{"error":{"type":"3008","message":"busy"}}`, true},
+		{`{"code":1302,"msg":"model concurrency limit exceeded"}`, false},
+		{`{"code":1005,"msg":"model admission concurrency limit"}`, false},
+		{`{"code":3012,"msg":"blocked"}`, false},
+		{`model concurrency limit exceeded`, true},
+	} {
+		if IsModelConcurrencyLimit(429, tc.body) != tc.want {
+			t.Fatalf("错误分类不符: %s", tc.body)
+		}
+		if IsModelConcurrencyLimit(405, tc.body) {
+			t.Fatal("非429不能误归并发")
+		}
+	}
+}

@@ -52,11 +52,12 @@ export interface Account {
   last_error_kind: AccountErrorKind | null
   /** 最近一次失敗的時間（Unix 秒）。 */
   last_error_at: number | null
-  /**
-   * 最近一次被上游風控攔截的時間（Unix 秒）。上游對觸發風控的帳號打服務端標記，
-   * 標記期內（靜默期）帳號不參與調度；恢復這類帳號會先轉入保護冷卻。
-   */
+  /** 最近一次风控响应时间；这是观测记录，不是上游封禁确认。 */
   last_risk_control_at: number | null
+  /** 本地门槛不包含模型额度；时间到达仅代表重新评估调度。 */
+  local_scheduling_reason?: string
+  local_recheck_at?: number | null
+  risk_extra_window_hours?: number
   proxy_url: string | null
   proxy_id: string | null
   created_at: number

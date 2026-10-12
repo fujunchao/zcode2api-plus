@@ -1,27 +1,6 @@
-// 风控的「账号级 / 请求级」分离：判定范围与处置。
-//
-// 背景（2026-09-24 整池雪崩，docs/analysis-riskcontrol-pool-cascade-20260924.md；
-// 两段式模型修正见 docs/analysis-auth-chain-vs-official.md §九）：
-// 上游用 HTTP 405 + "unusual activity" 表达风控拦截，这句话有两种完全不同的语义，
-// 而项目此前只有账号级一种处置——
-//
-//   - **账号级**：换号即成功。2026-09-23 全天 17 次零星风控，17/17 都在第 2 个账号上
-//     拿到 200（attempts=2），说明拦截确实跟着身份走；
-//   - **请求级**：同一 body 在多个不同账号 + 多个出口线路上全部被拒。09-24 当日 67/67，
-//     14 次重放共冷却 67 个账号、把 70 号池整池清空。
-//
-// 判据：同一请求内 ≥2 个**命中时仍处于干净状态**（不在风控静默期）的不同账号给出
-// 同一风控信号 ⇒ 达到本地停止换号的保护阈值。这是有界保护，不是供应商的原因诊断；
-// 账号、出口及内容等变量仍可能混杂。阈值取 2 的依据就是上面那组对照——账号级风控
-// 在第 2 个账号上就已经成功了。热账号（静默期内）的命中不计入：它的 405 只反映
-// 自身被标记，与内容无关（2026-10-12 晚污染池里「连抽两个热账号」曾被误判成请求级）。
-//
-// ⚠️ 请求级判定的处置语义已随账号级标记模型修正（2026-09-24 傍晚）：上游会给触发过
-// 的账号**打服务端标记**（标记期内该账号无论发什么都 405，实测 ≥14h）。因此
-// 「请求级 ⇒ 不冷却、回滚」的旧处置方向反了 —— 每个被尝试的账号都已被上游标记，
-// 本地冷却必须**保留**（否则账号立即被再次选中、再吃一个 405），并停止换号、登记
-// 重放防护（ReplayGuard）阻止同内容继续扩散标记。曾有的 Rollback/RiskControlSnapshot
-// 机制随之整体移除：回滚冷却等于替服务端解封账号。
+// 风控保护按账号阶梯冷却；同请求达到不同账号阈值后停止换号并启用重放保护。
+// 阈值仅限制进一步尝试，不诊断供应商的触发原因。默认冷却到期即可重试，
+// 只有显式开启额外本地隔离时才跳过窗口内账号。代理失败历史不等于账号封禁次数。
 package gateway
 
 import (
@@ -64,18 +43,8 @@ func (s *RiskScope) ContentKey() string {
 	return s.contentKey
 }
 
-// Verdict 记一次风控命中并给出判定：true 表示已达阈值，本次应判为请求级。
-//
-// 两条收窄规则（缺一不可）：
-//
-//  1. 按账号 **ID** 去重，而不是按命中次数：同一账号可能因验证码刷新 / 瞬时限流原地
-//     重试而重复进入风控分支，按次数计会把「同一个号被拒两次」误判成第二个身份。
-//  2. 只统计「命中时仍干净」的账号：命中账号若已处于风控静默期（近期被上游标记过），
-//     它的 405 只反映账号自身的标记状态，与请求内容无关。污染池里连抽两个热账号的
-//     概率极高，把它们计进来会误判「内容有罪」——错误地停止换号并封锁同内容
-//     （2026-10-12 晚 33 分钟全池风暴的直接机制；规格见
-//     docs/plan-riskcontrol-silent-window-20261012.md）。静默期内的命中只做
-//     账号级处置，不参与请求级判定。
+// Verdict 按不同账号去重记次；显式额外隔离中的账号不参与本地停止换号阈值。
+// 默认额外窗口为0，保留最初的两账号保护；结论不表示正文就是风控原因。
 func (s *RiskScope) Verdict(acc *model.Account, now time.Time) bool {
 	if s == nil || acc == nil {
 		return false
@@ -103,9 +72,7 @@ func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, no
 	_, _ = st.Update(snapshot.Provider, snapshot.ID, func(acc *model.Account) {
 		acc.RiskControlStreak++
 		streak = acc.RiskControlStreak
-		// 静默期证据章：记录命中时刻（持久化字段）。选号硬闸门与恢复护栏都读它——
-		// ladder 冷却只覆盖分钟级，而上游标记可持续 ≥14h，没有这个时刻就没有
-		// 「冷却到期 ≠ 标记解除」的判据（2026-10-12 晚事故）。
+		// 持久化观测时间；默认只走阶梯，额外本地隔离由管理员显式开启。
 		nowF := float64(now.UnixNano()) / 1e9
 		acc.LastRiskControlAt = &nowF
 		secs, invalid = riskControlCoolingSeconds(st, streak)
@@ -149,9 +116,11 @@ func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, no
 	if result.Reason == "changed" {
 		action = "风控后已更换代理，保留风控冷却/失效状态"
 	}
-	msg := fmt.Sprintf("账号 %s %s req=%q ticket=%q result=%s from_id=%q from_route=%q from_endpoint=%q from_mode=%s to_id=%q to_route=%q to_endpoint=%q to_mode=%s history_blocked=%d history_ttl_s=%d state=%s streak=%d cooling_s=%d",
+	_, recheck := st.FindAny(snapshot.ID).LocalSchedulingBarrier(now, config.RiskSilentWindow())
+	// history_blocked兼容旧解析器；新增名字明确这是候选代理排除数。
+	msg := fmt.Sprintf("账号 %s %s req=%q ticket=%q result=%s from_id=%q from_route=%q from_endpoint=%q from_mode=%s to_id=%q to_route=%q to_endpoint=%q to_mode=%s history_blocked=%d history_ttl_s=%d state=%s streak=%d cooling_s=%d history_blocked_candidates=%d history_scope=account_route_candidates local_recheck_at=%s",
 		snapshot.ID, action, observed.RequestID, observed.Ticket, result.Reason, from.ID, from.Label, from.Endpoint, from.Mode, to.ID, to.Label, to.Endpoint, to.Mode,
-		result.HistoryBlocked, int(store.RiskProxyHistoryTTL.Seconds()), state, streak, secs)
+		result.HistoryBlocked, int(store.RiskProxyHistoryTTL.Seconds()), state, streak, secs, result.HistoryBlocked, diagnosticTimestamp(recheck))
 	if err != nil {
 		msg += fmt.Sprintf(" error=%q", err.Error())
 	}

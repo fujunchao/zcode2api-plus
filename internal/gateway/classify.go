@@ -34,6 +34,11 @@ const (
 // 账号仍然可用，不能把模型准入限制写成账号 cooling。
 var defaultBusyRetryDelays = []time.Duration{time.Second, 2 * time.Second}
 
+// NewBusyRetryDelays 为同步/异步分别提供独立的有限并发退避预算。
+func NewBusyRetryDelays() []time.Duration {
+	return append([]time.Duration(nil), defaultBusyRetryDelays...)
+}
+
 // statusOverloaded 上游表达「平台服务过载」的状态码。它不在 net/http 的常量表里：
 // Anthropic 兼容面沿用 Anthropic 的 529（overloaded），而官方错误码表把同一业务码
 // 1305 标为 429——只认 429 会整类漏掉平台过载（线上实测：529 全部落到「其余错误」
@@ -425,7 +430,10 @@ func UpstreamBusinessCode(text string) string {
 	code := payload["code"]
 	if code == nil {
 		if errObj, ok := payload["error"].(map[string]any); ok {
-			code = errObj["type"]
+			code = errObj["code"]
+			if code == nil {
+				code = errObj["type"]
+			}
 		}
 	}
 	if code == nil {
@@ -434,16 +442,26 @@ func UpstreamBusinessCode(text string) string {
 	return fmt.Sprint(code)
 }
 
-// IsModelConcurrencyLimit 3010 是模型并发准入限制，不代表账号被限流或失效。
+// IsModelConcurrencyLimit 将并发拒绝与普通速率限制分开，不据此标记账号失效。
 func IsModelConcurrencyLimit(statusCode int, text string) bool {
+	return ModelConcurrencyCode(statusCode, text) != ""
+}
+
+// ModelConcurrencyCode 保留实际业务码。仅在无码时兼容已知文案，避免覆盖明确的其它错误。
+func ModelConcurrencyCode(statusCode int, text string) string {
 	if statusCode != 429 {
-		return false
+		return ""
 	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(text), &payload); err == nil && fmt.Sprint(payload["code"]) == "3010" {
-		return true
+	switch code := UpstreamBusinessCode(text); code {
+	case "3008", "3009", "3010":
+		return code
+	case "":
+		low := strings.ToLower(text)
+		if strings.Contains(low, "model admission concurrency limit") || strings.Contains(low, "model concurrency limit exceeded") {
+			return "unknown"
+		}
 	}
-	return strings.Contains(strings.ToLower(text), "model admission concurrency limit")
+	return ""
 }
 
 // IsUpstreamOverload 识别平台级服务过载：官方业务码 1305 的文案是「该模型当前访问量

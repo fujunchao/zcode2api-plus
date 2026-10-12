@@ -502,8 +502,8 @@ export function AccountsPage() {
       description: (
         <>
           將對選中的 <b>{targets.length}</b> 個帳號嘗試手動恢復；僅「風控失效」項會成功，其餘逐條回報失敗。
-          此操作<b>不會解除上游仍生效的風控標記</b>；未滿風控靜默期（預設 24 小時）的帳號
-          恢復後會先進入<b>保護冷卻</b>，暫不參與調度，期滿自動恢復。
+          此操作<b>仅修改本地状态，不保证上游接受请求</b>。默认恢复后重新参与调度；
+          只有管理员显式启用额外本地隔离时，才可能先进入保护冷却，结果会逐条提示。
         </>
       ),
       onConfirm: async () => {
@@ -689,9 +689,9 @@ export function AccountsPage() {
           確認將 <code className="rounded bg-muted px-1 py-0.5">{label}</code> 由「風控失效」恢復為正常？
           將清除本地風控標記、冷卻與連續計數。
           <div className="mt-2 text-xs text-muted-foreground">
-            此操作<b>不會解除上游仍生效的風控標記</b>（實測可持續 ≥14 小時）；距上次風控
-            未滿靜默期（預設 24 小時）的帳號恢復後會<b>先進入保護冷卻</b>，期滿自動重新參與調度；
-            期滿後若再命中風控會重新冷卻或失效。最近風控：{relativeTime(a.last_risk_control_at ?? a.last_error_at)}
+            此操作<b>仅修改本地状态，不保证上游接受请求</b>。默认重新参与调度；
+            显式启用的额外本地隔离可能使账号先进入保护冷却。再次命中会按阶梯冷却或失效。
+            最近風控：{relativeTime(a.last_risk_control_at ?? a.last_error_at)}
           </div>
         </>
       ),
@@ -955,7 +955,14 @@ export function AccountsPage() {
                       </div>
                     </TableCell>
                     <TableCell className="text-center">
-                      <Badge className={STATUS_BADGE[a.status]}>{STATUS_LABEL[a.status] || a.status}</Badge>
+                      <Badge className={STATUS_BADGE[a.local_scheduling_reason === 'risk_isolation' ? 'cooling' : a.status]}>
+                        {a.local_scheduling_reason === 'risk_isolation' ? '本地隔离' : STATUS_LABEL[a.status] || a.status}
+                      </Badge>
+                      {a.local_recheck_at != null && (
+                        <div className="mt-1 text-[10px] text-muted-foreground" title="本地时间门槛到期后重新评估状态和额度，不保证上游接受">
+                          重新评估：{fmtDate(a.local_recheck_at)}
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell>
                       {!a.proxy_url ? (

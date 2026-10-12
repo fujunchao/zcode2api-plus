@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,5 +67,70 @@ func TestDiagnosticOutboundSnapshotBothRoutes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestModelConcurrencyAsyncDoesNotSwitchOrCool(t *testing.T) {
+	var calls atomic.Int32
+	p, srv, _ := newDiagnosticHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(429)
+		_, _ = io.WriteString(w, `{"code":3009,"msg":"model concurrency limit exceeded"}`)
+	}))
+	addJWTAccountN(t, p.Store, "unrelated-account", 9)
+	_, status, response := postDiagnosticHTTP(t, srv, "/async/v1/messages", `{"model":"GLM-5.3","messages":[{"role":"user","content":"synthetic"}]}`)
+	p.Close()
+	if status != 200 || !strings.Contains(response, "3009") || !strings.Contains(response, "upstream_rate_limit") || calls.Load() != 3 {
+		t.Fatalf("并发有限重试应保留原始码: calls=%d %s", calls.Load(), response)
+	}
+	marked := 0
+	for _, a := range p.Store.ListAccounts(model.ProviderZai) {
+		if a.Status != model.StatusActive || a.CoolingUntil != nil || a.RateLimitStreak != 0 {
+			t.Fatal("不得冷却账号")
+		}
+		if a.LastErrorKind != nil && *a.LastErrorKind == model.ErrorKindModelBusy {
+			marked++
+		}
+	}
+	if marked != 1 {
+		t.Fatal("并发重试不得改用另一个账号")
+	}
+}
+
+func TestRiskLadderAsyncReturnsAfterDefaultCooling(t *testing.T) {
+	var calls atomic.Int32
+	p, srv, _ := newDiagnosticHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(405)
+			_, _ = io.WriteString(w, `{"code":3012,"msg":"blocked due to unusual activity"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	raw := `{"model":"GLM-5.3","messages":[{"role":"user","content":"synthetic"}]}`
+	_, _, _ = postDiagnosticHTTP(t, srv, "/async/v1/messages", raw)
+	a := p.Store.ListAccounts(model.ProviderZai)[0]
+	if a.Status != model.StatusCooling || a.LastRiskControlAt == nil {
+		t.Fatal("首次拒绝应进入阶梯")
+	}
+	_, err := p.Store.Update(a.Provider, a.ID, func(a *model.Account) {
+		expired := float64(time.Now().Add(-time.Second).Unix())
+		a.CoolingUntil = &expired
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, response := postDiagnosticHTTP(t, srv, "/async/v1/messages", raw)
+	p.Close()
+	if calls.Load() != 2 || !strings.Contains(response, "event: done") {
+		t.Fatalf("默认阶梯到期应重新调用: %s", response)
+	}
+	if p.Store.FindAny(a.ID).RiskControlStreak != 0 {
+		t.Fatal("成功应清零风控连击")
 	}
 }

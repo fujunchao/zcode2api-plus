@@ -18,7 +18,7 @@ import (
 // BeginUpstreamAttempt 紧贴 client.Do 调用。返回回调仅记录响应头/连接结果，不把 HTTP
 // 200 当作完整调用成功，也不记录可能包含代理凭据的原始网络错误。
 // request 是实际发出的请求；只提取安全摘要，不保留请求或读取正文。nil 表示未提供摘要。
-func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgress, request *http.Request) func(*http.Response, error) {
+func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgress, request *http.Request, current ...*model.Account) func(*http.Response, error) {
 	if d == nil {
 		return func(*http.Response, error) {}
 	}
@@ -30,6 +30,12 @@ func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgr
 	d.shape.mcsDeclared = request != nil && hasMCSDeclaration(request.Header.Get("Anthropic-Beta"))
 	summary := attemptRequestSummary(acc, request)
 	extra := trace + d.shape.format(d.preserveContext)
+	var observed *model.Account
+	if len(current) > 0 {
+		observed = current[0]
+	}
+	// 当前状态在发送前取样并冻结；响应到达期间额度/冷却变化不能改写这份证据。
+	extra += d.outboundAttemptSummary(acc, observed, request, d.Now())
 	web.Attempt(d.ReqID, "event=start "+base+summary+extra+" ts="+diagnosticTime(d.Now()))
 	return func(resp *http.Response, err error) {
 		status := 0
