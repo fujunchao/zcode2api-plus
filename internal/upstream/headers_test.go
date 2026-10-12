@@ -286,11 +286,17 @@ func TestDeviceMidNotSentOnModelRequests(t *testing.T) {
 // TestHeaderAndBodyPlatformAgree 头体同源守卫（GAP-3 的正面回归）：
 // 请求头声称的平台，必须与 body 里 # Environment 段声称的一致。
 // 修复前这里是「头说 win32-x64、body 说 linux-x64」。
+//
+// # Environment 默认不注入，本用例必须显式打开开关才有校验对象——
+// 它守的是「该段一旦存在就必须与头同源」，不是「该段必须存在」。
 func TestHeaderAndBodyPlatformAgree(t *testing.T) {
 	oldBare, oldArch := config.ZcodeClientBarePlatform, config.ZcodeClientArch
+	oldInject := config.UpstreamInjectEnvironment
 	t.Cleanup(func() {
 		config.ZcodeClientBarePlatform, config.ZcodeClientArch = oldBare, oldArch
+		config.UpstreamInjectEnvironment = oldInject
 	})
+	config.UpstreamInjectEnvironment = true
 
 	for _, tc := range []struct{ bare, arch, header, envPlatform string }{
 		{"win32", "x64", "win32-x64", "win32"},

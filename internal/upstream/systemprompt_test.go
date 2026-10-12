@@ -84,33 +84,78 @@ func TestEnvironmentBlockTracksProfile(t *testing.T) {
 	}
 }
 
-// TestSystemBlocksShape 三段结构与顺序：CLI Prefix → Agent Identity → Environment。
-// 顺序与官方的分段排序一致（system+stable 先于 system+dynamic），
-// 否则前缀缓存命中会变差。
+// TestSystemBlocksShape 块结构与顺序：CLI Prefix → Agent Identity（→ # Environment）。
+// 顺序与官方的分段排序一致（system+stable 先于 system+dynamic），否则前缀缓存命中会变差。
+//
+// 默认只注入前两块：# Environment 由 config.UpstreamInjectEnvironment 控制，
+// 关闭时上游照样返回 200（它只校验到身份段末尾）。开关打开即恢复三段。
 func TestSystemBlocksShape(t *testing.T) {
-	blocks := ZcodeSystemBlocks()
-	if len(blocks) != 3 {
-		t.Fatalf("应注入 3 段，实际 %d", len(blocks))
+	oldInject := config.UpstreamInjectEnvironment
+	t.Cleanup(func() { config.UpstreamInjectEnvironment = oldInject })
+
+	cases := []struct {
+		name   string
+		inject bool
+		want   []string
+	}{
+		{
+			name:   "默认：不注入 Environment",
+			inject: false,
+			want: []string{
+				"You are ZCode, an interactive coding agent",
+				"\nYou are an interactive ZCode agent",
+			},
+		},
+		{
+			name:   "开关打开：恢复三段",
+			inject: true,
+			want: []string{
+				"You are ZCode, an interactive coding agent",
+				"\nYou are an interactive ZCode agent",
+				"# Environment",
+			},
+		},
 	}
-	wantPrefix := []string{
-		"You are ZCode, an interactive coding agent",
-		"\nYou are an interactive ZCode agent",
-		"# Environment",
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config.UpstreamInjectEnvironment = tc.inject
+			blocks := ZcodeSystemBlocks()
+			if len(blocks) != len(tc.want) {
+				t.Fatalf("应注入 %d 段，实际 %d", len(tc.want), len(blocks))
+			}
+			for i, want := range tc.want {
+				m, ok := blocks[i].(map[string]any)
+				if !ok {
+					t.Fatalf("第 %d 段不是对象: %T", i, blocks[i])
+				}
+				if m["type"] != "text" {
+					t.Fatalf("第 %d 段类型应为 text: %v", i, m["type"])
+				}
+				text, _ := m["text"].(string)
+				if !strings.HasPrefix(text, want) {
+					t.Fatalf("第 %d 段前缀不符：\n got=%q\nwant前缀=%q", i, text[:min(60, len(text))], want)
+				}
+				if _, ok := m["cache_control"]; !ok {
+					t.Fatalf("第 %d 段缺 cache_control", i)
+				}
+			}
+		})
 	}
-	for i, want := range wantPrefix {
-		m, ok := blocks[i].(map[string]any)
-		if !ok {
-			t.Fatalf("第 %d 段不是对象: %T", i, blocks[i])
-		}
-		if m["type"] != "text" {
-			t.Fatalf("第 %d 段类型应为 text: %v", i, m["type"])
-		}
+}
+
+// TestEnvironmentBlockOmittedByDefault 默认关闭时，注入的 system 里不得出现
+// # Environment 行——这是「只发服务端校验的必需两块」的正面断言，防止有人
+// 顺手把该段塞回静态 JSON 或让开关默认值被改回去。
+func TestEnvironmentBlockOmittedByDefault(t *testing.T) {
+	oldInject := config.UpstreamInjectEnvironment
+	t.Cleanup(func() { config.UpstreamInjectEnvironment = oldInject })
+	config.UpstreamInjectEnvironment = false
+
+	for i, b := range ZcodeSystemBlocks() {
+		m, _ := b.(map[string]any)
 		text, _ := m["text"].(string)
-		if !strings.HasPrefix(text, want) {
-			t.Fatalf("第 %d 段前缀不符：\n got=%q\nwant前缀=%q", i, text[:min(60, len(text))], want)
-		}
-		if _, ok := m["cache_control"]; !ok {
-			t.Fatalf("第 %d 段缺 cache_control", i)
+		if strings.Contains(text, "# Environment") {
+			t.Fatalf("默认配置下第 %d 段仍含 # Environment：%q", i, text)
 		}
 	}
 }

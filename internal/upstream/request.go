@@ -27,9 +27,13 @@ var (
 // ZcodeSystemBlocks 返回 ZCode 官方系统提示词块（JSON 解析失败时为空，对齐 Python 版）。
 // 用于 JWT 缺省上下文及旧行为回退；调用者已有指令时由网关保留其内容。
 //
-// 只解析一次静态段（CLI Prefix / Agent Identity，内容是固定的），
-// 但**每次都重新生成** # Environment 段：它必须跟随当前伪装档案
-// （见 systemprompt.go 的说明），缓存会让改配置后 body 不更新。
+// 只解析一次静态段（CLI Prefix / Agent Identity，内容是固定的）。
+// # Environment 段是否追加由 config.UpstreamInjectEnvironment 决定，默认**不注入**：
+// 上游只从第 0 字节校验到身份段末尾，该段可有可无（见 config 里开关处的说明）。
+// 开关打开时每次重新生成该段——它必须跟随当前伪装档案，缓存会让改配置后 body 不更新。
+//
+// 两条分支都必须返回**新切片**：调用方会就地 append，共享切片会让一个请求污染后续
+// 所有请求（见 TestSystemBlocksReturnFreshSlice）。
 func ZcodeSystemBlocks() []any {
 	zcodeOnce.Do(func() {
 		var blocks []any
@@ -38,7 +42,10 @@ func ZcodeSystemBlocks() []any {
 		}
 		zcodeStaticBlocks = blocks
 	})
-	return appendEnvironmentBlock(zcodeStaticBlocks)
+	if config.UpstreamInjectEnvironment {
+		return appendEnvironmentBlock(zcodeStaticBlocks)
+	}
+	return append([]any(nil), zcodeStaticBlocks...)
 }
 
 // dropHeaders 透传客户端 header 时需要剔除的字段（对齐 agent.py _DROP_HEADERS）。

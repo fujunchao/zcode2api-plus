@@ -13,6 +13,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/upstream"
 )
 
 // 模拟官方 3.14.4 配置：验证码总开关仍开，但模型请求已经无需验证。
@@ -50,8 +51,8 @@ func TestJWTModelCaptchaSkipWithoutSolver(t *testing.T) {
 		t.Fatalf("JWT 路径及鉴权必须保留: %s %v", call.Path, call.Header)
 	}
 	system, ok := call.Body["system"].([]any)
-	if !ok || len(system) != 3 {
-		t.Fatalf("跳过验证码不能丢失 JWT 的三个 system 块: %v", call.Body["system"])
+	if !ok || len(system) != len(upstream.ZcodeSystemBlocks()) {
+		t.Fatalf("跳过验证码不能丢失 JWT 的标准 system 块: %v", call.Body["system"])
 	}
 	metadata, ok := call.Body["metadata"].(map[string]any)
 	if !ok {

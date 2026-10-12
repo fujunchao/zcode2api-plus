@@ -107,6 +107,7 @@ func TestNormalizeBodySystemInjection(t *testing.T) {
 // 通过 JSON 往返模拟下游重新提交同一请求，不依赖 Go 对象的指针身份。
 func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
 	useLegacyClientContext(t)
+	blocks := upstream.ZcodeSystemBlocks()
 	const prefix = "You are ZCode, an interactive coding agent"
 	known := map[string]any{
 		"type": "text", "text": prefix,
@@ -134,8 +135,8 @@ func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
 	body := map[string]any{"model": "GLM-5.3", "system": incoming}
 	NormalizeBody(body, true)
 	system := body["system"].([]any)
-	if len(system) != 3+len(tail) || !reflect.DeepEqual(system[3:], tail) {
-		t.Fatalf("只应前置一份三个标准块并原样保留调用者段落，实际共 %d 块", len(system))
+	if len(system) != len(blocks)+len(tail) || !reflect.DeepEqual(system[len(blocks):], tail) {
+		t.Fatalf("只应前置一份标准块并原样保留调用者段落，实际共 %d 块（标准块 %d）", len(system), len(blocks))
 	}
 	after, err := json.Marshal(incoming)
 	if err != nil || string(after) != string(before) {

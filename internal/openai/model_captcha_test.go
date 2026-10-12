@@ -61,7 +61,7 @@ func TestCompatibleAPIsSkipJWTModelCaptcha(t *testing.T) {
 					}
 				}
 				system, ok := call.Body["system"].([]any)
-				if !ok || len(system) < 3 {
+				if !ok || len(system) < 2 {
 					t.Fatalf("兼容接口不能丢失 JWT system: %v", call.Body["system"])
 				}
 			})
