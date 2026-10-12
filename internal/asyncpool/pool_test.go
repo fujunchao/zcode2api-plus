@@ -975,8 +975,11 @@ func Test405HotAccountSkippedInAsyncPool(t *testing.T) {
 	// ⚠️ 必须在 newTestPool 之后设置：fixture 会把 AsyncMaxRetries 钉回 0。
 	config.AsyncMaxRetries = 1
 	t.Cleanup(func() { config.AsyncMaxRetries = 0 })
-	hot := addJWTAccount(t, st, "hot-acc")
-	clean := addJWTAccount(t, st, "clean-acc")
+	// ⚠️ 两个账号必须用 addJWTAccountN 的**不同凭据**建号：AddAccount 按身份判重，
+	// 同一个 secret（如 addJWTAccount 的固定值）加两次只会得到一条记录——池里就
+	// 只剩一个（热）账号，本用例会以「0 次上游调用」失真失败。
+	hot := addJWTAccountN(t, st, "hot-acc", 1)
+	clean := addJWTAccountN(t, st, "clean-acc", 2)
 	blockedF := float64(time.Now().Add(-1*time.Hour).UnixNano()) / 1e9
 	if _, err := st.Update(model.ProviderZai, hot.ID, func(a *model.Account) {
 		a.LastRiskControlAt = &blockedF
