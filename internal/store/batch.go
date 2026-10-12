@@ -394,6 +394,94 @@ func (s *Store) BatchSetEnabled(ids []string, enabled, missingOK bool) (BatchRes
 	return res, nil
 }
 
+// ── 批量手动恢复（风控失效救济） ────────────────────────────────────────────
+
+// BatchRecoverAccounts 批量人工恢复因风控失效的账号。
+//
+// 与 BatchSetEnabled 同一骨架（单锁 + 单事务；事务里落「转移后」的克隆快照，
+// commit 成功后才对 live 对象应用 applyRecovered——失败回滚时内存零改动），
+// 差别只在逐条判定：
+//
+//   - 不存在的 ID：not_found（missing_ok 语义与其它批量一致：严格模式整批拒绝）；
+//   - 存在但不可恢复（非风控失效、已归档）：逐条 error 明细，不整批失败、不影响
+//     其它条目——目标集合由管理员显式选择（常见「筛选后全选」），混入不可恢复项
+//     是预期内的，逐条回报比整批拒绝有用。
+func (s *Store) BatchRecoverAccounts(ids []string, missingOK bool) (BatchResult, error) {
+	ids = dedupeIDs(ids)
+	res := BatchResult{Total: len(ids)}
+	if len(ids) == 0 {
+		return res, errors.New("批量恢复列表为空")
+	}
+	if len(ids) > MaxBatchSize {
+		return res, fmt.Errorf("批量恢复条目数超过上限 %d", MaxBatchSize)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var targets []*model.Account
+	for i, id := range ids {
+		acc := s.findAnyLocked(id)
+		switch {
+		case acc == nil:
+			res.NotFound++
+			res.Items = append(res.Items, BatchItemResult{
+				Index: i, ID: id, Status: BatchStatusNotFound, Message: "账号不存在",
+			})
+		case acc.ArchivedAt != nil:
+			res.Failed++
+			res.Items = append(res.Items, BatchItemResult{
+				Index: i, ID: acc.ID, Name: acc.Name,
+				Status: BatchStatusError, Message: "账号已归档，请先恢复到账号池",
+			})
+		case !model.IsRiskControlInvalid(acc):
+			res.Failed++
+			res.Items = append(res.Items, BatchItemResult{
+				Index: i, ID: acc.ID, Name: acc.Name,
+				Status: BatchStatusError, Message: "账号非风控失效状态",
+			})
+		default:
+			targets = append(targets, acc)
+			res.Succeeded++
+			res.IDs = append(res.IDs, acc.ID)
+			res.Items = append(res.Items, BatchItemResult{Index: i, ID: acc.ID, Name: acc.Name, Status: BatchStatusOK})
+		}
+	}
+
+	if !missingOK && res.NotFound > 0 {
+		// 严格模式：存在缺失即整体拒绝，零改动。
+		return res, ErrBatchMissingIDs
+	}
+	if len(targets) == 0 {
+		return res, nil // 无可恢复项：无需写库
+	}
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		markBatchRollback(&res, err)
+		return res, err
+	}
+	for _, acc := range targets {
+		snapshot := acc.Clone()
+		applyRecovered(snapshot)
+		if err := persistAccountOnTx(tx, snapshot); err != nil {
+			logPersistFailure("batch-recover", acc.Provider, err)
+			markBatchRollback(&res, err)
+			_ = tx.Rollback()
+			return res, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		logPersistFailure("batch-recover", "batch", err)
+		markBatchRollback(&res, err)
+		return res, err
+	}
+	for _, acc := range targets {
+		applyRecovered(acc)
+	}
+	return res, nil
+}
+
 // ── 条件查询 ────────────────────────────────────────────────────────────────
 
 // AccountQuery 账号列表的条件过滤器。零值 = 不过滤不分页，结果与

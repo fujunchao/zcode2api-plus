@@ -496,21 +496,31 @@ meta(key TEXT PK, value TEXT)
 **生效范围**：`IsSelectable` 为 false（全部模型不可选）+ 领取调度自动跳过（既有行为）。
 不覆盖手动 `disabled`（管理员意图优先）。
 
-**恢复出口（三条，缺一不可）**
+**恢复出口（四条，缺一不可）**
 
 1. **到期自动可再选**：`CoolingUntil` 过去后 `IsSelectable` 直接为真，无需显式清除。
 2. **成功即归零**：冷却到期后成功调用一次 ⇒ `Status → active` 且 `RiskControlStreak → 0`
    （回到最低档）。所以只有「冷却一到期立刻又被拦」才会继续升级。`MarkSuccess` 强制这个
    「到期后」前提：冷却未到期或已失效时的成功（同账号并发请求在冷却生效前选中、之后才
    返回 200）只累计调用次数，不复位状态与连击——否则阶梯对繁忙账号永远升不上去。
-3. **人工恢复**：换凭据（`store.EditAccount` 的 `SetSecret` 分支）会清 `Status`/`LastError*`
+3. **人工恢复（换凭据）**：换凭据（`store.EditAccount` 的 `SetSecret` 分支）会清 `Status`/`LastError*`
    **并清零 `RiskControlStreak`**——不清的话，救回来的账号下一次命中就是老计数 + 1，会立刻
    又判失效，等于人工修复无效。失效后真正要做的是换线路 / 换设备指纹 / 换凭据。
+4. **人工恢复（后台手动恢复）**：`POST /admin/api/accounts/{account_id}/recover`（单条）与
+   `POST /admin/api/accounts/batch/recover`（批量，逐条明细 + `missing_ok`）——补上
+   「风控失效待人工处理」终态此前缺失的救济入口。判定收口在 `model.IsRiskControlInvalid`
+   （`invalid` 且 `last_error_kind=risk_control`）；动作与第 3 条同语义（置 active、清
+   `CoolingUntil`/`LastError*`、清零 `RiskControlStreak`），不动 `Enabled`/`ArchivedAt`。
+   只接受风控失效：冷却中（会自然到期）、凭据失效（另有额度探测恢复路径）、额度耗尽
+   （走刷新）、已归档（先恢复到账号池）一律 400，批量逐条 error。它**不会**解除上游仍
+   生效的账号级标记（实测 ≥14h）——恢复后若仍被拦会重新冷却/失效（连击从零起算）。
+   规格见 `docs/plan-riskcontrol-manual-recovery-20261012.md`。
 
 **启停不是恢复出口**（v2.8.4）：`store.applyEnabled`（单账号、批量、归档共用）停用
 invalid 账号时只关闭 `Enabled`、状态保持 invalid，再启用也不复活；冷却截止时间全程保留，
 启用时未到期则回到 cooling。「是否已停用」一律看 `Enabled`（额度刷新筛选
 `Account.IsQuotaRefreshTarget`、后台启停按钮），不能只比 `Status == disabled`。
+手动恢复是**独立端点、不经 `applyEnabled`**，因此不是「启停后门」；启停仍不得复活失效账号。
 
 **风控换线历史**（v2.9.2）：消息风控改派避让该账号最近 24 小时的失败线路，按代理 ID
 和 URL 摘要匹配，最多最近 64 条；历史与绑定同事务落库，重启保留。候选耗尽保留当前

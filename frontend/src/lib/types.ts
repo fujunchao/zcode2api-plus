@@ -401,3 +401,11 @@ export const STATUS_COLOR: Record<AccountStatus, string> = {
   invalid: '#ef4444',
   disabled: '#94a3b8',
 }
+
+/**
+ * 账号是否因风控失效（后端 `model.IsRiskControlInvalid` 的前端镜像）。
+ * 两条件缺一不可：只看 status 会把凭据异常一并算入，只看 kind 会漏掉状态。
+ */
+export function isRiskControlInvalid(a: Account): boolean {
+  return a.status === 'invalid' && a.last_error_kind === 'risk_control'
+}

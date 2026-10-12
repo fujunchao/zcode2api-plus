@@ -49,6 +49,12 @@ var ErrNotFound = errors.New("条目不存在")
 // ErrProxyNotFound 指派账号时引用的代理线路不存在（对齐 Python 版 ValueError）。
 var ErrProxyNotFound = errors.New("代理配置不存在")
 
+// ErrAccountNotRecoverable 手动恢复目标不处于「风控失效」状态（该出口只解风控终态）。
+var ErrAccountNotRecoverable = errors.New("账号非风控失效状态")
+
+// ErrAccountArchived 手动恢复目标已归档：先恢复到账号池再操作（归档即停止调用）。
+var ErrAccountArchived = errors.New("账号已归档")
+
 // Store 线程安全的账号 / 设置存储，含轮询游标。
 type Store struct {
 	Requests         *requeststats.Tracker
@@ -1404,6 +1410,60 @@ func (s *Store) ResetTokenStats(provider, idOrName string) (bool, error) {
 	return s.Update(provider, idOrName, func(acc *model.Account) {
 		acc.ResetTokenStats()
 	})
+}
+
+// applyRecovered 风控失效的人工恢复出口（单账号与批量结构性共用，改一处即同时生效）。
+//
+// 与 EditAccount 的 SetSecret 分支（换凭据即视为重新可用）同语义：置 active、
+// 清冷却、清错误证据并清零风控连续计数——不春风控计数，救回来的账号下一次命中
+// 就是老计数 + 1，会立刻又判失效，等于人工修复无效。
+//
+// 调用方必须已确认 model.IsRiskControlInvalid(acc)：本函数只做字段转移、不做守卫，
+// 守卫在各自入口的锁内完成（单账号 RecoverAccount / 批量 BatchRecoverAccounts）。
+//
+// 刻意不动 Enabled 与 ArchivedAt（启停/归档与本出口正交），也不碰 RateLimitStreak
+// 与 Upstream503Streak（与换凭据一致；503 连击是刻意保留的）。
+func applyRecovered(acc *model.Account) {
+	acc.Status = model.StatusActive
+	acc.CoolingUntil = nil
+	acc.RiskControlStreak = 0
+	acc.LastError = nil
+	acc.LastErrorKind = nil
+	acc.LastErrorAt = nil
+}
+
+// RecoverAccount 人工恢复因风控失效的账号（后台「手动恢复」）。
+//
+// 「风控失效」是需人工介入的终态：额度探测被 quota 保护挡住、成功流水也不复活
+// （MarkSuccess 对 invalid 早退），此前唯一的人工手段是换凭据。本方法是显式的
+// 管理员救济出口——判定与写入在同一把锁内完成，杜绝「handler 先检查、store 后
+// 写入」之间的竞态窗口，且只接受 model.IsRiskControlInvalid 的账号。
+//
+// 拒绝集合（专属错误，handler 映射为 400）：
+//   - 已归档（ErrAccountArchived）：归档即停止调用，先恢复到账号池再操作；
+//   - 其它一切状态（ErrAccountNotRecoverable）：冷却中会自然到期、凭据失效另有
+//     额度探测恢复路径、额度耗尽走刷新——混进本出口会让「恢复了什么」不可说。
+//
+// 返回 (found, err)：false+nil = 不存在；true+err = 拒绝或写库失败；true+nil = 已恢复。
+func (s *Store) RecoverAccount(provider, idOrName string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := s.findLocked(provider, idOrName)
+	if acc == nil {
+		return false, nil
+	}
+	if acc.ArchivedAt != nil {
+		return true, ErrAccountArchived
+	}
+	if !model.IsRiskControlInvalid(acc) {
+		return true, ErrAccountNotRecoverable
+	}
+	applyRecovered(acc)
+	if err := s.persistAccountLocked(acc); err != nil {
+		logPersistFailure("recover", provider+"/"+idOrName, err)
+		return true, err
+	}
+	return true, nil
 }
 
 // sameStringPtr 判断两个可空字符串内容相同（都为 nil 视为相同）。

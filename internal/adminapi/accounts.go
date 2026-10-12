@@ -5,6 +5,7 @@ package adminapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
+	"zcode2api/internal/web"
 )
 
 func (h *Handler) handleVerify(w http.ResponseWriter, r *http.Request) {
@@ -520,6 +522,38 @@ func (h *Handler) handleResetStats(w http.ResponseWriter, r *http.Request) {
 		writeError500(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleRecoverAccount 人工恢复因风控失效的账号（后台「手动恢复」）。
+//
+// 只接受「风控失效」（status=invalid 且 last_error_kind=risk_control）：冷却中会
+// 自然到期、凭据失效另有额度探测恢复路径、额度耗尽走刷新——它们是不同的失败模式，
+// 混进本出口会让「恢复了什么」不可说。判定与状态转移由 Store.RecoverAccount 在
+// 锁内完成（拒绝原因见 store.ErrAccountNotRecoverable / store.ErrAccountArchived）。
+func (h *Handler) handleRecoverAccount(w http.ResponseWriter, r *http.Request) {
+	acc := h.Store.FindAny(r.PathValue("account_id"))
+	if acc == nil {
+		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	found, err := h.Store.RecoverAccount(acc.Provider, acc.ID)
+	switch {
+	case errors.Is(err, store.ErrAccountArchived):
+		writeAPIError(w, errBadRequest("账号已归档，请先恢复到账号池再恢复"))
+		return
+	case errors.Is(err, store.ErrAccountNotRecoverable):
+		writeAPIError(w, errBadRequest("账号非风控失效状态"))
+		return
+	case err != nil:
+		writeError500(w, err)
+		return
+	case !found:
+		// 查找与恢复之间被并发删除：按不存在处理。
+		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	web.Ok("account", fmt.Sprintf("账号 %s 已手动恢复（风控失效 → 正常，streak=%d）", acc.ID, acc.RiskControlStreak))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

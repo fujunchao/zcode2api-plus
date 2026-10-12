@@ -83,13 +83,15 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/refresh", guard(h.handleRefreshAll))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/refresh", guard(h.handleRefreshAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/reset-stats", guard(h.handleResetStats))
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/recover", guard(h.handleRecoverAccount))
 	// 批量管理端点（docs/plan-account-batch-management.md）：字面量段 batch
 	// 不会被 {account_id} 通配吞掉——现有通配路由的尾段都是具体字面量
-	// （enabled/archived/refresh/reset-stats），与 batch/* 不相交。
+	// （enabled/archived/refresh/reset-stats/recover），与 batch/* 不相交。
 	mux.HandleFunc("POST /admin/api/accounts/batch/add", guard(h.handleBatchAddAccounts))
 	mux.HandleFunc("POST /admin/api/accounts/batch/delete", guard(h.handleBatchDeleteAccounts))
 	mux.HandleFunc("POST /admin/api/accounts/batch/enable", guard(h.handleBatchEnable))
 	mux.HandleFunc("POST /admin/api/accounts/batch/disable", guard(h.handleBatchDisable))
+	mux.HandleFunc("POST /admin/api/accounts/batch/recover", guard(h.handleBatchRecover))
 	mux.HandleFunc("GET /admin/api/status", guard(h.handleStatus))
 	mux.HandleFunc("GET /admin/api/proxies", guard(h.handleListProxies))
 	mux.HandleFunc("POST /admin/api/proxies", guard(h.handleAddProxy))

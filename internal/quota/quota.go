@@ -256,7 +256,7 @@ func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
 		if model.NewStartPlanObservation(acc, 1, false).Matches(live) {
 			live.StartPlanObservation = model.StartPlanObservation{}
 		}
-		protectInvalid := isRiskControlInvalid(live)
+		protectInvalid := model.IsRiskControlInvalid(live)
 		protectCooling := live.Status == model.StatusCooling &&
 			(live.CoolingUntil == nil || *live.CoolingUntil > float64(s.now().UnixNano())/1e9)
 		if !protectInvalid && !protectCooling {
@@ -297,15 +297,6 @@ func (s *Service) fail(acc *model.Account, checkedAt float64, msg, kind, status 
 // 错误体要整段读进来判形态（405 尤其需要看 body 才能区分风控与重复查询），
 // 而上游异常时可能回一个任意大的 body——不限长会直接吃光内存。
 const maxBillingBodyBytes = 8 << 10
-
-// isRiskControlInvalid 账号是否因上游风控被置为失效。
-//
-// 用「失效 + 末次错误归类」两件事共同判定，而不是只看状态：失效还有别的成因
-// （凭据失效也置 invalid），那些成因下额度探测通了就该按既有语义放行。
-func isRiskControlInvalid(acc *model.Account) bool {
-	return acc.Status == model.StatusInvalid &&
-		acc.LastErrorKind != nil && *acc.LastErrorKind == model.ErrorKindRiskControl
-}
 
 // textPreview 取错误体预览：单行化 + 截断。last_error 会出现在后台界面上，
 // 整段 body 既没必要也撑不住（上游可能回 HTML 错误页）。

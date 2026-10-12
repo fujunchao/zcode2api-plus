@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   Gift,
+  HeartPulse,
   Loader2,
   Pencil,
   Plus,
@@ -48,6 +49,7 @@ import {
   ERROR_KIND_IS_FAULT,
   ERROR_KIND_LABEL,
   STATUS_LABEL,
+  isRiskControlInvalid,
   type Account,
   type AccountErrorKind,
   type AccountStatus,
@@ -484,6 +486,39 @@ export function AccountsPage() {
     })
   }
 
+  /* 批量手動恢復：所選集合全量發送、服務端逐條判定（與啟停/刪除同一語義，
+     不做前端預過濾）；僅「風控失效」項會成功，其餘逐條回報為失敗。 */
+  function batchRecover() {
+    const targets = [...selectedInFilter]
+    if (!targets.length) return
+    confirm({
+      title: '批量手動恢復帳號',
+      confirmText: '確認恢復',
+      description: (
+        <>
+          將對選中的 <b>{targets.length}</b> 個帳號嘗試手動恢復；僅「風控失效」項會成功，其餘逐條回報失敗。
+          此操作<b>不會解除上游仍生效的風控標記</b>，恢復後若再次命中風控會重新冷卻或失效。
+        </>
+      ),
+      onConfirm: async () => {
+        setBatchBusy(true)
+        try {
+          const d = await api<BatchResult>('POST', '/accounts/batch/recover', {
+            ids: targets.map((a) => a.id),
+            missing_ok: true,
+          })
+          batchResultToast('恢復', d)
+          setSelected(new Set())
+          invalidate()
+        } catch (e) {
+          toast.error('批量恢復失敗：' + errMsg(e))
+        } finally {
+          setBatchBusy(false)
+        }
+      },
+    })
+  }
+
   /* ── 歸檔 ┐─ 歸檔＝停止調用，帳號移入歸檔區僅保留記錄 */
   function doArchive(a: Account) {
     const label = a.email || a.name || a.id
@@ -630,6 +665,35 @@ export function AccountsPage() {
           invalidate()
         } catch (e) {
           toast.error('重置失敗：' + errMsg(e))
+        }
+      },
+    })
+  }
+
+  /* 手動恢復：只對「風控失效」帳號顯示。這是解開風控失效終態的人工出口（另一條
+     路是換憑證）；只清本地標記，不會解除上游仍生效的風控標記。 */
+  function recover(a: Account) {
+    const label = a.email || a.name || a.id
+    confirm({
+      title: '手動恢復帳號',
+      confirmText: '確認恢復',
+      description: (
+        <>
+          確認將 <code className="rounded bg-muted px-1 py-0.5">{label}</code> 由「風控失效」恢復為正常？
+          將清除本地風控標記、冷卻與連續計數，帳號會重新參與調度。
+          <div className="mt-2 text-xs text-muted-foreground">
+            此操作<b>不會解除上游仍生效的風控標記</b>（實測可持續 ≥14 小時）；若上游仍在攔截，
+            恢復後會再次冷卻或失效。最近風控：{a.last_error_at ? relativeTime(a.last_error_at) : '無記錄'}
+          </div>
+        </>
+      ),
+      onConfirm: async () => {
+        try {
+          await api('POST', '/accounts/' + a.id + '/recover')
+          toast.success('已恢復')
+          invalidate()
+        } catch (e) {
+          toast.error('恢復失敗：' + errMsg(e))
         }
       },
     })
@@ -800,6 +864,9 @@ export function AccountsPage() {
           >
             {batchBusy ? <Loader2 className="animate-spin" /> : <XCircle />} 批量停用
           </Button>
+          <Button variant="outline" size="sm" disabled={batchBusy} onClick={batchRecover}>
+            {batchBusy ? <Loader2 className="animate-spin" /> : <HeartPulse />} 批量恢復
+          </Button>
           <Button
             variant="destructive"
             size="sm"
@@ -946,6 +1013,16 @@ export function AccountsPage() {
                         <Button variant="ghost" size="icon-sm" title="重置 Token 統計" onClick={() => resetStats(a)}>
                           <RotateCcw />
                         </Button>
+                        {isRiskControlInvalid(a) && (
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            title="手動恢復（風控失效）"
+                            onClick={() => recover(a)}
+                          >
+                            <HeartPulse />
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="icon-sm"

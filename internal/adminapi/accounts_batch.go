@@ -224,6 +224,39 @@ func (h *Handler) handleBatchSetEnabled(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, http.StatusOK, batchBody(res, nil))
 }
 
+// POST /admin/api/accounts/batch/recover
+// 请求体：{"ids": [...], "missing_ok"?: bool}
+// 逐条判定：仅「风控失效」项执行恢复并记 ok；非风控失效/已归档记 error 明细，
+// 不整批失败——目标集合由管理员显式选择（常见「筛选后全选」），混入不可恢复项
+// 是预期内的；missing_ok 只管 not_found（严格模式整体拒绝），与其它批量一致。
+func (h *Handler) handleBatchRecover(w http.ResponseWriter, r *http.Request) {
+	payload, apiErr := decodeBody(r)
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		return
+	}
+	ids, apiErr := parseIDList(payload, "ids")
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		return
+	}
+	missingOK, apiErr := parseMissingOK(payload)
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		return
+	}
+
+	start := time.Now()
+	res, err := h.Store.BatchRecoverAccounts(ids, missingOK)
+	if err != nil {
+		h.logBatchOutcome("恢复", res, err, start)
+		writeJSON(w, batchErrorStatus(err), batchBody(res, map[string]any{"detail": err.Error()}))
+		return
+	}
+	h.logBatchOutcome("恢复", res, nil, start)
+	writeJSON(w, http.StatusOK, batchBody(res, nil))
+}
+
 // ── 条件查询（GET /admin/api/accounts 的 additive 扩展）────────────────────
 
 // parseAccountQuery 解析列表端点的过滤与分页参数。
