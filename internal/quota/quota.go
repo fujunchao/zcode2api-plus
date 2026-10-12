@@ -84,15 +84,14 @@ func (s *Service) SetNow(fn func() time.Time) { s.now = fn }
 
 // authHeaders 对齐 quota._auth_headers：额度端点必须携带完整设备信息。
 // X-Device-Mid 取账号自己的指纹（缺失回退全局值）：同机多账号共用一份会被上游关联。
+//
+// 来源头（User-Agent / Referer / Title / 语言 / 时区 / 平台三元组 / 版本）统一走
+// config.ZcodeSourceHeaders()——官方这批头与非模型端点用的是同一份集合，
+// 少发任意一项都是可被指纹化的差异。
 func authHeaders(acc *model.Account) map[string]string {
-	headers := map[string]string{
-		"Content-Type":        "application/json",
-		"User-Agent":          config.UserAgent,
-		"X-ZCode-App-Version": config.ZcodeClientVersion,
-		"X-Platform":          config.ZcodeClientPlatform,
-		"X-Device-Mid":        acc.DeviceMidOr(config.DeviceMid()),
-		"HTTP-Referer":        config.ZcodeEndpointOrigin,
-	}
+	headers := config.ZcodeSourceHeaders()
+	headers["Content-Type"] = "application/json"
+	headers["X-Device-Mid"] = acc.DeviceMidOr(config.DeviceMid())
 	if acc.Mode == "jwt" && acc.JWTToken != nil {
 		headers["Authorization"] = "Bearer " + *acc.JWTToken
 	} else if acc.APIKey != nil {

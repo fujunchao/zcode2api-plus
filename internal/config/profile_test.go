@@ -7,6 +7,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -101,5 +102,52 @@ func TestZcodeProfileTitle(t *testing.T) {
 	}
 	if got := (ZcodeProfile{SourceTitle: "electron"}).Title(); got != "Z Code@electron" {
 		t.Fatalf("Title()=%q", got)
+	}
+}
+
+// TestZcodeSourceHeadersShape 非模型端点（配置 / 额度 / 领取 / 遥测）的来源头必须
+// 恰好是官方那 10 项、取值全部由档案派生，且**不含** X-ZCode-Agent（只属模型端点）。
+func TestZcodeSourceHeadersShape(t *testing.T) {
+	headers := ZcodeSourceHeaders()
+
+	wantKeys := []string{
+		"User-Agent", "HTTP-Referer", "X-Title", "X-Release-Channel",
+		"X-Client-Language", "X-Client-Timezone", "X-Platform",
+		"X-Os-Category", "X-Os-Version", "X-ZCode-App-Version",
+	}
+	if len(headers) != len(wantKeys) {
+		t.Fatalf("来源头应为 %d 项，实际 %d: %v", len(wantKeys), len(headers), headers)
+	}
+	for _, key := range wantKeys {
+		if strings.TrimSpace(headers[key]) == "" {
+			t.Errorf("来源头缺 %s 或取值为空: %v", key, headers)
+		}
+	}
+
+	p := ZcodeClientProfile()
+	for key, expected := range map[string]string{
+		"HTTP-Referer":        ZcodeEndpointOrigin,
+		"X-Title":             p.Title(),
+		"X-Release-Channel":   p.ReleaseChannel,
+		"X-Client-Language":   p.Language,
+		"X-Client-Timezone":   p.Timezone,
+		"X-Platform":          p.Platform(),
+		"X-Os-Category":       p.OSCategory(),
+		"X-Os-Version":        p.OSRelease,
+		"X-ZCode-App-Version": p.AppVersion,
+	} {
+		if headers[key] != expected {
+			t.Errorf("%s = %q，期望 %q（必须由档案派生，不能另写一份）", key, headers[key], expected)
+		}
+	}
+	// 非模型端点的 UA 是裸串：带 ai-sdk 后缀是模型端点的形态，两者不可混用。
+	if strings.Contains(headers["User-Agent"], "ai-sdk/") {
+		t.Errorf("非模型端点 UA 应为裸串，实际 %q", headers["User-Agent"])
+	}
+
+	// 每次调用返回新 map：调用方会往里补 Content-Type / X-Device-Mid / Authorization。
+	headers["__polluted__"] = "x"
+	if _, ok := ZcodeSourceHeaders()["__polluted__"]; ok {
+		t.Error("ZcodeSourceHeaders 返回了共享 map，一个请求会污染后续所有请求")
 	}
 }

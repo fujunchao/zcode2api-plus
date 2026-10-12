@@ -679,3 +679,29 @@ func TestRefreshAccountsSummary(t *testing.T) {
 		t.Fatalf("成功批次汇总不符: %v", summary)
 	}
 }
+
+// TestQuotaAuthHeadersMatchSourceHeaders 额度端点的出站头必须包含完整的来源头集合，
+// 且不得混入只属于模型端点的 X-ZCode-Agent。
+//
+// 官方这批头在模型端点、额度端点、领取端点上用的是**同一份集合**；此前额度/领取
+// 只带了其中的「版本 + 平台」两项，缺项与多发项一样是可被指纹化的差异。
+func TestQuotaAuthHeadersMatchSourceHeaders(t *testing.T) {
+	mid := "mid-quota-1"
+	acc := &model.Account{VirtualDeviceMid: &mid}
+
+	headers := authHeaders(acc)
+	for key, want := range config.ZcodeSourceHeaders() {
+		if got := headers[key]; got != want {
+			t.Errorf("额度出站头 %s = %q，期望 %q", key, got, want)
+		}
+	}
+	if got := headers["Content-Type"]; got != "application/json" {
+		t.Errorf("Content-Type = %q，期望 application/json", got)
+	}
+	if got := headers["X-Device-Mid"]; got != mid {
+		t.Errorf("X-Device-Mid = %q，应取账号自己的指纹 %q", got, mid)
+	}
+	if _, ok := headers["X-ZCode-Agent"]; ok {
+		t.Error("X-ZCode-Agent 只属于模型端点，额度端点不得发送")
+	}
+}

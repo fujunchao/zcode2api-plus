@@ -456,3 +456,37 @@ func TestPreviewPlansSortedAndBusinessError(t *testing.T) {
 		t.Fatalf("1002 应翻译为文案: %v", err)
 	}
 }
+
+// TestClaimAuthHeadersMatchSourceHeaders 领取端点的出站头（authHeaders / claimHeaders）
+// 必须包含完整的来源头集合，且不得混入只属于模型端点的 X-ZCode-Agent。
+func TestClaimAuthHeadersMatchSourceHeaders(t *testing.T) {
+	mid := "mid-claim-1"
+	acc := &model.Account{VirtualDeviceMid: &mid}
+
+	variants := map[string]map[string]string{
+		"authHeaders":  authHeaders(acc),
+		"claimHeaders": claimHeaders(acc, "vp", "cn"),
+	}
+	for name, headers := range variants {
+		for key, want := range config.ZcodeSourceHeaders() {
+			if got := headers[key]; got != want {
+				t.Errorf("%s 的 %s = %q，期望 %q", name, key, got, want)
+			}
+		}
+		if _, ok := headers["X-ZCode-Agent"]; ok {
+			t.Errorf("%s 不得发送 X-ZCode-Agent（只属于模型端点）", name)
+		}
+	}
+
+	// claimHeaders 专属：验证码头恒注入（缺它即使码有效也会 3007），
+	// Region 头仅在非空时注入。
+	if got := variants["claimHeaders"][captchaHeader]; got != "vp" {
+		t.Errorf("%s = %q，期望 vp", captchaHeader, got)
+	}
+	if got := claimHeaders(acc, "vp", "sgp")[captchaRegionHeader]; got != "sgp" {
+		t.Errorf("%s = %q，期望 sgp", captchaRegionHeader, got)
+	}
+	if _, ok := claimHeaders(acc, "vp", "")[captchaRegionHeader]; ok {
+		t.Errorf("Region 为空时不应注入 %s", captchaRegionHeader)
+	}
+}

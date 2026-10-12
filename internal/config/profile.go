@@ -171,3 +171,37 @@ func (p ZcodeProfile) ModelUserAgent() string {
 	return "ZCode/" + p.AppVersion + " ai-sdk/provider-utils/" + p.AISDKVersion +
 		" runtime/node.js/" + p.NodeMajor
 }
+
+// ZcodeSourceHeaders 非模型端点（配置 / 额度 / 领取 / 遥测）的「来源头」集合。
+//
+// 官方客户端由 buildCliZCodeSourceHeaders 统一产出这批头，模型端点与非模型端点
+// 各自携带——**集合相同，只有 User-Agent 的形态不同**：
+//
+//	模型端点   User-Agent = ZCode/<ver> ai-sdk/provider-utils/<v> runtime/node.js/<major>
+//	非模型端点 User-Agent = ZCode/<ver>                            （裸串）
+//
+// 此前只有模型端点走 upstream/request.go 的固定头表，非模型端点（quota / claim）
+// 只带了其中的版本与平台两项，另外六项（X-Title / X-Release-Channel /
+// X-Client-Language / X-Client-Timezone / X-Os-Category / X-Os-Version）缺失。
+// 缺头与多发头一样是可被指纹化的差异，这里收敛成一份。
+//
+// 返回**新 map**：调用方会往里补 Content-Type / X-Device-Mid / Authorization，
+// 共享同一份 map 会让一个请求污染后续所有请求。
+//
+// 刻意**不含 X-ZCode-Agent**：该头（值 glm）只属于模型端点，官方在额度/领取
+// 端点上不发它。
+func ZcodeSourceHeaders() map[string]string {
+	p := ZcodeClientProfile()
+	return map[string]string{
+		"User-Agent":          UserAgent,
+		"HTTP-Referer":        ZcodeEndpointOrigin,
+		"X-Title":             p.Title(),
+		"X-Release-Channel":   p.ReleaseChannel,
+		"X-Client-Language":   p.Language,
+		"X-Client-Timezone":   p.Timezone,
+		"X-Platform":          p.Platform(),
+		"X-Os-Category":       p.OSCategory(),
+		"X-Os-Version":        p.OSRelease,
+		"X-ZCode-App-Version": p.AppVersion,
+	}
+}

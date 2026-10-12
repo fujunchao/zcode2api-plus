@@ -331,15 +331,13 @@ func billingErrorText(body map[string]any) string {
 
 // authHeaders 计费端点鉴权头（与 quota._auth_headers 同源形态）。
 // X-Device-Mid 取账号自己的指纹（缺失回退全局值）：同机多账号共用一份会被上游关联。
+//
+// 来源头统一走 config.ZcodeSourceHeaders()，与额度端点、以及模型端点的
+// upstream/request.go 固定头表同源：官方这批头在三处是同一份集合。
 func authHeaders(acc *model.Account) map[string]string {
-	headers := map[string]string{
-		"Content-Type":        "application/json",
-		"User-Agent":          config.UserAgent,
-		"X-ZCode-App-Version": config.ZcodeClientVersion,
-		"X-Platform":          config.ZcodeClientPlatform,
-		"X-Device-Mid":        acc.DeviceMidOr(config.DeviceMid()),
-		"HTTP-Referer":        config.ZcodeEndpointOrigin,
-	}
+	headers := config.ZcodeSourceHeaders()
+	headers["Content-Type"] = "application/json"
+	headers["X-Device-Mid"] = acc.DeviceMidOr(config.DeviceMid())
 	if acc.Mode == "jwt" && acc.JWTToken != nil {
 		headers["Authorization"] = "Bearer " + *acc.JWTToken
 	} else if acc.APIKey != nil {
@@ -475,15 +473,14 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 }
 
 // claimHeaders billing/claim 客户端请求头形态（asar claimManualPlan）。
-// 实测缺版本/平台头时即使验证码有效也 3007；X-Device-Mid 由 authHeaders 提供。
+// 实测缺版本/平台头时即使验证码有效也 3007——这两项由 authHeaders 的来源头提供，
+// 本函数不再重复写一遍。X-Device-Mid 同样由 authHeaders 提供。
 func claimHeaders(acc *model.Account, verifyParam, region string) map[string]string {
 	headers := authHeaders(acc)
 	headers[captchaHeader] = verifyParam
 	if region != "" {
 		headers[captchaRegionHeader] = region
 	}
-	headers["X-ZCode-App-Version"] = config.ZcodeClientVersion
-	headers["X-Platform"] = config.ZcodeClientPlatform
 	return headers
 }
 
