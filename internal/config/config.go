@@ -243,7 +243,7 @@ var (
 	// 保守取 24h：观测下界 ≥14h 之上取整到整天，并覆盖「命中会续期标记」的
 	// 最坏假设——静默期若短于标记时长，探测命中可能把标记续上，宁可晚恢复也
 	// 不主动踩雷。0 = 关闭（应急回退；选号闸门与恢复护栏必须同源，两处都读本值）。
-	RiskSilentHours = envInt("ZCODE_RISK_SILENT_HOURS", 24)
+	RiskSilentHours = envInt("ZCODE_RISK_SILENT_HOURS", 0)
 
 	// 官方客户端版本号：随请求头 / URL 参数上行，用于伪装成官方客户端。
 	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐；
