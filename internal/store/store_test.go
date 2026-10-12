@@ -914,20 +914,28 @@ func TestRiskCoolingStepsSetting(t *testing.T) {
 	}
 }
 
-// 换凭据（人工恢复动作）必须清零风控连续计数。
-// 不清的话，一个被升到失效的账号被救回来之后，下一次风控命中就是老 streak + 1，
-// 会立刻又判失效——等于人工修复无效。
+// 换凭据（人工恢复动作）必须清零风控连续计数与静默期证据。
+// 不清 streak 的话，一个被升到失效的账号被救回来之后，下一次风控命中就是
+// 老 streak + 1，会立刻又判失效——等于人工修复无效。
+// 同理必须清 LastRiskControlAt：它是旧身份的静默期证据，不清的话「换凭据救回」
+// 会被选号硬闸门按旧标记拦住 24h，与「换凭据即视为重新可用」的语义矛盾。
 func TestEditSecretResetsRiskControlStreak(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
 	s := newTestStore(t)
 	acc, err := s.AddAccount(model.ProviderZai, "banned", "h.p.s3")
 	if err != nil {
 		t.Fatal(err)
 	}
 	kind := model.ErrorKindRiskControl
+	blockedF := float64(time.Now().Add(-time.Hour).UnixNano()) / 1e9
 	if _, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
 		a.Status = model.StatusInvalid
 		a.RiskControlStreak = 4 // 已经超过三档阶梯
 		a.LastErrorKind = &kind
+		a.LastRiskControlAt = &blockedF
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -946,6 +954,12 @@ func TestEditSecretResetsRiskControlStreak(t *testing.T) {
 	}
 	if got.LastErrorKind != nil {
 		t.Fatalf("换凭据应清掉错误归类: %v", *got.LastErrorKind)
+	}
+	if got.LastRiskControlAt != nil {
+		t.Fatalf("换凭据应清掉静默期证据（新身份不继承旧标记）: %v", *got.LastRiskControlAt)
+	}
+	if sel := s.Select(model.ProviderZai, nil, ""); sel == nil || sel.ID != acc.ID {
+		t.Fatal("换凭据后的账号应立即可被选中（不被旧静默期闸门拦住）")
 	}
 }
 

@@ -6,9 +6,11 @@ package store
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 )
 
@@ -299,5 +301,151 @@ func TestRecoverDoesNotSoftenEnabledGuard(t *testing.T) {
 	}
 	if gotR := s.FindAny(recovered.ID); gotR.Status != model.StatusActive || !gotR.IsSelectable(time.Now()) {
 		t.Fatalf("已恢复账号应正常调度: %+v", gotR)
+	}
+}
+
+// 恢复护栏：仍在风控静默期（上游标记未过期）的账号不得直接放回轮转——转入保护冷却，
+// 到期时刻与静默期终点重合、期满自动重新参与调度。
+// 依据：2026-10-12 16:31 事故——批量恢复 51 个「本地失效但上游标记未过期」的账号，
+// 它们立即重回轮转并被逐对消耗，33 分钟二次烧伤全池（恢复≠解除）。
+func TestRecoverAccountProtectiveCoolingWithinSilentWindow(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "risk-recent", "risk-recent-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markRiskControlInvalid(t, s, acc.ID)
+	blockedAt := time.Now().Add(-2 * time.Hour)
+	blockedF := float64(blockedAt.UnixNano()) / 1e9
+	if _, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &blockedF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	found, err := s.RecoverAccount(model.ProviderZai, acc.ID)
+	if err != nil || !found {
+		t.Fatalf("恢复失败: found=%v err=%v", found, err)
+	}
+	got := s.FindAny(acc.ID)
+	if got.Status != model.StatusCooling {
+		t.Fatalf("静默期内的恢复应转入保护冷却: status=%s", got.Status)
+	}
+	if got.CoolingUntil == nil {
+		t.Fatal("保护冷却必须有到期时刻")
+	}
+	wantUntil := float64(blockedAt.Add(24*time.Hour).UnixNano()) / 1e9
+	if diff := *got.CoolingUntil - wantUntil; diff > 2 || diff < -2 {
+		t.Fatalf("保护冷却到期应等于静默期终点: got=%v want=%v", *got.CoolingUntil, wantUntil)
+	}
+	if got.RiskControlStreak != 0 {
+		t.Fatalf("恢复仍应清零风控连击: %d", got.RiskControlStreak)
+	}
+	// 静默期证据必须保留（恢复≠解除），且列表能读出成因。
+	if got.LastRiskControlAt == nil || *got.LastRiskControlAt != blockedF {
+		t.Fatalf("命中时刻不得被清除: %v", got.LastRiskControlAt)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
+		t.Fatalf("保护冷却的成因应可读（risk_control）: %v", got.LastErrorKind)
+	}
+	if got.LastError == nil || *got.LastError == "" {
+		t.Fatalf("保护冷却应带可读说明: %v", got.LastError)
+	}
+	// 保护冷却期间不可调度（冷却未到期）且闸门也不放行。
+	if got.IsSelectable(time.Now()) {
+		t.Fatal("保护冷却期间不得可调度")
+	}
+	if sel := s.Select(model.ProviderZai, nil, ""); sel != nil {
+		t.Fatalf("保护冷却期间不应被选中: %s", sel.ID)
+	}
+}
+
+// 静默期已过（≥窗口）的风控失效账号：恢复照旧直接回 active 并立即参与调度。
+func TestRecoverAccountPlainAfterSilentWindow(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	s := newTestStore(t)
+	acc, err := s.AddAccount(model.ProviderZai, "risk-old", "risk-old-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markRiskControlInvalid(t, s, acc.ID)
+	blockedF := float64(time.Now().Add(-25*time.Hour).UnixNano()) / 1e9
+	if _, err := s.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &blockedF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.RecoverAccount(model.ProviderZai, acc.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := s.FindAny(acc.ID)
+	if got.Status != model.StatusActive || got.CoolingUntil != nil {
+		t.Fatalf("静默期已过的恢复不应再保护冷却: status=%s until=%v", got.Status, got.CoolingUntil)
+	}
+	if sel := s.Select(model.ProviderZai, nil, ""); sel == nil || sel.ID != acc.ID {
+		t.Fatal("静默期已过的恢复账号应立即可被选中")
+	}
+}
+
+// 批量恢复的逐条 message 必须注明保护冷却：16:31 那次事故里，51 个账号「恢复成功、
+// 随即全部再次 405」，而响应只写了 ok——管理员无从得知恢复意味着什么。
+func TestBatchRecoverProtectiveCoolingMessage(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	s := newTestStore(t)
+	recent, err := s.AddAccount(model.ProviderZai, "recent", "recent-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAcc, err := s.AddAccount(model.ProviderZai, "old", "old-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markRiskControlInvalid(t, s, recent.ID)
+	markRiskControlInvalid(t, s, oldAcc.ID)
+	recentF := float64(time.Now().Add(-3*time.Hour).UnixNano()) / 1e9
+	oldF := float64(time.Now().Add(-30*time.Hour).UnixNano()) / 1e9
+	if _, err := s.Update(model.ProviderZai, recent.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &recentF
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Update(model.ProviderZai, oldAcc.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &oldF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.BatchRecoverAccounts([]string{recent.ID, oldAcc.ID}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Succeeded != 2 || len(res.Items) != 2 {
+		t.Fatalf("批量恢复应两项都成功: %+v", res)
+	}
+	if res.Items[0].Status != BatchStatusOK || res.Items[1].Status != BatchStatusOK {
+		t.Fatalf("逐条状态应为 ok: %+v", res.Items)
+	}
+	if res.Items[0].Message == "" || !strings.Contains(res.Items[0].Message, "保护冷却") {
+		t.Fatalf("静默期内条目的 message 应注明保护冷却: %q", res.Items[0].Message)
+	}
+	if res.Items[1].Message != "" {
+		t.Fatalf("静默期已过条目不应附加 protected 提示: %q", res.Items[1].Message)
+	}
+	if got := s.FindAny(recent.ID); got.Status != model.StatusCooling {
+		t.Fatalf("静默期内账号应转入保护冷却: %s", got.Status)
+	}
+	if got := s.FindAny(oldAcc.ID); got.Status != model.StatusActive {
+		t.Fatalf("静默期已过账号应直接回 active: %s", got.Status)
 	}
 }

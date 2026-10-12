@@ -98,6 +98,20 @@ type Account struct {
 	// LastErrorAt 最近一次失败的时间（Unix 秒，与其它时间字段同口径）。
 	LastErrorAt *float64 `json:"last_error_at"`
 
+	// LastRiskControlAt 最近一次被上游风控拦截（HTTP 405 + 风控文案）的时刻
+	// （Unix 秒，与其它时间字段同口径）。
+	//
+	// 与 RiskControlStreak 的区别：streak 只记「连续几次」且成功即清零，回答不了
+	// 「上次是多久前」；而风控静默期判定要的正是时刻——上游给触发风控的账号打的是
+	// **服务端标记**，标记期内该账号对任何请求都回 405（实测 ≥14h），本地阶梯冷却
+	// （分钟级）到期远早于标记解除。选号硬闸门（Select）与手动恢复护栏都读本字段；
+	// 没有它时「冷却到期即再入池」会循环踩雷（2026-10-12 晚池卫生事故）。
+	//
+	// 刻意持久化（对比三个 streak 的 json:"-"）：它衡量的是上游侧、跨重启存续的
+	// 状态，进程重启不得把静默期内的账号重新放回轮转。升级迁移见 normalize：
+	// 旧数据没有本键时，按 last_error_at（仅当错误归类仍是风控）回填一次。
+	LastRiskControlAt *float64 `json:"last_risk_control_at"`
+
 	ProxyURL   *string  `json:"proxy_url"`
 	ProxyID    *string  `json:"proxy_id"`
 	CreatedAt  float64  `json:"created_at"`
@@ -158,7 +172,7 @@ type Account struct {
 	// 才有意义；而「连续次数」语义在这个结构下不可靠——sync 路径的 e.success(acc)
 	// 在流开始读取**之前**就被调用（engine.deliverStream 首行），一旦用它归零，计数
 	// 会被同一次请求提前清掉。另外它是纯观测量，故同样 json:"-"：不为它新增
-	// accounts.data 的键（34 键硬契约）。
+	// accounts.data 的键（键集只增不减的硬契约）。
 	StreamTruncateCount int `json:"-"`
 
 	// TruncateAvoidUntil 上游侧断流后的「选号回避」截止时刻（Unix 秒，含小数）。
@@ -172,7 +186,7 @@ type Account struct {
 	//
 	// 它不是冷却：不写 Status、不写 CoolingUntil、不进 last_error、不显示在面板、
 	// 到期自动失效、成功不延长。写入点唯一（gateway.RecordUpstreamTruncate）。
-	// json:"-"：纯运行期状态，不新增 accounts.data 的键（34 键硬契约）。
+	// json:"-"：纯运行期状态，不新增 accounts.data 的键（键集只增不减的硬契约）。
 	TruncateAvoidUntil float64 `json:"-"`
 
 	StartPlanObservation StartPlanObservation `json:"-"` // 新账号双次额度检测使用的运行期查询证据
@@ -237,6 +251,13 @@ func (a *Account) normalize() {
 	}
 	if a.DisabledModels == nil {
 		a.DisabledModels = []string{}
+	}
+	// LastRiskControlAt 迁移回填（字段上线前的旧数据，含 2026-10-12 晚事故里已被
+	// 标记的账号）：仅当错误归类仍是风控时用 last_error_at 兜底——其它成因的
+	// last_error_at 与上游标记无关，不能拿来当静默期证据。
+	if a.LastRiskControlAt == nil && a.LastErrorAt != nil &&
+		a.LastErrorKind != nil && *a.LastErrorKind == ErrorKindRiskControl {
+		a.LastRiskControlAt = a.LastErrorAt
 	}
 }
 
@@ -324,6 +345,7 @@ func (a *Account) Clone() *Account {
 		LastError:                a.LastError,
 		LastErrorKind:            a.LastErrorKind,
 		LastErrorAt:              a.LastErrorAt,
+		LastRiskControlAt:        a.LastRiskControlAt,
 		ProxyURL:                 a.ProxyURL,
 		ProxyID:                  a.ProxyID,
 		CreatedAt:                a.CreatedAt,
@@ -750,12 +772,14 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		"last_error":      a.LastError,
 		"last_error_kind": a.LastErrorKind,
 		"last_error_at":   a.LastErrorAt,
-		"proxy_url":       a.ProxyURL,
-		"proxy_id":        a.ProxyID,
-		"created_at":      a.CreatedAt,
-		"archived_at":     a.ArchivedAt,
-		"user_id":         a.UserID,
-		"claim":           a.ClaimView(),
+		// 最近一次上游风控命中时刻：前端据此展示「距上次风控多久」与静默期提示。
+		"last_risk_control_at": a.LastRiskControlAt,
+		"proxy_url":            a.ProxyURL,
+		"proxy_id":             a.ProxyID,
+		"created_at":           a.CreatedAt,
+		"archived_at":          a.ArchivedAt,
+		"user_id":              a.UserID,
+		"claim":                a.ClaimView(),
 		// 暴露设备指纹便于后台核对账号间是否已相互隔离（管理员接口，非公开）。
 		"virtual_device_mid": a.VirtualDeviceMid,
 	}

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 func env(key, def string) string {
@@ -230,6 +231,20 @@ var (
 	// 上游账号标记随换号重试扩散（2026-09-24 整池雪崩的直接机制）。0 = 禁用（应急回退）。
 	ReplayGuardTTLSeconds = envInt("ZCODE_REPLAY_GUARD_TTL_SECONDS", 60)
 
+	// RiskSilentHours 风控静默窗口（小时）：账号被上游风控命中后，在此时长内
+	// 不参与选号；手动恢复这类账号时也转入保护冷却而不直接放回轮转。
+	//
+	// 上游对触发风控的账号打**服务端标记**，标记期内该账号无论发什么都回 405
+	// （实测 ≥14h；2026-09-24 首测、2026-10-12 晚污染池事故再次确认）。本地阶梯
+	// 冷却只有分钟级，远短于标记时长——没有这层闸门时「冷却到期 → 再入池 →
+	// 再 405」会循环消耗池子（2026-10-12 晚池卫生事故；规格见
+	// docs/plan-riskcontrol-silent-window-20261012.md）。
+	//
+	// 保守取 24h：观测下界 ≥14h 之上取整到整天，并覆盖「命中会续期标记」的
+	// 最坏假设——静默期若短于标记时长，探测命中可能把标记续上，宁可晚恢复也
+	// 不主动踩雷。0 = 关闭（应急回退；选号闸门与恢复护栏必须同源，两处都读本值）。
+	RiskSilentHours = envInt("ZCODE_RISK_SILENT_HOURS", 24)
+
 	// 官方客户端版本号：随请求头 / URL 参数上行，用于伪装成官方客户端。
 	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐；
 	// 2026-09-23 由 3.11.2 升至 3.14.3（本机实装客户端版本，激活失效排查项之一，
@@ -261,6 +276,12 @@ var (
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
 	AppVersion = "2.9.16-go"
 )
+
+// RiskSilentWindow 风控静默窗口的 Duration 形态。
+// 单一换算点：选号闸门（store.Select）、池状态统计、恢复护栏与请求级判定共用，
+// 避免各调用点在自乘 time.Hour 上漂移。读取的是 RiskSilentHours 的当前值，
+// 测试可以覆写该变量生效。
+func RiskSilentWindow() time.Duration { return time.Duration(RiskSilentHours) * time.Hour }
 
 // ── 遥测设备伪装 ────────────────────────────────────────────────────────────
 // 激活事件体里的设备字段。刻意**不跟随运行环境**：网关多跑在 Linux 容器里，

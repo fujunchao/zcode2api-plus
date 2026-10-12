@@ -37,6 +37,8 @@ func (s *Store) SaveOAuthAccount(name, token, email string) (*model.Account, boo
 		a.CoolingUntil = nil
 		a.RiskControlStreak = 0
 		a.LastError, a.LastErrorKind, a.LastErrorAt = nil, nil, nil
+		// 换凭据=换身份：旧身份的上游标记不适用于新凭据（与 EditAccount 同语义）。
+		a.LastRiskControlAt = nil
 		if candidate.UserID != nil {
 			a.UserID = candidate.UserID
 		}

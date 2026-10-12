@@ -531,6 +531,10 @@ func (h *Handler) handleResetStats(w http.ResponseWriter, r *http.Request) {
 // 自然到期、凭据失效另有额度探测恢复路径、额度耗尽走刷新——它们是不同的失败模式，
 // 混进本出口会让「恢复了什么」不可说。判定与状态转移由 Store.RecoverAccount 在
 // 锁内完成（拒绝原因见 store.ErrAccountNotRecoverable / store.ErrAccountArchived）。
+//
+// 恢复不解除上游标记：仍处风控静默期的账号会转入保护冷却（2026-10-12 晚事故护栏），
+// 响应 message 如实说明两种结果——前端据此提示「已恢复」或「已恢复但保护冷却至 XX」，
+// 不再制造 16:31 那种「恢复=解除」的错觉。
 func (h *Handler) handleRecoverAccount(w http.ResponseWriter, r *http.Request) {
 	acc := h.Store.FindAny(r.PathValue("account_id"))
 	if acc == nil {
@@ -553,8 +557,18 @@ func (h *Handler) handleRecoverAccount(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errNotFound("账号不存在"))
 		return
 	}
-	web.Ok("account", fmt.Sprintf("账号 %s 已手动恢复（风控失效 → 正常，streak=%d）", acc.ID, acc.RiskControlStreak))
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	msg := fmt.Sprintf("账号 %s 已手动恢复（风控失效 → 正常）", acc.ID)
+	if updated := h.Store.FindAny(acc.ID); updated != nil &&
+		updated.Status == model.StatusCooling && updated.CoolingUntil != nil {
+		hours := 0.0
+		if updated.LastRiskControlAt != nil {
+			hours = time.Since(time.Unix(0, int64(*updated.LastRiskControlAt*1e9))).Hours()
+		}
+		msg = fmt.Sprintf("账号 %s 已手动恢复；距上次风控 %.1f 小时（静默期内），已转入保护冷却至 %s，期满自动重新参与调度",
+			updated.ID, hours, time.Unix(int64(*updated.CoolingUntil), 0).Format("01-02 15:04"))
+	}
+	web.Ok("account", msg)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
 }
 
 func (h *Handler) handleCaptchaConfig(w http.ResponseWriter, r *http.Request) {

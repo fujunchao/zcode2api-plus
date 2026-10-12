@@ -783,6 +783,111 @@ func Test405AccountLevelRiskStillCoolsAndSwitches(t *testing.T) {
 	}
 }
 
+// 事故回归（2026-10-12 晚池卫生事故，规格见
+// docs/plan-riskcontrol-silent-window-20261012.md）：污染池里「热账号」（静默期内）
+// 必须被选号硬闸门跳过，请求只落在干净账号上；请求级判定只由干净账号构成。旧行为
+// 下热账号会被反复喂给请求、其 405 也计入判定——污染池里「连抽两个热账号」概率
+// 极高，被误判成「内容有罪」后错误地停止换号并封锁同内容，这正是 33 分钟全池
+// 风暴的机制。
+func Test405SkipsHotAccountsInPollutedPool(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	f := newFixture(t)
+	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
+	f.respond = jsonResp(405, riskBody)
+	hot, _ := f.st.AddAccount(model.ProviderZai, "hot", "sk-hot")
+	clean1, _ := f.st.AddAccount(model.ProviderZai, "clean1", "sk-c1")
+	clean2, _ := f.st.AddAccount(model.ProviderZai, "clean2", "sk-c2")
+	blockedF := float64(time.Now().Add(-1*time.Hour).UnixNano()) / 1e9
+	if _, err := f.st.Update(model.ProviderZai, hot.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &blockedF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != 405 || raw != riskBody {
+		t.Fatalf("两个干净账号都被拒应原样透传 405: %d %q", status, raw)
+	}
+	// 热账号被硬闸门跳过：恰好只尝试两个干净账号。
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("热账号应被跳过，上游调用应为 2 次: %d", n)
+	}
+	// 两个干净账号都冷却、阶梯各推进一次（请求级处置：保留冷却）。
+	for _, acc := range []*model.Account{clean1, clean2} {
+		got := f.st.Find(model.ProviderZai, acc.ID)
+		if got.Status != model.StatusCooling || got.RiskControlStreak != 1 {
+			t.Fatalf("干净账号应冷却且推进一次: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
+		}
+	}
+	// 热账号纹丝不动：没被喂给请求，不新增冷却/连击。
+	gotHot := f.st.Find(model.ProviderZai, hot.ID)
+	if gotHot.Status != model.StatusActive || gotHot.RiskControlStreak != 0 {
+		t.Fatalf("热账号不应被动过: status=%s streak=%d", gotHot.Status, gotHot.RiskControlStreak)
+	}
+	// 重放防护按「两个干净账号」成立：同内容直接拒绝，不再消耗账号。
+	callsBefore := f.callCount()
+	status, raw = f.post(t, msgBody(), "sk-test")
+	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "risk_control_cooldown") {
+		t.Fatalf("同内容请求应命中重放防护: %d %q", status, raw)
+	}
+	if n := f.callCount(); n != callsBefore {
+		t.Fatalf("重放防护生效后上游调用数不得增长: %d → %d", callsBefore, n)
+	}
+}
+
+// 事故回归（之二）：池里只剩 1 个干净账号时，它的单次 405 **不构成**请求级判定——
+// 旧行为会用热账号凑数把它顶成请求级并封锁内容；新行为判定不足即停止尝试（其余
+// 账号全在静默期），以 no_available_account 结束，池状态如实报出「風控靜默期」，
+// 且**不登记重放防护**（内容并未被证伪，不该封锁）。
+func Test405SingleCleanAccountNoFalseRequestLevel(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	f := newFixture(t)
+	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
+	f.respond = jsonResp(405, riskBody)
+	hot, _ := f.st.AddAccount(model.ProviderZai, "hot", "sk-hot")
+	clean, _ := f.st.AddAccount(model.ProviderZai, "clean", "sk-clean")
+	blockedF := float64(time.Now().Add(-1*time.Hour).UnixNano()) / 1e9
+	if _, err := f.st.Update(model.ProviderZai, hot.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &blockedF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, raw := f.post(t, msgBody(), "sk-test")
+	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "no_available_account") {
+		t.Fatalf("干净账号耗尽后应 503 no_available_account: %d %q", status, raw)
+	}
+	if !strings.Contains(raw, "風控靜默期") {
+		t.Fatalf("池状态分解应报出静默期成因: %q", raw)
+	}
+	if n := f.callCount(); n != 1 {
+		t.Fatalf("只应尝试唯一干净账号: %d", n)
+	}
+	gotClean := f.st.Find(model.ProviderZai, clean.ID)
+	if gotClean.Status != model.StatusCooling || gotClean.RiskControlStreak != 1 {
+		t.Fatalf("干净账号应冷却、阶梯推进一次: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
+	}
+	gotHot := f.st.Find(model.ProviderZai, hot.ID)
+	if gotHot.Status != model.StatusActive || gotHot.RiskControlStreak != 0 {
+		t.Fatalf("热账号不应被动过: status=%s streak=%d", gotHot.Status, gotHot.RiskControlStreak)
+	}
+	// 未登记重放防护：同内容再来一次仍是（不消耗任何账号的）503，而不是封锁文案；
+	// 上游调用数不增长。
+	status2, raw2 := f.post(t, msgBody(), "sk-test")
+	if status2 != http.StatusServiceUnavailable || strings.Contains(raw2, "risk_control_cooldown") {
+		t.Fatalf("单干净账号命中不得登记重放防护: %d %q", status2, raw2)
+	}
+	if n := f.callCount(); n != 1 {
+		t.Fatalf("上游调用不得增长: %d", n)
+	}
+}
+
 // 405 风控的日志必须带上游 body 预览，否则事后无法区分 405 的三种语义（风控 / 计费重复
 // 查询 / 缺顶层 system 注入）——2026-09-24 那份完整日志就是因为缺这一行，只能靠统计推断。
 func Test405RiskControlLogCarriesUpstreamBody(t *testing.T) {

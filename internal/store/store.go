@@ -1333,6 +1333,11 @@ func (s *Store) EditAccount(provider, idOrName string, edit AccountEdit) (bool, 
 			// 换身份。不清的话，一个被升到 invalid 的账号人工救回来之后，下一次风控
 			// 命中就是老 streak + 1，会立刻又判失效——等于人工修复无效。
 			acc.RiskControlStreak = 0
+			// 静默期证据同理清零：LastRiskControlAt 记录的是「这个身份最近被上游
+			// 标记过」，而换凭据就是换身份——旧标记不适用于新凭据。不清的话，
+			// 「换凭据救回」会被选号硬闸门拦住 24h，与「换凭据即视为重新可用」
+			// 的既有语义矛盾。
+			acc.LastRiskControlAt = nil
 		}
 		if edit.SetProxyURL {
 			// 地址没变则保留原线路指派；变了说明要改成手工代理，解除指派。
@@ -1377,8 +1382,8 @@ func (s *Store) SetIdentity(provider, idOrName string, email, name *string) (boo
 }
 
 // RenewJWT 重新授权命中已有账号时换上新 JWT 登录令牌（OAuth 登录链路）。
-// 与编辑换凭据同语义：清掉旧失效状态与风控计数，真实状态交给随后的额度刷新判定；
-// 已有 API Key 保留，兑换成功后再覆盖。
+// 与编辑换凭据同语义：清掉旧失效状态、风控计数与静默期证据，真实状态交给随后的
+// 额度刷新判定；已有 API Key 保留，兑换成功后再覆盖。
 func (s *Store) RenewJWT(provider, idOrName, token string) (bool, error) {
 	return s.Update(provider, idOrName, func(acc *model.Account) {
 		acc.Mode = "jwt"
@@ -1388,6 +1393,7 @@ func (s *Store) RenewJWT(provider, idOrName, token string) (bool, error) {
 		acc.LastErrorKind = nil
 		acc.LastErrorAt = nil
 		acc.RiskControlStreak = 0
+		acc.LastRiskControlAt = nil
 	})
 }
 
@@ -1418,18 +1424,37 @@ func (s *Store) ResetTokenStats(provider, idOrName string) (bool, error) {
 // 清冷却、清错误证据并清零风控连续计数——不春风控计数，救回来的账号下一次命中
 // 就是老计数 + 1，会立刻又判失效，等于人工修复无效。
 //
+// 恢复护栏（2026-10-12 晚事故补上）：账号仍在风控静默期时**不得直接回 active**——
+// 上游标记未过期，放回轮转只会重演「批量恢复 51 个账号 → 二次烧伤」。此时转入
+// **保护冷却**：Status=cooling、CoolingUntil=静默期终点（与选号闸门的放行时刻
+// 重合），期满自动重新参与调度；错误证据写明成因（kind 保持 risk_control，供
+// 池状态与列表如实展示），不再是「已恢复健康」的假象。历史字段（LastRiskControlAt）
+// 刻意保留：它是上游侧状态，恢复≠解除。静默期已过或关闭时回退旧的直接恢复语义。
+//
 // 调用方必须已确认 model.IsRiskControlInvalid(acc)：本函数只做字段转移、不做守卫，
 // 守卫在各自入口的锁内完成（单账号 RecoverAccount / 批量 BatchRecoverAccounts）。
 //
 // 刻意不动 Enabled 与 ArchivedAt（启停/归档与本出口正交），也不碰 RateLimitStreak
 // 与 Upstream503Streak（与换凭据一致；503 连击是刻意保留的）。
-func applyRecovered(acc *model.Account) {
+func applyRecovered(acc *model.Account, now time.Time) {
 	acc.Status = model.StatusActive
 	acc.CoolingUntil = nil
 	acc.RiskControlStreak = 0
 	acc.LastError = nil
 	acc.LastErrorKind = nil
 	acc.LastErrorAt = nil
+	until := acc.RiskControlSilentUntil(config.RiskSilentWindow())
+	if until == nil || !now.Before(time.Unix(0, int64(*until*1e9))) {
+		return
+	}
+	acc.Status = model.StatusCooling
+	acc.CoolingUntil = until
+	kind := model.ErrorKindRiskControl
+	note := "已手动恢复；上游风控静默期未过，保护冷却中，期满自动重新参与调度"
+	ts := float64(now.UnixNano()) / 1e9
+	acc.LastErrorKind = &kind
+	acc.LastError = &note
+	acc.LastErrorAt = &ts
 }
 
 // RecoverAccount 人工恢复因风控失效的账号（后台「手动恢复」）。
@@ -1438,6 +1463,9 @@ func applyRecovered(acc *model.Account) {
 // （MarkSuccess 对 invalid 早退），此前唯一的人工手段是换凭据。本方法是显式的
 // 管理员救济出口——判定与写入在同一把锁内完成，杜绝「handler 先检查、store 后
 // 写入」之间的竞态窗口，且只接受 model.IsRiskControlInvalid 的账号。
+//
+// 恢复不解除上游标记：仍在风控静默期内的账号由 applyRecovered 转入保护冷却
+// （见该函数注释），静默期已过的账号照旧直接回 active。
 //
 // 拒绝集合（专属错误，handler 映射为 400）：
 //   - 已归档（ErrAccountArchived）：归档即停止调用，先恢复到账号池再操作；
@@ -1458,7 +1486,7 @@ func (s *Store) RecoverAccount(provider, idOrName string) (bool, error) {
 	if !model.IsRiskControlInvalid(acc) {
 		return true, ErrAccountNotRecoverable
 	}
-	applyRecovered(acc)
+	applyRecovered(acc, time.Now())
 	if err := s.persistAccountLocked(acc); err != nil {
 		logPersistFailure("recover", provider+"/"+idOrName, err)
 		return true, err
@@ -1543,7 +1571,13 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 // Select 按模型额度优先、并列时轮询的方式选择账号。
 //
 // 选号分五层，前一层筛出的池子决定后一层的作用范围：
-//  1. 可选：状态可调度（IsSelectable）且未被本次请求跳过（skipIDs）；
+//  1. 可选：状态可调度（IsSelectable）、未被本次请求跳过（skipIDs），且不在风控
+//     静默期（InRiskControlSilentWindow）。静默期是**硬闸门**：被上游标记的账号
+//     在标记期内对任何请求都 405，本地 ladder 冷却（分钟级）到期远早于标记解除，
+//     照常入池只会反复踩雷并污染请求级判定（2026-10-12 晚 33 分钟全池风暴）。
+//     池内账号全在静默期时宁可走 no_available_account 出口（池状态会如实报出
+//     「风控静默期」分桶），也不把必然被拒的账号喂给请求。ZCODE_RISK_SILENT_HOURS=0
+//     可整体关闭（应急回退）。
 //  2. 模型分档：该模型 available 者优先，其次 unknown；absent/exhausted 一律排除；
 //  3. 优惠优先：持有未耗尽的一次性优惠额度（one_time）者优先——这类额度不用就过期，
 //     与「谁剩得多」是两回事，故独立成层；
@@ -1555,9 +1589,10 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	window := config.RiskSilentWindow()
 	var base []*model.Account
 	for _, a := range s.accounts[provider] {
-		if a.IsSelectable(now) && !skipIDs[a.ID] {
+		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) {
 			base = append(base, a)
 		}
 	}
@@ -1662,9 +1697,9 @@ func orStar(modelName string) string {
 
 // PoolStat 池状态快照：按「为什么不可选」分桶 + 冷却细分 + 指定模型的可用性分布。
 //
-// 桶口径与 Select 第一层一致（IsSelectable）：归档 / 停用 / 失效 / 整号耗尽 /
-// 冷却中（未到期）/ 其余计入 Active。Active 桶再按 ModelAvailability(modelName)
-// 细分，直接回答「健康账号里有多少被模型层排除、为什么」。
+// 桶口径与 Select 第一层一致（IsSelectable + 风控静默期闸门）：归档 / 停用 / 失效 /
+// 整号耗尽 / 冷却中（未到期）/ 风控静默期 / 其余计入 Active。Active 桶再按
+// ModelAvailability(modelName) 细分，直接回答「健康账号里有多少被模型层排除、为什么」。
 type PoolStat struct {
 	Total     int
 	Archived  int
@@ -1672,7 +1707,11 @@ type PoolStat struct {
 	Invalid   int
 	Exhausted int // 整号 exhausted（全部已知模型耗尽）
 	Cooling   int // Status=cooling 且冷却未到期
-	Active    int // 通过健康门槛（Select 第一层）的账号数
+	// RiskSilent 处于风控静默期的账号数：状态层已放行（冷却到期或本就 active），
+	// 但被选号硬闸门拦下。冷却未到期的账号先记 Cooling，冷却已到期但静默期未过
+	// 的记本桶——每个账号只进一个桶，「为什么不可选」唯一。
+	RiskSilent int
+	Active     int // 通过健康门槛（Select 第一层，含静默期闸门）的账号数
 	// CoolingEarliest 冷却账号中最早的到期时间（unix 秒）；无冷却账号为 nil。
 	CoolingEarliest *float64
 	// CoolingByKind 冷却账号按 last_error_kind 细分（upstream_unavailable /
@@ -1723,6 +1762,10 @@ func (s *Store) PoolStats(provider, modelName string) PoolStat {
 				stat.CoolingByKind[kind]++
 				continue
 			}
+		}
+		if a.InRiskControlSilentWindow(now, config.RiskSilentWindow()) {
+			stat.RiskSilent++
+			continue
 		}
 		stat.Active++
 		if modelName != "" {

@@ -8,7 +8,7 @@
 //     不再出现「批量里某几条成功但调用方不知道是哪几条」。
 //   - 兼容既有约定：判重复用 duplicateLocked 三轮语义；启用/禁用的字段转移与
 //     单账号 SetEnabled 共用 applyEnabled；落库 SQL 与 persistAccountLocked
-//     逐字一致（事务版镜像）；不新增 Account 字段，不触碰 34 键 JSON 契约。
+//     逐字一致（事务版镜像）；不新增 Account 字段，不违反 JSON 键集契约。
 package store
 
 import (
@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
@@ -406,6 +407,11 @@ func (s *Store) BatchSetEnabled(ids []string, enabled, missingOK bool) (BatchRes
 //   - 存在但不可恢复（非风控失效、已归档）：逐条 error 明细，不整批失败、不影响
 //     其它条目——目标集合由管理员显式选择（常见「筛选后全选」），混入不可恢复项
 //     是预期内的，逐条回报比整批拒绝有用。
+//
+// 恢复护栏（2026-10-12 晚事故）：仍在风控静默期内的账号由 applyRecovered 转入
+// 保护冷却，逐条 message 注明「保护冷却至 XX」——16:31 那次批量恢复把 51 个
+// 上游标记未过期的账号直接放回轮转，是本事故的直接放大动作，这个出口必须
+// 让「恢复了什么」在响应里可读。
 func (s *Store) BatchRecoverAccounts(ids []string, missingOK bool) (BatchResult, error) {
 	ids = dedupeIDs(ids)
 	res := BatchResult{Total: len(ids)}
@@ -416,6 +422,8 @@ func (s *Store) BatchRecoverAccounts(ids []string, missingOK bool) (BatchResult,
 		return res, fmt.Errorf("批量恢复条目数超过上限 %d", MaxBatchSize)
 	}
 
+	now := time.Now()
+	nowF := float64(now.UnixNano()) / 1e9
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -444,7 +452,12 @@ func (s *Store) BatchRecoverAccounts(ids []string, missingOK bool) (BatchResult,
 			targets = append(targets, acc)
 			res.Succeeded++
 			res.IDs = append(res.IDs, acc.ID)
-			res.Items = append(res.Items, BatchItemResult{Index: i, ID: acc.ID, Name: acc.Name, Status: BatchStatusOK})
+			msg := ""
+			if until := acc.RiskControlSilentUntil(config.RiskSilentWindow()); until != nil && *until > nowF {
+				msg = fmt.Sprintf("已恢复；风控静默期未过，保护冷却至 %s",
+					time.Unix(int64(*until), 0).Format("01-02 15:04"))
+			}
+			res.Items = append(res.Items, BatchItemResult{Index: i, ID: acc.ID, Name: acc.Name, Status: BatchStatusOK, Message: msg})
 		}
 	}
 
@@ -463,7 +476,7 @@ func (s *Store) BatchRecoverAccounts(ids []string, missingOK bool) (BatchResult,
 	}
 	for _, acc := range targets {
 		snapshot := acc.Clone()
-		applyRecovered(snapshot)
+		applyRecovered(snapshot, now)
 		if err := persistAccountOnTx(tx, snapshot); err != nil {
 			logPersistFailure("batch-recover", acc.Provider, err)
 			markBatchRollback(&res, err)
@@ -477,7 +490,7 @@ func (s *Store) BatchRecoverAccounts(ids []string, missingOK bool) (BatchResult,
 		return res, err
 	}
 	for _, acc := range targets {
-		applyRecovered(acc)
+		applyRecovered(acc, now)
 	}
 	return res, nil
 }

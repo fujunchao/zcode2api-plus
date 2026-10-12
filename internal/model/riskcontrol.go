@@ -13,7 +13,10 @@
 // 因此判定必须落在 body 上。
 package model
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // IsRiskControlBody 判断上游错误体是否为风控拦截（大小写无关）。
 //
@@ -39,4 +42,31 @@ func IsRiskControlBody(text string) bool {
 func IsRiskControlInvalid(acc *Account) bool {
 	return acc.Status == StatusInvalid &&
 		acc.LastErrorKind != nil && *acc.LastErrorKind == ErrorKindRiskControl
+}
+
+// InRiskControlSilentWindow 账号是否处于「风控静默期」：距最近一次上游风控命中
+// 不足 window（window 由调用方传入，model 包刻意不依赖 config）。
+//
+// 语义：命中过风控意味着该账号已被上游打上服务端标记，标记期内它对**任何**内容
+// 都回 405（2026-10-12 晚实测 28/28 热账号 vs 干净账号 0/9；规格见
+// docs/plan-riskcontrol-silent-window-20261012.md）。因此静默期内：
+//   - 选号硬闸门直接跳过它（区别于 ladder 冷却：冷却到期 ≠ 标记解除）；
+//   - 请求级风控判定不把它计入（它的 405 只反映账号自身状态，与内容无关）。
+//
+// window <= 0 视为关闭（应急回退，见 config.RiskSilentHours）；无命中记录为 false。
+func (a *Account) InRiskControlSilentWindow(now time.Time, window time.Duration) bool {
+	if a == nil || window <= 0 || a.LastRiskControlAt == nil {
+		return false
+	}
+	return now.Before(unixTime(*a.LastRiskControlAt).Add(window))
+}
+
+// RiskControlSilentUntil 静默期结束时刻（Unix 秒）；无记录或 window <= 0 时为 nil。
+// 供恢复护栏（保护冷却截止时刻 = 静默期终点）与展示使用。
+func (a *Account) RiskControlSilentUntil(window time.Duration) *float64 {
+	if a == nil || window <= 0 || a.LastRiskControlAt == nil {
+		return nil
+	}
+	v := float64(unixTime(*a.LastRiskControlAt).Add(window).UnixNano()) / 1e9
+	return &v
 }

@@ -59,8 +59,9 @@ const pythonAccountJSON = `{
 // pythonAccountKeys 序列化契约的全部键。
 // Go 增量字段：archived_at（归档）、user_id（身份判据）、
 // virtual_device_mid（每账号设备指纹）、claim（领取状态）、
-// last_error_kind / last_error_at（最近一次错误的归类与时间）——Python 侧已退休，
-// 旧版 json.loads 对多出的键会原样保留在 dict 中，不影响旧数据互读；
+// last_error_kind / last_error_at（最近一次错误的归类与时间）、
+// last_risk_control_at（最近一次上游风控命中时刻，静默期闸门的依据）——Python
+// 侧已退休，旧版 json.loads 对多出的键会原样保留在 dict 中，不影响旧数据互读；
 // 本测试现在保护的是 Go 自身的往返一致性。键集只增不减。
 var pythonAccountKeys = []string{
 	"id", "name", "provider", "mode", "email", "jwt_token", "api_key",
@@ -68,7 +69,7 @@ var pythonAccountKeys = []string{
 	"plan", "plans", "usage", "use_count", "fail_count",
 	"total_input_tokens", "total_output_tokens", "total_cache_creation_tokens",
 	"total_cache_read_tokens", "last_used_at", "last_checked_at", "cooling_until",
-	"last_error", "last_error_kind", "last_error_at",
+	"last_error", "last_error_kind", "last_error_at", "last_risk_control_at",
 	"proxy_url", "proxy_id", "created_at", "archived_at",
 	"user_id", "virtual_device_mid", "claim",
 }
@@ -724,7 +725,7 @@ func TestCloneCopiesStreamTruncateCount(t *testing.T) {
 	}
 }
 
-// 观测计数不得被序列化：accounts.data 的 34 键是与 Python 版互读的硬契约，
+// 观测计数不得被序列化：accounts.data 的键集是与 Python 版互读的硬契约（只增不减），
 // 为观测量新增键会破坏它。（TestJSONContractWithPython 从另一侧守住同一件事。）
 func TestStreamTruncateCountNotSerialized(t *testing.T) {
 	a := Create(ProviderZai, "k", "sk-abc")
@@ -740,7 +741,7 @@ func TestStreamTruncateCountNotSerialized(t *testing.T) {
 }
 
 // TruncateAvoidUntil 同为 json:"-" 运行期字段：Clone 必须复制（选号软过滤要在
-// store 内部对象上生效），序列化不得携带（34 键硬契约）。
+// store 内部对象上生效），序列化不得携带（键集只增不减的硬契约）。
 func TestCloneCopiesTruncateAvoidUntil(t *testing.T) {
 	a := Create(ProviderZai, "k", "sk-abc")
 	a.TruncateAvoidUntil = 1790055386.5

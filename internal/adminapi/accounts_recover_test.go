@@ -6,9 +6,11 @@ package adminapi
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
 )
@@ -60,6 +62,65 @@ func TestRecoverAccountEndpointNotFound(t *testing.T) {
 	}
 	if detail := str(t, body["detail"]); detail != "账号不存在" {
 		t.Fatalf("detail 不符: %q", detail)
+	}
+}
+
+// 恢复护栏的端点行为：静默期内的账号恢复后转入保护冷却，响应 message 如实说明
+// （前端 toast 直接采用该 message，不再制造「恢复=解除」的错觉）。
+func TestRecoverAccountEndpointProtectiveCoolingMessage(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	mux, st, _ := setup(t)
+	acc := seedRiskControlInvalid(t, st, "risk-recent", "risk-recent-secret")
+	blockedF := float64(time.Now().Add(-2*time.Hour).UnixNano()) / 1e9
+	if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &blockedF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := do(t, mux, st, http.MethodPost, "/admin/api/accounts/"+acc.ID+"/recover", nil)
+	if code != http.StatusOK {
+		t.Fatalf("恢复应 200: %d %v", code, body)
+	}
+	msg := str(t, body["message"])
+	if !strings.Contains(msg, "距上次风控") || !strings.Contains(msg, "保护冷却") {
+		t.Fatalf("响应 message 应说明保护冷却: %q", msg)
+	}
+	got := st.FindAny(acc.ID)
+	if got.Status != model.StatusCooling || got.CoolingUntil == nil {
+		t.Fatalf("静默期内恢复应转保护冷却: %+v", got)
+	}
+}
+
+// 静默期已过：message 退回旧口径（直接恢复为正常）。
+func TestRecoverAccountEndpointPlainMessageAfterWindow(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	mux, st, _ := setup(t)
+	acc := seedRiskControlInvalid(t, st, "risk-old", "risk-old-secret")
+	blockedF := float64(time.Now().Add(-25*time.Hour).UnixNano()) / 1e9
+	if _, err := st.Update(model.ProviderZai, acc.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &blockedF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := do(t, mux, st, http.MethodPost, "/admin/api/accounts/"+acc.ID+"/recover", nil)
+	if code != http.StatusOK {
+		t.Fatalf("恢复应 200: %d %v", code, body)
+	}
+	msg := str(t, body["message"])
+	if strings.Contains(msg, "保护冷却") {
+		t.Fatalf("静默期已过不应提保护冷却: %q", msg)
+	}
+	got := st.FindAny(acc.ID)
+	if got.Status != model.StatusActive || got.CoolingUntil != nil {
+		t.Fatalf("静默期已过应直接回 active: %+v", got)
 	}
 }
 

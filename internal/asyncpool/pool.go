@@ -751,8 +751,9 @@ func (p *Pool) attemptUpstreamOnce(
 		// 两条路径不得对同一份 body 给出不同判定）。
 		//
 		// 账号级（换号即成功）→ 整号冷却（按连续命中递进，超限置失效）并换号。
-		// 请求级（同一 body 在 ≥2 个不同账号上都被拒）→ 达到本地停止换号的保护阈值，
-		// 不是服务端给出的触发原因，不能据此确定为正文问题。
+		// 请求级（同一 body 在 ≥2 个**命中时仍干净**（非静默期）的不同账号上都被拒）
+		// → 达到本地停止换号的保护阈值，不是服务端给出的触发原因，不能据此确定为
+		// 正文问题。热账号的命中不计入判定（它的 405 与内容无关）。
 		// 处置（账号级标记模型，见 gateway.RiskScope 头注释）：停止换号、**保留**本票
 		// 已施加的风控冷却（每个被尝试的账号都已被上游标记）、登记重放防护，把上游原文
 		// 终止性投递给客户端。
@@ -761,7 +762,7 @@ func (p *Pool) attemptUpstreamOnce(
 		// 回的错（那种情况每个账号都会一样失败，冷却账号等于把代码缺陷变成账号惩罚）。
 		if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(bodyText) {
 			preview := gateway.ErrorPreview(bodyText)
-			if scope.Verdict(acc) {
+			if scope.Verdict(acc, time.Now()) {
 				// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
 				// 相同，差别只在后续：停止换号 + 登记重放防护。
 				_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,

@@ -961,6 +961,60 @@ func Test405RequestLevelRiskInAsyncPool(t *testing.T) {
 	}
 }
 
+// 事故回归（async 镜像，与 sync 路径同判定——项目硬不变式）：污染池里「热账号」
+// （风控静默期内）被选号硬闸门跳过，不得再被喂给请求；单干净账号的 405 不构成
+// 请求级判定，池子耗尽走 no_account（文案带上静默期成因），不登记重放防护。
+func Test405HotAccountSkippedInAsyncPool(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 24
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
+	p, st, _, _ := newTestPool(t)
+	// fixture 默认 AsyncMaxRetries=0（只试 1 个账号）；本用例需要第二次选号来证明
+	// 「第二次也选不到热账号」，放开到 1（付出一次 2s 换号退避，是该路径既有代价）。
+	// ⚠️ 必须在 newTestPool 之后设置：fixture 会把 AsyncMaxRetries 钉回 0。
+	config.AsyncMaxRetries = 1
+	t.Cleanup(func() { config.AsyncMaxRetries = 0 })
+	hot := addJWTAccount(t, st, "hot-acc")
+	clean := addJWTAccount(t, st, "clean-acc")
+	blockedF := float64(time.Now().Add(-1*time.Hour).UnixNano()) / 1e9
+	if _, err := st.Update(model.ProviderZai, hot.ID, func(a *model.Account) {
+		a.LastRiskControlAt = &blockedF
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusMethodNotAllowed, body: riskBody},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-hot-skip", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-hot-skip")
+
+	// 只尝试了干净账号一次；第二次选号也选不到（热账号被闸门跳过）。
+	if n := up.callCount(); n != 1 {
+		t.Fatalf("热账号应被跳过，上游调用应为 1 次: %d", n)
+	}
+	events := drainEvents(tk)
+	last := events[len(events)-1]
+	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
+	if errObj == nil || errObj["type"] != "no_account" {
+		t.Fatalf("池子耗尽应投递 no_account（而非请求级/重放封锁）: %v", events)
+	}
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "靜默期") {
+		t.Fatalf("no_account 文案应带静默期成因: %q", errObj["message"])
+	}
+	gotClean := st.FindAny(clean.ID)
+	if gotClean.Status != model.StatusCooling || gotClean.RiskControlStreak != 1 {
+		t.Fatalf("干净账号应冷却、阶梯推进一次: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
+	}
+	if gotHot := st.FindAny(hot.ID); gotHot.Status != model.StatusActive || gotHot.RiskControlStreak != 0 {
+		t.Fatalf("热账号不应被动过: status=%s streak=%d", gotHot.Status, gotHot.RiskControlStreak)
+	}
+}
+
 // 非风控 405 在异步路径同样不冷却（与 sync 一致），落「其余错误」投递事件。
 func Test405WithoutRiskBodyInAsyncPool(t *testing.T) {
 	p, st, _, _ := newTestPool(t)

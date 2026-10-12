@@ -72,6 +72,9 @@ func PoolStatusText(stat store.PoolStat) string {
 		}
 		parts = append(parts, head)
 	}
+	if stat.RiskSilent > 0 {
+		parts = append(parts, fmt.Sprintf("%d 帳號風控靜默期（上游標記未解除）", stat.RiskSilent))
+	}
 	if stat.Exhausted > 0 {
 		parts = append(parts, fmt.Sprintf("%d 帳號全部額度已用完", stat.Exhausted))
 	}
@@ -111,6 +114,7 @@ func PoolStatusDetails(stat store.PoolStat, modelName string) map[string]any {
 		"total_accounts": stat.Total,
 		"active":         stat.Active,
 		"cooling":        stat.Cooling,
+		"risk_silent":    stat.RiskSilent,
 		"exhausted":      stat.Exhausted,
 		"invalid":        stat.Invalid,
 		"disabled":       stat.Disabled,

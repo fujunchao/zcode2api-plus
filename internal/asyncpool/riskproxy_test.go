@@ -51,9 +51,14 @@ func TestAsyncRiskProxyRotationUsesNewEgressAfterCooling(t *testing.T) {
 				got.Status != model.StatusCooling || got.RiskControlStreak != 1 || got.CoolingUntil == nil {
 				t.Fatal("异步风控应换线并保留冷却")
 			}
+			// 模拟冷却到期（并且静默期已过）：仅把冷却调旧不足以重新入池——
+			// 被上游标记的账号还要过 24h 风控静默期硬闸门，两个时间证据一起调旧，
+			// 让本用例聚焦异步路径的代理轮换语义。
 			_, _ = st.Update(a.Provider, a.ID, func(live *model.Account) {
 				expired := float64(time.Now().Add(-time.Second).Unix())
 				live.CoolingUntil = &expired
+				past := float64(time.Now().Add(-25 * time.Hour).Unix())
+				live.LastRiskControlAt = &past
 			})
 			tk := insertTicket(p, "after-cooling", request)
 			p.processTicket(context.Background(), "after-cooling")

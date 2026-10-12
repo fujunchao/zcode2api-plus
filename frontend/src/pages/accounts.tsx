@@ -424,13 +424,17 @@ export function AccountsPage() {
     })
   }
 
-  /* 批量結果的 toast：成功合併成一條；失敗項逐條提示（最多 3 條，防止刷屏） */
+  /* 批量結果的 toast：成功合併成一條；失敗項逐條提示（最多 3 條，防止刷屏）。
+     成功項帶 message（如恢復時「保護冷卻至 XX」）時在摘要裡帶上數量提示——
+     16:31 事故里批量恢復的響應只寫 ok，管理員無從得知帳號實際沒有回到調度。 */
   function batchResultToast(op: string, d: BatchResult) {
     const parts = [`成功 ${d.succeeded}`]
     if (d.duplicated) parts.push(`重複 ${d.duplicated}`)
     if (d.not_found) parts.push(`缺失 ${d.not_found}`)
     if (d.failed) parts.push(`失敗 ${d.failed}`)
-    const summary = `批量${op}完成：${parts.join(' · ')}`
+    const noted = d.items.filter((x) => x.status === 'ok' && x.message)
+    const suffix = noted.length ? `（${noted.length} 個帳號進入風控保護冷卻）` : ''
+    const summary = `批量${op}完成：${parts.join(' · ')}${suffix}`
     if (d.failed) {
       toast.warning(summary)
       for (const item of d.items.filter((x) => x.status === 'error').slice(0, 3)) {
@@ -487,7 +491,8 @@ export function AccountsPage() {
   }
 
   /* 批量手動恢復：所選集合全量發送、服務端逐條判定（與啟停/刪除同一語義，
-     不做前端預過濾）；僅「風控失效」項會成功，其餘逐條回報為失敗。 */
+     不做前端預過濾）；僅「風控失效」項會成功，其餘逐條回報為失敗。
+     未滿靜默期的帳號由後端轉入保護冷卻（逐條 message 註明），不在前端預判。 */
   function batchRecover() {
     const targets = [...selectedInFilter]
     if (!targets.length) return
@@ -497,7 +502,8 @@ export function AccountsPage() {
       description: (
         <>
           將對選中的 <b>{targets.length}</b> 個帳號嘗試手動恢復；僅「風控失效」項會成功，其餘逐條回報失敗。
-          此操作<b>不會解除上游仍生效的風控標記</b>，恢復後若再次命中風控會重新冷卻或失效。
+          此操作<b>不會解除上游仍生效的風控標記</b>；未滿風控靜默期（預設 24 小時）的帳號
+          恢復後會先進入<b>保護冷卻</b>，暫不參與調度，期滿自動恢復。
         </>
       ),
       onConfirm: async () => {
@@ -671,7 +677,8 @@ export function AccountsPage() {
   }
 
   /* 手動恢復：只對「風控失效」帳號顯示。這是解開風控失效終態的人工出口（另一條
-     路是換憑證）；只清本地標記，不會解除上游仍生效的風控標記。 */
+     路是換憑證）；只清本地標記，不會解除上游仍生效的風控標記。未滿靜默期的帳號
+     恢復後由後端轉入保護冷卻（詳見確認框文案與復原端點 message）。 */
   function recover(a: Account) {
     const label = a.email || a.name || a.id
     confirm({
@@ -680,17 +687,18 @@ export function AccountsPage() {
       description: (
         <>
           確認將 <code className="rounded bg-muted px-1 py-0.5">{label}</code> 由「風控失效」恢復為正常？
-          將清除本地風控標記、冷卻與連續計數，帳號會重新參與調度。
+          將清除本地風控標記、冷卻與連續計數。
           <div className="mt-2 text-xs text-muted-foreground">
-            此操作<b>不會解除上游仍生效的風控標記</b>（實測可持續 ≥14 小時）；若上游仍在攔截，
-            恢復後會再次冷卻或失效。最近風控：{a.last_error_at ? relativeTime(a.last_error_at) : '無記錄'}
+            此操作<b>不會解除上游仍生效的風控標記</b>（實測可持續 ≥14 小時）；距上次風控
+            未滿靜默期（預設 24 小時）的帳號恢復後會<b>先進入保護冷卻</b>，期滿自動重新參與調度；
+            期滿後若再命中風控會重新冷卻或失效。最近風控：{relativeTime(a.last_risk_control_at ?? a.last_error_at)}
           </div>
         </>
       ),
       onConfirm: async () => {
         try {
-          await api('POST', '/accounts/' + a.id + '/recover')
-          toast.success('已恢復')
+          const d = await api<{ ok: boolean; message?: string }>('POST', '/accounts/' + a.id + '/recover')
+          toast.success(d.message || '已恢復')
           invalidate()
         } catch (e) {
           toast.error('恢復失敗：' + errMsg(e))
