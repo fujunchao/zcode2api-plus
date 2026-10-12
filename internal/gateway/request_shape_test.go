@@ -7,11 +7,17 @@ import (
 	"testing"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/upstream"
 )
 
 func TestDiagnosticShapeSourcesAndCounts(t *testing.T) {
 	old := config.PreserveClientContext
 	t.Cleanup(func() { config.PreserveClientContext = old })
+
+	// 网关注入的标准块数由 config.UpstreamInjectEnvironment 决定（默认两块，
+	// 关掉 # Environment 后就是两块），派生而不是写死：写死会让「切换注入开关」
+	// 与「裁剪 Environment 段」这两件事互相打架。
+	injected := len(upstream.ZcodeSystemBlocks())
 	for _, tc := range []struct {
 		name          string
 		preserve, jwt bool
@@ -20,13 +26,14 @@ func TestDiagnosticShapeSourcesAndCounts(t *testing.T) {
 		source, form  string
 		blocks        int
 	}{
-		{"missing_jwt", true, true, nil, false, false, "gateway_fallback", "blocks", 3},
+		{"missing_jwt", true, true, nil, false, false, "gateway_fallback", "blocks", injected},
 		{"missing_apikey", true, false, nil, false, false, "none", "missing", 0},
 		{"null_apikey", true, false, nil, true, false, "none", "null", 0},
 		{"empty_text", true, true, "", true, false, "input", "string", 1},
 		{"empty_blocks", true, true, []any{}, true, false, "input", "blocks", 0},
 		{"mid_only", true, true, nil, false, true, "input_messages", "missing", 0},
-		{"legacy", false, true, "private-system-sentinel", true, true, "legacy_merge", "blocks", 4},
+		// legacy_merge 会把调用者的字符串 system 并成一块，排在注入块之后。
+		{"legacy", false, true, "private-system-sentinel", true, true, "legacy_merge", "blocks", injected + 1},
 		{"other", false, true, false, true, false, "input", "other", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
