@@ -14,6 +14,7 @@ import (
 
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
+	"zcode2api/internal/upstream"
 )
 
 func TestAsyncClientContextReachesActualUpstream(t *testing.T) {
@@ -89,8 +90,22 @@ func TestAsyncClientContextReachesActualUpstream(t *testing.T) {
 	}
 	select {
 	case actual := <-calls:
-		if actual.body["system"] != body["system"] || !reflect.DeepEqual(actual.body["tools"], body["tools"]) || actual.body["max_tokens"] != float64(64) {
-			t.Fatalf("后台处理不能改写本地客户端上下文: %v", actual.body)
+		// 非官方前缀的调用者 system 在出站前会前置官方标准块（2026-10-12 前缀感知修复），
+		// 客户端原文必须原样保留在标准块之后；工具与采样参数不受影响。
+		blocks := upstream.ZcodeSystemBlocks()
+		system, ok := actual.body["system"].([]any)
+		if !ok || len(system) != len(blocks)+1 {
+			t.Fatalf("异步出站 system 应为「官方块 + 客户端原文」: %v", actual.body["system"])
+		}
+		first, _ := system[0].(map[string]any)
+		if text, _ := first["text"].(string); !strings.HasPrefix(text, "You are ZCode, an interactive coding agent") {
+			t.Fatalf("首段必须是官方固定前缀: %v", first)
+		}
+		if last, _ := system[len(system)-1].(map[string]any); last["text"] != "本地客户端规则，不提供服务器工具。" {
+			t.Fatalf("客户端原文必须原样保留在官方块之后: %v", system)
+		}
+		if !reflect.DeepEqual(actual.body["tools"], body["tools"]) || actual.body["max_tokens"] != float64(64) {
+			t.Fatalf("后台处理不能改写本地客户端的工具与采样参数: %v", actual.body)
 		}
 		messages := actual.body["messages"].([]any)
 		if len(messages) != 3 || messages[1].(map[string]any)["content"] != "第二轮只读" {
