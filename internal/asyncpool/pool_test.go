@@ -1007,8 +1007,8 @@ func Test405HotAccountSkippedInAsyncPool(t *testing.T) {
 	if errObj == nil || errObj["type"] != "no_account" {
 		t.Fatalf("池子耗尽应投递 no_account（而非请求级/重放封锁）: %v", events)
 	}
-	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "靜默期") {
-		t.Fatalf("no_account 文案应带静默期成因: %q", errObj["message"])
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "額外本地風控隔離") || strings.Contains(msg, "上游標記未解除") {
+		t.Fatalf("no_account 应说明本地策略，不能声称上游封禁: %q", errObj["message"])
 	}
 	gotClean := st.FindAny(clean.ID)
 	if gotClean.Status != model.StatusCooling || gotClean.RiskControlStreak != 1 {
@@ -1186,6 +1186,8 @@ func TestConcurrencyLimitKeepsAccountState(t *testing.T) {
 
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusTooManyRequests, body: `{"code":3010,"msg":"model admission concurrency limit"}`},
+		{status: http.StatusTooManyRequests, body: `{"code":3010,"msg":"model admission concurrency limit"}`},
+		{status: http.StatusTooManyRequests, body: `{"code":3010,"msg":"model admission concurrency limit"}`},
 	}}
 	config.UpstreamZai = up.start(t).URL
 
@@ -1197,6 +1199,9 @@ func TestConcurrencyLimitKeepsAccountState(t *testing.T) {
 		t.Fatalf("3010 不应改变账号状态（当前 %s）", acc.Status)
 	}
 	wantErrorKind(t, acc, model.ErrorKindModelBusy)
+	if up.callCount() != 3 || acc.CoolingUntil != nil {
+		t.Fatal("并发只能有限原地重试，不能整号冷却")
+	}
 }
 
 // wantErrorKind 断言账号上记录的「最近错误归类」。

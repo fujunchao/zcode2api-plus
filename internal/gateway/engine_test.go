@@ -863,8 +863,8 @@ func Test405SingleCleanAccountNoFalseRequestLevel(t *testing.T) {
 	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "no_available_account") {
 		t.Fatalf("干净账号耗尽后应 503 no_available_account: %d %q", status, raw)
 	}
-	if !strings.Contains(raw, "風控靜默期") {
-		t.Fatalf("池状态分解应报出静默期成因: %q", raw)
+	if !strings.Contains(raw, "額外本地風控隔離") || strings.Contains(raw, "上游標記未解除") {
+		t.Fatalf("池状态应说明本地策略而非供应商封禁结论: %q", raw)
 	}
 	if n := f.callCount(); n != 1 {
 		t.Fatalf("只应尝试唯一干净账号: %d", n)

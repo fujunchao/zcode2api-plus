@@ -56,3 +56,50 @@ func TestDiagnosticOutboundValuesAreBoundedAndRedacted(t *testing.T) {
 		}
 	}
 }
+
+func TestDiagnosticAccountSnapshotFreezesPerAttempt(t *testing.T) {
+	f := newFixture(t)
+	a, err := f.st.AddAccount(model.ProviderZai, "snapshot-account", "synthetic-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setQuota := func(amount float64) {
+		_, err := f.st.Update(a.Provider, a.ID, func(a *model.Account) {
+			a.Quota = map[string]map[string]any{"GLM-5.3": {"remaining": amount, "available": amount}}
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	setQuota(42)
+	f.respond = func(n int, _ *http.Request) (int, http.Header, string) {
+		if n == 1 {
+			setQuota(77) // 模拟首个请求发送后，旁路账单更新。
+			return jsonResp(429, `{"msg":"rate limited"}`)(n, nil)
+		}
+		return jsonResp(200, okUpstreamJSON)(n, nil)
+	}
+	buf := &syncBuffer{}
+	web.SetOut(buf)
+	t.Cleanup(func() { web.SetOut(nil) })
+	if status, _ := f.post(t, msgBody(), "sk-test"); status != 200 || f.callCount() != 2 {
+		t.Fatal("夹具应产生两次实际出站")
+	}
+	count := 0
+	for _, line := range strings.Split(stripANSI(buf.String()), "\n") {
+		if !strings.Contains(line, "[attempt]") || !(strings.Contains(line, "event=start") || strings.Contains(line, "event=headers")) {
+			continue
+		}
+		want := "quota_available=42"
+		if strings.Contains(line, "attempt=2 ") {
+			want = "quota_available=77"
+		}
+		if !strings.Contains(line, want) {
+			t.Fatalf("响应不能回写首轮快照，后续尝试须读新快照: %s", line)
+		}
+		count++
+	}
+	if count != 4 {
+		t.Fatalf("两次尝试须各有一对开始/响应快照: %d", count)
+	}
+}
