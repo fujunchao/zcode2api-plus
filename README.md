@@ -56,6 +56,14 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 默认客户端版本已同步至 `3.14.5`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。升级只需替换网关程序/镜像并重启，无数据库迁移。
 
+`v2.9.16-go` 修正第三方客户端的 405 回归：`v2.9.11-go` 起「带自有 system 即原样保留」
+会把 DeepSeek Harness 等自有提示词的客户端首段直接透传上游，而服务端从 system 第 0
+字节逐字节校验到身份段末尾，非官方前缀必然 `3012`。保留策略改为**前缀感知**：首段自带
+官方固定前缀（或显式空值 / 消息内 system）的调用者原样保留，其余回退旧版「官方标准块
+前置 + 精确去重」；内置提示词快照同步更新为 3.14.5 实发字节（补 `# ZCode Desktop Context`
+一节，使完整官方三块的去重重新生效）。不改变鉴权、调度、重试预算与风控阈值。
+详见 [发布说明](docs/releases/v2.9.16-go.md)。
+
 `v2.9.15-go` 為風控失效帳號補上手動恢復：後台帳號頁對「風控失效」行顯示恢復按鈕
 （確認框會註明不會解除上游仍生效的標記），批量欄可一次恢復多個；端點為
 `POST /admin/api/accounts/{id}/recover` 與 `POST /admin/api/accounts/batch/recover`。
