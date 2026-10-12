@@ -1,7 +1,7 @@
 // Package claim 激活遥测上报：官方 event/report 端点的单一事实源（对应
 // Python 版 app/telemetry.py）。活动套餐投放疑似以「官方客户端当日活跃」
-// 为资格信号，preview 前模拟 app_launch / app_daily_active 两个事件。
-// 端点不校验登录态，请求不带 Authorization。
+// 为资格信号，preview 前模拟 app_launch / app_daily_active / app_login_success
+// 三个事件。端点不校验登录态，请求不带 Authorization。
 //
 // 出站口径与 billing 一致：事件经 Service.clientFor(acc) 走**账号绑定的代理
 // 线路**。真实桌面客户端的 event/report 与 billing/preview 永远来自同一个 IP；
@@ -26,11 +26,41 @@ import (
 // EventReportURL 激活事件上报端点（测试可覆写指向 mock）。
 var EventReportURL = "https://zcode.z.ai/api/v1/event/report"
 
-// ActivationElements preview 前依次上报的两个激活事件。
-var ActivationElements = []string{"app_launch", "app_daily_active"}
+// ActivationElements preview 前依次上报的激活事件。
+//
+// 第三个 app_login_success 是 2026-10-12 由第三方实现（zcode-pool）对照补齐的：
+// 官方客户端这一轮共上报这三个元素，此前只发前两个。顺序即上报顺序——上游按序
+// 消费，且首个失败即中止整轮（见 ReportActivationEvents）。
+var ActivationElements = []string{"app_launch", "app_daily_active", "app_login_success"}
 
 // activationScreen 桌面端常见分辨率；上游仅做形态校验，固定值即可。
 const activationScreen = "2560x1440"
+
+// activationLoginElement 需要走「登录」形态的事件名：它的 event_region 与
+// event_extra_detail 与其余事件不同。
+const activationLoginElement = "app_login_success"
+
+// activationRegion 事件体的 event_region：登录事件归入 app_profile，其余归入 app。
+func activationRegion(element string) string {
+	if element == activationLoginElement {
+		return "app_profile"
+	}
+	return "app"
+}
+
+// activationExtraDetail 事件体的 event_extra_detail：登录事件需声明登录入口，
+// 其余为空对象。
+//
+// 登录入口写死 "zai"：本网关的账号只有 zai / bigmodel 两种 provider，而活动
+// 套餐投放只对 zai 侧生效，与官方客户端上报的口径一致。刻意**不为此在
+// model.Account 上加字段**——那会牵连账号结构的五处同步（json tag / PublicView /
+// accounts.data / 导出格式 / Clone），为一个只用于遥测的常量不值当。
+func activationExtraDetail(element string) map[string]any {
+	if element == activationLoginElement {
+		return map[string]any{"login_provider": "zai"}
+	}
+	return map[string]any{}
+}
 
 // DeviceOSCategory 把客户端平台标识（win32-x64 / darwin-arm64 / linux-x64）映射为
 // 事件体的 device_os_category。
@@ -68,10 +98,10 @@ func BuildActivationEventBody(element, userID, deviceMid string) map[string]any 
 		"client_timezone":    config.ZcodeClientTimezone,
 		"client_language":    config.ZcodeClientLanguage,
 		"element_name":       element,
-		"event_region":       "app",
+		"event_region":       activationRegion(element),
 		"event_type":         "view",
 		"event_text":         "",
-		"event_extra_detail": map[string]any{},
+		"event_extra_detail": activationExtraDetail(element),
 		"user_id":            userID,
 		"screen_resolution":  activationScreen,
 		"app_version":        config.ZcodeClientVersion,

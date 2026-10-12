@@ -393,12 +393,14 @@ func TestActivationEventsUseAccountEgress(t *testing.T) {
 		t.Fatalf("应成功领取 1 个套餐: %v", outcomes)
 	}
 
-	// 两个激活事件先于 preview 发生，且都经过注入的同一个客户端。
-	if len(eventBodies) != 2 {
-		t.Fatalf("应上报 2 个激活事件，实际 %d（requests=%v）", len(eventBodies), up.requests)
+	// 三个激活事件先于 preview 发生，且都经过注入的同一个客户端。
+	if len(eventBodies) != 3 {
+		t.Fatalf("应上报 3 个激活事件，实际 %d（requests=%v）", len(eventBodies), up.requests)
 	}
-	if !strings.Contains(eventBodies[0], "app_launch") || !strings.Contains(eventBodies[1], "app_daily_active") {
-		t.Fatalf("激活事件体缺失元素名: %v", eventBodies)
+	for i, want := range []string{"app_launch", "app_daily_active", "app_login_success"} {
+		if !strings.Contains(eventBodies[i], want) {
+			t.Fatalf("第 %d 个激活事件体缺失元素名 %q: %v", i, want, eventBodies)
+		}
 	}
 	sawPreview := false
 	for i, call := range up.requests {

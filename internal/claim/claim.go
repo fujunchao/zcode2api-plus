@@ -348,7 +348,8 @@ func authHeaders(acc *model.Account) map[string]string {
 	return headers
 }
 
-// ReportActivationEvents 上报激活事件（app_launch + app_daily_active），
+// ReportActivationEvents 上报激活事件（app_launch + app_daily_active +
+// app_login_success，见 ActivationElements），
 // 返回错误文案或空串；首个失败即中止（日活键上游按 device_mid+日期去重）。
 // 事件与 billing 请求共用 Service.clientFor 的账号出站——真实客户端的
 // event/report 与 billing/preview 永远同 IP，这里是同一口径。

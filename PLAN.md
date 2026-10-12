@@ -325,9 +325,11 @@ meta(key TEXT PK, value TEXT)
   `X-Aliyun-Captcha-Verify-Param`（+ 可选 `X-Aliyun-Captcha-Verify-Region`）。
 - 业务码映射：1001 套餐不存在 / 1002 活动结束 / 1003 已领取过 / 1004 不符合条件 /
   1005 今日名额用完 / 3001 参数错误 / 3007 验证码失败（换码重试一次）/ 401 未登录。
-- 激活上报：preview 前对 `https://zcode.z.ai/api/v1/event/report` 发 `app_launch` +
-  `app_daily_active` 两事件（16 字段体，无 Authorization；疑似活动投放资格信号；失败仅记日志
-  不阻断）。device_mid 取**账号自己的指纹**（见 §5.10）。**出站走账号线路**（`Service.clientFor`，
+- 激活上报：preview 前对 `https://zcode.z.ai/api/v1/event/report` 依次发 `app_launch` +
+  `app_daily_active` + `app_login_success` 三个事件（各 16 字段体，无 Authorization；疑似活动投放
+  资格信号；失败仅记日志不阻断）。`app_login_success` 的 `event_region` 为 `app_profile`、`event_extra_detail`
+  为 `{"login_provider":"zai"}`，其余两个事件为 `app` / `{}`（2026-10-12 对照第三方实现补齐，见
+  `docs/plan-client-format-parity.md` 阶段 4）。device_mid 取**账号自己的指纹**（见 §5.10）。**出站走账号线路**（`Service.clientFor`，
   与 billing 同一出口，v2.5.1 起）：真实客户端的 event/report 与 billing/preview 永远同 IP，
   事件若用独立直连客户端，绑线路账号的同一 device_mid 会从两个 IP 出现（2026-09-23 事故：
   激活全部"成功"、preview 恒返回空套餐）。

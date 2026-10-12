@@ -91,3 +91,46 @@ func TestBuildActivationEventBodyUsesDisguiseConfig(t *testing.T) {
 		t.Fatalf("激活事件体应固定 16 个字段，实际 %d: %v", len(body), body)
 	}
 }
+
+// TestActivationElementsOrder 三个激活事件的顺序必须是官方口径：
+// app_launch → app_daily_active → app_login_success。
+// 顺序即上报顺序——首个失败会中止整轮上报（见 ReportActivationEvents）。
+func TestActivationElementsOrder(t *testing.T) {
+	want := []string{"app_launch", "app_daily_active", "app_login_success"}
+	if len(ActivationElements) != len(want) {
+		t.Fatalf("激活事件应为 %d 个，实际 %d: %v", len(want), len(ActivationElements), ActivationElements)
+	}
+	for i, w := range want {
+		if ActivationElements[i] != w {
+			t.Errorf("第 %d 个激活事件应为 %q，实际 %q", i, w, ActivationElements[i])
+		}
+	}
+}
+
+// TestBuildActivationEventBodyLoginProfile 登录事件的 event_region 与
+// event_extra_detail 与其余事件不同：前者 app_profile + login_provider，
+// 后者 app + 空对象；两者字段数都必须仍是 16（键集不随 element 变化）。
+func TestBuildActivationEventBodyLoginProfile(t *testing.T) {
+	login := BuildActivationEventBody(activationLoginElement, "u-1", "mid-1")
+	if got := login["event_region"]; got != "app_profile" {
+		t.Errorf("登录事件 event_region = %v，期望 app_profile", got)
+	}
+	detail, ok := login["event_extra_detail"].(map[string]any)
+	if !ok || detail["login_provider"] != "zai" {
+		t.Errorf("登录事件 event_extra_detail = %v，期望 login_provider=zai", login["event_extra_detail"])
+	}
+	if len(login) != 16 {
+		t.Fatalf("登录事件体应固定 16 个字段，实际 %d: %v", len(login), login)
+	}
+
+	launch := BuildActivationEventBody("app_launch", "u-1", "mid-1")
+	if got := launch["event_region"]; got != "app" {
+		t.Errorf("非登录事件 event_region = %v，期望 app", got)
+	}
+	if detail, ok := launch["event_extra_detail"].(map[string]any); !ok || len(detail) != 0 {
+		t.Errorf("非登录事件 event_extra_detail = %v，期望空对象", launch["event_extra_detail"])
+	}
+	if len(launch) != 16 {
+		t.Fatalf("非登录事件体应固定 16 个字段，实际 %d: %v", len(launch), launch)
+	}
+}
