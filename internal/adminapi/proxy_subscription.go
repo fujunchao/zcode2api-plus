@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"zcode2api/internal/proxysub"
+	"zcode2api/internal/store"
 )
 
 func (h *Handler) handleSubscription(w http.ResponseWriter, r *http.Request) {
@@ -36,9 +37,13 @@ func (h *Handler) handleSaveSubscription(w http.ResponseWriter, r *http.Request)
 	}
 	allowed := map[string]bool{"revision": true, "url": true, "clear_url": true, "auto": true, "interval_minutes": true,
 		"max_age_minutes": true, "candidates": true, "import_limit": true, "capacity": true, "concurrency": true, "budget_seconds": true, "enable_imported": true}
-	for key := range payload {
+	for key, value := range payload {
 		if !allowed[key] {
 			writeAPIError(w, errBadRequest("未知订阅配置字段"))
+			return
+		}
+		if value == nil {
+			writeAPIError(w, errBadRequest("订阅配置字段不能为 null"))
 			return
 		}
 	}
@@ -159,7 +164,7 @@ func (h *Handler) handleSubscriptionBlocks(w http.ResponseWriter, r *http.Reques
 
 func (h *Handler) handleUnblockSubscription(w http.ResponseWriter, r *http.Request) {
 	if err := h.Store.UnblockSubscription(r.PathValue("fingerprint")); err != nil {
-		if errors.Is(err, proxysub.ErrState) {
+		if !errors.Is(err, store.ErrNotFound) {
 			writeAPIError(w, &apiError{status: 500, message: "无法保存暂缓记录"})
 			return
 		}

@@ -277,7 +277,10 @@ func (s *Store) commitProxyBundleLocked(ctx context.Context, profiles []ProxyPro
 		}
 		values[proxysub.StateKey] = string(raw)
 	}
-	oldProfiles := s.listProxyProfilesLocked()
+	var oldProfiles []ProxyProfile
+	if profiles != nil {
+		oldProfiles = s.listProxyProfilesLocked()
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err

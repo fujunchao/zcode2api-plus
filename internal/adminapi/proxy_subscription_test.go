@@ -22,6 +22,7 @@ func TestSubscriptionAdminConfigContract(t *testing.T) {
 		{"revision": 0, "url": "http://user:secret@127.0.0.1:1"},
 		{"revision": 0, "concurrency": 9}, {"revision": 0, "auto": "true"}, {"revision": 0, "unknown": 1},
 		{"revision": 0, "url": ""}, {"revision": 0, "auto": true},
+		{"revision": nil}, {"revision": 0, "concurrency": nil}, {"revision": 0, "auto": nil},
 	} {
 		code, _ = do(t, mux, st, "PUT", "/admin/api/proxies/subscription", p)
 		if code != 400 {

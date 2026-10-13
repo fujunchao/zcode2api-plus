@@ -94,9 +94,64 @@ export interface ProxyProfile {
   name: string
   url: string
   enabled: boolean
+  subscription?: { source: string; fingerprint: string; imported_at: number; last_ok: number; probed_at: number; ip?: string }
   /** 線路級斷流計數（後端記憶體態，有斷流記錄時才有值）：連續 / 累計。 */
   truncate_streak?: number
   truncate_total?: number
+}
+
+export interface SubscriptionConfig {
+  revision: number
+  configured: boolean
+  source_display: string
+  auto: boolean
+  interval_minutes: number
+  max_age_minutes: number
+  candidates: number
+  import_limit: number
+  capacity: number
+  concurrency: number
+  budget_seconds: number
+  enable_imported: boolean
+}
+
+export interface SubscriptionRun {
+  id: string
+  mode: 'preview' | 'import'
+  automatic: boolean
+  status: string
+  started_at: number
+  finished_at: number
+  received: number
+  rejected: number
+  expired: number
+  existing: number
+  blocked: number
+  candidates: number
+  probed: number
+  passed: number
+  added: number
+  commit_skipped: number
+  error?: string
+  details: { fingerprint: string; endpoint: string; ok: boolean; reason: string; ms: number }[]
+}
+
+export interface SubscriptionView {
+  config: SubscriptionConfig
+  current: SubscriptionRun | null
+  last_result: SubscriptionRun | null
+  runs: SubscriptionRun[]
+  owned: number
+  next_run_at: number
+  import_paused: boolean
+  target_supported: boolean
+}
+
+export interface SubscriptionBlock {
+  fingerprint: string
+  reason: string
+  created_at: number
+  until: number
 }
 
 export interface AccountsResponse {

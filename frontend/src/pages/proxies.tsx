@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
 import { Empty, PanelCard } from '@/components/panel'
+import { ProxySubscription } from '@/components/proxy-subscription'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -291,6 +292,8 @@ export function ProxiesPage() {
         </div>
       </div>
 
+      <ProxySubscription />
+
       {/* 伺服器目前出口 */}
       <div
         aria-live="polite"
@@ -353,6 +356,9 @@ export function ProxiesPage() {
                     </span>
                     <div className="min-w-0 flex-1 leading-tight">
                       <strong className="block truncate text-sm">{p.name}</strong>
+                      {p.subscription && <small className="block text-xs text-muted-foreground" title={'导入：' + new Date(p.subscription.imported_at).toLocaleString()}>
+                        订阅来源 · 最近复检 {new Date(p.subscription.probed_at).toLocaleString()}
+                      </small>}
                       <small className="block truncate font-mono text-xs text-muted-foreground">{maskUrl(p.url)}</small>
                       {result && (
                         <em
