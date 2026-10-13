@@ -103,13 +103,8 @@ func TestModelConcurrencyAsyncDoesNotSwitchOrCool(t *testing.T) {
 	}
 }
 
-// 显式关闭静默窗口（ZCODE_RISK_SILENT_HOURS=0）时，异步路径回退纯阶梯：
-// 每档到期即重新调用。这是应急回退路径，行为与 v2.9.18 默认一致。
-func TestRiskLadderAsyncPureCoolingWhenSilentDisabled(t *testing.T) {
-	oldHours := config.RiskSilentHours
-	config.RiskSilentHours = 0
-	t.Cleanup(func() { config.RiskSilentHours = oldHours })
-
+// 异步不覆盖默认值：每档到期即重新调用，不叠加额外静默窗口。
+func TestRiskLadderAsyncDefaultCooling(t *testing.T) {
 	var calls atomic.Int32
 	p, srv, _ := newDiagnosticHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)

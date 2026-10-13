@@ -101,3 +101,26 @@ func TestLateUsageUsesSSEEventNameWhenTypeMissing(t *testing.T) {
 		t.Fatalf("event: 与 JSON type 的合法类型声明都应被识别：%+v", u.AsDict())
 	}
 }
+
+func TestBatch2UsageMultilineChunkBoundaries(t *testing.T) {
+	stream := "event:message_start\r\ndata:{\r\ndata:\"message\":{\"usage\":{\"input_tokens\":17,\"cache_read_input_tokens\":101,\"cache_creation_input_tokens\":5}}\r\ndata:}\r\n\r\n" +
+		"event:message_delta\r\ndata:{\r\ndata:\"delta\":{\"stop_reason\":\"end_turn\"},\r\ndata:\"usage\":{\"output_tokens\":7}\r\ndata:}\r\n\r\n" +
+		"event:message_stop\r\ndata:{}"
+	for _, size := range []int{1, 2, 7, len(stream)} {
+		u := NewUsageCollector(true)
+		for data := []byte(stream); len(data) > 0; {
+			n := min(size, len(data))
+			u.Feed(data[:n])
+			data = data[n:]
+		}
+		u.Finish()
+		want := model.Usage{Input: 17, Output: 7, CacheRead: 101, CacheCreation: 5}
+		if u.AsDict() != want || !u.UsageComplete() || u.StreamError() != nil {
+			t.Fatalf("任意块边界下完整事件的统计应一致：size=%d usage=%+v err=%v", size, u.AsDict(), u.StreamError())
+		}
+		u.Finish()
+		if u.AsDict() != want {
+			t.Fatal("重复收尾不得重复计量")
+		}
+	}
+}

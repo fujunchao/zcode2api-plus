@@ -783,6 +783,8 @@ func (e *Engine) deliverStream(ctx context.Context, reqID string, acc *model.Acc
 // （线上曾漏计一次 57,352 output token 的生成，详见
 // docs/analysis-flash-30min-stream-cut.md §5）。usage 不完整时仍旧不计入。
 func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Account, usage *UsageCollector, err error, diag *ReqDiag) attemptResult {
+	// 中断也须冲刷已经收齐但没有尾空行的事件；半截 JSON 不会被算成终值。
+	usage.Finish()
 	if err != nil {
 		requeststats.Fail(ctx)
 	}
@@ -824,7 +826,6 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 		}
 		return attemptResult{final: runResult{Delivered: true}}
 	}
-	usage.Finish()
 	got := e.accumulateUsage(acc, usage)
 	diag.Usage = got
 	diag.UsageComplete = usage.UsageComplete()

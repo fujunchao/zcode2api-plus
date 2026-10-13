@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"zcode2api/internal/model"
+	"zcode2api/internal/sse"
 )
 
 // UsageCollector 收集单次回應的 token 用量。
@@ -33,7 +34,7 @@ type UsageCollector struct {
 	jsonMessage   bool // JSON 是否为完整 Messages 响应；仅供恢复探测确认，不改变用量统计。
 }
 
-// NewUsageCollector 创建收集器；isSSE 决定逐行解析还是缓冲到 Finish 一次解析。
+// NewUsageCollector 创建收集器；SSE 按完整事件解析，JSON 缓冲到 Finish 一次解析。
 func NewUsageCollector(isSSE bool) *UsageCollector {
 	u := &UsageCollector{isSSE: isSSE}
 	if isSSE {
@@ -59,16 +60,18 @@ func (u *UsageCollector) Feed(chunk []byte) {
 	}
 }
 
-// FeedLine 解析一行 SSE data；供串流分块解析与 async 池逐行解析共用。
+// FeedLine 输入一行 SSE；仅在完整事件到齐时记用量，不能把 data 行当成 JSON 事件。
 func (u *UsageCollector) FeedLine(line string) {
 	if u.stream != nil {
-		u.stream.feedLine(line)
+		u.observeSSEUsage(u.stream.feedLine(line))
 	}
-	line = strings.TrimSpace(line)
-	if !strings.HasPrefix(line, "data:") {
+}
+
+func (u *UsageCollector) observeSSEUsage(frame *sse.Event) {
+	if frame == nil {
 		return
 	}
-	payloadText := strings.TrimSpace(line[len("data:"):])
+	payloadText := strings.TrimSpace(frame.Data)
 	if payloadText == "" || payloadText == "[DONE]" {
 		return
 	}
@@ -76,10 +79,10 @@ func (u *UsageCollector) FeedLine(line string) {
 	if err := json.Unmarshal([]byte(payloadText), &payload); err != nil {
 		return
 	}
-	event, _ := payload["type"].(string)
-	if event == "" && u.stream != nil {
+	event := frame.Name
+	if event == "" {
 		// 合法 SSE 也可只在 event: 声明类型；不能因 JSON 缺 type 而漏记用量。
-		event = u.stream.event
+		event, _ = payload["type"].(string)
 	}
 	switch event {
 	case "message_start":
@@ -160,7 +163,7 @@ func (u *UsageCollector) Finish() {
 			u.FeedLine(string(u.buf))
 		}
 		u.buf = nil
-		u.stream.finishEvent()
+		u.observeSSEUsage(u.stream.finishEvent())
 		return
 	}
 	var payload map[string]any

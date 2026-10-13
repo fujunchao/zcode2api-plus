@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"zcode2api/internal/sse"
 )
 
 // UpstreamErrorEvent 上游在 SSE 中正常发出的 error 事件（如 overloaded_error）。
@@ -41,32 +43,30 @@ func IsUpstreamErrorEvent(err error) bool {
 // 收到 message_stop。只观察、不改写字节，因此原生接口仍能透传正常 SSE。
 // 选号引擎与异步池都通过 UsageCollector 使用它，避免再次出现两种 EOF 判据。
 type sseState struct {
-	event   string
-	data    strings.Builder
+	decoder sse.Decoder
 	stopped bool
 	err     error
 }
 
-func (s *sseState) feedLine(line string) {
-	line = strings.TrimSuffix(line, "\r")
-	switch {
-	case line == "":
-		s.finishEvent()
-	case strings.HasPrefix(line, "event:"):
-		s.event = strings.TrimSpace(line[len("event:"):])
-	case strings.HasPrefix(line, "data:"):
-		if s.data.Len() > 0 {
-			s.data.WriteByte('\n')
-		}
-		s.data.WriteString(strings.TrimSpace(line[len("data:"):]))
-	}
+func (s *sseState) feedLine(line string) *sse.Event {
+	event := s.decoder.FeedLine(line)
+	s.observeEvent(event)
+	return event
 }
 
 // finishEvent 兼容显式 event 字段、JSON 的 type 字段以及多行 data；EOF 时也会
 // 调用一次，容忍最后一个完整事件没有尾部空行，与 OpenAI 重编码器保持一致。
-func (s *sseState) finishEvent() {
-	event, data := s.event, s.data.String()
-	s.event, s.data = "", strings.Builder{}
+func (s *sseState) finishEvent() *sse.Event {
+	event := s.decoder.Finish()
+	s.observeEvent(event)
+	return event
+}
+
+func (s *sseState) observeEvent(frame *sse.Event) {
+	if frame == nil {
+		return
+	}
+	event, data := frame.Name, strings.TrimSpace(frame.Data)
 	if data == "" || data == "[DONE]" {
 		return // [DONE] 是 OpenAI 标记，不能替代 Anthropic 的 message_stop。
 	}

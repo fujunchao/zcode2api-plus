@@ -297,6 +297,8 @@ func TestAbortedDeliveryStillCountsFinalUsage(t *testing.T) {
 
 	complete := NewUsageCollector(true)
 	complete.FeedLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}`)
+	complete.FeedLine("")
+	// 完整终值 JSON 不带尾空行，交付错误收尾仍应冲刷，不能丢失已知用量。
 	complete.FeedLine(`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}`)
 
 	// 客户端断开：请求 ctx 已结束 ⇒ 属于客户端侧，观测计数不得被污染。
@@ -313,6 +315,7 @@ func TestAbortedDeliveryStillCountsFinalUsage(t *testing.T) {
 	// 反例：流在半途断掉（只有中途的 usage 更新、没有 stop_reason）时不得记半截数字。
 	partial := NewUsageCollector(true)
 	partial.FeedLine(`data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}`)
+	partial.FeedLine("")
 	partial.FeedLine(`data: {"type":"message_delta","usage":{"output_tokens":17}}`)
 	if res := f.eng.finishDelivery(context.Background(), "t2", acc, partial, errors.New("上游串流在 message_stop 之前结束: unexpected EOF"), nil); !res.final.Delivered {
 		t.Fatal("交付中断仍应记为 Delivered")

@@ -1,6 +1,6 @@
 // 风控保护按账号阶梯冷却；同请求达到不同账号阈值后停止换号并启用重放保护。
-// 阈值仅限制进一步尝试，不诊断供应商的触发原因。默认在阶梯冷却之外叠加
-// 24h 静默隔离（config.RiskSilentHours），窗口内的账号不参与选号；
+// 阈值仅限制进一步尝试，不诊断供应商的触发原因。默认只按阶梯冷却；显式开启
+// 额外静默隔离（config.RiskSilentHours）时，窗口内的账号不参与选号；
 // 代理失败历史不等于账号封禁次数。
 package gateway
 
@@ -73,7 +73,7 @@ func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, no
 	_, _ = st.Update(snapshot.Provider, snapshot.ID, func(acc *model.Account) {
 		acc.RiskControlStreak++
 		streak = acc.RiskControlStreak
-		// 持久化观测时间；默认在阶梯冷却之外叠加 RiskSilentHours（默认 24h）静默隔离。
+		// 保留观测历史；只有显式配置 RiskSilentHours > 0 时才额外叠加静默隔离。
 		nowF := float64(now.UnixNano()) / 1e9
 		acc.LastRiskControlAt = &nowF
 		secs, invalid = riskControlCoolingSeconds(st, streak)

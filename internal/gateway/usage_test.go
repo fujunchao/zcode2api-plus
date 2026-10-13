@@ -8,11 +8,11 @@ import (
 
 func TestUsageCollectorSSE(t *testing.T) {
 	u := NewUsageCollector(true)
-	u.Feed([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":5}}}` + "\n"))
+	u.Feed([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":5}}}` + "\n\n"))
 	// 故意把一行拆到两个 Feed，验证跨块缓冲
-	u.Feed([]byte(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}` + "\n" + `data: {"type":"message_delta","us`))
-	u.Feed([]byte(`age":{"output_tokens":22}}` + "\n"))
-	u.Feed([]byte(`data: {"type":"message_delta","usage":{"output_tokens":30}}` + "\n" + "data: [DONE]\n\n"))
+	u.Feed([]byte(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}` + "\n\n" + `data: {"type":"message_delta","us`))
+	u.Feed([]byte(`age":{"output_tokens":22}}` + "\n\n"))
+	u.Feed([]byte(`data: {"type":"message_delta","usage":{"output_tokens":30}}` + "\n\n" + "data: [DONE]\n\n"))
 	u.Finish()
 
 	got := u.AsDict()
@@ -82,7 +82,9 @@ func TestUsageCollectorUsageComplete(t *testing.T) {
 	t.Run("中途的 usage 更新不算终值", func(t *testing.T) {
 		u := NewUsageCollector(true)
 		u.FeedLine(start)
+		u.FeedLine("")
 		u.FeedLine(`data: {"type":"message_delta","usage":{"output_tokens":17}}`)
+		u.FeedLine("")
 		if u.UsageComplete() {
 			t.Fatal("没有 stop_reason 的 message_delta 不应判为终值")
 		}
@@ -91,7 +93,9 @@ func TestUsageCollectorUsageComplete(t *testing.T) {
 	t.Run("只有 stop_reason 没有 usage 不算终值", func(t *testing.T) {
 		u := NewUsageCollector(true)
 		u.FeedLine(start)
+		u.FeedLine("")
 		u.FeedLine(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`)
+		u.FeedLine("")
 		if u.UsageComplete() {
 			t.Fatal("usage 缺失时不应判为终值（会把 output 记成 0）")
 		}
@@ -100,7 +104,12 @@ func TestUsageCollectorUsageComplete(t *testing.T) {
 	t.Run("stop_reason 与 usage 齐备即终值", func(t *testing.T) {
 		u := NewUsageCollector(true)
 		u.FeedLine(start)
+		u.FeedLine("")
 		u.FeedLine(final)
+		if u.UsageComplete() {
+			t.Fatal("尚未到事件边界，不能提前把单个 data 行判为终值")
+		}
+		u.FeedLine("")
 		if !u.UsageComplete() {
 			t.Fatal("stop_reason + output_tokens 应判为终值")
 		}

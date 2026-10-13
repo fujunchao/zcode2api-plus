@@ -63,6 +63,8 @@ test('单号恢复只说明本地策略，不声称上游封禁期限', async ()
   const dialog = await screen.findByRole('alertdialog')
   expect(dialog.textContent).toContain('仅修改本地状态，不保证上游接受请求')
   expect(dialog.textContent).not.toContain('預設 24 小時')
+  expect(dialog.textContent).not.toContain('默认 24 小时')
+  expect(dialog.textContent).toContain('显式开启额外静默窗口')
   expect(dialog.textContent).not.toContain('≥14 小時')
   expect(dialog.textContent).toContain('最近風控')
   fireEvent.click(within(dialog).getByRole('button', { name: '確認恢復', exact: true }))
@@ -89,6 +91,8 @@ test('批量恢復：勾選後對所選集合調用批量端點', async () => {
   fireEvent.click(screen.getByRole('checkbox', { name: '選取 風控號' }))
   fireEvent.click(await screen.findByRole('button', { name: /批量恢復/ }))
   const dialog = await screen.findByRole('alertdialog')
+  expect(dialog.textContent).not.toContain('默认 24 小时')
+  expect(dialog.textContent).toContain('显式开启额外静默窗口')
   fireEvent.click(within(dialog).getByRole('button', { name: '確認恢復', exact: true }))
   await waitFor(() =>
     expect(mock.api).toHaveBeenCalledWith('POST', '/accounts/batch/recover', { ids: ['risk'], missing_ok: true }),

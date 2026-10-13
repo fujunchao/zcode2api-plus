@@ -26,6 +26,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/requeststats"
+	"zcode2api/internal/sse"
 	"zcode2api/internal/store"
 	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
@@ -967,7 +968,38 @@ func (p *Pool) bumpFail(acc *model.Account, kind string) {
 // 所以这两个指标必须在各自路径上单独采集。
 func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Response, acc *model.Account, diag *gateway.ReqDiag) (bool, error) {
 	usage := gateway.NewUsageCollector(true)
+	var decoder sse.Decoder
 	chunksSent := 0
+	// 转发与用量统计共用成帧规则，各自处理完整事件，不再逐 data 行解码。
+	forwardEvent := func(event *sse.Event) bool {
+		if event == nil || strings.TrimSpace(event.Data) == "" || strings.TrimSpace(event.Data) == "[DONE]" {
+			return true
+		}
+		var payload any
+		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+			return true // 同一事件的协议错误由 UsageCollector 统一记录。
+		}
+		if object, ok := payload.(map[string]any); ok && object != nil && event.Name != "" {
+			if kind, _ := object["type"].(string); kind == "" {
+				// ticket chunk 不携带原 event 行；补上缺失的有效 type，避免丢失语义。
+				object["type"] = event.Name
+			}
+		}
+		if !p.emit(ctx, ticketID, ticketEvent{Type: "chunk", Data: payload}) {
+			return false
+		}
+		chunksSent++
+		return true
+	}
+	consumerGone := func() (bool, error) {
+		p.accumulateFinalUsage(ticketID, acc, usage)
+		if diag != nil {
+			diag.Usage = usage.AsDict()
+			diag.UsageComplete = usage.UsageComplete()
+			diag.ErrText = fmt.Sprintf("consumer gone: %v", ctx.Err())
+		}
+		return false, ctx.Err()
+	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -977,30 +1009,14 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 			// scanner.Text() 去掉了换行符，补 1 让字节数与「上游实际发出的量」同量级。
 			diag.MarkRead(diag.Now(), len(line)+1)
 		}
-		if !strings.HasPrefix(line, "data: ") {
-			continue
+		if !forwardEvent(decoder.FeedLine(line)) {
+			return consumerGone()
 		}
-		chunkData := line[len("data: "):]
-		if strings.TrimSpace(chunkData) == "[DONE]" {
-			continue
-		}
-		var payload any
-		if err := json.Unmarshal([]byte(chunkData), &payload); err != nil {
-			continue
-		}
-		if !p.emit(ctx, ticketID, ticketEvent{Type: "chunk", Data: payload}) {
-			// 消费者提前断开（票务被释放）：上游若已交出终值，这笔用量仍要计入
-			p.accumulateFinalUsage(ticketID, acc, usage)
-			if diag != nil {
-				diag.Usage = usage.AsDict()
-				diag.UsageComplete = usage.UsageComplete()
-				diag.ErrText = fmt.Sprintf("consumer gone: %v", ctx.Err())
-			}
-			return false, ctx.Err()
-		}
-		chunksSent++
 	}
 	usage.Finish()
+	if !forwardEvent(decoder.Finish()) {
+		return consumerGone()
+	}
 	streamErr := scanner.Err()
 	if streamErr == nil {
 		streamErr = usage.StreamError()
@@ -1076,10 +1092,10 @@ func (p *Pool) fireQuotaRefresh(acc *model.Account) {
 // 不会重复计数：两个中断出口都走向终止（消费者断开由调用方按 ctx.Err 直接 return；
 // needChunks 场景返回 midStream=true 后不换号重发），不存在「记一次又重试成功再记一次」。
 func (p *Pool) accumulateFinalUsage(ticketID string, acc *model.Account, usage *gateway.UsageCollector) {
+	usage.Finish()
 	if !usage.UsageComplete() {
 		return
 	}
-	usage.Finish()
 	got := usage.AsDict()
 	if _, err := p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
 		live.AccumulateTokens(got)

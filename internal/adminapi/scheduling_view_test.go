@@ -51,7 +51,7 @@ func TestAccountSchedulingViewMatchesLocalPolicy(t *testing.T) {
 
 // 人工恢复与静默窗口的联动：窗口内恢复转保护冷却、不直接放回轮转；
 // 显式关闭（0）时恢复直接解除并立即参与调度。默认窗口值由 gateway 包的
-// TestDefaultRiskSilentHoursIs24 锁定，本用例只覆盖两种显式配置。
+// TestDefaultRiskSilentHoursUsesLadder 锁定，本用例保留两种显式配置的精确断言。
 func TestManualRecoveryRespectsSilentWindow(t *testing.T) {
 	for _, hours := range []int{0, 24} {
 		t.Run(time.Duration(hours).String(), func(t *testing.T) {
