@@ -167,8 +167,8 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 		b, blocked := state.Blocks[a.Key]
 		if e != nil || proxysub.Fingerprint(endpoint) != a.Key || keys[a.Key] ||
 			(blocked && b.Active(now)) || owned >= c.Capacity || r.Added >= c.ImportLimit ||
-			!proxysub.Fresh(a.LastOK, now, c.MaxAgeMinutes) || !proxysub.Fresh(a.ProbedAt, now, 5) ||
-			a.Streak < 2 || len(state.Blocks)+owned >= proxysub.MaxBlocks {
+			!proxysub.FreshLocalProbe(a.ProbedAt, now) ||
+			len(state.Blocks)+owned >= proxysub.MaxBlocks {
 			r.CommitSkipped++
 			continue
 		}

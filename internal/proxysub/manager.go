@@ -178,7 +178,7 @@ func (m *Manager) Launch(mode string, automatic bool) (Run, error) {
 	if s.State.ImportPaused && mode == "import" {
 		return Run{}, errors.New("禁止记录达到预算，已闭锁导入，请检查订阅状态")
 	}
-	r := Run{ID: config.NewUUIDv4(), Revision: c.Revision, Mode: mode, Automatic: automatic, Status: "fetching", StartedAt: m.now().UnixMilli(), Details: []Detail{}}
+	r := Run{ID: config.NewUUIDv4(), Revision: c.Revision, Mode: mode, Automatic: automatic, Status: "fetching", HistoryPolicy: HistoryReferenceOnly, StartedAt: m.now().UnixMilli(), Details: []Detail{}}
 	if err = m.repo.BeginSubscriptionRun(r); err != nil {
 		return Run{}, ErrState
 	}

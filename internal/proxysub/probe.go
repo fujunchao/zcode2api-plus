@@ -53,7 +53,7 @@ func fetch(ctx context.Context, endpoint string) ([]byte, error) {
 }
 
 // Parse 保留逐条拒绝计数，但结构/大小越界拒绝整批，绝不退回 TXT 导入。
-func Parse(data []byte, c Config, now time.Time) ([]Candidate, Run, error) {
+func Parse(data []byte, _ Config, now time.Time) ([]Candidate, Run, error) {
 	report := Run{}
 	if len(data) > MaxResponse {
 		return nil, report, errors.New("订阅超过大小限制")
@@ -74,19 +74,15 @@ func Parse(data []byte, c Config, now time.Time) ([]Candidate, Run, error) {
 			Target   string          `json:"target_profile"`
 			Usable   bool            `json:"usable"`
 			Aux      map[string]bool `json:"aux_reachable"`
-			Streak   int             `json:"pass_streak"`
+			Streak   json.RawMessage `json:"pass_streak"`
 			Failures int             `json:"fail_count"`
-			LastOK   int64           `json:"last_ok"`
+			LastOK   json.RawMessage `json:"last_ok"`
 			IP       string          `json:"ip"`
 			Shared   bool            `json:"ip_shared"`
 			Latency  float64         `json:"latency"`
 		}
-		if json.Unmarshal(row, &item) != nil || item.Target != "zai" || !item.Usable || !item.Aux["zcode"] || item.Streak < 2 || item.Failures != 0 {
+		if json.Unmarshal(row, &item) != nil || item.Target != "zai" || !item.Usable || !item.Aux["zcode"] || item.Failures != 0 {
 			report.Rejected++
-			continue
-		}
-		if !Fresh(item.LastOK, now, c.MaxAgeMinutes) {
-			report.Expired++
 			continue
 		}
 		endpoint, err := PublicEndpoint(item.Proxy)
@@ -104,7 +100,13 @@ func Parse(data []byte, c Config, now time.Time) ([]Candidate, Run, error) {
 		if parsed, err := netip.ParseAddr(item.IP); err == nil {
 			ip = parsed.Unmap().String()
 		}
-		out = append(out, Candidate{URL: endpoint, Key: key, LastOK: item.LastOK, Streak: item.Streak, IP: ip, Shared: item.Shared, Latency: int64(item.Latency)})
+		// 外部历史只影响排序：缺失、异常或旧记录不能阻止当次本机复检。
+		lastOK := historyNumber(item.LastOK)
+		if lastOK < 946684800000 || lastOK > now.Add(5*time.Minute).UnixMilli() {
+			// 秒单位/明显异常/未来时间降为未知，不猜测转换，也不给排序优势。
+			lastOK = 0
+		}
+		out = append(out, Candidate{URL: endpoint, Key: key, LastOK: lastOK, Streak: int(historyNumber(item.Streak)), IP: ip, Shared: item.Shared, Latency: int64(item.Latency)})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].LastOK != out[j].LastOK {
@@ -119,6 +121,14 @@ func Parse(data []byte, c Config, now time.Time) ([]Candidate, Run, error) {
 		return out[i].Key < out[j].Key
 	})
 	return out, report, nil
+}
+
+func historyNumber(raw json.RawMessage) int64 {
+	var value int64
+	if json.Unmarshal(raw, &value) != nil || value < 0 {
+		return 0
+	}
+	return value
 }
 
 func TargetSupported() bool {

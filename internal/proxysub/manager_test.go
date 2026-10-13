@@ -103,6 +103,9 @@ func TestSubscriptionManagerPreviewAndImport(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := awaitRun(t, repo)
+		if r.HistoryPolicy != HistoryReferenceOnly {
+			t.Fatal("新任务必须记录历史仅参考策略")
+		}
 		if r.Status != "completed" || r.Passed < 10 || r.Probed > 13 {
 			t.Fatalf("工作队列未按需停止: %+v", r)
 		}
@@ -218,5 +221,45 @@ func TestSubscriptionManagerAdvancesCandidates(t *testing.T) {
 	}
 	if len(keys) != 6 {
 		t.Fatal("候选未推进")
+	}
+}
+
+func TestSubscriptionOldHistoryStillRequiresLiveHTTPProbe(t *testing.T) {
+	m, repo := testManager(t, 0)
+	rows := []any{}
+	for i := range 3 {
+		row := fixture(fmt.Sprintf("http://8.8.8.8:%d", 8080+i), time.Now().Add(-48*time.Hour))
+		row["pass_streak"] = 1
+		rows = append(rows, row)
+	}
+	raw, _ := json.Marshal(rows)
+	m.fetch = func(context.Context, string) ([]byte, error) { return raw, nil }
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Header.Get("Authorization") != "" {
+			t.Error("探测不应携带账号凭据")
+		}
+		if r.URL.Path != "/pass" {
+			w.WriteHeader(405)
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"providers":[{"id":"synthetic"}]}}`))
+	}))
+	defer server.Close()
+	m.probe = func(ctx context.Context, c Candidate) Detail {
+		path := "/fail"
+		if c.URL == "http://8.8.8.8:8080" {
+			path = "/pass"
+		}
+		ok, reason := probeConfig(ctx, server.Client(), server.URL+path)
+		return Detail{Key: c.Key, Endpoint: c.URL, OK: ok, Reason: reason}
+	}
+	if _, err := m.Launch("import", false); err != nil {
+		t.Fatal(err)
+	}
+	r := awaitRun(t, repo)
+	if r.Status != "completed" || r.Candidates != 3 || r.Probed != 3 || r.Passed != 1 || r.Added != 1 || r.Expired != 0 || requests.Load() != 3 {
+		t.Fatalf("历史合格不能绕过当前 HTTP 复检: %+v requests=%d", r, requests.Load())
 	}
 }

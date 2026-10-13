@@ -106,7 +106,8 @@ export interface SubscriptionConfig {
   source_display: string
   auto: boolean
   interval_minutes: number
-  max_age_minutes: number
+  /** 兼容旧版接口的无效字段，新界面不再展示或提交。 */
+  max_age_minutes?: number
   candidates: number
   import_limit: number
   capacity: number
@@ -120,6 +121,7 @@ export interface SubscriptionRun {
   mode: 'preview' | 'import'
   automatic: boolean
   status: string
+  history_policy?: string
   started_at: number
   finished_at: number
   received: number

@@ -52,6 +52,8 @@ test('收起时不发请求，配置默认关闭且保存不回传隐藏地址',
   expect(payload).not.toHaveProperty('source_display')
   expect(screen.queryByLabelText('结果有效期（分钟）')).toBeNull()
   expect(payload).not.toHaveProperty('max_age_minutes')
+  expect(screen.getByText(/历史成功时间和连续次数仅供排序参考/)).toBeTruthy()
+  expect(screen.getByLabelText('任务预算（秒）')).toBeTruthy()
   client.clear()
 })
 
@@ -91,5 +93,17 @@ test('清空地址必须显式选择，保存时不附加旧 URL', async () => {
   fireEvent.submit(screen.getByRole('form', { name: '订阅配置' }))
   await waitFor(() => expect(mock.api).toHaveBeenCalledWith('PUT', '/proxies/subscription',
     expect.objectContaining({ clear_url: true, auto: false })))
+  client.clear()
+})
+
+test('旧任务保留原拒绝统计，新任务不再显示历史过期计数', async () => {
+  const d = view()
+  d.last_result = { ...run(), status: 'completed', finished_at: 1791892316000, rejected: 211, expired: 110 }
+  const client = mount(d)
+  fireEvent.click(screen.getByRole('button', { name: '配置自动补充' }))
+  expect(await screen.findByText(/旧规则历史过期 110/)).toBeTruthy()
+  client.setQueryData(['proxy-subscription'], { ...d, last_result: { ...d.last_result, id: 'new-run', history_policy: 'reference_only', rejected: 0, expired: 0 } })
+  await waitFor(() => expect(screen.queryByText(/旧规则历史过期/)).toBeNull())
+  expect(screen.getByText(/格式／目标拒绝 0/)).toBeTruthy()
   client.clear()
 })

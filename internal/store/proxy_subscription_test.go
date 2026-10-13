@@ -79,7 +79,7 @@ func TestSubscriptionImportIdempotentAndIsolated(t *testing.T) {
 }
 
 func TestSubscriptionCommitRechecksChanges(t *testing.T) {
-	for _, change := range []string{"revision", "manual", "capacity", "cancel", "expired", "preview"} {
+	for _, change := range []string{"revision", "manual", "capacity", "cancel", "stale-local-probe", "preview"} {
 		t.Run(change, func(t *testing.T) {
 			s := newTestStore(t)
 			c := subscriptionFixture(t, s)
@@ -103,8 +103,8 @@ func TestSubscriptionCommitRechecksChanges(t *testing.T) {
 				_, _ = s.FinishSubscriptionRun(ctx, other, []proxysub.Candidate{subscriptionCandidate(2)})
 			case "cancel":
 				cancel()
-			case "expired":
-				a.LastOK = time.Now().Add(-3 * time.Hour).UnixMilli()
+			case "stale-local-probe":
+				a.ProbedAt = time.Now().Add(-3 * time.Hour).UnixMilli()
 			case "preview":
 				r.Mode = "preview"
 			}

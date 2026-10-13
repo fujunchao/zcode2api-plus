@@ -103,7 +103,7 @@ function SubscriptionContent() {
       {d.current && <Button variant="outline" size="sm" disabled={acting} onClick={() => void cancel(d.current!.id)}>取消当前任务</Button>}
       <Button variant="ghost" size="sm" onClick={refresh}><RefreshCw className="size-3.5" />刷新状态</Button>
     </div>
-    <p className="text-xs text-muted-foreground">复检只验证配置入口，不使用账号凭据，不证明模型业务成功或不会触发 405。修改配置会取消当前任务。</p>
+    <p className="text-xs text-muted-foreground">历史成功时间和连续次数仅供排序参考，不再作为入库门槛。必须通过本次配置入口复检；不使用账号凭据，不保证模型业务成功或不会触发 405。修改配置会取消当前任务。</p>
     {selected ? <RunResult run={selected} /> : <p className="text-sm text-muted-foreground">尚无任务。保存 JSON 订阅地址后，建议先执行预览。</p>}
     <details className="border-t pt-3">
       <summary className="cursor-pointer text-sm">同步历史（最近 {d.runs.length} 轮）</summary>
@@ -143,7 +143,7 @@ function ConfigEditor({ initial, onSaved }: { initial: SubscriptionConfig; onSav
   async function save(e: FormEvent) {
     e.preventDefault()
     setSaving(true)
-    const { configured: _configured, source_display: _display, ...values } = c
+    const { configured: _configured, source_display: _display, max_age_minutes: _legacyAge, ...values } = c
     try {
       await api('PUT', base, { ...values, ...(clear ? { clear_url: true } : url.trim() ? { url: url.trim() } : {}) })
       toast.success('订阅配置已保存')
@@ -151,9 +151,8 @@ function ConfigEditor({ initial, onSaved }: { initial: SubscriptionConfig; onSav
     } catch (error) { toast.error(errMsg(error)) }
     finally { setSaving(false) }
   }
-  const numbers: { key: 'interval_minutes' | 'max_age_minutes' | 'candidates' | 'import_limit' | 'capacity' | 'concurrency' | 'budget_seconds'; label: string; min: number; max: number }[] = [
+  const numbers: { key: 'interval_minutes' | 'candidates' | 'import_limit' | 'capacity' | 'concurrency' | 'budget_seconds'; label: string; min: number; max: number }[] = [
     { key: 'interval_minutes', label: '同步间隔（分钟）', min: 5, max: 1440 },
-    { key: 'max_age_minutes', label: '结果有效期（分钟）', min: 5, max: 1440 },
     { key: 'candidates', label: '每轮复检上限', min: 1, max: 500 },
     { key: 'import_limit', label: '每轮新增上限', min: 1, max: 100 },
     { key: 'capacity', label: '来源池容量', min: 1, max: 500 },
@@ -184,13 +183,17 @@ function ConfigEditor({ initial, onSaved }: { initial: SubscriptionConfig; onSav
 }
 
 function RunResult({ run: r }: { run: SubscriptionRun }) {
+  const legacy = r.history_policy !== 'reference_only'
   return <div className="mt-3 rounded-lg border p-3 text-xs" aria-live="polite">
     <p className="font-medium">{r.mode === 'preview' ? '预览' : '导入'} · {statusLabels[r.status] ?? r.status}{r.automatic ? ' · 定时任务' : ''}</p>
     <p className="mt-1 text-muted-foreground">{timeText(r.started_at)}{r.finished_at ? ' → ' + timeText(r.finished_at) : ''}</p>
     <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 font-mono tabular-nums">
       <span>收到 {r.received}</span><span>候选 {r.candidates}</span><span>已复检 {r.probed}</span><span>通过 {r.passed}</span><strong>新增 {r.added}</strong>
     </div>
-    <p className="mt-2 text-muted-foreground">格式／门槛拒绝 {r.rejected} · 过期 {r.expired} · 已有／重复 {r.existing} · 暂缓 {r.blocked} · 提交跳过 {r.commit_skipped}</p>
+    <p className="mt-2 text-muted-foreground">{legacy ? '旧规则格式／门槛拒绝' : '格式／目标拒绝'} {r.rejected}
+      {legacy && r.expired > 0 ? ' · 旧规则历史过期 ' + r.expired : ''}
+      {' · 已有／重复 ' + r.existing + ' · 暂缓 ' + r.blocked + ' · 提交跳过 ' + r.commit_skipped}
+    </p>
     {r.error && <p role="alert" className="mt-2 text-destructive">{r.error}</p>}
     {!!r.details?.length && <details className="mt-3">
       <summary className="cursor-pointer">查看复检明细（最多 50 条）</summary>

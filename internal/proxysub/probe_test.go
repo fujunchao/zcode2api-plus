@@ -26,12 +26,12 @@ func TestSubscriptionContract(t *testing.T) {
 		{"不同档位", func(x map[string]any) { x["target_profile"] = "generic" }, 0, 0},
 		{"错误布尔", func(x map[string]any) { x["usable"] = "true" }, 0, 0},
 		{"未达标", func(x map[string]any) { x["aux_reachable"] = map[string]bool{"zcode": false} }, 0, 0},
-		{"一次成功", func(x map[string]any) { x["pass_streak"] = 1 }, 0, 0},
+		{"一次成功", func(x map[string]any) { x["pass_streak"] = 1 }, 1, 0},
 		{"失败记录", func(x map[string]any) { x["fail_count"] = 1 }, 0, 0},
-		{"秒时间戳", func(x map[string]any) { x["last_ok"] = now.Unix() }, 0, 1},
-		{"过期", func(x map[string]any) { x["last_ok"] = now.Add(-3 * time.Hour).UnixMilli() }, 0, 1},
-		{"未来", func(x map[string]any) { x["last_ok"] = now.Add(6 * time.Minute).UnixMilli() }, 0, 1},
-		{"缺时间", func(x map[string]any) { delete(x, "last_ok") }, 0, 1},
+		{"秒时间戳", func(x map[string]any) { x["last_ok"] = now.Unix() }, 1, 0},
+		{"过期", func(x map[string]any) { x["last_ok"] = now.Add(-3 * time.Hour).UnixMilli() }, 1, 0},
+		{"未来", func(x map[string]any) { x["last_ok"] = now.Add(6 * time.Minute).UnixMilli() }, 1, 0},
+		{"缺时间", func(x map[string]any) { delete(x, "last_ok") }, 1, 0},
 		{"未知字段", func(x map[string]any) { x["future_field"] = true }, 1, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -15,13 +15,14 @@ import (
 )
 
 const (
-	StateKey    = "proxy_subscription_v1"
-	SourceID    = "proxy-checker"
-	MaxResponse = 2 << 20
-	MaxItems    = 1000
-	MaxHistory  = 50
-	MaxBlocks   = 2000
-	ProbeTarget = "https://zcode.z.ai/api/v1/client/configs"
+	StateKey             = "proxy_subscription_v1"
+	SourceID             = "proxy-checker"
+	MaxResponse          = 2 << 20
+	MaxItems             = 1000
+	MaxHistory           = 50
+	MaxBlocks            = 2000
+	ProbeTarget          = "https://zcode.z.ai/api/v1/client/configs"
+	HistoryReferenceOnly = "reference_only"
 )
 
 var (
@@ -35,13 +36,14 @@ type Config struct {
 	URL             string `json:"url"`
 	Auto            bool   `json:"auto"`
 	IntervalMinutes int    `json:"interval_minutes"`
-	MaxAgeMinutes   int    `json:"max_age_minutes"`
-	Candidates      int    `json:"candidates"`
-	ImportLimit     int    `json:"import_limit"`
-	Capacity        int    `json:"capacity"`
-	Concurrency     int    `json:"concurrency"`
-	BudgetSeconds   int    `json:"budget_seconds"`
-	EnableImported  bool   `json:"enable_imported"`
+	// Deprecated: 仅保留 v2.10.2 配置/客户端格式兼容，不参与筛选、排序或提交判定。
+	MaxAgeMinutes  int  `json:"max_age_minutes"`
+	Candidates     int  `json:"candidates"`
+	ImportLimit    int  `json:"import_limit"`
+	Capacity       int  `json:"capacity"`
+	Concurrency    int  `json:"concurrency"`
+	BudgetSeconds  int  `json:"budget_seconds"`
+	EnableImported bool `json:"enable_imported"`
 }
 
 func DefaultConfig() Config {
@@ -134,6 +136,7 @@ type Run struct {
 	Mode          string   `json:"mode"`
 	Automatic     bool     `json:"automatic"`
 	Status        string   `json:"status"`
+	HistoryPolicy string   `json:"history_policy,omitempty"`
 	StartedAt     int64    `json:"started_at"`
 	FinishedAt    int64    `json:"finished_at"`
 	Error         string   `json:"error,omitempty"`
@@ -257,6 +260,7 @@ func PublicEndpoint(raw string) (string, error) {
 	return canonical, nil
 }
 
-func Fresh(ms int64, now time.Time, minutes int) bool {
-	return ms > 0 && ms >= now.Add(-time.Duration(minutes)*time.Minute).UnixMilli() && ms <= now.Add(5*time.Minute).UnixMilli()
+// FreshLocalProbe 只约束本机复检结果的提交时效，不检查 PRX 的历史成功时间。
+func FreshLocalProbe(ms int64, now time.Time) bool {
+	return ms > 0 && ms >= now.Add(-5*time.Minute).UnixMilli() && ms <= now.Add(5*time.Minute).UnixMilli()
 }

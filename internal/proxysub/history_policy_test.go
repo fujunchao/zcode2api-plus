@@ -46,5 +46,30 @@ func TestSubscriptionHistoryMetadataIsOptional(t *testing.T) {
 		if err != nil || len(got) != 1 || report.Rejected != 0 || report.Expired != 0 {
 			t.Fatalf("参考信息不能当成硬门槛：候选=%d report=%+v err=%v", len(got), report, err)
 		}
+		if got[0].LastOK != 0 || got[0].Streak != 0 {
+			t.Fatal("异常历史应降为未知，不能取得额外排序优势")
+		}
+	}
+}
+
+func TestSubscriptionHistoryOnlyOrdersCandidates(t *testing.T) {
+	now := time.Now()
+	recent := fixture("http://8.8.8.8:8080", now.Add(-time.Hour))
+	recent["pass_streak"] = 1
+	repeated := fixture("http://8.8.8.8:8081", now.Add(-time.Hour))
+	repeated["pass_streak"] = 3
+	old := fixture("http://8.8.8.8:8082", now.Add(-48*time.Hour))
+	old["pass_streak"] = 1
+	future := fixture("http://8.8.8.8:8083", now.Add(time.Hour))
+	future["pass_streak"] = 999
+	raw, _ := json.Marshal([]any{future, old, recent, repeated})
+	got, _, err := Parse(raw, DefaultConfig(), now)
+	if err != nil || len(got) != 4 {
+		t.Fatalf("候选被历史过滤: %v", err)
+	}
+	for i, want := range []string{"http://8.8.8.8:8081", "http://8.8.8.8:8080", "http://8.8.8.8:8082", "http://8.8.8.8:8083"} {
+		if got[i].URL != want {
+			t.Fatalf("排序 %d: %s != %s", i, got[i].URL, want)
+		}
 	}
 }
