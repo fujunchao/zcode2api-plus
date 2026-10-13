@@ -1007,7 +1007,7 @@ func Test405HotAccountSkippedInAsyncPool(t *testing.T) {
 	if errObj == nil || errObj["type"] != "no_account" {
 		t.Fatalf("池子耗尽应投递 no_account（而非请求级/重放封锁）: %v", events)
 	}
-	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "額外本地風控隔離") || strings.Contains(msg, "上游標記未解除") {
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "本地風控靜默隔離") || strings.Contains(msg, "上游標記未解除") {
 		t.Fatalf("no_account 应说明本地策略，不能声称上游封禁: %q", errObj["message"])
 	}
 	gotClean := st.FindAny(clean.ID)

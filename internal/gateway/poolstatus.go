@@ -73,7 +73,7 @@ func PoolStatusText(stat store.PoolStat) string {
 		parts = append(parts, head)
 	}
 	if stat.RiskSilent > 0 {
-		parts = append(parts, fmt.Sprintf("%d 帳號處於額外本地風控隔離（依配置計時，非上游封禁確認）", stat.RiskSilent))
+		parts = append(parts, fmt.Sprintf("%d 帳號處於本地風控靜默隔離（依配置計時，非上游封禁確認）", stat.RiskSilent))
 	}
 	if stat.Exhausted > 0 {
 		parts = append(parts, fmt.Sprintf("%d 帳號全部額度已用完", stat.Exhausted))

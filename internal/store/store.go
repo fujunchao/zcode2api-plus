@@ -1425,7 +1425,7 @@ func (s *Store) ResetTokenStats(provider, idOrName string) (bool, error) {
 // 就是老计数 + 1，会立刻又判失效，等于人工修复无效。
 //
 // 默认恢复直接解除本地失效与冷却，保留历史观测时间。
-// 只有管理员显式开启额外隔离且窗口未过时才转保护冷却；不是上游解封判定。
+// 静默窗口（RiskSilentHours，默认24h）未过时转保护冷却；不是上游解封判定。
 //
 // 调用方必须已确认 model.IsRiskControlInvalid(acc)：本函数只做字段转移、不做守卫，
 // 守卫在各自入口的锁内完成（单账号 RecoverAccount / 批量 BatchRecoverAccounts）。
@@ -1446,7 +1446,7 @@ func applyRecovered(acc *model.Account, now time.Time) {
 	acc.Status = model.StatusCooling
 	acc.CoolingUntil = until
 	kind := model.ErrorKindRiskControl
-	note := "已手动恢复；已启用额外本地隔离，保护冷却中，到期重新评估调度"
+	note := "已手动恢复；处于本地风控静默隔离，保护冷却中，到期重新评估调度"
 	ts := float64(now.UnixNano()) / 1e9
 	acc.LastErrorKind = &kind
 	acc.LastError = &note
@@ -1567,8 +1567,8 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 // Select 按模型额度优先、并列时轮询的方式选择账号。
 //
 // 选号分五层，前一层筛出的池子决定后一层的作用范围：
-//  1. 可选：状态可调度、未被本请求跳过；显式配置的额外本地隔离为附加门槛。
-//     默认额外窗口为0，原阶梯冷却到期即重新候选；历史时间本身不排除账号。
+//  1. 可选：状态可调度、未被本请求跳过；风控静默隔离（RiskSilentHours，
+//     默认24h）为附加门槛，窗口内账号即使冷却到期也不重新候选。
 //  2. 模型分档：该模型 available 者优先，其次 unknown；absent/exhausted 一律排除；
 //  3. 优惠优先：持有未耗尽的一次性优惠额度（one_time）者优先——这类额度不用就过期，
 //     与「谁剩得多」是两回事，故独立成层；

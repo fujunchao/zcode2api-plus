@@ -454,7 +454,7 @@ func (s *Store) BatchRecoverAccounts(ids []string, missingOK bool) (BatchResult,
 			res.IDs = append(res.IDs, acc.ID)
 			msg := ""
 			if until := acc.RiskControlSilentUntil(config.RiskSilentWindow()); until != nil && *until > nowF {
-				msg = fmt.Sprintf("已恢复；额外本地隔离已启用，保护冷却至 %s",
+				msg = fmt.Sprintf("已恢复；处于本地风控静默隔离，保护冷却至 %s",
 					time.Unix(int64(*until), 0).Format("01-02 15:04"))
 			}
 			res.Items = append(res.Items, BatchItemResult{Index: i, ID: acc.ID, Name: acc.Name, Status: BatchStatusOK, Message: msg})

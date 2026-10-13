@@ -1,6 +1,7 @@
 // 风控保护按账号阶梯冷却；同请求达到不同账号阈值后停止换号并启用重放保护。
-// 阈值仅限制进一步尝试，不诊断供应商的触发原因。默认冷却到期即可重试，
-// 只有显式开启额外本地隔离时才跳过窗口内账号。代理失败历史不等于账号封禁次数。
+// 阈值仅限制进一步尝试，不诊断供应商的触发原因。默认在阶梯冷却之外叠加
+// 24h 静默隔离（config.RiskSilentHours），窗口内的账号不参与选号；
+// 代理失败历史不等于账号封禁次数。
 package gateway
 
 import (
@@ -43,8 +44,8 @@ func (s *RiskScope) ContentKey() string {
 	return s.contentKey
 }
 
-// Verdict 按不同账号去重记次；显式额外隔离中的账号不参与本地停止换号阈值。
-// 默认额外窗口为0，保留最初的两账号保护；结论不表示正文就是风控原因。
+// Verdict 按不同账号去重记次；静默隔离中的账号（旧账）不参与本地停止换号阈值。
+// 阈值只看本次请求新命中的账号；结论不表示正文就是风控原因。
 func (s *RiskScope) Verdict(acc *model.Account, now time.Time) bool {
 	if s == nil || acc == nil {
 		return false
@@ -72,7 +73,7 @@ func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, no
 	_, _ = st.Update(snapshot.Provider, snapshot.ID, func(acc *model.Account) {
 		acc.RiskControlStreak++
 		streak = acc.RiskControlStreak
-		// 持久化观测时间；默认只走阶梯，额外本地隔离由管理员显式开启。
+		// 持久化观测时间；默认在阶梯冷却之外叠加 RiskSilentHours（默认 24h）静默隔离。
 		nowF := float64(now.UnixNano()) / 1e9
 		acc.LastRiskControlAt = &nowF
 		secs, invalid = riskControlCoolingSeconds(st, streak)

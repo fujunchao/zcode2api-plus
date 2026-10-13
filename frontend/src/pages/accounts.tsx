@@ -503,7 +503,7 @@ export function AccountsPage() {
         <>
           將對選中的 <b>{targets.length}</b> 個帳號嘗試手動恢復；僅「風控失效」項會成功，其餘逐條回報失敗。
           此操作<b>仅修改本地状态，不保证上游接受请求</b>。默认恢复后重新参与调度；
-          只有管理员显式启用额外本地隔离时，才可能先进入保护冷却，结果会逐条提示。
+          风控命中未满静默期（默认 24 小时）的账号恢复后先进入保护冷却，结果会逐条提示。
         </>
       ),
       onConfirm: async () => {
@@ -690,7 +690,7 @@ export function AccountsPage() {
           將清除本地風控標記、冷卻與連續計數。
           <div className="mt-2 text-xs text-muted-foreground">
             此操作<b>仅修改本地状态，不保证上游接受请求</b>。默认重新参与调度；
-            显式启用的额外本地隔离可能使账号先进入保护冷却。再次命中会按阶梯冷却或失效。
+            未满静默期（默认 24 小时）的账号恢复后先进入保护冷却。再次命中会按阶梯冷却或失效。
             最近風控：{relativeTime(a.last_risk_control_at ?? a.last_error_at)}
           </div>
         </>

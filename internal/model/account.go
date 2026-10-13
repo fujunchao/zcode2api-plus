@@ -99,8 +99,8 @@ type Account struct {
 	LastErrorAt *float64 `json:"last_error_at"`
 
 	// LastRiskControlAt 最近一次405风控响应时间（Unix秒），持久化观测字段。
-	// 默认不影响冷却到期调度；只有显式启用额外隔离窗口时才作为其计时依据。
-	// 不能把本地历史等同于上游封禁状态。
+	// 它是静默隔离窗口（RiskSilentHours，默认24h）的计时依据；窗口为0时
+	// 不影响冷却到期调度。不能把本地历史等同于上游封禁状态。
 	LastRiskControlAt *float64 `json:"last_risk_control_at"`
 
 	ProxyURL   *string  `json:"proxy_url"`

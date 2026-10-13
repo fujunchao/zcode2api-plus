@@ -44,7 +44,7 @@ func IsRiskControlInvalid(acc *Account) bool {
 		acc.LastErrorKind != nil && *acc.LastErrorKind == ErrorKindRiskControl
 }
 
-// InRiskControlSilentWindow 判断管理员是否显式开启了额外本地隔离且尚未到期。
+// InRiskControlSilentWindow 判断账号是否处于风控静默隔离窗口内（window<=0 关闭）。
 // 这是本地计时器，不查询上游、不证明其仍被封禁。window<=0 时仅记录历史。
 func (a *Account) InRiskControlSilentWindow(now time.Time, window time.Duration) bool {
 	if a == nil || window <= 0 || a.LastRiskControlAt == nil {
