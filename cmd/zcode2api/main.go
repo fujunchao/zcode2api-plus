@@ -155,6 +155,7 @@ func serve() int {
 	//（全部线路不可用且直连也不可达时跳过该轮，防本机网络故障清空线路池）
 	proxyHealth := adminapi.NewProxyHealthScheduler(st, ctx)
 	proxyHealth.Start()
+	admin.Subscription.Start()
 
 	printBanner(st)
 

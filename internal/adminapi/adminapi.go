@@ -16,22 +16,24 @@ import (
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxysub"
 	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
 )
 
 // Handler 后台管理 HTTP 层。
 type Handler struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	autoMu     sync.Mutex
-	autoClosed bool
-	autoTasks  sync.WaitGroup
-	Store      *store.Store
-	Auth       *auth.Service
-	Captcha    *captcha.Manager
-	Quota      *quota.Service
-	StartedAt  time.Time
+	Subscription *proxysub.Manager
+	ctx          context.Context
+	cancel       context.CancelFunc
+	autoMu       sync.Mutex
+	autoClosed   bool
+	autoTasks    sync.WaitGroup
+	Store        *store.Store
+	Auth         *auth.Service
+	Captcha      *captcha.Manager
+	Quota        *quota.Service
+	StartedAt    time.Time
 }
 
 // New 创建后台管理处理器（StartedAt 对齐 Python 版模块导入时刻 _STARTED_AT）。
@@ -41,7 +43,7 @@ func New(st *store.Store, au *auth.Service, cm *captcha.Manager, qs *quota.Servi
 		parent = parents[0]
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &Handler{ctx: ctx, cancel: cancel, Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now()}
+	return &Handler{ctx: ctx, cancel: cancel, Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now(), Subscription: proxysub.New(st, ctx)}
 }
 
 func (h *Handler) backgroundContext() context.Context {
@@ -60,6 +62,9 @@ func (h *Handler) Close() {
 	}
 	h.autoMu.Unlock()
 	h.autoTasks.Wait()
+	if h.Subscription != nil {
+		h.Subscription.Close()
+	}
 }
 
 // Register 在 mux 上注册全部 /admin/api/* 路由；每个端点先过后台密钥鉴权。
@@ -93,6 +98,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/batch/disable", guard(h.handleBatchDisable))
 	mux.HandleFunc("POST /admin/api/accounts/batch/recover", guard(h.handleBatchRecover))
 	mux.HandleFunc("GET /admin/api/status", guard(h.handleStatus))
+	mux.HandleFunc("GET /admin/api/proxies/subscription", guard(h.handleSubscription))
+	mux.HandleFunc("PUT /admin/api/proxies/subscription", guard(h.handleSaveSubscription))
+	mux.HandleFunc("POST /admin/api/proxies/subscription/runs", guard(h.handleStartSubscription))
+	mux.HandleFunc("GET /admin/api/proxies/subscription/runs", guard(h.handleSubscriptionRuns))
+	mux.HandleFunc("GET /admin/api/proxies/subscription/runs/{run_id}", guard(h.handleSubscriptionRun))
+	mux.HandleFunc("POST /admin/api/proxies/subscription/runs/{run_id}/cancel", guard(h.handleCancelSubscription))
+	mux.HandleFunc("GET /admin/api/proxies/subscription/blocks", guard(h.handleSubscriptionBlocks))
+	mux.HandleFunc("DELETE /admin/api/proxies/subscription/blocks/{fingerprint}", guard(h.handleUnblockSubscription))
 	mux.HandleFunc("GET /admin/api/proxies", guard(h.handleListProxies))
 	mux.HandleFunc("POST /admin/api/proxies", guard(h.handleAddProxy))
 	mux.HandleFunc("PUT /admin/api/proxies/{profile_id}", guard(h.handleUpdateProxy))

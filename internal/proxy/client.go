@@ -59,6 +59,44 @@ func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http
 	if t, ok := transportPrec[key]; ok {
 		return t, nil
 	}
+	t, err := NewTransport(raw, responseHeaderTimeout)
+	if err != nil {
+		return nil, err
+	}
+	// 自动来源可能持续轮换；缓存也必须有硬上限。只释放空闲连接，不打断在途流。
+	if len(transportPrec) >= 512 {
+		for oldKey, old := range transportPrec {
+			delete(transportPrec, oldKey)
+			old.CloseIdleConnections()
+			break
+		}
+	}
+	transportPrec[key] = t
+	return t, nil
+}
+
+// ForgetTransport 退役端点的所有超时变体；已有请求仍持有自己的 Transport。
+func ForgetTransport(raw string) {
+	normalized, err := NormalizeProxyURL(raw)
+	if err != nil || normalized == nil {
+		return
+	}
+	transportMu.Lock()
+	defer transportMu.Unlock()
+	for key, t := range transportPrec {
+		if strings.HasPrefix(key, *normalized+"\x00") {
+			delete(transportPrec, key)
+			t.CloseIdleConnections()
+		}
+	}
+}
+
+// NewTransport 与生产使用同一协议实现，但不进入全局缓存。调用方负责关闭空闲连接。
+func NewTransport(raw string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
+	normalized, err := NormalizeProxyURL(raw)
+	if err != nil {
+		return nil, err
+	}
 	t := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -91,7 +129,6 @@ func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http
 			return nil, fmt.Errorf("不支持的代理协议: %s", u.Scheme)
 		}
 	}
-	transportPrec[key] = t
 	return t, nil
 }
 

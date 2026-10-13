@@ -848,7 +848,7 @@ type ProxyReassign struct {
 func (s *Store) DeleteProxyProfile(profileID string) (bool, ProxyReassign, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	removed, reassign, err := s.removeProxiesLocked(map[string]bool{profileID: true}, "")
+	removed, reassign, err := s.removeProxiesLocked(map[string]bool{profileID: true}, "", "manual")
 	return len(removed) > 0, reassign, err
 }
 
