@@ -100,6 +100,10 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # 未支持的卡/订阅上下文必须早拒绝，合法头、换号和异步行为保持；仅用合成数据。
+      - name: Test account context boundary regression (repeat)
+        run: go test ./internal/upstream ./internal/openai ./internal/asyncpool -run '^TestAccountContext' -count=20 -timeout=180s
+
       # 新增诊断不读取正文、不影响流式交付；New API 关联、读断、重放均使用本地服务。
       - name: Test request diagnostics regression (repeat)
         run: go test ./internal/gateway ./internal/asyncpool ./internal/upstream -run '^TestDiagnostic' -count=20 -timeout=180s

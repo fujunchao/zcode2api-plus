@@ -53,8 +53,17 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 同步、异步及 OpenAI 兼容模型请求均跳过验证码，不依赖浏览器或人工回填；
 **套餐领取仍保留验证码**，因此自动领取场景不要关闭浏览器求解开关。
 该策略使用既有配置缓存（默认 10 分钟），字段缺失或配置获取失败时保留原验证要求。
-默认客户端版本已同步至 `3.14.5`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
+默认客户端版本已同步至 `3.15.1`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。升级只需替换网关程序/镜像并重启，无数据库迁移。
+
+`v2.10.0-go` 显式拒绝当前未支持的账号/权益绑定头：`X-Highspeed-Card-ID`、
+`X-Bigmodel-Authorization`、`Bigmodel-Target-Type`、`Bigmodel-Organization`、
+`Bigmodel-Project`。三个同步推理入口及异步入口均在选号或建票前返回 HTTP 400
+（`error.type=unsupported_account_context`），不回显凭据、不换号、不悄悄降级成普通计费请求。
+普通客户端若被中间代理额外附加这些头，需移除非必要头；真正的高速卡权益暂未接入。
+版本标识同步到 3.15.1，SDK/运行时兼容声明、核心提示词、普通归因及重试策略保持。
+升级不需要数据库迁移，也不改变既有 24 小时本地风控静默策略。
+详见 [发布说明](docs/releases/v2.10.0-go.md)。
 
 `v2.9.19-go` 恢复默认风控静默隔离：账号被上游 405（unusual activity）命中后，
 默认 24 小时内不参与选号、人工恢复转入保护冷却。依据 2026-10-13 观测：上游

@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -149,6 +150,10 @@ type attemptBudget struct {
 // RunMessages 执行完整循环。body 是入口 NormalizeBody 后的请求体；
 // incomingHeaders 为客户端透传头；deliver 在上游 200 时被调用一次。
 func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingHeaders map[string]string, deliver DeliverFunc) runResult {
+	// 调用方的卡/订阅上下文不能与池中账号混搭；必须在选号和验证码之前拒绝。
+	if err := upstream.ValidateAccountContextHeaders(incomingHeaders); err != nil {
+		return errResult(http.StatusBadRequest, "unsupported_account_context", err.Error())
+	}
 	modelName, _ := body["model"].(string)
 	stream := bodyBool(body, "stream")
 	reqID := RequestShortID(ctx)
@@ -345,6 +350,9 @@ func (e *Engine) tryAccount(
 
 		req, err := upstream.BuildRequestWithAttribution(acc, verifyParam, verifyRegion, incomingHeaders, attr)
 		if err != nil {
+			if errors.Is(err, upstream.ErrUnsupportedAccountContext) {
+				return attemptResult{final: errResult(http.StatusBadRequest, "unsupported_account_context", err.Error())}
+			}
 			e.mark(acc, model.StatusInvalid, model.ErrorKindAuthFailed, err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 凭证无效，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}

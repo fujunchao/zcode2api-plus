@@ -155,6 +155,14 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 异步不透传调用方头，也不能把其权益请求悄悄转成普通计费请求。
+	if err := upstream.ValidateAccountContextHeaders(gateway.IncomingHeaders(r)); err != nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]any{"message": err.Error(), "type": "unsupported_account_context"},
+		})
+		return
+	}
+
 	ticketID := p.newTicketContext(r.Context(), body)
 
 	w.Header().Set("Content-Type", "text/event-stream")

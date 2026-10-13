@@ -27,8 +27,8 @@ func TestClientVersionShape(t *testing.T) {
 }
 
 // 默认声明必须与本次核验的桌面补丁版本一致；显式环境覆盖仍由既有配置入口接管。
-func TestDefaultClientVersionMatches3145(t *testing.T) {
-	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.14.5" {
+func TestDefaultClientVersionMatches3151(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.15.1" {
 		t.Fatalf("默认客户端声明未同步: %q", ZcodeClientVersion)
 	}
 }

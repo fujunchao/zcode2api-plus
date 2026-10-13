@@ -247,6 +247,9 @@ func BuildRequest(acc *model.Account, verifyParam, verifyRegion string, incoming
 //     x-session-id / x-query-id —— 优先沿用下游的值，缺失则合成；
 //  3. 鉴权与传输头。
 func BuildRequestWithAttribution(acc *model.Account, verifyParam, verifyRegion string, incomingHeaders map[string]string, attr Attribution) (Request, error) {
+	if err := ValidateAccountContextHeaders(incomingHeaders); err != nil {
+		return Request{}, err
+	}
 	var targetURL, authValue, apiKeyValue string
 	if acc.Provider == model.ProviderZai {
 		if acc.Mode == "jwt" && acc.JWTToken != nil {
