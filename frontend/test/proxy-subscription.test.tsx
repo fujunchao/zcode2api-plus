@@ -50,6 +50,8 @@ test('收起时不发请求，配置默认关闭且保存不回传隐藏地址',
   const payload = mock.api.mock.calls.find(([method]) => method === 'PUT')![2]
   expect(payload).not.toHaveProperty('url')
   expect(payload).not.toHaveProperty('source_display')
+  expect(screen.queryByLabelText('结果有效期（分钟）')).toBeNull()
+  expect(payload).not.toHaveProperty('max_age_minutes')
   client.clear()
 })
 

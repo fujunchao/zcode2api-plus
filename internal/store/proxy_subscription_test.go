@@ -319,3 +319,21 @@ func TestSubscriptionExpiredBlockStillRequiresFreshProbe(t *testing.T) {
 		t.Fatalf("新的有效复检应允许入库: %+v %v", r, err)
 	}
 }
+
+func TestSubscriptionOldHistoryCanCommitWithCurrentProbe(t *testing.T) {
+	s := newTestStore(t)
+	c := subscriptionFixture(t, s) // 保留 v2.10.2 的 120 分钟配置。
+	for i := range 2 {
+		a := subscriptionCandidate(10 + i)
+		a.LastOK = time.Now().Add(-48 * time.Hour).UnixMilli()
+		a.Streak = 1
+		if i == 1 {
+			a.LastOK = 0
+			a.Streak = 0
+		}
+		r, err := s.FinishSubscriptionRun(context.Background(), subscriptionRun(t, s, c, fmt.Sprint("historical-", i)), []proxysub.Candidate{a})
+		if err != nil || r.Added != 1 {
+			t.Fatalf("当前本机复检通过后不应再次按外部历史拒绝：%+v %v", r, err)
+		}
+	}
+}
