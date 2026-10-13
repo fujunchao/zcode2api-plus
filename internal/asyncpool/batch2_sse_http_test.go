@@ -51,6 +51,7 @@ func TestBatch2NativeMultilineSSEUsage(t *testing.T) {
 type batch2Wire struct {
 	name, newline, prefix      string
 	multiline, eventOnly, tail bool
+	eventPadding               string
 }
 
 func batch2EncodeEvent(t *testing.T, wire batch2Wire, kind string, payload map[string]any) string {
@@ -69,7 +70,7 @@ func batch2EncodeEvent(t *testing.T, wire batch2Wire, kind string, payload map[s
 		t.Fatal(err)
 	}
 	var output strings.Builder
-	output.WriteString("event:" + kind + wire.newline)
+	output.WriteString("event:" + wire.eventPadding + kind + wire.eventPadding + wire.newline)
 	for _, line := range strings.Split(string(raw), "\n") {
 		output.WriteString(wire.prefix + line + wire.newline)
 	}
@@ -151,11 +152,12 @@ func batch2ClientPayloads(t *testing.T, raw string) []map[string]any {
 
 func TestBatch2SSEAcrossHTTPProtocols(t *testing.T) {
 	for _, wire := range []batch2Wire{
-		{"single_line", "\n", "data: ", false, false, false},
-		{"multiline", "\n", "data: ", true, false, false},
-		{"no_space_crlf", "\r\n", "data:", true, false, false},
-		{"event_only", "\r\n", "data:", true, true, false},
-		{"tail_without_blank", "\n", "data:", true, true, true},
+		{"single_line", "\n", "data: ", false, false, false, ""},
+		{"multiline", "\n", "data: ", true, false, false, ""},
+		{"no_space_crlf", "\r\n", "data:", true, false, false, ""},
+		{"event_only", "\r\n", "data:", true, true, false, ""},
+		{"tail_without_blank", "\n", "data:", true, true, true, ""},
+		{"spaced_event", "\n", "data:", true, true, false, " \t"},
 	} {
 		for _, path := range []string{"/v1/messages", "/async/v1/messages", "/v1/chat/completions", "/v1/responses"} {
 			t.Run(wire.name+path, func(t *testing.T) {
@@ -260,7 +262,7 @@ func TestBatch2SSEAcrossHTTPProtocols(t *testing.T) {
 }
 
 func TestBatch2SSEFailuresDoNotReplayOrInventUsage(t *testing.T) {
-	wire := batch2Wire{"errors", "\r\n", "data:", true, true, false}
+	wire := batch2Wire{"errors", "\r\n", "data:", true, true, false, ""}
 	for _, mode := range []string{"without_final", "without_stop", "business_error", "malformed_event"} {
 		for _, path := range []string{"/v1/messages", "/async/v1/messages", "/v1/chat/completions", "/v1/responses"} {
 			t.Run(mode+path, func(t *testing.T) {

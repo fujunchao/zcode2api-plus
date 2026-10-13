@@ -979,10 +979,11 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
 			return true // 同一事件的协议错误由 UsageCollector 统一记录。
 		}
-		if object, ok := payload.(map[string]any); ok && object != nil && event.Name != "" {
+		name := strings.TrimSpace(event.Name)
+		if object, ok := payload.(map[string]any); ok && object != nil && name != "" {
 			if kind, _ := object["type"].(string); kind == "" {
 				// ticket chunk 不携带原 event 行；补上缺失的有效 type，避免丢失语义。
-				object["type"] = event.Name
+				object["type"] = name
 			}
 		}
 		if !p.emit(ctx, ticketID, ticketEvent{Type: "chunk", Data: payload}) {

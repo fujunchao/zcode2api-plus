@@ -66,7 +66,8 @@ func (s *sseState) observeEvent(frame *sse.Event) {
 	if frame == nil {
 		return
 	}
-	event, data := frame.Name, strings.TrimSpace(frame.Data)
+	// 保留原有模型事件名的空白兼容，通用成帧器本身不改变原字段值。
+	event, data := strings.TrimSpace(frame.Name), strings.TrimSpace(frame.Data)
 	if data == "" || data == "[DONE]" {
 		return // [DONE] 是 OpenAI 标记，不能替代 Anthropic 的 message_stop。
 	}

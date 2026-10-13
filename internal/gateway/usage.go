@@ -79,7 +79,7 @@ func (u *UsageCollector) observeSSEUsage(frame *sse.Event) {
 	if err := json.Unmarshal([]byte(payloadText), &payload); err != nil {
 		return
 	}
-	event := frame.Name
+	event := strings.TrimSpace(frame.Name)
 	if event == "" {
 		// 合法 SSE 也可只在 event: 声明类型；不能因 JSON 缺 type 而漏记用量。
 		event, _ = payload["type"].(string)
