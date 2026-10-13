@@ -175,7 +175,7 @@ func TestBatch2SSEAcrossHTTPProtocols(t *testing.T) {
 				}))
 				_, status, raw := postDiagnosticHTTP(t, srv, path, batch2HTTPBody(path))
 				p.Close()
-				if status != http.StatusOK || !strings.Contains(raw, "多行回答") || calls.Load() != 1 {
+				if status != http.StatusOK || calls.Load() != 1 {
 					t.Fatalf("合法流必须完整交付且不重试：status=%d calls=%d body=%s", status, calls.Load(), raw)
 				}
 				a := p.Store.ListAccounts(model.ProviderZai)[0]
@@ -191,6 +191,34 @@ func TestBatch2SSEAcrossHTTPProtocols(t *testing.T) {
 					return
 				}
 				payloads := batch2ClientPayloads(t, raw)
+				// 异步保留 ensure_ascii 的既有转义；按解码后的内容精确断言，不改线格式。
+				var text strings.Builder
+				for _, payload := range payloads {
+					switch path {
+					case "/async/v1/messages":
+						if payload["type"] == "content_block_delta" {
+							delta, _ := payload["delta"].(map[string]any)
+							value, _ := delta["text"].(string)
+							text.WriteString(value)
+						}
+					case "/v1/chat/completions":
+						choices, _ := payload["choices"].([]any)
+						for _, rawChoice := range choices {
+							choice, _ := rawChoice.(map[string]any)
+							delta, _ := choice["delta"].(map[string]any)
+							value, _ := delta["content"].(string)
+							text.WriteString(value)
+						}
+					case "/v1/responses":
+						if payload["type"] == "response.output_text.delta" {
+							value, _ := payload["delta"].(string)
+							text.WriteString(value)
+						}
+					}
+				}
+				if text.String() != "多行回答" {
+					t.Fatalf("解码后的文本不能丢失或重复：%q", text.String())
+				}
 				if path == "/async/v1/messages" {
 					counts := map[string]int{}
 					for _, payload := range payloads {

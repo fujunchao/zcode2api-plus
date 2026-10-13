@@ -273,13 +273,11 @@ func ExchangeAPIKey(accessToken, proxyURL string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		var parsed struct {
-			Data map[string]any `json:"data"`
+		parsed, err := decodeBusinessResponse(body)
+		if err != nil {
+			return "", err
 		}
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			return "", errors.New("Z.AI 业务凭证响应无效 JSON")
-		}
-		biz := parsed.Data
+		biz, _ := parsed["data"].(map[string]any)
 		for _, key := range []string{"access_token", "accessToken"} {
 			if v, ok := biz[key].(string); ok && strings.TrimSpace(v) != "" {
 				return strings.TrimSpace(v), nil
@@ -371,7 +369,7 @@ func findNamed(items []any, name string) map[string]any {
 	return nil
 }
 
-// postJSON POST JSON 并返回响应体（非 2xx 或业务码非 0 视为失败）。
+// postJSON POST JSON 并返回响应体；HTTP 失败在这里拒绝，业务码由对应调用方检查。
 // proxyURL 为空即直连。
 func postJSON(endpoint string, payload any, proxyURL string) ([]byte, error) {
 	return postJSONContext(context.Background(), endpoint, payload, proxyURL)
@@ -433,11 +431,7 @@ func postJSONAuth(client *http.Client, endpoint, token string, payload any, prox
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, truncate(string(body), 200))
 	}
-	var parsed map[string]any
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, errors.New("上游响应无效 JSON")
-	}
-	return parsed, nil
+	return decodeBusinessResponse(body)
 }
 
 // getJSON 带鉴权头的 GET。
@@ -459,11 +453,7 @@ func getJSON(client *http.Client, endpoint, token, proxyURL string) (map[string]
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return nil, fmt.Errorf("上游请求失败 (%d): %s", res.StatusCode, truncate(string(body), 200))
 	}
-	var parsed map[string]any
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, errors.New("上游响应无效 JSON")
-	}
-	return parsed, nil
+	return decodeBusinessResponse(body)
 }
 
 // truncate 截断错误详情。

@@ -2,6 +2,8 @@ package oauth
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"zcode2api/internal/proxy"
 )
 
 // 所有 api.z.ai 请求只允许连接本地 TLS 服务；不改生产端点，不发送真实账号材料。
@@ -64,5 +68,175 @@ func TestBatch2APIKeyBusinessUnauthorizedIsNotMissingOrganization(t *testing.T) 
 	defer mu.Unlock()
 	if len(calls) != 2 {
 		t.Fatalf("业务未授权后必须终止兑换，不创建或复制 Key：%v", calls)
+	}
+}
+
+type batch2KeyStep struct {
+	method, path string
+	data         any
+}
+
+func batch2KeySteps(existing bool) []batch2KeyStep {
+	const base = "/api/biz/v1/organization/synthetic-org/projects/synthetic-project/api_keys"
+	keys := []any{}
+	if existing {
+		keys = append(keys, map[string]any{"name": "zcode-api-key", "apiKey": "synthetic-key-id"})
+	}
+	steps := []batch2KeyStep{
+		{http.MethodPost, "/api/auth/z/login", map[string]any{"access_token": "synthetic-business-token"}},
+		{http.MethodGet, "/api/biz/customer/getCustomerInfo", map[string]any{
+			"organizations": []any{map[string]any{
+				"organizationName": "默认机构", "organizationId": "synthetic-org",
+				"projects": []any{map[string]any{"projectName": "默认项目", "projectId": "synthetic-project"}},
+			}},
+		}},
+		{http.MethodGet, base, keys},
+	}
+	if !existing {
+		steps = append(steps, batch2KeyStep{http.MethodPost, base, map[string]any{"apiKey": "synthetic-key-id"}})
+	}
+	return append(steps, batch2KeyStep{http.MethodGet, base + "/copy/synthetic-key-id", map[string]any{"secretKey": "synthetic-secret-value"}})
+}
+
+// tweak 只修改模拟服务响应，整个业务过程始终从公开 ExchangeAPIKey 进入。
+func runBatch2KeyExchange(t *testing.T, existing bool, tweak func(int, map[string]any) (int, string)) (string, error, int) {
+	t.Helper()
+	steps := batch2KeySteps(existing)
+	var mu sync.Mutex
+	calls := 0
+	routeAPIKeyExchangeToLocalTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		index := calls
+		calls++
+		mu.Unlock()
+		if index >= len(steps) {
+			t.Error("兑换发出了额外请求")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		step := steps[index]
+		if r.Host != "api.z.ai" || r.Method != step.method || r.URL.Path != step.path {
+			t.Errorf("兑换步骤偏离公开 HTTP 协议：%s %s %s", r.Host, r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if index > 0 && r.Header.Get("Authorization") != "Bearer synthetic-business-token" {
+			t.Error("后续步骤必须使用兑换所得的业务令牌")
+		}
+		payload := map[string]any{"code": 0, "data": step.data}
+		status, raw := http.StatusOK, ""
+		if tweak != nil {
+			status, raw = tweak(index, payload)
+		}
+		if raw == "" {
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			raw = string(body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, raw)
+	}))
+	key, err := ExchangeAPIKey("synthetic-access-token", "")
+	mu.Lock()
+	count := calls
+	mu.Unlock()
+	return key, err, count
+}
+
+func TestBatch2APIKeyBusinessFailuresStopEveryStep(t *testing.T) {
+	for stage := range 5 {
+		for _, tc := range []struct {
+			name         string
+			code         any
+			unauthorized bool
+		}{
+			{"numeric_401", 401, true},
+			{"string_401", "401", true},
+			{"other_failure", 3401, false},
+			{"opaque_code", "synthetic-business-token\nprivate", false},
+		} {
+			t.Run(fmt.Sprintf("step=%d/%s", stage, tc.name), func(t *testing.T) {
+				key, err, calls := runBatch2KeyExchange(t, false, func(index int, payload map[string]any) (int, string) {
+					if index == stage {
+						// 故意保留貌似合法的 data，业务失败不能继续使用它。
+						payload["code"] = tc.code
+						payload["msg"] = "synthetic-access-token synthetic-business-token must not leak"
+					}
+					return http.StatusOK, ""
+				})
+				if key != "" || err == nil || calls != stage+1 {
+					t.Fatalf("业务失败必须立即终止，不继续创建/复制或返回 Key：stage=%d calls=%d key=%q err=%v", stage, calls, key, err)
+				}
+				if errors.Is(err, ErrBusinessUnauthorized) != tc.unauthorized {
+					t.Fatalf("401 应与其他业务错误明确区分：%v", err)
+				}
+				if strings.Contains(err.Error(), "synthetic-") || proxy.IsEndpointUnreachable(context.Background(), err) {
+					t.Fatalf("业务失败不能泄漏材料或被归为代理不可达：%v", err)
+				}
+				if !tc.unauthorized && tc.name == "other_failure" && !strings.Contains(err.Error(), "3401") {
+					t.Fatalf("安全的数字业务码应保留：%v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestBatch2APIKeySuccessShapesAndExistingKey(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		for _, shape := range []string{"missing", "numeric_zero", "string_zero", "null"} {
+			t.Run(fmt.Sprintf("existing=%t/%s", existing, shape), func(t *testing.T) {
+				key, err, calls := runBatch2KeyExchange(t, existing, func(_ int, payload map[string]any) (int, string) {
+					switch shape {
+					case "missing":
+						delete(payload, "code")
+					case "string_zero":
+						payload["code"] = "0"
+					case "null":
+						payload["code"] = nil
+					}
+					return http.StatusOK, ""
+				})
+				wantCalls := 5
+				if existing {
+					wantCalls = 4
+				}
+				if err != nil || key != "synthetic-key-id.synthetic-secret-value" || calls != wantCalls {
+					t.Fatalf("合法成功或已有 Key 复用不能改变：calls=%d key=%q err=%v", calls, key, err)
+				}
+			})
+		}
+	}
+}
+
+func TestBatch2APIKeyOtherFailuresRemainDistinct(t *testing.T) {
+	for _, kind := range []string{"empty_organizations", "malformed_json", "http_failure"} {
+		t.Run(kind, func(t *testing.T) {
+			key, err, calls := runBatch2KeyExchange(t, false, func(index int, payload map[string]any) (int, string) {
+				if index == 1 {
+					switch kind {
+					case "empty_organizations":
+						payload["data"] = map[string]any{"organizations": []any{}}
+					case "malformed_json":
+						return http.StatusOK, "{"
+					case "http_failure":
+						return http.StatusServiceUnavailable, `{"message":"temporarily unavailable"}`
+					}
+				}
+				return http.StatusOK, ""
+			})
+			if key != "" || err == nil || calls != 2 || errors.Is(err, ErrBusinessUnauthorized) {
+				t.Fatalf("其他失败不应伪装业务 401 或继续兑换：calls=%d err=%v", calls, err)
+			}
+			want := map[string]string{"empty_organizations": "找不到可用的机构", "malformed_json": "无效 JSON", "http_failure": "503"}[kind]
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("原有诊断应保留：want=%q err=%v", want, err)
+			}
+		})
 	}
 }

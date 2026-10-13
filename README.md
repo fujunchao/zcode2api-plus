@@ -56,6 +56,13 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 默认客户端版本已同步至 `3.15.1`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。升级只需替换网关程序/镜像并重启，无数据库迁移。
 
+`v2.10.1-go` 恢复默认纯阶梯冷却：`ZCODE_RISK_SILENT_HOURS` 默认 `0`，
+不再叠加 24 小时静默；仍按 5 / 15 / 60 分钟递进，超档失效、成功清零连续计数。
+若部署曾显式设为 `24`，需改为 `0` 或移除覆盖。已有独立冷却/失效等记录不会被自动清空。
+同时修复四种 API 的多行 SSE 用量一致性、异步事件漏转，以及 API Key 兑换中
+HTTP 200 业务 `401` 被误报“缺机构”的问题；不改代理配置、不增加全局登出。
+详见 [发布说明](docs/releases/v2.10.1-go.md)。下方旧版本段落为历史行为，当前默认以本段为准。
+
 `v2.10.0-go` 显式拒绝当前未支持的账号/权益绑定头：`X-Highspeed-Card-ID`、
 `X-Bigmodel-Authorization`、`Bigmodel-Target-Type`、`Bigmodel-Organization`、
 `Bigmodel-Project`。三个同步推理入口及异步入口均在选号或建票前返回 HTTP 400

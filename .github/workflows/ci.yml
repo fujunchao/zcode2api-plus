@@ -104,6 +104,10 @@ jobs:
       - name: Test account context boundary regression (repeat)
         run: go test ./internal/upstream ./internal/openai ./internal/asyncpool -run '^TestAccountContext' -count=20 -timeout=180s
 
+      # 第二批：默认阶梯、完整 SSE 成帧及业务错误使用隔离数据和本地 HTTP/TLS 重复核验。
+      - name: Test ladder and stream business regression (repeat)
+        run: go test ./internal/sse ./internal/gateway ./internal/asyncpool ./internal/oauth -run 'TestSSEFraming|TestBatch2|TestDefaultRiskSilentHoursUsesLadder|TestRiskLadder|TestRiskSilentExplicitWindow' -count=20 -timeout=180s
+
       # 新增诊断不读取正文、不影响流式交付；New API 关联、读断、重放均使用本地服务。
       - name: Test request diagnostics regression (repeat)
         run: go test ./internal/gateway ./internal/asyncpool ./internal/upstream -run '^TestDiagnostic' -count=20 -timeout=180s
