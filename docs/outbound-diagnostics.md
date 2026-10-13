@@ -14,13 +14,13 @@
 | device_header_present / signing_header_present | 实际发送头中是否出现设备头/签名头，不记录其值 |
 | account_status_before / risk_streak_before / risk_last_at | 发送前的本地账户快照；不是供应商实时状态 |
 | account_state_identity_match | 当前状态快照的凭据是否仍与本次请求所用账号快照一致；false时不可把新身份状态归给旧请求 |
-| risk_extra_window_s / risk_extra_active | 管理员配置的额外本地隔离及是否仍在窗口内，默认0/false |
+| risk_extra_window_s / risk_extra_active | 本地风控静默隔离窗口（秒）及是否仍在窗口内，窗口默认 86400（24 小时） |
 | local_barrier / local_recheck_at | 本地限制类别和最早重新评估时间；ready不代表模型额度充足，失效/停用等不承诺自动恢复 |
 | account_checked_at | 最近一次额度检查时间，检查可能失败，不能等同成功快照 |
 | quota_observed_at | 当前进程确认且仍匹配账号凭据/出口的有效账单观测时间；重启或查询失败后可为- |
 | quota_model_state / quota_available | 模型在本地额度快照中的状态、可用量；未知与0区分，不保证上游实际准入 |
 | history_blocked_candidates | risk-proxy换线时，被近期失败历史排除的候选代理条数；不是账号被封次数 |
 
-`history_blocked` 是上述候选数的兼容别名，`history_scope=account_route_candidates` 明确统计口径。历史失败、阶梯连击、当前额外隔离是三个不同概念。
+`history_blocked` 是上述候选数的兼容别名，`history_scope=account_route_candidates` 明确统计口径。历史失败、阶梯连击、当前静默隔离是三个不同概念。
 
 日志不保存用户正文、工具名称/参数/schema、JWT、API Key、认证头、metadata设备或会话标识原文。原有账号/线路关联字段仍用于排障，日志应作为内部运维资料保管。不同层的请求数、账号尝试数和上游响应数必须分开统计。
