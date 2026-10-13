@@ -4,25 +4,27 @@
 
 ## 1. 试运行前提
 
-- 使用包含本功能、且当前提交完整 CI 已通过的工作分支构建。旧版 Release 不会因为保存订阅地址就拥有本功能。
+- 本功能从 `v2.10.2-go` 提供，可使用对应 Release 二进制或 `ghcr.io/fujunchao/zcode2api-plus:2.10.2-go` 镜像。更早版本不会因为保存订阅地址就拥有本功能。
 - 建议先在服务器上使用独立容器名、端口和空数据卷，不挂载生产账号库，不向测试实例导入账号。
 - 本机开发环境不运行自动化测试。所有测试使用合成数据和本地模拟服务，在 GitHub Actions 执行。
 - 真实订阅地址只保存在部署实例的管理配置中，不放进源码、文档、CI 变量或公开日志。
 
-下面是**服务器上**隔离部署的示例，须在已经检出并验证的功能分支目录执行。示例只构建试运行镜像，不覆盖生产镜像名称：
+下面是**服务器上**隔离部署的示例，使用固定版本镜像，不覆盖生产容器或数据：
 
 ```bash
-docker build -t zcode2api-plus:proxy-subscription-trial .
+docker pull ghcr.io/fujunchao/zcode2api-plus:2.10.2-go
 docker run -d --name zcode-proxy-trial --init \
   -p 127.0.0.1:3301:3000 \
   -v zcode-proxy-trial-data:/data \
   -e ZCODE_CAPTCHA_BROWSER=false \
   -e ZCODE_QUOTA_REFRESH_INTERVAL=0 \
   -e ZCODE_PROXY_HEALTH_ENABLED=false \
-  zcode2api-plus:proxy-subscription-trial
+  ghcr.io/fujunchao/zcode2api-plus:2.10.2-go
 ```
 
 通过受控隧道或管理反向代理访问该实例后台。首次生成的管理凭据只在服务器本地查看。此示例关闭已有巡检，避免观察阶段自动删除测试池中的线路；准备业务使用时再按需求开启。不要直接在生产 Compose 目录执行覆盖部署命令。
+
+若自行构建，检出对应版本标签后可使用仓库 Dockerfile；不要用旧版镜像测试新功能。
 
 ## 2. 配置 proxy-checker
 
