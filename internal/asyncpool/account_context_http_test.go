@@ -65,9 +65,17 @@ func TestAccountContextAsyncRejectedBeforeTicket(t *testing.T) {
 	if up.callCount() != 0 || solver.callCount() != 0 {
 		t.Fatalf("拒绝前不得调用上游或求解验证码：upstream=%d solver=%d", up.callCount(), solver.callCount())
 	}
-	status, _, raw = postAsyncAccountContext(t, srv, "", http.Header{"X-Highspeed-Card-ID": {"private"}})
-	if status != http.StatusUnauthorized || strings.Contains(raw, "unsupported_account_context") {
-		t.Fatalf("异步仍应先鉴权：%d %s", status, raw)
+	for _, authCase := range []struct {
+		key    string
+		status int
+	}{
+		{"", http.StatusUnauthorized},
+		{"invalid-synthetic-gateway-key", http.StatusForbidden},
+	} {
+		status, _, raw = postAsyncAccountContext(t, srv, authCase.key, http.Header{"X-Highspeed-Card-ID": {"private"}})
+		if status != authCase.status || strings.Contains(raw, "unsupported_account_context") {
+			t.Fatalf("异步仍应先鉴权：%d %s", status, raw)
+		}
 	}
 
 	// 普通异步请求仍成功，且维持原来不继承下游请求头的行为。

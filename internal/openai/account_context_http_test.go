@@ -184,9 +184,15 @@ func TestAccountContextHeadersRejectedBeforePoolSelection(t *testing.T) {
 			headers := http.Header{"X-Highspeed-Card-ID": {"synthetic-private-card"}}
 			status, raw := postAccountContextRequest(t, f, path, "sk-test", false, headers)
 			assertAccountContextRejected(t, status, raw, "synthetic-private-card")
-			for _, key := range []string{"", "invalid-synthetic-gateway-key"} {
-				status, raw = postAccountContextRequest(t, f, path, key, false, headers)
-				if status != http.StatusUnauthorized || strings.Contains(raw, "unsupported_account_context") {
+			for _, authCase := range []struct {
+				key    string
+				status int
+			}{
+				{"", http.StatusUnauthorized},
+				{"invalid-synthetic-gateway-key", http.StatusForbidden},
+			} {
+				status, raw = postAccountContextRequest(t, f, path, authCase.key, false, headers)
+				if status != authCase.status || strings.Contains(raw, "unsupported_account_context") {
 					t.Fatalf("未授权请求仍应先返回鉴权错误：%d %s", status, raw)
 				}
 			}
