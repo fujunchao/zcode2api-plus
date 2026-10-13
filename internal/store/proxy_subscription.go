@@ -153,9 +153,12 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 	if state.ImportPaused && len(passed) > 0 {
 		return r, errors.New("订阅禁止记录达到预算")
 	}
-	for key, b := range state.Blocks {
-		if !b.Active(now) {
-			delete(state.Blocks, key)
+	// 预览只写任务摘要，不能顺带清理禁止记录。
+	if r.Mode == "import" && r.Status == "completed" {
+		for key, b := range state.Blocks {
+			if !b.Active(now) {
+				delete(state.Blocks, key)
+			}
 		}
 	}
 	r.Added = 0

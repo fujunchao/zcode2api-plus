@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/proxysub"
 )
 
@@ -224,5 +225,97 @@ func TestSubscriptionFinishTransactionAndRecovery(t *testing.T) {
 	snap, _ = s.SubscriptionSnapshot()
 	if len(snap.State.Runs) != proxysub.MaxHistory {
 		t.Fatal("历史无界")
+	}
+}
+
+func TestSubscriptionPreviewDoesNotCleanBlocks(t *testing.T) {
+	s := newTestStore(t)
+	c := subscriptionFixture(t, s)
+	snap, _ := s.SubscriptionSnapshot()
+	a := subscriptionCandidate(1)
+	snap.State.Blocks[a.Key] = proxysub.Block{Key: a.Key, Reason: "合成已过期暂缓", Until: time.Now().Add(-time.Hour).UnixMilli()}
+	raw, _ := json.Marshal(snap.State)
+	if err := s.SetSetting(proxysub.StateKey, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	r := subscriptionRun(t, s, c, "preview")
+	r.Mode = "preview"
+	if _, err := s.FinishSubscriptionRun(context.Background(), r, nil); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := s.SubscriptionSnapshot()
+	if !reflect.DeepEqual(snap.State.Blocks, after.State.Blocks) {
+		t.Fatal("预览不应清理或改变禁止记录")
+	}
+}
+
+func TestSubscriptionManualBlockPersistsAndSharedTransportSurvives(t *testing.T) {
+	s := newTestStore(t)
+	c := subscriptionFixture(t, s)
+	a := subscriptionCandidate(3)
+	if _, err := s.FinishSubscriptionRun(context.Background(), subscriptionRun(t, s, c, "seed"), []proxysub.Candidate{a}); err != nil {
+		t.Fatal(err)
+	}
+	imported := s.ListProxyProfiles()[0]
+	manual, err := s.AddProxyProfile("手工同址", a.URL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := proxy.TransportFor(a.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proxy.ForgetTransport(a.URL) })
+	if _, _, err = s.DeleteProxyProfile(imported.ID); err != nil {
+		t.Fatal(err)
+	}
+	still, _ := proxy.TransportFor(a.URL)
+	if tr != still {
+		t.Fatal("仍被手工线路引用的传输不应清理")
+	}
+	if _, _, err = s.DeleteProxyProfile(manual.ID); err != nil {
+		t.Fatal(err)
+	}
+	next, _ := proxy.TransportFor(a.URL)
+	if next == tr {
+		t.Fatal("最后引用删除后应清理退役缓存")
+	}
+	reopened, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	snap, err := reopened.SubscriptionSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if block, ok := snap.State.Blocks[a.Key]; !ok || block.Until != 0 {
+		t.Fatal("人工重入保护未持久化")
+	}
+	result, err := reopened.FinishSubscriptionRun(context.Background(), subscriptionRun(t, reopened, c, "reopen"), []proxysub.Candidate{a})
+	if err != nil || result.Added != 0 {
+		t.Fatal("重启绕过了人工重入保护")
+	}
+}
+
+func TestSubscriptionExpiredBlockStillRequiresFreshProbe(t *testing.T) {
+	s := newTestStore(t)
+	c := subscriptionFixture(t, s)
+	a := subscriptionCandidate(1)
+	snap, _ := s.SubscriptionSnapshot()
+	snap.State.Blocks[a.Key] = proxysub.Block{Key: a.Key, Reason: "合成自动淘汰", Until: time.Now().Add(-time.Minute).UnixMilli()}
+	raw, _ := json.Marshal(snap.State)
+	if err := s.SetSetting(proxysub.StateKey, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	a.ProbedAt = time.Now().Add(-time.Hour).UnixMilli()
+	r, err := s.FinishSubscriptionRun(context.Background(), subscriptionRun(t, s, c, "stale-probe"), []proxysub.Candidate{a})
+	if err != nil || r.Added != 0 {
+		t.Fatal("暂缓到期不能复用过期本地探测")
+	}
+	a.ProbedAt = time.Now().UnixMilli()
+	r, err = s.FinishSubscriptionRun(context.Background(), subscriptionRun(t, s, c, "fresh-probe"), []proxysub.Candidate{a})
+	if err != nil || r.Added != 1 {
+		t.Fatalf("新的有效复检应允许入库: %+v %v", r, err)
 	}
 }
