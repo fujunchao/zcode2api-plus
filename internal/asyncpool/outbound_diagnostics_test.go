@@ -2,6 +2,7 @@ package asyncpool
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/upstream"
 )
@@ -53,9 +55,11 @@ func TestDiagnosticOutboundSnapshotBothRoutes(t *testing.T) {
 			if got["max_tokens"] != float64(128000) || got["model"] != "GLM-5.3" {
 				t.Fatal("观测不应改写出站参数")
 			}
+			// 静默窗口字段与配置一致（默认 24h；本断言动态取值，不锁定具体窗口）。
+			windowField := fmt.Sprintf("risk_extra_window_s=%d", int(config.RiskSilentWindow().Seconds()))
 			for _, want := range []string{"outbound_model=glm-5.3", "outbound_max_tokens=128000", "outbound_thinking=enabled", "outbound_effort=max",
 				"system_text_bytes=", "system_text_sha256=", "official_prefix_match=true", "official_identity_match=true",
-				"account_status_before=active", "risk_extra_window_s=0", "risk_extra_active=false", "quota_model_state=available", "quota_available=42", "quota_observed_at=",
+				"account_status_before=active", windowField, "risk_extra_active=false", "quota_model_state=available", "quota_available=42", "quota_observed_at=",
 				"auth_dual_equal=true", "metadata_session_matches_header=true"} {
 				if !strings.Contains(logs.String(), want) {
 					t.Errorf("实际出站诊断缺少 %q", want)
@@ -99,7 +103,13 @@ func TestModelConcurrencyAsyncDoesNotSwitchOrCool(t *testing.T) {
 	}
 }
 
-func TestRiskLadderAsyncReturnsAfterDefaultCooling(t *testing.T) {
+// 显式关闭静默窗口（ZCODE_RISK_SILENT_HOURS=0）时，异步路径回退纯阶梯：
+// 每档到期即重新调用。这是应急回退路径，行为与 v2.9.18 默认一致。
+func TestRiskLadderAsyncPureCoolingWhenSilentDisabled(t *testing.T) {
+	oldHours := config.RiskSilentHours
+	config.RiskSilentHours = 0
+	t.Cleanup(func() { config.RiskSilentHours = oldHours })
+
 	var calls atomic.Int32
 	p, srv, _ := newDiagnosticHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)

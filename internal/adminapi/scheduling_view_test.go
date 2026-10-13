@@ -49,16 +49,36 @@ func TestAccountSchedulingViewMatchesLocalPolicy(t *testing.T) {
 	}
 }
 
-func TestDefaultManualRecoveryKeepsHistoryWithoutExtraIsolation(t *testing.T) {
-	mux, st, _ := setup(t)
-	a := seedRiskControlInvalid(t, st, "recent", "synthetic-recover")
-	_, err := st.Update(a.Provider, a.ID, func(a *model.Account) { at := float64(time.Now().Unix()); a.LastRiskControlAt = &at })
-	if err != nil {
-		t.Fatal(err)
-	}
-	status, _ := do(t, mux, st, http.MethodPost, "/admin/api/accounts/"+a.ID+"/recover", nil)
-	got := st.FindAny(a.ID)
-	if status != 200 || got.LastRiskControlAt == nil || got.CoolingUntil != nil || st.Select(a.Provider, nil, "GLM-5.3") == nil {
-		t.Fatal("默认人工恢复应解除本地失效，历史不应延长隔离")
+// 人工恢复与静默窗口的联动：窗口内恢复转保护冷却、不直接放回轮转；
+// 显式关闭（0）时恢复直接解除并立即参与调度。默认窗口值由 gateway 包的
+// TestDefaultRiskSilentHoursIs24 锁定，本用例只覆盖两种显式配置。
+func TestManualRecoveryRespectsSilentWindow(t *testing.T) {
+	for _, hours := range []int{0, 24} {
+		t.Run(time.Duration(hours).String(), func(t *testing.T) {
+			old := config.RiskSilentHours
+			config.RiskSilentHours = hours
+			t.Cleanup(func() { config.RiskSilentHours = old })
+
+			mux, st, _ := setup(t)
+			a := seedRiskControlInvalid(t, st, "recent", "synthetic-recover")
+			_, err := st.Update(a.Provider, a.ID, func(a *model.Account) { at := float64(time.Now().Unix()); a.LastRiskControlAt = &at })
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, _ := do(t, mux, st, http.MethodPost, "/admin/api/accounts/"+a.ID+"/recover", nil)
+			got := st.FindAny(a.ID)
+			if status != 200 || got.LastRiskControlAt == nil {
+				t.Fatal("恢复应保留历史观测时间")
+			}
+			if hours == 0 {
+				if got.CoolingUntil != nil || st.Select(a.Provider, nil, "GLM-5.3") == nil {
+					t.Fatal("显式关闭静默后，恢复应直接解除并立即参与调度")
+				}
+				return
+			}
+			if got.Status != model.StatusCooling || got.CoolingUntil == nil || st.Select(a.Provider, nil, "GLM-5.3") != nil {
+				t.Fatal("静默窗口内恢复应转保护冷却且暂不可调度")
+			}
+		})
 	}
 }
