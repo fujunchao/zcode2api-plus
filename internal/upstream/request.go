@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/textproto"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -104,7 +105,10 @@ type Attribution struct {
 	TraceID     string // x-zcode-trace-id
 	SessionType string // x-zcode-session-type：main | subagent | other
 	QueryID     string // x-query-id（轮次 id）
+	QuerySource string // 可选用途；缺失时不能把未知请求伪造成 main_turn。
 }
+
+var querySourcePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 
 // NewAttribution 计算一次请求的归因标识。
 //
@@ -158,24 +162,33 @@ func NewAttribution(incoming map[string]string, bodySessionID string) Attributio
 	if queryID == "" {
 		queryID = config.NewUUIDv4()
 	}
+	querySource := pick("X-Zcode-Query-Source")
+	if !querySourcePattern.MatchString(querySource) {
+		querySource = ""
+	}
 	return Attribution{
 		RequestID:   requestID,
 		SessionID:   sessionID,
 		TraceID:     traceID,
 		SessionType: sessionType,
 		QueryID:     queryID,
+		QuerySource: querySource,
 	}
 }
 
 // Headers 归因标识的出站形态。
 func (a Attribution) Headers() map[string]string {
-	return map[string]string{
+	headers := map[string]string{
 		"X-Request-Id":         a.RequestID,
 		"X-Session-Id":         a.SessionID,
 		"X-Zcode-Trace-Id":     a.TraceID,
 		"X-Zcode-Session-Type": a.SessionType,
 		"X-Query-Id":           a.QueryID,
 	}
+	if querySourcePattern.MatchString(a.QuerySource) {
+		headers["X-Zcode-Query-Source"] = a.QuerySource
+	}
+	return headers
 }
 
 // WithFreshRequestID 换一个新请求 id，其余归因标识原样保留。
