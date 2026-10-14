@@ -243,8 +243,8 @@ var (
 	// 见 docs/analysis-zcode-client-activation-diff.md）。
 	// 2026-09-30 同步 3.14.4；模型验证码按 skip_model_request 策略独立跳过。
 	// 2026-10-09 同步本机确认的 3.14.5；此次客户端修复不改变模型/重置协议。
-	// 2026-10-13 同步 3.15.1；普通路由与核心提示词保持，未支持的账号上下文显式拒绝。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.15.1")
+	// 2026-10-14 同步 3.15.3；普通路由与核心提示词保持，未支持的账号上下文显式拒绝。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.15.3")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
@@ -267,7 +267,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.10.3-go"
+	AppVersion = "2.10.4-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

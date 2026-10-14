@@ -66,7 +66,7 @@ type ZcodeProfile struct {
 	OSRelease      string // 10.0.26100
 	Shell          string // cmd.exe
 	CWD            string // 伪装工作目录
-	AppVersion     string // 3.15.1
+	AppVersion     string // 3.15.3
 	SourceTitle    string // electron | cli
 	ReleaseChannel string // production
 	Language       string // zh-CN
@@ -175,9 +175,9 @@ func (p ZcodeProfile) Title() string { return "Z Code@" + p.SourceTitle }
 // ModelUserAgent 模型请求的 User-Agent。
 //
 // 与 `UserAgent`（裸 `ZCode/<版本>`）不同：模型请求由 ai-sdk 发出，UA 是 ai-sdk 拼的，
-// 3.15.1 的 SDK 拼接形态保持；运行时声明沿用已有配置，本次不推测新运行时值：
+// 3.15.3 的 SDK 拼接形态保持；运行时声明沿用已有配置，本次不推测新运行时值：
 //
-//	ZCode/3.15.1 ai-sdk/provider-utils/4.0.27 runtime/node.js/24
+//	ZCode/3.15.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/24
 //
 // 而非模型接口（`/api/v1/agent/configs`、额度、领取）用的是裸串——所以这两处**必须分开**，
 // 用一个常量两处用会留下「模型请求少了 ai-sdk 后缀」这个可被上游识别的差异。
