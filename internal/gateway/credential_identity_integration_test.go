@@ -121,6 +121,44 @@ func TestCredentialIdentityKeepsAdministrativeDisable(t *testing.T) {
 	}
 }
 
+func TestCredentialIdentityModeChange(t *testing.T) {
+	for _, entry := range []string{"sync", "async", "quota"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newCredentialFixture(t, entry, http.StatusUnauthorized)
+			done := f.start(t)
+			f.waitStarted(t)
+			// 故意复用相同字节，只有比较认证模式才能识别这次身份变更。
+			if _, err := f.st.EditAccount(f.account.Provider, f.account.ID, store.AccountEdit{SetSecret: true, Secret: f.oldJWT, SecretMode: "apiKey"}); err != nil {
+				t.Fatal(err)
+			}
+			f.release()
+			f.waitDone(t, done)
+			got := f.st.FindAny(f.account.ID)
+			if got.Mode != "apiKey" || got.Status != model.StatusActive || got.LastErrorKind != nil {
+				t.Fatal("旧 JWT 结果污染了同字节但不同认证模式的新身份")
+			}
+		})
+	}
+}
+
+func TestCredentialIdentityKeepsAdministrativeArchive(t *testing.T) {
+	for _, entry := range []string{"sync", "async", "quota"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newCredentialFixture(t, entry, http.StatusUnauthorized)
+			done := f.start(t)
+			f.waitStarted(t)
+			if _, err := f.st.SetArchived(f.account.Provider, f.account.ID, true); err != nil {
+				t.Fatal(err)
+			}
+			f.release()
+			f.waitDone(t, done)
+			if got := f.st.FindAny(f.account.ID); got.Enabled || got.ArchivedAt == nil || got.Status != model.StatusDisabled {
+				t.Fatal("在途结果覆盖了管理员归档状态")
+			}
+		})
+	}
+}
+
 type credentialFixture struct {
 	st      *store.Store
 	account *model.Account

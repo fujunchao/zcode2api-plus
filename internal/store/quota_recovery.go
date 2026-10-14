@@ -113,7 +113,8 @@ func (s *Store) MarkQuotaExhausted(expected *model.Account, name, detail string,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	live := s.findLocked(expected.Provider, expected.ID)
-	if !live.AcceptsRequestResult(expected) {
+	// 同凭据的模型耗尽事实仍可记录；下方 strong 守卫保持人工停用等整号状态。
+	if !live.SameCredential(expected) {
 		return nil
 	}
 	pending := live.Clone()
