@@ -105,7 +105,10 @@ func runBatch2KeyExchange(t *testing.T, existing bool, tweak func(int, map[strin
 	var mu sync.Mutex
 	calls := 0
 	routeAPIKeyExchangeToLocalTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			t.Errorf("读取合成请求失败：%v", readErr)
+		}
 		mu.Lock()
 		index := calls
 		calls++
@@ -121,8 +124,20 @@ func runBatch2KeyExchange(t *testing.T, existing bool, tweak func(int, map[strin
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if index > 0 && r.Header.Get("Authorization") != "Bearer synthetic-business-token" {
-			t.Error("后续步骤必须使用兑换所得的业务令牌")
+		// 3.15.3 按端点区分认证；customerInfo 用裸业务 token，Key 管理仍用 Bearer。
+		wantAuthorization := "Bearer synthetic-business-token"
+		switch step.path {
+		case "/api/auth/z/login":
+			wantAuthorization = ""
+			var login map[string]string
+			if json.Unmarshal(body, &login) != nil || login["token"] != "synthetic-access-token" {
+				t.Error("业务登录必须使用原 OAuth access token")
+			}
+		case "/api/biz/customer/getCustomerInfo":
+			wantAuthorization = "synthetic-business-token"
+		}
+		if r.Header.Get("Authorization") != wantAuthorization {
+			t.Errorf("端点 %s 的认证格式错误：got=%q want=%q", step.path, r.Header.Get("Authorization"), wantAuthorization)
 		}
 		payload := map[string]any{"code": 0, "data": step.data}
 		status, raw := http.StatusOK, ""
