@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"time"
@@ -100,7 +101,7 @@ func (s *Store) RotateAccountProxyAt(expected *model.Account, now time.Time) (Pr
 		}
 		candidates = append(candidates, p)
 	}
-	p, ok := leastLoadedProxy(candidates, s.proxyOccupancyLocked(), "", "")
+	p, ok := s.chooseProxyLocked(candidates, s.proxyOccupancyLocked(), "", "")
 	result.Reason = "no_alternative"
 	var pending []*model.Account
 	if ok {
@@ -109,6 +110,19 @@ func (s *Store) RotateAccountProxyAt(expected *model.Account, now time.Time) (Pr
 		pending = append(pending, copy)
 	} else if result.HistoryBlocked > 0 {
 		result.Reason = "recent_routes_exhausted"
+	}
+	// 旧接口没有真实严格观测时保留历史行为；有效观测下无候选允许自动直连。
+	if !ok && s.strictSuspectLocked(strictProxyIdentity(derefStr(live.ProxyURL)), now) {
+		copy := live.Clone()
+		copy.ProxyID, copy.ProxyURL = nil, nil
+		next := s.cloneStrictProxyLocked()
+		setStrictIntent(&next, copy, "auto_pending_proxy")
+		if err := s.commitProxyBundleStrictLocked(context.Background(), nil, []*model.Account{copy}, history, nil, &next); err != nil {
+			result.Reason = "persist_failed"
+			return result, err
+		}
+		result.Reason = "direct_fallback"
+		return result, nil
 	}
 	// 即使没有候选，也必须记录当前失败出口，避免新增候选后丢失这次证据。
 	if err := s.commitProxyStateWithHistoryLocked(nil, pending, history); err != nil {

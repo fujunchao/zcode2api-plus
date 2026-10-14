@@ -8,6 +8,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -57,18 +58,22 @@ var ErrAccountArchived = errors.New("账号已归档")
 
 // Store 线程安全的账号 / 设置存储，含轮询游标。
 type Store struct {
-	Requests         *requeststats.Tracker
-	mu               sync.Mutex
-	db               *sql.DB
-	processLock      *os.File
-	closeOnce        sync.Once
-	closeErr         error
-	accounts         map[string][]*model.Account
-	settings         map[string]string
-	rotation         map[string]int
-	riskProxyHistory riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
-	quotaRecovery    quotaRecovery    // API Key 模型恢复退避，保存在内部 meta，不进入账号 JSON。
-	quotaProbes      map[quotaProbeKey]*QuotaProbe
+	Requests          *requeststats.Tracker
+	mu                sync.Mutex
+	db                *sql.DB
+	processLock       *os.File
+	closeOnce         sync.Once
+	closeErr          error
+	accounts          map[string][]*model.Account
+	settings          map[string]string
+	rotation          map[string]int
+	riskProxyHistory  riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
+	quotaRecovery     quotaRecovery    // API Key 模型恢复退避，保存在内部 meta，不进入账号 JSON。
+	quotaProbes       map[quotaProbeKey]*QuotaProbe
+	strictProxy       strictProxyState
+	strictEvidence    []strictProxyEvidence
+	strictDispatch    map[string]int
+	strictJournalPath string
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -98,13 +103,14 @@ func New() (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		Requests:         requeststats.New(),
-		db:               db,
-		accounts:         map[string][]*model.Account{model.ProviderZai: {}},
-		settings:         map[string]string{},
-		rotation:         map[string]int{},
-		lineTruncStrikes: map[string]int{},
-		lineTruncTotals:  map[string]int{},
+		Requests:          requeststats.New(),
+		db:                db,
+		accounts:          map[string][]*model.Account{model.ProviderZai: {}},
+		settings:          map[string]string{},
+		rotation:          map[string]int{},
+		lineTruncStrikes:  map[string]int{},
+		lineTruncTotals:   map[string]int{},
+		strictJournalPath: config.DBPath + ".strict-proxy.json",
 	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
@@ -255,6 +261,10 @@ func (s *Store) load() error {
 		}
 	}
 	delete(settings, quotaRecoveryKey)
+	if err := s.loadStrictProxy(settings[strictProxyStateKey]); err != nil {
+		return err
+	}
+	delete(settings, strictProxyStateKey)
 	// 密钥由 bootstrapAuthKeys 保证存在；此处缺省空值即拒绝鉴权（fail closed）
 	if _, ok := settings["admin_key"]; !ok {
 		settings["admin_key"] = ""
@@ -292,7 +302,10 @@ func (s *Store) load() error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return s.migrateAccountIdentity()
+	if err := s.migrateAccountIdentity(); err != nil {
+		return err
+	}
+	return s.RecoverStrictProxyRetirements()
 }
 
 // migrateAccountIdentity 一次性回填 Go 增量身份字段（幂等，仅有改动时落库）：
@@ -388,6 +401,9 @@ func (s *Store) GetSetting(key string) (string, bool) {
 func (s *Store) publishSettings() {
 	cp := make(map[string]string, len(s.settings))
 	for k, v := range s.settings {
+		if k == strictProxyStateKey || k == riskProxyHistoryKey || k == quotaRecoveryKey {
+			continue
+		}
 		cp[k] = v
 	}
 	s.settingsSnapshot.Store(&cp)
@@ -767,6 +783,9 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, e
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.strictProxyBlockedLocked(*normalized) {
+		return ProxyProfile{}, ErrProxyRetired
+	}
 	profiles := s.listProxyProfilesLocked()
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -793,6 +812,9 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.strictProxyBlockedLocked(*normalized) {
+		return ProxyProfile{}, ErrProxyRetired
+	}
 	profiles := s.listProxyProfilesLocked()
 	target := -1
 	for i, p := range profiles {
@@ -951,6 +973,9 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 		found := false
 		for _, p := range s.listProxyProfilesLocked() {
 			if p.ID == profileID {
+				if s.strictProxyBlockedLocked(p.URL) {
+					return false, ErrProxyRetired
+				}
 				u := p.URL
 				profileURL = &u
 				found = true
@@ -966,7 +991,11 @@ func (s *Store) AssignProxyProfile(accountID, profileID string) (bool, error) {
 		acc.ProxyID = nil
 		acc.ProxyURL = nil
 	}
-	if err := s.commitProxyStateLocked(nil, []*model.Account{acc}); err != nil {
+	intent := "manual_proxy"
+	if profileID == "" {
+		intent = "explicit_direct"
+	}
+	if err := s.commitProxyIntentLocked([]*model.Account{acc}, intent); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -986,23 +1015,29 @@ func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]stri
 	profiles := s.listProxyProfilesLocked()
 	occupancy := s.proxyOccupancyLocked()
 	var pending []*model.Account
+	next := s.cloneStrictProxyLocked()
 	for _, id := range dedupeIDs(accountIDs) {
 		acc := s.findAnyLocked(id).Clone()
 		if acc == nil || derefStr(acc.ProxyID) != "" || derefStr(acc.ProxyURL) != "" {
 			continue
 		}
-		p, ok := leastLoadedProxy(profiles, occupancy, "", "")
+		if next.Intents[acc.ID] == "explicit_direct" {
+			continue
+		}
+		p, ok := s.chooseProxyLocked(profiles, occupancy, "", "")
 		if !ok {
 			directFallback = append(directFallback, id)
+			setStrictIntent(&next, acc, "auto_pending_proxy")
 			continue
 		}
 		profileID, profileURL := p.ID, p.URL
 		acc.ProxyID, acc.ProxyURL = &profileID, &profileURL
 		occupancy[profileID]++
 		pending = append(pending, acc)
+		setStrictIntent(&next, acc, "auto_proxy")
 		assigned[id] = profileID
 	}
-	if err := s.commitProxyStateLocked(nil, pending); err != nil {
+	if err := s.commitProxyBundleStrictLocked(context.Background(), nil, pending, nil, nil, &next); err != nil {
 		logPersistFailure("proxy-assign", "batch", err)
 		for _, acc := range pending {
 			directFallback = append(directFallback, acc.ID)
@@ -1360,9 +1395,16 @@ func (s *Store) SetProxyURL(provider, idOrName string, url *string) (bool, error
 	if acc == nil {
 		return false, nil
 	}
+	if derefStr(url) != "" && s.strictProxyBlockedLocked(derefStr(url)) {
+		return false, ErrProxyRetired
+	}
 	acc.ProxyID = nil
 	acc.ProxyURL = url
-	if err := s.commitProxyStateLocked(nil, []*model.Account{acc}); err != nil {
+	intent := "manual_proxy"
+	if derefStr(url) == "" {
+		intent = "explicit_direct"
+	}
+	if err := s.commitProxyIntentLocked([]*model.Account{acc}, intent); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1583,7 +1625,7 @@ func (s *Store) Select(provider string, skipIDs map[string]bool, modelName strin
 	window := config.RiskSilentWindow()
 	var base []*model.Account
 	for _, a := range s.accounts[provider] {
-		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) {
+		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (derefStr(a.ProxyURL) == "" || !s.strictProxyBlockedLocked(derefStr(a.ProxyURL))) {
 			base = append(base, a)
 		}
 	}

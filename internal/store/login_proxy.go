@@ -32,7 +32,7 @@ func (s *Store) ReplaceFailedLoginProxy(id, url string, previousFailures map[str
 			break
 		}
 	}
-	if next, ok := leastLoadedProxy(proxyProfilesExcluding(s.listProxyProfilesLocked(), excluded), s.proxyOccupancyLocked(), "", ""); ok {
+	if next, ok := s.chooseProxyLocked(proxyProfilesExcluding(s.listProxyProfilesLocked(), excluded), s.proxyOccupancyLocked(), "", ""); ok {
 		result.Next = &next
 	}
 	return result, nil

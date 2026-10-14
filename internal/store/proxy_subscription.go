@@ -111,6 +111,11 @@ func (s *Store) RecoverSubscriptionRuns() error {
 func (s *Store) UnblockSubscription(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, b := range s.strictProxy.Blocks {
+		if b.SubscriptionKey == key {
+			return errors.New("严格淘汰记录只能通过严格代理解除入口恢复")
+		}
+	}
 	state, err := s.subscriptionLocked()
 	if err != nil {
 		return err
@@ -166,6 +171,7 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 		endpoint, e := proxysub.PublicEndpoint(a.URL)
 		b, blocked := state.Blocks[a.Key]
 		if e != nil || proxysub.Fingerprint(endpoint) != a.Key || keys[a.Key] ||
+			s.strictProxyBlockedLocked(endpoint) ||
 			(blocked && b.Active(now)) || owned >= c.Capacity || r.Added >= c.ImportLimit ||
 			!proxysub.FreshLocalProbe(a.ProbedAt, now) ||
 			len(state.Blocks)+owned >= proxysub.MaxBlocks {
@@ -198,7 +204,7 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 // subscriptionMutationLocked 与线路修改处在同一把 Store 锁/同一事务中。
 // reason=manual 只用于人工删除；停用与改 URL 从前后差异识别。
 func (s *Store) subscriptionMutationLocked(profiles []ProxyProfile, reason string) (*proxysub.State, error) {
-	if s.settings[proxysub.StateKey] == "" {
+	if s.settings[proxysub.StateKey] == "" && len(s.strictProxy.Blocks) == 0 {
 		return nil, nil
 	}
 	state, err := s.subscriptionLocked()
@@ -247,18 +253,54 @@ func (s *Store) subscriptionMutationLocked(profiles []ProxyProfile, reason strin
 		case old.Enabled && !p.Enabled:
 			block(key, "人工停用", true)
 		case !old.Enabled && p.Enabled:
-			delete(state.Blocks, key)
+			if !s.strictProxyBlockedLocked(p.URL) {
+				delete(state.Blocks, key)
+			}
 		}
+	}
+	for _, b := range s.strictProxy.Blocks {
+		if b.SubscriptionKey != "" {
+			state.Blocks[b.SubscriptionKey] = proxysub.Block{Key: b.SubscriptionKey, Reason: "strict_3012:" + b.Reason, CreatedAt: b.CreatedAt, Until: 0}
+		}
+	}
+	if s.strictProxy.Paused {
+		state.ImportPaused = true
 	}
 	return &state, nil
 }
 
 // 断流/自动巡检保持同一自动淘汰语义；账号风控换线不经过此处。
 func (s *Store) commitProxyBundleLocked(ctx context.Context, profiles []ProxyProfile, pending []*model.Account, history riskProxyHistory, sub *proxysub.State) error {
-	if profiles == nil && len(pending) == 0 && history == nil && sub == nil {
+	return s.commitProxyBundleStrictLocked(ctx, profiles, pending, history, sub, nil)
+}
+
+func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []ProxyProfile, pending []*model.Account, history riskProxyHistory, sub *proxysub.State, strict *strictProxyState) error {
+	if profiles == nil && len(pending) == 0 && history == nil && sub == nil && strict == nil {
 		return nil
 	}
+	if strict == nil {
+		next := s.cloneStrictProxyLocked()
+		strict = &next
+	}
+	if profiles != nil {
+		old := map[string]ProxyProfile{}
+		for _, p := range s.listProxyProfilesLocked() {
+			old[p.ID] = p
+		}
+		for _, p := range profiles {
+			previous, ok := old[p.ID]
+			if !ok || strictProxyIdentity(previous.URL) != strictProxyIdentity(p.URL) || previous.Enabled != p.Enabled {
+				strict.Generations[p.ID]++
+			}
+		}
+		pending = s.rebindStrictPendingLocked(profiles, pending, strict)
+	}
 	values := map[string]string{}
+	strictRaw, err := marshalJSON(strict)
+	if err != nil {
+		return err
+	}
+	values[strictProxyStateKey] = string(strictRaw)
 	if profiles != nil {
 		raw, err := marshalJSON(profiles)
 		if err != nil {
@@ -308,7 +350,11 @@ func (s *Store) commitProxyBundleLocked(ctx context.Context, profiles []ProxyPro
 	if history != nil {
 		s.riskProxyHistory = history
 	}
+	s.strictProxy = *strict
 	for key, value := range values {
+		if key == strictProxyStateKey || key == riskProxyHistoryKey {
+			continue
+		}
 		s.settings[key] = value
 	}
 	if len(values) > 0 {

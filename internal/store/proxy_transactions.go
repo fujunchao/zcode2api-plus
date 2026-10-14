@@ -75,6 +75,7 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 	assignable := proxyProfilesExcluding(remaining, excluded)
 	occupancy := s.proxyOccupancyLocked()
 	var pending []*model.Account
+	next := s.cloneStrictProxyLocked()
 	for _, a := range s.allAccountsLocked() {
 		if a.ProxyID != nil && ids[*a.ProxyID] {
 			copy := a.Clone()
@@ -83,17 +84,27 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 		}
 	}
 	for _, a := range pending {
-		p, ok := leastLoadedProxy(assignable, occupancy, "", "")
+		p, ok := s.chooseProxyLocked(assignable, occupancy, "", "")
 		if !ok {
 			result.Direct = append(result.Direct, a.ID)
+			setStrictIntent(&next, a, "auto_pending_proxy")
 			continue
 		}
 		id, url := p.ID, p.URL
 		a.ProxyID, a.ProxyURL = &id, &url
 		occupancy[id]++
 		result.Assigned[a.ID] = id
+		setStrictIntent(&next, a, "auto_proxy")
 	}
-	if err := s.commitProxyStateWithHistoryLocked(remaining, pending, nil, reasons...); err != nil {
+	reason := "automatic"
+	if len(reasons) > 0 {
+		reason = reasons[0]
+	}
+	sub, err := s.subscriptionMutationLocked(remaining, reason)
+	if err != nil {
+		return nil, ProxyReassign{Assigned: map[string]string{}}, err
+	}
+	if err := s.commitProxyBundleStrictLocked(context.Background(), remaining, pending, nil, sub, &next); err != nil {
 		return nil, ProxyReassign{Assigned: map[string]string{}}, err
 	}
 	for _, id := range removed {

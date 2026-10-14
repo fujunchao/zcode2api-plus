@@ -43,7 +43,7 @@ func (s *Store) PickAvailableProxyProfile() (ProxyProfile, bool) {
 func (s *Store) PickAvailableProxyProfileExcluding(excluded map[string]bool) (ProxyProfile, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return leastLoadedProxy(proxyProfilesExcluding(s.listProxyProfilesLocked(), excluded), s.proxyOccupancyLocked(), "", "")
+	return s.chooseProxyLocked(proxyProfilesExcluding(s.listProxyProfilesLocked(), excluded), s.proxyOccupancyLocked(), "", "")
 }
 
 func proxyProfilesExcluding(profiles []ProxyProfile, excluded map[string]bool) []ProxyProfile {
@@ -52,7 +52,14 @@ func proxyProfilesExcluding(profiles []ProxyProfile, excluded map[string]bool) [
 	}
 	allowed := make([]ProxyProfile, 0, len(profiles))
 	for _, profile := range profiles {
-		if !excluded[profile.URL] {
+		blocked := excluded[profile.URL]
+		for raw, skip := range excluded {
+			if skip && strictProxyIdentity(raw) == strictProxyIdentity(profile.URL) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
 			allowed = append(allowed, profile)
 		}
 	}
