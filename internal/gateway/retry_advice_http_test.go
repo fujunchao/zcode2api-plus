@@ -1,0 +1,44 @@
+package gateway
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
+	"testing"
+
+	"zcode2api/internal/model"
+)
+
+// 初次已用完风险尝试预算的405和随后本地503都必须阻止同范围立即重投。
+func TestRetryAdviceCoversRiskExhaustionAndReplay(t *testing.T) {
+	f := newFixture(t)
+	f.respond = jsonResp(405, `{"code":"3012","message":"Request has been blocked due to unusual activity."}`)
+	for _, name := range []string{"one", "two"} {
+		if _, err := f.st.AddAccount(model.ProviderZai, name, "sk-synthetic-"+name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body, _ := json.Marshal(msgBody())
+	for _, wantStatus := range []int{405, 503} {
+		req, _ := http.NewRequest(http.MethodPost, f.srv.URL+"/v1/messages", bytes.NewReader(body))
+		req.Header.Set("X-Api-Key", "sk-test")
+		resp, err := f.srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != wantStatus {
+			t.Fatalf("状态不应被等待建议改写: got=%d want=%d", resp.StatusCode, wantStatus)
+		}
+		seconds, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+		if err != nil || seconds <= 0 || resp.Header.Get("X-Zcode2api-Retry-Policy") != "wait_same_gateway" {
+			t.Fatalf("需要明确等待建议: Retry-After=%q policy=%q", resp.Header.Get("Retry-After"), resp.Header.Get("X-Zcode2api-Retry-Policy"))
+		}
+	}
+	if f.callCount() != 2 {
+		t.Fatalf("第二次入站必须零出站，实际总数=%d", f.callCount())
+	}
+}
