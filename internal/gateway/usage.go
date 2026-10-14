@@ -172,9 +172,10 @@ func (u *UsageCollector) Finish() {
 	var payload map[string]any
 	if err := json.Unmarshal(u.buf, &payload); err == nil {
 		_, contentOK := payload["content"].([]any)
+		messageID, _ := payload["id"].(string)
 		stopReason, _ := payload["stop_reason"].(string)
 		u.jsonMessage = payload["type"] == "message" && payload["role"] == "assistant" &&
-			contentOK && stopReason != "" && payload["error"] == nil
+			strings.TrimSpace(messageID) != "" && contentOK && stopReason != "" && payload["error"] == nil
 		usage, _ := payload["usage"].(map[string]any)
 		if usage != nil {
 			u.observeUsage(usage)

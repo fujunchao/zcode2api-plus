@@ -119,7 +119,7 @@ func TestAsyncInvalidManualProxyIsTerminalWithoutDialOrAccountPenalty(t *testing
 // 从真实模型 HTTP 收包到严格规则闭环：只有完整成功与完整 3012 能构成线路对照。
 // 账号/路由切换仅发生在合成隔离存储，直接驱动一次派发以固定对照条件，不改变生产冷却策略。
 func TestAsyncStrictProxyObservationRequiresCompleteBodies(t *testing.T) {
-	for _, kind := range []string{"complete", "truncated_success", "json_not_stream", "oversized_3012", "aborted_3012"} {
+	for _, kind := range []string{"complete", "legacy_ticket", "truncated_success", "json_not_stream", "oversized_3012", "aborted_3012"} {
 		t.Run(kind, func(t *testing.T) {
 			p, st, _, _ := newTestPool(t)
 			t.Cleanup(p.Close)
@@ -176,6 +176,14 @@ func TestAsyncStrictProxyObservationRequiresCompleteBodies(t *testing.T) {
 			}
 			var lastBad *model.Account
 			for i, line := range []store.ProxyProfile{goodLine, badLine, badLine} {
+				if kind == "legacy_ticket" {
+					// 仅为合成旧票据固定可比条件，实际走完整 processTicket 选号与发送链。
+					if _, err := st.Update(acc.Provider, acc.ID, func(live *model.Account) {
+						live.Status, live.CoolingUntil, live.LastRiskControlAt = model.StatusActive, nil, nil
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
 				if _, err := st.AssignProxyProfile(acc.ID, line.ID); err != nil {
 					t.Fatal(err)
 				}
@@ -189,20 +197,25 @@ func TestAsyncStrictProxyObservationRequiresCompleteBodies(t *testing.T) {
 				}
 				id := fmt.Sprintf("independent-entry-%d", i)
 				insertTicket(p, id, body)
-				_, _ = p.attemptUpstreamOnce(context.Background(), id, snapshot, "GLM-5.3", req, payload, nil, nil)
+				if kind == "legacy_ticket" {
+					// 没有 HTTP trace、没有快照的旧/内部票据仍以稳定 ticketID 作入口引用。
+					p.processTicket(context.Background(), id)
+				} else {
+					_, _ = p.attemptUpstreamOnce(context.Background(), id, snapshot, "GLM-5.3", req, payload, nil, nil)
+				}
 			}
 			summary, err := st.StrictProxySummary()
 			if err != nil || summary.ActiveDispatch != 0 || badCalls.Load() != 2 {
 				t.Fatalf("观察结束应释放所有许可：summary=%+v calls=%d err=%v", summary, badCalls.Load(), err)
 			}
 			wantBlocks := 0
-			if kind == "complete" {
+			if kind == "complete" || kind == "legacy_ticket" {
 				wantBlocks = 1
 			}
 			if len(summary.Blocks) != wantBlocks {
 				t.Fatalf("严格对照不能把不完整结果当证据：kind=%s blocks=%+v", kind, summary.Blocks)
 			}
-			if kind == "complete" {
+			if kind == "complete" || kind == "legacy_ticket" {
 				req, err := upstream.BuildRequestWithAttribution(lastBad, "", "", nil, attr)
 				if err != nil {
 					t.Fatal(err)

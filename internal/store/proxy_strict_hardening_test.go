@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -209,5 +210,121 @@ func TestStrictProxyPendingAuditAndOriginalAccountStateArePreserved(t *testing.T
 	got := s.FindAny(peer.ID)
 	if got.Status != model.StatusCooling || got.CoolingUntil == nil || *got.CoolingUntil != until || got.Enabled {
 		t.Fatal("严格删除只能变路由，不能清账号保护")
+	}
+}
+
+func TestStrictProxyDeletedAccountsLeaveNoAutomaticPending(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprint(batch), func(t *testing.T) {
+			s := newTestStore(t)
+			a := addSelectionAccount(t, s, "自动等待", "")
+			s.AutoAssignProxies([]string{a.ID})
+			var err error
+			if batch {
+				_, err = s.BatchRemoveAccounts([]string{a.ID}, false)
+			} else {
+				_, err = s.RemoveAccount(a.Provider, a.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, _ := s.StrictProxySummary()
+			if status.Pending != 0 {
+				t.Fatalf("账号删除必须同时移除等待意图：%+v", status)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if status, _ := reopened.StrictProxySummary(); status.Pending != 0 {
+				t.Fatal("重启后不能恢复已删除账号的等待项")
+			}
+		})
+	}
+}
+
+func TestStrictProxyBatchCredentialGenerationIsInitializedAtomically(t *testing.T) {
+	s := newTestStore(t)
+	result, err := s.BatchAddAccounts(model.ProviderZai, []BatchAddItem{{Name: "批量", Secret: "synthetic-batch-key"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := s.FindAny(result.IDs[0])
+	egress := s.ProxyEgress(a)
+	if egress.CredentialGeneration() == 0 {
+		t.Fatal("批量入池不能遗漏初始凭据代次")
+	}
+	if _, err := s.Update(a.Provider, a.ID, func(live *model.Account) { live.UseCount++ }); err != nil {
+		t.Fatal(err)
+	}
+	release, err := s.AcquireProxyDispatch(a, egress)
+	if err != nil {
+		t.Fatalf("普通额度/统计写入不能使同凭据快照失效：%v", err)
+	}
+	release()
+}
+
+func TestStrictProxyRecoveryRejectsEmptyAndNullJournal(t *testing.T) {
+	for _, raw := range []string{"", "null", "{broken"} {
+		t.Run(fmt.Sprintf("length-%d", len(raw)), func(t *testing.T) {
+			s := newTestStore(t)
+			if err := os.WriteFile(s.strictJournalPath, []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if reopened, err := New(); err == nil {
+				_ = reopened.Close()
+				t.Fatal("损坏恢复记录不能让旧代理默认健康")
+			}
+		})
+	}
+}
+
+func TestStrictProxyOldPlatformSuccessDoesNotControlNewAllRouteFailures(t *testing.T) {
+	s, bad, good, a := strictComparisonSetup(t)
+	if _, err := s.AssignProxyProfile(a.ID, good.ID); err != nil {
+		t.Fatal(err)
+	}
+	strictObserve(t, s, s.FindAny(a.ID), strictObservation("earlier-success", 200))
+	strictObserve(t, s, s.FindAny(a.ID), strictObservation("control-now-failing", 405))
+	if _, err := s.AssignProxyProfile(a.ID, bad.ID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		d := strictObserve(t, s, s.FindAny(a.ID), strictObservation(fmt.Sprintf("platform-bad-%d", i), 405))
+		if len(d.Removed) != 0 {
+			t.Fatalf("全线路转为失败后不能用此前旧成功自动删除：%+v", d)
+		}
+	}
+}
+
+func TestStrictProxySelectionForceDirectKeepsAccountProtection(t *testing.T) {
+	s, bad, good, a := strictComparisonSetup(t)
+	manual := addSelectionAccount(t, s, "手工退役线路", "")
+	if _, err := s.SetProxyURL(manual.Provider, manual.ID, &bad.URL); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		strictObserve(t, s, a, strictObservation(fmt.Sprintf("bad-%d", i), 405))
+	}
+	strictFinishComparison(t, s, a, good)
+	skip := map[string]bool{a.ID: true}
+	if s.Select(a.Provider, skip, "") != nil {
+		t.Fatal("普通选号不得使用被退役的人工裸 URL")
+	}
+	if selected := s.SelectForDirect(a.Provider, skip, ""); selected == nil || selected.ID != manual.ID {
+		t.Fatal("显式强制直连无需使用旧代理，仍应能选择健康账号")
+	}
+	if _, err := s.Update(manual.Provider, manual.ID, func(live *model.Account) { live.Enabled = false }); err != nil {
+		t.Fatal(err)
+	}
+	if s.SelectForDirect(a.Provider, skip, "") != nil {
+		t.Fatal("强制直连不能绕过账号停用")
 	}
 }

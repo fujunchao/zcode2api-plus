@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
+	"zcode2api/internal/upstream"
 )
 
 func asyncErrorFromSSE(t *testing.T, raw string) map[string]any {
@@ -51,9 +53,23 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 	base := time.Now()
 	p.replay = gateway.NewReplayGuard(time.Minute, func() time.Time { return base.Add(time.Duration(clockOffset.Load())) })
 	var calls atomic.Int32
+	var captureMu sync.Mutex
+	var capturedHeaders []http.Header
 	riskBody := `{"code":3012,"msg":"synthetic risk-control rejection"}`
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if upstream.MetadataSessionID(body) != "http-session" || r.Header.Get("X-Session-Id") != "http-session" {
+			t.Error("异步换号必须沿用入站快照并保持头体会话一致")
+		}
+		captureMu.Lock()
+		capturedHeaders = append(capturedHeaders, r.Header.Clone())
+		captureMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		if n <= 2 {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -85,6 +101,10 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		}
 		req.Header.Set("Authorization", "Bearer synthetic-key")
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Session-Id", "sess_http-session")
+		req.Header.Set("X-Zcode-Trace-Id", "http-trace")
+		req.Header.Set("X-Query-Id", "query_http-turn")
+		req.Header.Set("X-Zcode-Query-Source", "compact")
 		resp, err := srv.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -123,5 +143,22 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 	_, raw := post("另一个正常请求")
 	if !strings.Contains(raw, "event: done") || strings.Contains(raw, "wait_same_gateway") || calls.Load() != 4 {
 		t.Fatal("局部风控保护不能全局关闭其他请求的 3009 原地重试")
+	}
+	captureMu.Lock()
+	observed := append([]http.Header(nil), capturedHeaders...)
+	captureMu.Unlock()
+	seen := map[string]bool{}
+	for _, header := range observed {
+		if header.Get("X-Zcode-Trace-Id") != "http-trace" || header.Get("X-Query-Id") != "http-turn" || header.Get("X-Zcode-Query-Source") != "compact" {
+			t.Fatal("入站快照必须跨 405 换号和 3009 同号重试保持用途与逻辑归因")
+		}
+		requestID := header.Get("X-Request-Id")
+		if requestID == "" || seen[requestID] {
+			t.Fatal("每个真实 HTTP 尝试必须有新的 request ID")
+		}
+		seen[requestID] = true
+	}
+	if len(observed) != 4 || observed[0].Get("Authorization") == observed[1].Get("Authorization") || observed[2].Get("Authorization") != observed[3].Get("Authorization") {
+		t.Fatal("405 应按原预算换号，3009 应按原预算同号重试")
 	}
 }

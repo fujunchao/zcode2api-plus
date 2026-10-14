@@ -15,11 +15,12 @@ func (h *Handler) finishNewAccountQuotaCheck(ctx context.Context, acc *model.Acc
 	if ctx.Err() != nil || live == nil || !live.IsQuotaRefreshTarget() {
 		return
 	}
+	route := h.Store.ProxyEgress(live)
 	_, final := h.Quota.FetchQuotaFresh(ctx, live)
 	if ctx.Err() != nil || !h.Store.ClaimAutoEnabled() {
 		return
 	}
-	removed, reassign, err := h.Store.PurgeEmptyNewAccountProxy(acc, initial, final)
+	removed, reassign, err := h.Store.PurgeEmptyNewAccountProxy(acc, initial, final, route)
 	if err != nil {
 		web.Warn("new-account-quota", fmt.Sprintf("新账号 %s 双次空额度检测移除代理失败，保留原绑定: %v", acc.ID, err))
 	} else if removed {

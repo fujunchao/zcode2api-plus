@@ -113,18 +113,21 @@ func (s *Service) clientFor(acc *model.Account) (HTTPClient, error) {
 	if s.Client != nil {
 		return s.Client, nil
 	}
+	raw := ""
 	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
-		client, err := proxy.ClientFor(*acc.ProxyURL, 25*time.Second)
-		if err != nil {
-			return nil, err
-		}
-		if s.Store != nil {
-			client = s.Store.GuardProxyClient(client, acc, s.Store.ProxyEgress(acc))
-		}
-		return client, nil
+		raw = *acc.ProxyURL
 	}
 	// 空线路表示明确直连/自动直连回退，不继承进程环境代理。
-	return proxy.ClientFor("", 25*time.Second)
+	client, err := proxy.ClientFor(raw, 25*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	// 领取认证/验证码只能发给明确目标，不自动把认证头或 POST 正文转到 Location。
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if s.Store != nil {
+		client = s.Store.GuardProxyClient(client, acc, s.Store.ProxyEgress(acc))
+	}
+	return client, nil
 }
 
 func (s *Service) proxyFailureError(acc *model.Account, err *ClaimError, reason string) *ClaimError {
@@ -271,6 +274,9 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 	}
 	if res.StatusCode == http.StatusProxyAuthRequired {
 		return nil, s.proxyFailureError(acc, &ClaimError{msg: "代理认证失败 HTTP 407", httpStatus: res.StatusCode, endpointUnreachable: true}, proxy.FailureEndpointUnreachable)
+	}
+	if res.StatusCode >= 300 && res.StatusCode < 400 {
+		return nil, &ClaimError{msg: fmt.Sprintf("领取端点返回重定向 HTTP %d，未转发认证材料", res.StatusCode), httpStatus: res.StatusCode}
 	}
 	raw, readErr := io.ReadAll(res.Body)
 	if s.context().Err() != nil {

@@ -28,6 +28,51 @@ func newAccountQuotaEvidence(t *testing.T, s *Store, id string) (*model.Account,
 	return snap, snap.StartPlanObservation, final
 }
 
+func TestNewAccountQuotaProxyProofRejectsCredentialAndRouteABA(t *testing.T) {
+	for _, kind := range []string{"unchanged", "credential", "proxy-url"} {
+		t.Run(kind, func(t *testing.T) {
+			s := newTestStore(t)
+			p := addSelectionProxy(t, s, "初始线路", 18080, true)
+			a := addSelectionAccount(t, s, "新账号", p.ID)
+			initial := model.NewStartPlanObservation(a, float64(time.Now().Unix()), true)
+			if _, err := s.Update(a.Provider, a.ID, func(live *model.Account) { live.StartPlanObservation = initial }); err != nil {
+				t.Fatal(err)
+			}
+			a = s.FindAny(a.ID)
+			if !s.RecordStartPlanProxyObservation(a, s.ProxyEgress(a), initial) {
+				t.Fatal("真实初始快照应建立代次证明")
+			}
+			switch kind {
+			case "credential":
+				for _, secret := range []string{jwtFor("new-generation"), a.Secret()} {
+					if _, err := s.RenewJWT(a.Provider, a.ID, secret); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "proxy-url":
+				for _, raw := range []string{"http://127.0.0.1:18888", p.URL} {
+					if _, err := s.UpdateProxyProfile(p.ID, p.Name, raw, true); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			live := s.FindAny(a.ID)
+			route := s.ProxyEgress(live)
+			final := model.NewStartPlanObservation(live, initial.CheckedAt+1, true)
+			if _, err := s.Update(a.Provider, a.ID, func(current *model.Account) { current.StartPlanObservation = final }); err != nil {
+				t.Fatal(err)
+			}
+			if !s.RecordStartPlanProxyObservation(live, route, final) {
+				t.Fatal("真实末次快照应建立代次证明")
+			}
+			removed, _, err := s.PurgeEmptyNewAccountProxy(a, initial, final, route)
+			if err != nil || removed != (kind == "unchanged") {
+				t.Fatalf("两次证据必须同代，不能因 A→B→A 恢复：%s removed=%v err=%v", kind, removed, err)
+			}
+		})
+	}
+}
+
 func TestNewAccountQuotaPurgeReassignsAllBindings(t *testing.T) {
 	for _, shared := range []bool{false, true} {
 		t.Run(fmt.Sprintf("共享=%v", shared), func(t *testing.T) {

@@ -1,0 +1,187 @@
+package channel_test
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/gin-gonic/gin"
+)
+
+// 实际 rc.41 Claude/OpenAI adapter + DoApiRequest + 本地 HTTP，而不是复刻 HeaderOverride。
+// 默认缺头与五字段配置修复在同一固定版本分别断言；客户端秘密不能穿过白名单。
+func TestZcode2apiAttributionContractAdaptersAndPreciseOverrides(t *testing.T) {
+	service.InitHttpClient()
+	patched := os.Getenv("ZCODE2API_CONTRACT_PATCHED") == "1"
+	policyRaw, err := os.ReadFile("testdata/zcode2api-attribution-headers.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policy map[string]any
+	if json.Unmarshal(policyRaw, &policy) != nil || len(policy) != 5 {
+		t.Fatal("配置必须恰好五个明确归因头")
+	}
+	wantHeaders := map[string]string{
+		"X-Session-Id":         "sess_synthetic-session",
+		"X-Zcode-Trace-Id":     "synthetic-trace",
+		"X-Query-Id":           "query_synthetic-query",
+		"X-Zcode-Session-Type": "subagent",
+		"X-Zcode-Query-Source": "synthetic_review",
+	}
+	for _, route := range []struct {
+		name, incoming, outgoing string
+		claude                   bool
+	}{
+		{"messages", "/v1/messages", "/v1/messages", true},
+		{"chat", "/v1/chat/completions", "/v1/chat/completions", false},
+		{"completions", "/v1/completions", "/v1/completions", false},
+		{"responses", "/v1/responses", "/v1/responses", false},
+		{"responses_to_claude", "/v1/responses", "/v1/messages", true},
+	} {
+		for _, model := range []string{"glm-5.3", "glm-5.3-flash"} {
+			for _, shape := range []string{"default", "configured", "missing", "multiple", "aliases", "merged", "invalid_source", "invalid_type", "oversized_ids"} {
+				t.Run(route.name+"/"+model+"/"+shape, func(t *testing.T) {
+					seen := make(chan *http.Request, 2)
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						_, _ = io.Copy(io.Discard, r.Body)
+						seen <- r
+						_, _ = io.WriteString(w, `{}`)
+					}))
+					t.Cleanup(server.Close)
+					c, _ := gin.CreateTestContext(httptest.NewRecorder())
+					c.Request = httptest.NewRequest(http.MethodPost, route.incoming, strings.NewReader(`{}`))
+					c.Request.Header.Set("Content-Type", "application/json")
+					c.Request.Header.Set("Authorization", "Bearer synthetic-client-secret")
+					c.Request.Header.Set("X-Api-Key", "synthetic-client-key")
+					c.Request.Header.Set("Cookie", "synthetic-session-secret")
+					c.Request.Header.Set("X-Zcode-Caller-Scope", "untrusted-scope")
+					c.Request.Header.Set("X-Internal-Only", "must-not-pass")
+					c.Request.Header.Set("X-Request-Id", "client-attempt-id")
+					if shape != "missing" {
+						for name, value := range wantHeaders {
+							c.Request.Header.Set(strings.ToLower(name), value)
+							if shape == "multiple" {
+								c.Request.Header.Add(name, "second-value")
+							}
+							if shape == "aliases" {
+								c.Request.Header[strings.ToLower(name)] = []string{"aliased-second"}
+							}
+							if shape == "merged" {
+								c.Request.Header.Set(name, value+",second-value")
+							}
+						}
+					}
+					if shape == "invalid_source" {
+						c.Request.Header.Set("X-Zcode-Query-Source", "bad source")
+					}
+					if shape == "invalid_type" {
+						c.Request.Header.Set("X-Zcode-Session-Type", "unsupported-type")
+					}
+					if shape == "oversized_ids" {
+						for _, name := range []string{"X-Session-Id", "X-Zcode-Trace-Id", "X-Query-Id"} {
+							c.Request.Header.Set(name, strings.Repeat("s", 1025))
+						}
+					}
+					info := &relaycommon.RelayInfo{
+						ChannelMeta:     &relaycommon.ChannelMeta{ChannelId: 7, ChannelType: constant.ChannelTypeOpenAI, ChannelBaseUrl: server.URL, ApiKey: "synthetic-gateway-key", UpstreamModelName: model},
+						OriginModelName: model, RequestURLPath: route.incoming, RelayMode: relayconstant.Path2RelayMode(route.incoming),
+					}
+					if shape != "default" {
+						info.HeadersOverride = policy
+					}
+					var adapter channel.Adaptor = &openai.Adaptor{}
+					if route.claude {
+						info.ChannelType = constant.ChannelTypeClaude
+						adapter = &claude.Adaptor{}
+					}
+					adapter.Init(info)
+					for range 2 {
+						response, err := channel.DoApiRequest(adapter, c, info, strings.NewReader(`{"model":"synthetic","messages":[]}`))
+						if err != nil {
+							t.Fatal(err)
+						}
+						_, _ = io.Copy(io.Discard, response.Body)
+						_ = response.Body.Close()
+						r := <-seen
+						if r.URL.Path != route.outgoing {
+							t.Fatalf("真实adapter目标错误: %s", r.URL.Path)
+						}
+						for name, value := range wantHeaders {
+							want := ""
+							if shape != "default" && shape != "missing" {
+								want = value
+							}
+							if shape == "merged" {
+								want += ",second-value"
+							}
+							invalid := shape == "multiple" || shape == "aliases" || shape == "merged"
+							if shape == "invalid_source" && name == "X-Zcode-Query-Source" {
+								want, invalid = "bad source", true
+							}
+							if shape == "invalid_type" && name == "X-Zcode-Session-Type" {
+								want, invalid = "unsupported-type", true
+							}
+							if shape == "oversized_ids" && (name == "X-Session-Id" || name == "X-Zcode-Trace-Id" || name == "X-Query-Id") {
+								want, invalid = strings.Repeat("s", 1025), true
+							}
+							if patched && invalid {
+								want = ""
+							}
+							if got := r.Header.Get(name); got != want {
+								t.Errorf("归因 %s: got=%q want=%q", name, got, want)
+							}
+						}
+						if route.claude {
+							if r.Header.Get("X-Api-Key") != "synthetic-gateway-key" || r.Header.Get("Authorization") != "" {
+								t.Fatal("Claude必须只用渠道认证，不透传调用者秘密")
+							}
+						} else if r.Header.Get("Authorization") != "Bearer synthetic-gateway-key" || r.Header.Get("X-Api-Key") != "" {
+							t.Fatal("OpenAI必须只用渠道认证，不透传调用者秘密")
+						}
+						for _, name := range []string{"Cookie", "X-Zcode-Caller-Scope", "X-Internal-Only", "X-Request-Id"} {
+							if r.Header.Get(name) != "" {
+								t.Errorf("五字段配置不得透传 %s", name)
+							}
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestZcode2apiAttributionContractActualPlaceholderHook(t *testing.T) {
+	source, err := os.ReadFile("api_request.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 0
+	if os.Getenv("ZCODE2API_CONTRACT_PATCHED") == "1" {
+		want = 1
+	}
+	if got := strings.Count(string(source), "zcode2apiAttributionPlaceholder(c, name)"); got != want {
+		t.Fatalf("实际五字段占位符钩子数量：got=%d want=%d", got, want)
+	}
+}
+
+func TestZcode2apiAttributionContractOtherPlaceholderKeepsLegacySemantics(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header["X-Other"] = []string{"first-legacy-value", "second-legacy-value"}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{HeadersOverride: map[string]any{"X-Other": "{client_header:X-Other}"}}}
+	headers, err := channel.ResolveHeaderOverride(info, c)
+	if err != nil || headers["x-other"] != "first-legacy-value" {
+		t.Fatalf("归因专项不得扩大到其他占位符：%v %v", headers, err)
+	}
+}

@@ -106,3 +106,65 @@ func TestLoginProfileDispatchRejectsDisabledChangedAndRemoved(t *testing.T) {
 		})
 	}
 }
+
+func TestGuardDirectClientRejectsChangedBindingBeforeNetwork(t *testing.T) {
+	for _, mode := range []string{"new-manual-proxy", "binding-aba"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newTestStore(t)
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = io.WriteString(w, "complete")
+			}))
+			defer server.Close()
+			p, err := s.AddProxyProfile("人工改绑", server.URL, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := addSelectionAccount(t, s, "初始直连", "")
+			client, err := proxy.ClientFor("", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			guarded := s.GuardProxyClient(client, a, s.ProxyEgress(a))
+			if _, err := s.AssignProxyProfile(a.ID, p.ID); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "binding-aba" {
+				if _, err := s.AssignProxyProfile(a.ID, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+			if _, err := guarded.Do(req); !errors.Is(err, ErrProxyRetired) {
+				t.Fatalf("改绑后旧直连客户端不得派发：%v", err)
+			}
+			if calls.Load() != 0 {
+				t.Fatal("直连旧快照应在出站前拦截")
+			}
+			forced := s.GuardProxyClient(client, a, s.DirectEgress(a, "forced_direct"))
+			resp, err := forced.Do(req)
+			if err != nil {
+				t.Fatalf("显式强制直连仍不受代理绑定影响：%v", err)
+			}
+			_ = resp.Body.Close()
+			if calls.Load() != 1 {
+				t.Fatal("显式强制直连应只产生一次实际请求")
+			}
+		})
+	}
+}
+
+func TestDirectDispatchRechecksLiveBindingEvenIfEgressWasDerivedLate(t *testing.T) {
+	s := newTestStore(t)
+	a := addSelectionAccount(t, s, "旧直连快照", "")
+	p := addSelectionProxy(t, s, "稍后人工绑定", 18888, true)
+	if _, err := s.AssignProxyProfile(a.ID, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 归因生成发生在改绑之后，但传入的账号来自改绑之前，不能只比较新读出的代次。
+	lateEgress := s.ProxyEgress(a)
+	if _, err := s.AcquireProxyDispatch(a, lateEgress); !errors.Is(err, ErrProxyRetired) {
+		t.Fatalf("实际当前人工代理意图必须在派发锁内复核：%v", err)
+	}
+}

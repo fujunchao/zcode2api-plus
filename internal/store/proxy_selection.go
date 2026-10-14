@@ -95,7 +95,7 @@ func (s *Store) RotateAccountProxy(expected *model.Account) (ProxyProfile, bool,
 // PurgeEmptyNewAccountProxy 仅供本次真正新建账号的领取收尾调用。
 // initial/final 是领取前后的独立查询证据，expected 是领取开始前的账号快照。
 // 全部关联账号按空闲优先/最少绑定原子改派；不改领取状态，也不在新线路循环检测。
-func (s *Store) PurgeEmptyNewAccountProxy(expected *model.Account, initial, final model.StartPlanObservation) (bool, ProxyReassign, error) {
+func (s *Store) PurgeEmptyNewAccountProxy(expected *model.Account, initial, final model.StartPlanObservation, route ...ProxyEgress) (bool, ProxyReassign, error) {
 	empty := ProxyReassign{Assigned: map[string]string{}}
 	if !expected.MissingStartPlanEvidence() || initial.ProxyID == "" || !initial.Missing || !final.Missing ||
 		!initial.Matches(expected) || !final.Matches(expected) || final.CheckedAt <= initial.CheckedAt ||
@@ -104,6 +104,11 @@ func (s *Store) PurgeEmptyNewAccountProxy(expected *model.Account, initial, fina
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(route) > 0 && (!s.proxyDispatchCurrentLocked(expected, route[0]) ||
+		!s.startPlanProxyProofCurrentLocked(expected, initial, route[0]) ||
+		!s.startPlanProxyProofCurrentLocked(expected, final, route[0])) {
+		return false, empty, nil
+	}
 	live := s.findLocked(expected.Provider, expected.ID)
 	// 本次领取成功允许检测，但历史使用、并发新快照、凭据/出口变更都要保护。
 	// final 必须仍是最新观测；不能拿迟到的空回包覆盖后来的有效额度。

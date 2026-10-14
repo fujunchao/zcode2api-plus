@@ -37,7 +37,14 @@ const exchangeTimeout = 30 * time.Second
 var httpClientFor = proxy.ClientFor // 隔离 HTTP/TLS 回归可替换工厂，不访问真实服务。
 
 func clientFor(proxyURL string, timeout time.Duration) (*http.Client, error) {
-	return httpClientFor(proxyURL, timeout)
+	client, err := httpClientFor(proxyURL, timeout)
+	if err != nil {
+		return nil, err
+	}
+	// 只在请求自己的目标兑换凭据，307/308 也不能把授权码或业务 token 转往别处。
+	copy := *client
+	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &copy, nil
 }
 
 // requestError 统一网络错误文案；经代理时附带（已脱敏的）代理地址，

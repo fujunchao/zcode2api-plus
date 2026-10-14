@@ -220,6 +220,15 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 	if len(fresh) == 0 {
 		return res, nil // 全部重复：无需写库，幂等达成
 	}
+	next := s.cloneStrictProxyLocked()
+	for _, a := range fresh {
+		trackStrictAccountVersions(&next, a)
+	}
+	strictRaw, err := marshalJSON(next)
+	if err != nil {
+		markBatchRollback(&res, err)
+		return res, err
+	}
 
 	// 单事务插入；commit 成功才追加进内存（先落库再改内存的批量形态）。
 	tx, err := s.db.BeginTx(context.Background(), nil)
@@ -235,11 +244,17 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 			return res, err
 		}
 	}
+	if _, err := tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", strictProxyStateKey, string(strictRaw)); err != nil {
+		markBatchRollback(&res, err)
+		_ = tx.Rollback()
+		return res, err
+	}
 	if err := tx.Commit(); err != nil {
 		logPersistFailure("batch-add", provider, err)
 		markBatchRollback(&res, err)
 		return res, err
 	}
+	s.strictProxy = next
 	s.accounts[provider] = append(s.accounts[provider], fresh...)
 	return res, nil
 }
@@ -288,6 +303,15 @@ func (s *Store) BatchRemoveAccounts(ids []string, missingOK bool) (BatchResult, 
 	if len(targets) == 0 {
 		return res, nil // 全部缺失（宽松模式）：无需写库
 	}
+	next := s.cloneStrictProxyLocked()
+	for _, a := range targets {
+		clearStrictAccountState(&next, a.ID)
+	}
+	strictRaw, err := marshalJSON(next)
+	if err != nil {
+		markBatchRollback(&res, err)
+		return res, err
+	}
 
 	// 单事务删除；commit 成功才改内存。删除常用于撤销外泄凭证，宁可整批失败
 	// 也不能出现「部分删除 + 调用方以为全删了」。
@@ -304,14 +328,21 @@ func (s *Store) BatchRemoveAccounts(ids []string, missingOK bool) (BatchResult, 
 			return res, err
 		}
 	}
+	if _, err := tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", strictProxyStateKey, string(strictRaw)); err != nil {
+		markBatchRollback(&res, err)
+		_ = tx.Rollback()
+		return res, err
+	}
 	if err := tx.Commit(); err != nil {
 		logPersistFailure("batch-delete", "batch", err)
 		markBatchRollback(&res, err)
 		return res, err
 	}
+	s.strictProxy = next
 	removed := make(map[string]bool, len(targets))
 	for _, acc := range targets {
 		removed[acc.ID] = true
+		delete(s.strictStartPlanProofs, acc.ID)
 	}
 	for p, list := range s.accounts {
 		remaining := list[:0:0]

@@ -1,0 +1,158 @@
+package service
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
+)
+
+// 同一组测试在真实 rc.41 service 包运行两次：原版证明缺口，补丁版证明定点消费。
+func TestZcode2apiRetryContractAdviceMatrix(t *testing.T) {
+	patched := os.Getenv("ZCODE2API_CONTRACT_PATCHED") == "1"
+	for _, tc := range []struct {
+		name, body, policy, after string
+		status, channel           int
+		trusted, stops            bool
+	}{
+		{"first_405", `{"code":3012,"msg":"synthetic risk"}`, "wait_same_gateway", "120", 405, 7, true, true},
+		{"nested_405", `{"error":{"code":"3012","message":"synthetic risk"}}`, "wait_same_gateway", "119", 405, 7, true, true},
+		{"cooldown_503", `{"error":{"type":"risk_control_cooldown","message":"synthetic wait"}}`, "wait_same_gateway", "118", 503, 7, true, true},
+		{"retry_after_only", `{"code":3012,"msg":"synthetic risk"}`, "", "120", 405, 7, true, false},
+		{"body_advice_only", `{"error":{"type":"risk_control_cooldown","message":"synthetic wait","details":{"retry_policy":"wait_same_gateway","retry_after_seconds":120}}}`, "", "", 503, 7, true, false},
+		{"ordinary_503", `{"error":{"type":"upstream_unavailable","message":"temporary"}}`, "wait_same_gateway", "120", 503, 7, true, false},
+		{"busy_3009", `{"code":3009,"msg":"busy"}`, "wait_same_gateway", "120", 429, 7, true, false},
+		{"ordinary_405", `{"code":4000,"msg":"wrong method"}`, "wait_same_gateway", "120", 405, 7, true, false},
+		{"no_wait", `{"code":3012,"msg":"synthetic risk"}`, "wait_same_gateway", "0", 405, 7, true, false},
+		{"invalid_wait", `{"code":3012,"msg":"synthetic risk"}`, "wait_same_gateway", "not-seconds", 405, 7, true, false},
+		{"signed_wait", `{"code":3012,"msg":"synthetic risk"}`, "wait_same_gateway", "+120", 405, 7, true, false},
+		{"trailing_json", `{"code":3012,"msg":"synthetic risk"} {}`, "wait_same_gateway", "120", 405, 7, true, false},
+		{"oversized_wait", `{"code":3012,"msg":"synthetic risk"}`, "wait_same_gateway", "9999999999", 405, 7, true, false},
+		{"different_channel", `{"code":3012,"msg":"synthetic risk"}`, "wait_same_gateway", "120", 405, 8, true, false},
+		{"unconfigured_target", `{"code":3012,"msg":"synthetic risk"}`, "wait_same_gateway", "120", 405, 7, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.policy != "" {
+					w.Header().Set("X-Zcode2api-Retry-Policy", tc.policy)
+				}
+				if tc.after != "" {
+					w.Header().Set("Retry-After", tc.after)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+			target := server.URL
+			if !tc.trusted {
+				target = "http://untrusted.example.invalid"
+			}
+			t.Setenv("NEWAPI_ZCODE2API_RETRY_GATEWAYS", fmt.Sprintf(`{"7":%q}`, target))
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Set("channel_id", tc.channel)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			// 客户端自带同名头不能建立信任。
+			c.Request.Header.Set("X-Zcode2api-Retry-Policy", "wait_same_gateway")
+			response, err := server.Client().Post(server.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"synthetic"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Request = c.Request.WithContext(Zcode2apiRetryContext(c))
+			apiErr := NormalizeViolationFeeError(RelayErrorHandler(c.Request.Context(), response, false))
+			wantStop := patched && tc.stops
+			if apiErr == nil || apiErr.StatusCode != tc.status || ShouldRetryRelayError(c, apiErr, 3) == wantStop {
+				t.Fatalf("原状态须保留，消费行为必须符合版本：patched=%t stop=%t err=%v", patched, wantStop, apiErr)
+			}
+			if types.IsSkipRetryError(apiErr) != wantStop {
+				t.Fatal("只能给经过信任检查的两类风险错误设置停止标志")
+			}
+			if wantStop && c.Writer.Header().Get("Retry-After") != tc.after {
+				t.Fatal("尚未发送 HTTP 响应头时应保留当前剩余等待时间")
+			}
+			if !wantStop && c.Writer.Header().Get("Retry-After") != "" {
+				t.Fatal("无效/不受信任建议不能污染响应头")
+			}
+		})
+	}
+}
+
+func TestZcode2apiRetryContractOuterRequestBoundary(t *testing.T) {
+	patched := os.Getenv("ZCODE2API_CONTRACT_PATCHED") == "1"
+	var gatewayCalls, syntheticModelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := gatewayCalls.Add(1)
+		w.Header().Set("X-Zcode2api-Retry-Policy", "wait_same_gateway")
+		w.Header().Set("Retry-After", strconv.Itoa(121-int(call)))
+		if call == 1 {
+			// 网关合同夹具：仅首次请求代表两账号 3012，此后本地重放拒绝零模型出站。
+			// 真正 gateway.Engine 的相同断言由本仓库 gateway 回归独立执行。
+			syntheticModelCalls.Add(2)
+			w.WriteHeader(405)
+			_, _ = io.WriteString(w, `{"code":3012,"msg":"synthetic risk"}`)
+			return
+		}
+		w.WriteHeader(503)
+		_, _ = io.WriteString(w, `{"error":{"type":"risk_control_cooldown","message":"synthetic wait"}}`)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("NEWAPI_ZCODE2API_RETRY_GATEWAYS", fmt.Sprintf(`{"7":%q}`, server.URL))
+	runOuter := func() (int, string) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Set("channel_id", 7)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		calls := 0
+		for remaining := 3; remaining >= 0; remaining-- {
+			calls++
+			response, err := server.Client().Post(server.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"synthetic"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Request = c.Request.WithContext(Zcode2apiRetryContext(c))
+			apiErr := NormalizeViolationFeeError(RelayErrorHandler(c.Request.Context(), response, false))
+			if !ShouldRetryRelayError(c, apiErr, remaining) {
+				break
+			}
+		}
+		return calls, c.Writer.Header().Get("Retry-After")
+	}
+	firstCalls, firstWait := runOuter()
+	nextCalls, nextWait := runOuter()
+	wantCalls := 4
+	if patched {
+		wantCalls = 1
+	}
+	if firstCalls != wantCalls || nextCalls != wantCalls || syntheticModelCalls.Load() != 2 {
+		t.Fatalf("外层重投应由对应版本消费，后续新请求仍到网关重放闸门：first=%d next=%d model=%d", firstCalls, nextCalls, syntheticModelCalls.Load())
+	}
+	if patched {
+		first, _ := strconv.Atoi(firstWait)
+		next, _ := strconv.Atoi(nextWait)
+		if first != 120 || next != 119 || next >= first {
+			t.Fatal("后续重放等待应递减，不因消费者重提续期")
+		}
+	}
+}
+
+func TestZcode2apiRetryContractActualControllerBridge(t *testing.T) {
+	// 除真实 service 行为回归外，固定 controller 必须有且仅有一个上下文接线点。
+	// 否则仅向单测手工传 gin.Context 会掩盖真正协议入口拿不到受信任渠道信息的错误。
+	source, err := os.ReadFile("../controller/relay.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 0
+	if os.Getenv("ZCODE2API_CONTRACT_PATCHED") == "1" {
+		want = 1
+	}
+	if got := strings.Count(string(source), "c.Request = c.Request.WithContext(service.Zcode2apiRetryContext(c))"); got != want {
+		t.Fatalf("controller 实际接线数量不符：got=%d want=%d", got, want)
+	}
+}

@@ -58,25 +58,27 @@ var ErrAccountArchived = errors.New("账号已归档")
 
 // Store 线程安全的账号 / 设置存储，含轮询游标。
 type Store struct {
-	Requests          *requeststats.Tracker
-	mu                sync.Mutex
-	db                *sql.DB
-	processLock       *os.File
-	closeOnce         sync.Once
-	closeErr          error
-	accounts          map[string][]*model.Account
-	settings          map[string]string
-	rotation          map[string]int
-	riskProxyHistory  riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
-	quotaRecovery     quotaRecovery    // API Key 模型恢复退避，保存在内部 meta，不进入账号 JSON。
-	quotaProbes       map[quotaProbeKey]*QuotaProbe
-	strictProxy       strictProxyState
-	strictEvidence    []strictProxyEvidence
-	strictDispatch    map[string]int
-	strictJournalPath string
-	strictRetryCancel context.CancelFunc
-	strictRetryDone   chan struct{}
-	strictClosed      bool
+	Requests              *requeststats.Tracker
+	mu                    sync.Mutex
+	db                    *sql.DB
+	processLock           *os.File
+	closeOnce             sync.Once
+	closeErr              error
+	accounts              map[string][]*model.Account
+	settings              map[string]string
+	rotation              map[string]int
+	riskProxyHistory      riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
+	quotaRecovery         quotaRecovery    // API Key 模型恢复退避，保存在内部 meta，不进入账号 JSON。
+	quotaProbes           map[quotaProbeKey]*QuotaProbe
+	strictProxy           strictProxyState
+	strictEvidence        []strictProxyEvidence
+	strictDispatch        map[string]int
+	strictJournalPath     string
+	strictRetryCancel     context.CancelFunc
+	strictRetryDone       chan struct{}
+	strictClosed          bool
+	strictStartPlanProofs map[string][]startPlanProxyProof
+	strictNow             func() time.Time // 仅替换严格证据的时钟，供确定性窗口回归。
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -381,8 +383,29 @@ func (s *Store) persistAccountLocked(acc *model.Account) error {
 }
 
 func (s *Store) deleteAccountLocked(id string) error {
-	_, err := s.db.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", accountsTable), id)
-	return err
+	next := s.cloneStrictProxyLocked()
+	clearStrictAccountState(&next, id)
+	raw, err := marshalJSON(next)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := deleteAccountOnTx(tx, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", strictProxyStateKey, string(raw)); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.strictProxy = next
+	delete(s.strictStartPlanProofs, id)
+	return nil
 }
 
 func (s *Store) setMeta(key, value string) error {

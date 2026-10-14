@@ -1,0 +1,7 @@
+{
+  "X-Session-Id": "{client_header:X-Session-Id}",
+  "X-Zcode-Trace-Id": "{client_header:X-Zcode-Trace-Id}",
+  "X-Query-Id": "{client_header:X-Query-Id}",
+  "X-Zcode-Session-Type": "{client_header:X-Zcode-Session-Type}",
+  "X-Zcode-Query-Source": "{client_header:X-Zcode-Query-Source}"
+}

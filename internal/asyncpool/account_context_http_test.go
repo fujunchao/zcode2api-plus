@@ -78,11 +78,18 @@ func TestAccountContextAsyncRejectedBeforeTicket(t *testing.T) {
 		}
 	}
 
-	// 普通异步请求仍成功，且维持原来不继承下游请求头的行为。
+	// 普通请求只继承经过验证的逻辑归因白名单，其余头继续不透传。
 	status, contentType, raw := postAsyncAccountContext(t, srv, "synthetic-gateway-key", http.Header{
-		"X-Custom-Safe":    {"synthetic-caller-extension"},
-		"X-Zcode-Trace-Id": {"synthetic-caller-trace"},
-		"Anthropic-Beta":   {"synthetic-caller-beta"},
+		"X-Custom-Safe":        {"synthetic-caller-extension"},
+		"X-Zcode-Unknown":      {"synthetic-unknown-context"},
+		"X-Zcode-Trace-Id":     {"synthetic-caller-trace"},
+		"X-Session-Id":         {"sess_synthetic-session"},
+		"X-Query-Id":           {"query_synthetic-turn"},
+		"X-Zcode-Session-Type": {"subagent"},
+		"X-Zcode-Query-Source": {"compact"},
+		"X-Request-Id":         {"synthetic-old-request"},
+		"Cookie":               {"synthetic-private-cookie"},
+		"Anthropic-Beta":       {"synthetic-caller-beta"},
 	})
 	if status != http.StatusOK || !strings.Contains(contentType, "text/event-stream") ||
 		!strings.Contains(raw, "event: ticket") || !strings.Contains(raw, "event: done") || strings.Contains(raw, "event: error") {
@@ -92,13 +99,21 @@ func TestAccountContextAsyncRejectedBeforeTicket(t *testing.T) {
 		t.Fatalf("只有合法请求应调用上游：%d", up.callCount())
 	}
 	headers := up.header(0)
-	for _, name := range []string{"X-Highspeed-Card-ID", "X-Bigmodel-Authorization", "Bigmodel-Target-Type", "Bigmodel-Organization", "Bigmodel-Project", "X-Custom-Safe", "Anthropic-Beta"} {
+	for _, name := range []string{"X-Highspeed-Card-ID", "X-Bigmodel-Authorization", "Bigmodel-Target-Type", "Bigmodel-Organization", "Bigmodel-Project", "X-Custom-Safe", "X-Zcode-Unknown", "Cookie", "Anthropic-Beta"} {
 		if len(headers.Values(name)) != 0 {
 			t.Errorf("异步不应突然继承下游头 %s", name)
 		}
 	}
-	if headers.Get("X-Zcode-Trace-Id") == "" || headers.Get("X-Zcode-Trace-Id") == "synthetic-caller-trace" {
-		t.Fatal("异步仍应生成自身归因而非转发调用者的头")
+	for name, want := range map[string]string{
+		"X-Zcode-Trace-Id": "synthetic-caller-trace", "X-Session-Id": "synthetic-session",
+		"X-Query-Id": "synthetic-turn", "X-Zcode-Session-Type": "subagent", "X-Zcode-Query-Source": "compact",
+	} {
+		if got := headers.Get(name); got != want {
+			t.Fatalf("异步应保留验证后的逻辑归因：%s=%q want=%q", name, got, want)
+		}
+	}
+	if headers.Get("X-Request-Id") == "" || headers.Get("X-Request-Id") == "synthetic-old-request" {
+		t.Fatal("每次实际 HTTP 派发仍须生成新 request ID，不能沿用调用者尝试 ID")
 	}
 	if headers.Get("Authorization") != "Bearer header.payload.signature" || headers.Get("X-Api-Key") != "header.payload.signature" {
 		t.Fatal("合法异步请求仍应使用所选 JWT 的一致双头")

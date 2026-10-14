@@ -15,14 +15,19 @@ import (
 	"zcode2api/internal/web"
 )
 
-// bindAsyncLine：建两条线路（地址都用脚本化上游），把账号绑到坏线路。
+// bindAsyncLine 创建两个真实不同的受控代理地址，不能把同 URL 的别名当作幸存线路。
 func bindAsyncLine(t *testing.T, st *store.Store, acc *model.Account, proxyURL string) (badID, goodID string) {
 	t.Helper()
 	bad, err := st.AddProxyProfile("async-bad", proxyURL, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	good, err := st.AddProxyProfile("async-good", proxyURL, true)
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, completeProxyFixtureSSE)
+	}))
+	t.Cleanup(goodServer.Close)
+	good, err := st.AddProxyProfile("async-good", goodServer.URL, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +86,13 @@ func TestAsyncLineTruncateStrikesPurgeLine(t *testing.T) {
 	}
 	if live := st.Find(model.ProviderZai, acc.ID); live.ProxyID == nil || *live.ProxyID != goodID {
 		t.Fatalf("绑定账号应被改派到幸存线路: %v", live.ProxyID)
+	}
+	// 再走一次真实异步发送，证明不只是绑定标签变化，而是从新地址完成交付。
+	continued := insertTicket(p, "after-line-purge", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "after-line-purge")
+	events := drainEvents(continued)
+	if len(events) == 0 || events[len(events)-1].Type != "done" || up.callCount() != 3 {
+		t.Fatalf("改派后应从不同的存活代理完成，不能重用被判失败的地址：events=%v bad_calls=%d", events, up.callCount())
 	}
 	// 断流即刷新：三次断流各触发一次（异步钩子，轮询等待）。
 	deadline := time.Now().Add(2 * time.Second)

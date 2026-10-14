@@ -75,6 +75,9 @@ type strictProxyState struct {
 	Paused        bool
 	// 容量保护只暂停导入，不能把仍然健康的存量线路也停用。
 	ImportPaused bool
+	// 有效样本因容量被裁剪后，不能再从残存样本断言“窗口内没有矛盾成功”。
+	// 持久化该截止时间，进程重启也不能提前恢复删除判定；不影响既有退役记录。
+	EvidenceIncompleteUntil int64
 }
 
 type strictCredentialVersion struct {
@@ -95,15 +98,17 @@ type strictProxyEvidence struct {
 
 // StrictProxyStatus 只提供维护所需的去敏摘要，不输出账号或输入引用。
 type StrictProxyStatus struct {
-	RuleVersion     string                    `json:"rule_version"`
-	Blocks          []StrictProxyBlockSummary `json:"blocks"`
-	Pending         int                       `json:"pending"`
-	Retiring        int                       `json:"retiring"`
-	ImportPaused    bool                      `json:"import_paused"`
-	DispatchPaused  bool                      `json:"dispatch_paused"`
-	DecisionEnabled bool                      `json:"decision_enabled"`
-	ActiveDispatch  int                       `json:"active_dispatch"`
-	Audit           []string                  `json:"audit"`
+	RuleVersion             string                    `json:"rule_version"`
+	Blocks                  []StrictProxyBlockSummary `json:"blocks"`
+	Pending                 int                       `json:"pending"`
+	Retiring                int                       `json:"retiring"`
+	ImportPaused            bool                      `json:"import_paused"`
+	DispatchPaused          bool                      `json:"dispatch_paused"`
+	DecisionEnabled         bool                      `json:"decision_enabled"`
+	ActiveDispatch          int                       `json:"active_dispatch"`
+	Audit                   []string                  `json:"audit"`
+	EvidenceLimited         bool                      `json:"evidence_limited"`
+	EvidenceIncompleteUntil int64                     `json:"evidence_incomplete_until,omitempty"`
 }
 
 type StrictProxyBlockSummary struct {
@@ -227,15 +232,19 @@ func (s *Store) writeStrictJournalLocked(blocks map[string]strictProxyBlock) err
 	if err = f.Close(); err != nil {
 		return err
 	}
-	if err = os.Rename(name, s.strictJournalPath); err != nil {
-		return err
-	}
-	return syncStrictJournalDirectory(filepath.Dir(s.strictJournalPath))
+	return replaceStrictJournal(name, s.strictJournalPath)
 }
 
 func (s *Store) strictProxyBlockedLocked(raw string) bool {
 	_, blocked := s.strictProxy.Blocks[strictProxyIdentity(raw)]
 	return blocked || s.strictProxy.Paused
+}
+
+func (s *Store) strictObservationNow() time.Time {
+	if s.strictNow != nil {
+		return s.strictNow()
+	}
+	return time.Now()
 }
 
 func (s *Store) strictSuspectLocked(identity string, now time.Time) bool {
@@ -251,7 +260,7 @@ func (s *Store) strictSuspectLocked(identity string, now time.Time) bool {
 // chooseProxyLocked 是全部自动选线的唯一准入：待核查不新增绑定，禁止记录不按用途放行。
 func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]int, excludeID, excludeURL string) (ProxyProfile, bool) {
 	allowed := make([]ProxyProfile, 0, len(profiles))
-	now := time.Now()
+	now := s.strictObservationNow()
 	s.pruneStrictEvidenceLocked(now)
 	suspects := map[string]bool{}
 	for _, e := range s.strictEvidence {
@@ -385,7 +394,7 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 	if !((isProxy && o.Status == 405 && o.BusinessCode == "3012") || (o.Complete && o.Status >= 200 && o.Status < 300 && o.BusinessCode == "")) {
 		return result, nil
 	}
-	now := time.Now()
+	now := s.strictObservationNow()
 	if o.At.IsZero() {
 		o.At = now
 	}
@@ -416,7 +425,26 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 	filtered := append(s.strictEvidence, strictProxyEvidence{ProxyObservation: o, Identity: identity, Credential: s.strictCredentialRefLocked(acc), Provider: acc.Provider,
 		AccountID: acc.ID, ProxyID: egress.ID, ProxyGeneration: egress.Generation, CredentialGeneration: s.strictProxy.Credentials[acc.ID].Generation})
 	if len(filtered) > strictProxyEvidenceLimit {
-		filtered = filtered[len(filtered)-strictProxyEvidenceLimit:]
+		cut := len(filtered) - strictProxyEvidenceLimit
+		until := s.strictProxy.EvidenceIncompleteUntil
+		for _, dropped := range filtered[:cut] {
+			// 向上取毫秒，不能在仍有效的最后一个亚毫秒提前解除限制。
+			deadline := dropped.At.Add(strictProxyWindow + time.Millisecond).UnixMilli()
+			if deadline > until {
+				until = deadline
+			}
+		}
+		filtered = filtered[cut:]
+		if until > s.strictProxy.EvidenceIncompleteUntil {
+			// 先在内存闭锁；SQL 失败也不能从截断后的缓存产生删除决定。
+			s.strictProxy.EvidenceIncompleteUntil = until
+			next := s.cloneStrictProxyLocked()
+			if err := s.commitProxyBundleStrictLocked(context.Background(), nil, nil, nil, nil, &next); err != nil {
+				s.strictEvidence = filtered
+				result.Reason = "evidence_incomplete"
+				return result, fmt.Errorf("持久化证据不完整窗口失败，已暂停新删除决定: %w", err)
+			}
+		}
 	}
 	s.strictEvidence = filtered
 	result.Reason = "suspect"
@@ -426,6 +454,10 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 	// 关闭仅停止产生新决定；墓碑、在途许可和恢复事务不受回滚开关影响。
 	if !s.StrictProxyEnabled() {
 		result.Reason = "decision_disabled"
+		return result, nil
+	}
+	if now.UnixMilli() < s.strictProxy.EvidenceIncompleteUntil {
+		result.Reason = "evidence_incomplete"
 		return result, nil
 	}
 	identities := map[string]bool{}
@@ -524,6 +556,13 @@ func (s *Store) AcquireProxyDispatch(acc *model.Account, egress ProxyEgress) (fu
 		if acc != nil && !s.strictCredentialCurrentLocked(acc, egress) {
 			return nil, ErrProxyRetired
 		}
+		if acc != nil && egress.Mode != "forced_direct" {
+			live := s.findLocked(acc.Provider, acc.ID)
+			if derefStr(live.ProxyID) != "" || derefStr(live.ProxyURL) != "" ||
+				s.strictProxy.RouteVersions[acc.ID].Generation != egress.RouteGeneration {
+				return nil, ErrProxyRetired
+			}
+		}
 		return func() {}, nil
 	}
 	if !s.proxyDispatchCurrentLocked(acc, egress) {
@@ -538,6 +577,10 @@ func (s *Store) StrictProxySummary() (StrictProxyStatus, error) {
 	out := StrictProxyStatus{RuleVersion: StrictProxyRuleVersion, Blocks: []StrictProxyBlockSummary{}, Pending: len(s.strictProxy.Pending),
 		ImportPaused: s.strictProxy.Paused || s.strictProxy.ImportPaused, DispatchPaused: s.strictProxy.Paused,
 		DecisionEnabled: s.StrictProxyEnabled(), Audit: append([]string(nil), s.strictProxy.Audit...)}
+	if s.strictObservationNow().UnixMilli() < s.strictProxy.EvidenceIncompleteUntil {
+		out.EvidenceLimited = true
+		out.EvidenceIncompleteUntil = s.strictProxy.EvidenceIncompleteUntil
+	}
 	for _, count := range s.strictDispatch {
 		out.ActiveDispatch += count
 	}

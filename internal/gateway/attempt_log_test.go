@@ -79,8 +79,14 @@ func TestRiskProxyInvalidManualConfigFailsBeforeDispatch(t *testing.T) {
 	t.Cleanup(func() { web.SetOut(nil) })
 	status, body := f.post(t, msgBody(), "sk-test")
 	logs := stripANSI(buf.String())
-	if status != http.StatusServiceUnavailable || !strings.Contains(body, "selected_proxy_unavailable") || f.callCount() != 0 || strings.Contains(logs, "event=start req=") && strings.Contains(logs, "[attempt]") || strings.Contains(logs, "secret-sentinel") {
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "selected_proxy_unavailable") {
 		t.Fatalf("手工无效路由必须明确拒绝、零出站且不泄密：status=%d calls=%d body=%s logs=%s", status, f.callCount(), body, logs)
+	}
+	if f.callCount() != 0 || !strings.Contains(logs, "upstream_attempts=0") {
+		t.Fatalf("拒绝派发必须零出站：calls=%d logs=%s", f.callCount(), logs)
+	}
+	if strings.Contains(logs, "secret-sentinel") || strings.Contains(body, "secret-sentinel") {
+		t.Fatal("无效路由诊断不得泄漏代理密码")
 	}
 	current := f.st.FindAny(a.ID)
 	if *current.ProxyURL != bad || current.Status != model.StatusActive || current.FailCount != 0 || current.LastRiskControlAt != nil {

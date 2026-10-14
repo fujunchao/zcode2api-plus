@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,7 +41,15 @@ func TestStrictProxyHTTPDirectSuccessIsControl(t *testing.T) {
 	strictHTTPControlCase(t, strictRiskJSON, "application/json", strictCompleteJSON, true, true)
 }
 
-func strictHTTPControlCase(t *testing.T, badBody, goodType, goodBody string, wantRetired, direct bool) {
+func TestStrictProxyHTTPRedirectCannotSupplySuccessEvidence(t *testing.T) {
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			strictHTTPControlCase(t, strictRiskJSON, "application/json", strictCompleteJSON, false, false, status)
+		})
+	}
+}
+
+func strictHTTPControlCase(t *testing.T, badBody, goodType, goodBody string, wantRetired, direct bool, responseStatus ...int) {
 	t.Helper()
 	f := newFixture(t)
 	badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,6 +60,10 @@ func strictHTTPControlCase(t *testing.T, badBody, goodType, goodBody string, wan
 	defer badServer.Close()
 	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", goodType)
+		if len(responseStatus) > 0 {
+			w.Header().Set("Location", f.upstream.URL+"/redirected")
+			w.WriteHeader(responseStatus[0])
+		}
 		_, _ = w.Write([]byte(goodBody))
 	}))
 	defer goodServer.Close()
@@ -96,5 +109,8 @@ func strictHTTPControlCase(t *testing.T, badBody, goodType, goodBody string, wan
 	_, err = f.st.AddProxyProfile("bad-reimport", bad.URL, true)
 	if (err != nil) != wantRetired {
 		t.Fatalf("只在严格HTTP对照成立后拒绝重导: retired=%t err=%v", wantRetired, err)
+	}
+	if !direct && f.callCount() != 0 {
+		t.Fatal("模型请求不得在一次许可下自动跟随重定向")
 	}
 }

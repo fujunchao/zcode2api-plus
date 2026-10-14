@@ -27,6 +27,11 @@ func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgr
 	base := fmt.Sprintf("req=%q ticket=%q attempt=%d selection=%d acc_id=%q route_id=%q route=%q endpoint=%q mode=%s",
 		d.ReqID, d.Ticket, d.upstreamAttempts, d.Attempts, acc.ID, egress.ID, egress.Label, egress.Endpoint, egress.Mode)
 	base += fmt.Sprintf(" proxy_generation=%d binding_generation=%d credential_generation=%d route_reason=%q", egress.ConfigurationGeneration(), egress.BindingGeneration(), egress.CredentialGeneration(), egress.Reason)
+	acquired := false
+	if request != nil && egress.Mode != "custom_client" {
+		_, acquired = ProxyAttemptEgress(request.Context())
+	}
+	base += fmt.Sprintf(" dispatch_acquired=%t", acquired)
 	trace := fmt.Sprintf(" gateway_request_id=%q protocol=%s", d.GatewayRequestID, d.Protocol)
 	d.lastAttemptBase = base + trace
 	d.shape.mcsDeclared = request != nil && hasMCSDeclaration(request.Header.Get("Anthropic-Beta"))

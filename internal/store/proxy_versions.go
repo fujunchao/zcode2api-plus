@@ -34,13 +34,36 @@ func trackStrictAccountVersions(next *strictProxyState, a *model.Account) bool {
 	return changed
 }
 
+func clearStrictAccountState(next *strictProxyState, id string) {
+	delete(next.Intents, id)
+	delete(next.Pending, id)
+	delete(next.PendingAvoid, id)
+	// 保留递增的撤销代次，但擦除已删除凭据的摘要；重复 ID 也不能恢复旧许可。
+	credential := next.Credentials[id]
+	credential.Digest = ""
+	credential.Generation++
+	next.Credentials[id] = credential
+	route := next.RouteVersions[id]
+	route.Digest = ""
+	route.Generation++
+	next.RouteVersions[id] = route
+}
+
 func (s *Store) migrateStrictProxyVersions() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := s.cloneStrictProxyLocked()
 	changed := false
+	liveIDs := map[string]bool{}
 	for _, a := range s.allAccountsLocked() {
+		liveIDs[a.ID] = true
 		if trackStrictAccountVersions(&next, a) {
+			changed = true
+		}
+	}
+	for id := range next.Pending {
+		if !liveIDs[id] {
+			clearStrictAccountState(&next, id)
 			changed = true
 		}
 	}

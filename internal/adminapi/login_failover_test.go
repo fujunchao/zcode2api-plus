@@ -43,12 +43,16 @@ type loginFailoverFixture struct {
 
 // 本地 CONNECT 隧道只允许转发到指定的本地 TLS 服务，绝不解析/连接外部目标。
 func loginTestProxy(t *testing.T, backend *httptest.Server) *httptest.Server {
+	return loginTestProxyForHost(t, backend, "zcode.z.ai:443")
+}
+
+func loginTestProxyForHost(t *testing.T, backend *httptest.Server, allowedHost string) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
 	connections := map[net.Conn]bool{}
 	closing := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodConnect || r.Host != "zcode.z.ai:443" {
+		if r.Method != http.MethodConnect || r.Host != allowedHost {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -240,6 +244,10 @@ func TestLoginProxyFailoverFallsBackDirectOnce(t *testing.T) {
 	code, body := f.complete(t, id, callback)
 	if code != http.StatusOK || direct.Load() != 1 || body["account"].(map[string]any)["proxy_id"] != nil {
 		t.Fatalf("无可用线路应沿用直连回退：%d %v", code, body)
+	}
+	accountID := body["account"].(map[string]any)["id"].(string)
+	if f.h.Store.ProxyEgress(f.h.Store.FindAny(accountID)).Mode != "direct_fallback" {
+		t.Fatal("自动登录实际直连必须保留待补绑意图，不得记为人工直连")
 	}
 }
 

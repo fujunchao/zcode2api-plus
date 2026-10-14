@@ -1,0 +1,112 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
+)
+
+type zcode2apiRetryContextKey struct{}
+
+// rc.41 的协议处理器向 RelayErrorHandler 传 Request.Context，不传 gin.Context。
+// 在 controller 的真实尝试入口显式附加受信任上下文，同时保留取消、截止时间和日志字段。
+func Zcode2apiRetryContext(c *gin.Context) context.Context {
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	return context.WithValue(ctx, zcode2apiRetryContextKey{}, c)
+}
+
+// 本文件只适用于固定的 New API rc.41 源码；默认关闭，必须由管理员配置可信渠道和目标。
+// 停止的是当前外层请求的继续投递，不改变全局 503/429 重试规则或后续新请求。
+func applyZcode2apiRetryAdvice(ctx context.Context, resp *http.Response, body []byte, apiErr *types.NewAPIError) {
+	c, ok := ctx.Value(zcode2apiRetryContextKey{}).(*gin.Context)
+	if !ok || c == nil || apiErr == nil || resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return
+	}
+	if !trustedZcode2apiRetryTarget(c.GetInt("channel_id"), resp.Request.URL) ||
+		len(resp.Header.Values("X-Zcode2api-Retry-Policy")) != 1 ||
+		resp.Header.Get("X-Zcode2api-Retry-Policy") != "wait_same_gateway" ||
+		len(resp.Header.Values("Retry-After")) != 1 {
+		return
+	}
+	wait := resp.Header.Get("Retry-After")
+	if len(wait) == 0 || len(wait) > 6 {
+		return
+	}
+	for _, char := range wait {
+		if char < '0' || char > '9' {
+			return
+		}
+	}
+	seconds, err := strconv.Atoi(wait)
+	if err != nil || seconds <= 0 || seconds > 7*24*60*60 {
+		return
+	}
+	var envelope struct {
+		Code  any `json:"code"`
+		Error struct {
+			Code any    `json:"code"`
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if decoder.Decode(&envelope) != nil || decoder.Decode(new(any)) != io.EOF {
+		return
+	}
+	is3012 := func(code any) bool {
+		switch value := code.(type) {
+		case json.Number:
+			return value.String() == "3012"
+		case string:
+			return value == "3012"
+		}
+		return false
+	}
+	if !(resp.StatusCode == http.StatusMethodNotAllowed && (is3012(envelope.Code) || is3012(envelope.Error.Code))) &&
+		!(resp.StatusCode == http.StatusServiceUnavailable && envelope.Error.Type == "risk_control_cooldown") {
+		return
+	}
+	// 不依赖上游中文文案，不修改已解析的原始状态/业务码，只使用既有停止重试能力。
+	types.ErrOptionWithSkipRetry()(apiErr)
+	if !c.Writer.Written() {
+		c.Header("Retry-After", strconv.Itoa(seconds))
+		c.Header("X-Zcode2api-Retry-Policy", "wait_same_gateway")
+	}
+}
+
+func trustedZcode2apiRetryTarget(channelID int, actual *url.URL) bool {
+	if channelID <= 0 || actual == nil || actual.User != nil {
+		return false
+	}
+	raw := os.Getenv("NEWAPI_ZCODE2API_RETRY_GATEWAYS")
+	if len(raw) == 0 || len(raw) > 64*1024 {
+		return false
+	}
+	var configured map[string]string
+	if json.Unmarshal([]byte(raw), &configured) != nil {
+		return false
+	}
+	target, err := url.Parse(configured[strconv.Itoa(channelID)])
+	if err != nil || target == nil || target.Host == "" || target.User != nil || target.RawQuery != "" || target.Fragment != "" ||
+		(target.Scheme != "https" && target.Scheme != "http") {
+		return false
+	}
+	// 渠道 ID 来自 New API 的认证调度上下文，目标来自实际 HTTP 响应，不取客户端头。
+	if !strings.EqualFold(target.Scheme, actual.Scheme) || !strings.EqualFold(target.Host, actual.Host) {
+		return false
+	}
+	prefix := strings.TrimRight(target.Path, "/")
+	return prefix == "" || actual.Path == prefix || strings.HasPrefix(actual.Path, prefix+"/")
+}

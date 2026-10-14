@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,14 +61,16 @@ func (u *cutUp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fl.Flush()
 }
 
-// bindToLine 建两条启用线路（地址都用 mock 上游，能真实承载请求）并把账号绑到坏线路。
+// bindToLine 建两个真正不同的本地端点；同地址改名只是别名，不能伪装成替代线路。
 func bindToLine(t *testing.T, st *store.Store, acc *model.Account, proxyURL string) (badID, goodID string) {
 	t.Helper()
 	bad, err := st.AddProxyProfile("bad-line", proxyURL, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	good, err := st.AddProxyProfile("good-line", proxyURL, true)
+	goodServer := httptest.NewServer(&cutUp{})
+	t.Cleanup(goodServer.Close)
+	good, err := st.AddProxyProfile("good-line", goodServer.URL, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +150,15 @@ func TestLineTruncateStrikesPurgeLineAndReassign(t *testing.T) {
 	// 移除后计数条目一并清理。
 	if _, ok := f.st.LineTruncateStats()[badID]; ok {
 		t.Fatal("被移除线路的计数条目应被清理")
+	}
+	if status, _ := f.post(t, msgBody()); status != http.StatusOK {
+		t.Fatal("改派后的真实请求应在替代线路完整交付")
+	}
+	up.mu.Lock()
+	badCalls := up.calls
+	up.mu.Unlock()
+	if badCalls != 3 || f.st.FindAny(acc.ID).StreamTruncateCount != 3 {
+		t.Fatal("新请求不能回到已删除线路或继续累计断流")
 	}
 }
 

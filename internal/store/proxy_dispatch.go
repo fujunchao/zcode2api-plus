@@ -94,9 +94,10 @@ func (s *Store) acquireStrictLeaseLocked(identity string) func() {
 }
 
 // GuardProxyClient 复制客户端而不修改共享 Transport，真正 RoundTrip 前才取得许可。
-// 直连不参与代理状态；错误立即释放，正常响应持有到响应体关闭或 EOF。
+// 有账号的直连同样复核绑定快照，避免管理员改绑后仍从旧直连客户端出站。
+// 错误立即释放，正常响应持有到响应体关闭或 EOF。
 func (s *Store) GuardProxyClient(client *http.Client, acc *model.Account, egress ProxyEgress) *http.Client {
-	if client == nil || egress.Mode != "proxy" {
+	if client == nil || egress.Mode == "custom_client" || (acc == nil && egress.Mode != "proxy") {
 		return client
 	}
 	copy := *client

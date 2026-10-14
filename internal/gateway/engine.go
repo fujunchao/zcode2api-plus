@@ -41,9 +41,11 @@ type DeliverFunc func(d Delivery) error
 
 // Engine 选号 + 验证码 + 上游调用 + 错误分类循环。
 type Engine struct {
-	Store   *store.Store
-	Captcha *captcha.Manager
-	Client  *http.Client
+	Store                  *store.Store
+	Captcha                *captcha.Manager
+	Client                 *http.Client
+	defaultDirectClient    *http.Client
+	defaultDirectTransport *http.Transport
 
 	// BusyRetryDelays 3010 并发准入的重试延迟（默认 1s/2s；测试可缩短）。
 	BusyRetryDelays []time.Duration
@@ -69,8 +71,10 @@ type Engine struct {
 
 // NewEngine 创建引擎；client 为 nil 时使用默认上游客户端。
 func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engine {
+	var defaultDirect *http.Client
 	if client == nil {
 		client = defaultUpstreamClient()
+		defaultDirect = client
 	}
 	e := &Engine{
 		Store:               st,
@@ -80,6 +84,10 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 		RateLimitRetryDelay: RateLimitRetryDelay,
 		OverloadRetryDelays: OverloadRetryDelays,
 		now:                 time.Now,
+	}
+	if defaultDirect != nil {
+		e.defaultDirectClient = defaultDirect
+		e.defaultDirectTransport = defaultDirect.Transport.(*http.Transport)
 	}
 	if ReplayGuardTTL > 0 {
 		e.replay = NewReplayGuard(time.Duration(ReplayGuardTTL)*time.Second, e.now)
@@ -95,6 +103,14 @@ func (e *Engine) SetNow(fn func() time.Time) { e.now = fn }
 func (e *Engine) clientFor(acc *model.Account) (*http.Client, store.ProxyEgress) {
 	egress := e.Store.ProxyEgress(acc)
 	if acc == nil || acc.ProxyURL == nil || *acc.ProxyURL == "" {
+		// 注入客户端可以自行选出口；不能把它的成功响应冒称为已经确认的直连对照。
+		var transport *http.Transport
+		if e.Client != nil {
+			transport, _ = e.Client.Transport.(*http.Transport)
+		}
+		if e.Client != e.defaultDirectClient || transport == nil || transport != e.defaultDirectTransport || transport.Proxy != nil {
+			egress.Mode, egress.Label, egress.Endpoint, egress.Reason = "custom_client", "custom_client", "custom", "injected_client"
+		}
 		return e.Client, egress
 	}
 	t, err := proxy.TransportFor(*acc.ProxyURL)
@@ -393,9 +409,7 @@ func (e *Engine) tryAccount(
 		if diag != nil {
 			// 首字节延迟与耗时的基准点：紧贴出站调用。
 			diag.UpstreamStart = diag.Now()
-			if egress.Mode != "proxy" {
-				diag.Route = "direct"
-			}
+			diag.Route = egress.Label
 		}
 		requeststats.Attempt(ctx)
 		finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq, e.Store.FindAny(acc.ID))
@@ -420,6 +434,10 @@ func (e *Engine) tryAccount(
 
 		if diag != nil {
 			diag.Status = resp.StatusCode
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			_ = resp.Body.Close()
+			return attemptResult{final: errResult(http.StatusBadGateway, "unexpected_upstream_redirect", "模型端点返回重定向，本次未继续派发，请检查上游地址")}
 		}
 
 		if resp.StatusCode >= 400 {

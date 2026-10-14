@@ -247,6 +247,18 @@ func TestTransparentSessionAndQueryLifecycleOverFourEntrypoints(t *testing.T) {
 			if first.Header.Get("X-Query-Id") != "same-query" || second.Header.Get("X-Query-Id") != "same-query" || first.Header.Get("X-Request-Id") == second.Header.Get("X-Request-Id") || first.Header.Get("X-Zcode-Trace-Id") == second.Header.Get("X-Zcode-Trace-Id") {
 				t.Fatal("固定 query 不是可信幂等授权；只给 session 时 trace 仍每入口生成")
 			}
+			ambiguous := http.Header{
+				"X-Session-Id":     {"sess_first", "sess_second"},
+				"X-Zcode-Trace-Id": {"trace-first", "trace-second"},
+				"X-Query-Id":       {"query_first", "query_second"},
+			}
+			call := postAttributionProtocol(t, f, path, body, ambiguous)
+			if call.Header.Get("X-Session-Id") != "body-only" || upstream.MetadataSessionID(call.Body) != "body-only" {
+				t.Fatal("多值 session 头不可任意选一个；应回退合法正文来源")
+			}
+			if call.Header.Get("X-Zcode-Trace-Id") == "" || strings.Contains(call.Header.Get("X-Zcode-Trace-Id"), "trace-") || call.Header.Get("X-Query-Id") == "" || strings.Contains(call.Header.Get("X-Query-Id"), "first") || strings.Contains(call.Header.Get("X-Query-Id"), "second") {
+				t.Fatal("无唯一来值的 trace/query 应生成本入口值，不透传合并多值")
+			}
 		})
 	}
 }

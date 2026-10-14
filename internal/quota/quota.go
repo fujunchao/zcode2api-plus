@@ -221,6 +221,10 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[
 			if resp.StatusCode == http.StatusOK {
 				payload, _ := result["balance"].(map[string]any)
 				observation = startPlanObservation(snap, checkedAt, payload)
+				// 双次空额度清理还须匹配两次真实查询的凭据/线路代次，不能只比较 URL 字节。
+				if proxied {
+					s.Store.RecordStartPlanProxyObservation(snap, route, observation)
+				}
 			}
 			return result, observation
 		}
@@ -316,22 +320,24 @@ func (s *Service) clientFor(acc *model.Account, route ...store.ProxyEgress) (HTT
 	if s.Client != nil {
 		return s.Client, nil
 	}
+	raw := ""
 	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
-		client, err := proxy.ClientFor(*acc.ProxyURL, 20*time.Second)
-		if err != nil {
-			return nil, err
-		}
-		if s.Store != nil {
-			egress := s.Store.ProxyEgress(acc)
-			if len(route) > 0 {
-				egress = route[0]
-			}
-			client = s.Store.GuardProxyClient(client, acc, egress)
-		}
-		return client, nil
+		raw = *acc.ProxyURL
 	}
 	// 账号直连必须与模型派发保持一致，不能被 HTTP(S)_PROXY 隐式改路。
-	return proxy.ClientFor("", 20*time.Second)
+	client, err := proxy.ClientFor(raw, 20*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if s.Store != nil {
+		egress := s.Store.ProxyEgress(acc)
+		if len(route) > 0 {
+			egress = route[0]
+		}
+		client = s.Store.GuardProxyClient(client, acc, egress)
+	}
+	return client, nil
 }
 
 // handleBillingResponse 处理计费端点响应：错误分类、快照解析与状态回写。

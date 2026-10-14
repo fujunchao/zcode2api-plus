@@ -2,6 +2,10 @@ package gateway
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -34,14 +38,25 @@ type proxyAttemptObservation struct {
 	egress           store.ProxyEgress
 	value            store.ProxyObservation
 	responseVerified bool
+	responseStatus   int
 	targetRef        string
 }
+
+// 判定引用只存在于本进程的十分钟证据窗口，不输出、不持久化。其密钥须稳定到进程结束，
+// 不能借用会到期轮换的日志 HMAC，否则跨日志周期的同一次 HTTP 都可能被误判为其它目标。
+var observationKey = func() [32]byte {
+	var key [32]byte
+	_, _ = rand.Read(key[:])
+	return key
+}()
 
 func observationRef(value string) string {
 	if value == "" {
 		return ""
 	}
-	return privateReference(value, time.Now())
+	mac := hmac.New(sha256.New, observationKey[:])
+	_, _ = mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // BeginProxyAttempt 获取本次派发许可并冻结去敏证据；不让日志容器承担调度职责。
@@ -105,6 +120,7 @@ func ConfirmProxyAttemptResponse(ctx context.Context, response *http.Response) {
 		return
 	}
 	p.responseVerified = response.Request.Method == p.value.Method && observationRef(response.Request.URL.String()) == p.targetRef
+	p.responseStatus = response.StatusCode
 }
 
 // ProxyAttemptEgress 把本次真实路由交给断流/成功处理，不能重新读取账号后来修改的绑定。
@@ -119,7 +135,12 @@ func ProxyAttemptEgress(ctx context.Context) (store.ProxyEgress, bool) {
 // ObserveProxyAttempt 只收完整成功或已读完的3012，不读取/保留任何响应正文。
 func ObserveProxyAttempt(ctx context.Context, status int, code string, complete bool, now time.Time) {
 	p, _ := ctx.Value(proxyObservationKey{}).(*proxyAttemptObservation)
-	if p == nil || !p.responseVerified || ctx.Err() != nil || !((status == 405 && code == "3012") || (complete && status >= 200 && status < 300)) {
+	if p == nil || !p.responseVerified || ctx.Err() != nil {
+		return
+	}
+	// 交付层可能统一写 200；严格证据必须使用实际上游状态，不把 3xx 或异常响应算成功。
+	status = p.responseStatus
+	if !((status == 405 && code == "3012") || (complete && status >= 200 && status < 300)) {
 		return
 	}
 	p.once.Do(func() {

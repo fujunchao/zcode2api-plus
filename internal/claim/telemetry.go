@@ -137,7 +137,7 @@ func PostActivationEventContext(ctx context.Context, client HTTPClient, userID, 
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
 	text := string(raw)
-	if res.StatusCode >= 400 {
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return fmt.Errorf("event/report %s HTTP %d: %s", element, res.StatusCode, truncateStr(text, 120))
 	}
 	var parsed map[string]any

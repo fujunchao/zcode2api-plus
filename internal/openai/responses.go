@@ -249,10 +249,9 @@ func stringOf(v any) string {
 // ConvertResponsesResponse 把上游 Anthropic Messages JSON 转换为 Responses 形态。
 func ConvertResponsesResponse(payload map[string]any) map[string]any {
 	id, _ := payload["id"].(string)
-	if id == "" {
-		if _, ok := payload["content"].([]any); !ok {
-			return nil
-		}
+	if _, ok := payload["content"].([]any); !ok || id == "" {
+		// 与 Chat 入口一致：不能把缺少消息 ID 的异常对象伪装成成功的 resp_。
+		return nil
 	}
 	output, _ := messageToResponsesOutput(payload)
 	status, incompleteDetails := responsesCompletion(payload["stop_reason"])

@@ -754,7 +754,7 @@ func (p *Pool) attemptUpstreamOnce(
 	var observationBody map[string]any
 	_ = json.Unmarshal(payload, &observationBody)
 	entry := ticketID
-	if diag != nil {
+	if diag != nil && diag.GatewayRequestID != "" {
 		entry = diag.GatewayRequestID
 	}
 	attemptCtx, release, permitErr := gateway.BeginProxyAttempt(ctx, p.Store, acc, egress, httpReq, observationBody, entry)
@@ -769,13 +769,8 @@ func (p *Pool) attemptUpstreamOnce(
 		riskAttempt.RequestID = diag.ReqID
 		// 首字节延迟与耗时的基准点：紧贴出站调用（与 sync 路径同）。
 		diag.UpstreamStart = diag.Now()
-		// 如实报本次实际出口（direct / 线路名 / proxy:掩码URL），与 sync 的
-		// Store.ProxyLabel 同口径。egress 由 clientFor 一并交出，保证读数与实际
-		// 出口不可能不一致。
-		diag.Route = "direct"
-		if egress.Mode == "proxy" {
-			diag.Route = p.Store.ProxyLabel(acc)
-		}
+		// 用冻结的实际路由；注入客户端不得在汇总日志里冒称直连。
+		diag.Route = egress.Label
 	}
 	requeststats.Attempt(ctx)
 	finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq, p.Store.FindAny(acc.ID))

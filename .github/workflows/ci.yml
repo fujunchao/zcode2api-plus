@@ -124,6 +124,10 @@ jobs:
       - name: Test risk proxy regression (repeat)
         run: go test ./internal/store ./internal/gateway ./internal/asyncpool -run 'TestRiskProxy|TestAttemptLog|TestAsyncRiskProxy|TestAsyncForcedDirect|TestRotateAccountProxy|TestConcurrentRiskResponses|TestProxyMutationFailureIsAtomic' -count=20 -timeout=180s
 
+      # v3 真实 HTTP 判定、准入和等待契约重复验证；容量/重启等重用例仍由全量与 race 覆盖。
+      - name: Test strict proxy and retry contract regression (repeat)
+        run: go test ./internal/store ./internal/gateway ./internal/asyncpool ./internal/adminapi ./internal/claim ./internal/quota ./internal/oauth -run 'TestStrictProxyHTTP|TestStrictProxyAdmin|TestProxyDispatch|TestRetryAdvice|TestNonModel' -count=10 -timeout=240s
+
       - name: Test proxy deletion regression (repeat)
         run: |
           go test ./internal/store -run 'TestDeleteProxy|TestConcurrentDeleteProxies' -count=20 -timeout=180s
@@ -175,6 +179,52 @@ jobs:
           ZCODE_TEST_CLIENTS: python,pi
           ZCODE_PI_AI_MODULE: ${{ runner.temp }}/pi-client/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js
         run: go test -race -count=1 -timeout=180s ./internal/openai -run '^TestClientSDKCompatibility$' -v
+
+  # 固定消费端版本独立验收：真实 rc.41 的原始实现与定点补丁使用同一组合成合同。
+  # 两个 checkout 均无运行数据；默认补丁开关关闭，不能把此项冒充现网部署验收。
+  newapi-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: gateway
+      - uses: actions/checkout@v4
+        with:
+          repository: QuantumNous/new-api
+          ref: 2035a82aeb5414253a728bd937d4b8f97aa99b9b
+          path: newapi
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: newapi/go.mod
+          cache-dependency-path: newapi/go.sum
+      - name: Install baseline consumer contract
+        run: python3 gateway/scripts/newapi-compat/prepare.py newapi baseline
+      - name: Verify original consumer behavior
+        working-directory: newapi
+        run: go test ./controller ./relay ./relay/channel ./service -run '^TestZcode2api(Retry|Attribution)Contract' -count=1 -timeout=180s
+      - name: Install version-pinned consumer patch
+        run: python3 gateway/scripts/newapi-compat/prepare.py newapi patched
+      - name: Verify patched consumer behavior
+        working-directory: newapi
+        env:
+          ZCODE2API_CONTRACT_PATCHED: "1"
+        run: go test -race ./controller ./relay ./relay/channel ./service -run '^TestZcode2api(Retry|Attribution)Contract' -count=1 -timeout=180s
+
+  # Windows 仅验证恢复日志替换的 OS 特有边界；全量测试仍统一由 Ubuntu 执行。
+  windows-proxy-journal:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test Windows strict proxy journal replacement
+        run: go test ./internal/store -run '^TestStrictProxyWindowsJournal' -count=10 -timeout=180s
 
   # 平台矩阵下只做编译：确认可交叉编译（与 release.yml 的目标一致），不重复跑测试
   cross-build:

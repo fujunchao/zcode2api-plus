@@ -1,0 +1,55 @@
+package channel
+
+import (
+	"regexp"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+var zcode2apiQuerySourcePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+
+// 只约束管理员显式配置的五个 client_header 来源，不改变其他占位符和认证覆盖规则。
+// ID 预算对应本网关透明归因快照，不声称供应商要求所有 ID 必须是 UUID。
+func zcode2apiAttributionPlaceholder(c *gin.Context, name string) (string, bool, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	switch key {
+	case "x-session-id", "x-zcode-trace-id", "x-query-id", "x-zcode-session-type", "x-zcode-query-source":
+	default:
+		return "", false, false
+	}
+	if c == nil || c.Request == nil {
+		return "", false, true
+	}
+	count, raw := 0, ""
+	for header, values := range c.Request.Header {
+		if strings.EqualFold(header, name) {
+			count += len(values)
+			if len(values) == 1 {
+				raw = values[0]
+			}
+		}
+	}
+	if count != 1 || len(raw) > 1024 || strings.TrimSpace(raw) == "" {
+		return "", false, true
+	}
+	for i := range len(raw) {
+		if raw[i] < 0x20 || raw[i] > 0x7e || raw[i] == ',' {
+			return "", false, true
+		}
+	}
+	value := strings.TrimSpace(raw)
+	switch key {
+	case "x-zcode-query-source":
+		if !zcode2apiQuerySourcePattern.MatchString(value) {
+			return "", false, true
+		}
+	case "x-zcode-session-type":
+		switch value {
+		case "main", "subagent", "side_chat", "other":
+		default:
+			return "", false, true
+		}
+	}
+	return value, true, true
+}
