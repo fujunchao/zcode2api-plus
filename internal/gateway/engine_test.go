@@ -474,7 +474,7 @@ func TestTransientRateLimitCoolingEscalates(t *testing.T) {
 
 	want := []int{30, 60, 120, config.CoolingSeconds}
 	for i, secs := range want {
-		got, streak := MarkRateLimited(st, model.ProviderZai, acc.ID, "上游限流 HTTP 429", now)
+		got, streak := MarkRateLimited(st, acc, "上游限流 HTTP 429", now)
 		if got != secs {
 			t.Fatalf("第 %d 次限流冷却应为 %ds，实得 %ds", i+1, secs, got)
 		}
@@ -483,7 +483,7 @@ func TestTransientRateLimitCoolingEscalates(t *testing.T) {
 		}
 	}
 	// 超出阶梯长度后封顶，不再继续加重
-	if got, _ := MarkRateLimited(st, model.ProviderZai, acc.ID, "上游限流 HTTP 429", now); got != config.CoolingSeconds {
+	if got, _ := MarkRateLimited(st, acc, "上游限流 HTTP 429", now); got != config.CoolingSeconds {
 		t.Fatalf("超出阶梯应封顶在 %ds: %d", config.CoolingSeconds, got)
 	}
 	// 成功调用后计数清零，下次从最低档重新起算（清零须对 live 对象做才落库）
@@ -492,7 +492,7 @@ func TestTransientRateLimitCoolingEscalates(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := MarkRateLimited(st, model.ProviderZai, acc.ID, "上游限流 HTTP 429", now); got != 30 {
+	if got, _ := MarkRateLimited(st, acc, "上游限流 HTTP 429", now); got != 30 {
 		t.Fatalf("成功调用后应回到最低档 30s: %d", got)
 	}
 }
@@ -1104,7 +1104,7 @@ func TestQuotaSignalKeepsStrongStatus(t *testing.T) {
 
 			// 账号没有额度快照 → anyState=false，正是原先会落到 else 分支
 			// 把状态写成 active 的那条路径。
-			MarkModelExhausted(st, model.ProviderZai, acc.ID, "glm-5.3", "GLM-5.3 額度已用完", time.Now())
+			MarkModelExhausted(st, acc, "glm-5.3", "GLM-5.3 額度已用完", time.Now())
 
 			got := st.Find(model.ProviderZai, acc.ID)
 			if got.Status != strong {

@@ -62,7 +62,7 @@ func (s *Store) RotateAccountProxyAt(expected *model.Account, now time.Time) (Pr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	live := s.findLocked(expected.Provider, expected.ID)
-	if live == nil || derefStr(live.ProxyID) != derefStr(expected.ProxyID) ||
+	if !live.AcceptsRequestResult(expected) || derefStr(live.ProxyID) != derefStr(expected.ProxyID) ||
 		derefStr(live.ProxyURL) != derefStr(expected.ProxyURL) {
 		return result, nil
 	}

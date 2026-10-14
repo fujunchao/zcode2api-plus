@@ -856,13 +856,12 @@ func (e *Engine) accumulateUsage(acc *model.Account, usage *UsageCollector) mode
 // MarkAccount 设置账号状态并记下这次失败的归类；status 为 cooling 时按配置写入
 // 冷却截止时间。
 //
-// 按 provider + ID 在 store 锁内改「当前」对象：调用方持有的是账号副本，直接改它
-// 既不落库、也会与并发读写相撞；账号已不存在时静默跳过（可能刚被后台删除）。
+// 持有实际出站快照，在 store 锁内核对凭据后修改；不能让旧身份失败覆盖重新登录。
 //
 // kind 必填而不是可选（见 classify.go「最近错误」一节）：账号状态与错误归类在同一次
 // 写入里落库，既省一次持久化，也避免两处对同一次失败给出不同分类。
-func MarkAccount(st *store.Store, provider, idOrName, status, kind, errMsg string, now time.Time) {
-	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+func MarkAccount(st *store.Store, expected *model.Account, status, kind, errMsg string, now time.Time) {
+	_, _ = st.UpdateForRequest(expected, func(acc *model.Account) {
 		acc.Status = status
 		if status == model.StatusCooling {
 			until := float64(now.Add(time.Duration(config.CoolingSeconds)*time.Second).UnixNano()) / 1e9
@@ -911,14 +910,14 @@ func isClientGone(ctx context.Context) bool {
 //
 // 错误归类固定为 quota_exhausted：本函数的全部调用点（402、429 上限码族、200+1005）
 // 都是额度/用量上限这一件事，kind 由函数语义唯一确定，故不开放成参数。
-func MarkModelExhausted(st *store.Store, provider, idOrName string, modelName any, errMsg string, now time.Time) {
-	if err := st.MarkQuotaExhausted(st.SnapshotAccount(provider, idOrName), model.NormalizeModelName(modelName), errMsg, now, 0); err != nil {
+func MarkModelExhausted(st *store.Store, expected *model.Account, modelName any, errMsg string, now time.Time) {
+	if err := st.MarkQuotaExhausted(expected, model.NormalizeModelName(modelName), errMsg, now, 0); err != nil {
 		web.Warn("gateway", "保存模型耗尽状态失败: "+err.Error())
 	}
 }
 
 func (e *Engine) mark(acc *model.Account, status, kind, errMsg string) {
-	MarkAccount(e.Store, acc.Provider, acc.ID, status, kind, errMsg, e.now())
+	MarkAccount(e.Store, acc, status, kind, errMsg, e.now())
 }
 
 func (e *Engine) markModelExhausted(acc *model.Account, modelName any, errMsg string, minimum ...time.Duration) {
@@ -942,7 +941,7 @@ func quotaMinimumWait(code string) time.Duration {
 // recordError 写一次「最近错误」，不改账号状态、不计失败次数。
 // 用于「该失败不影响账号可用性」的分类：平台过载、并发准入、验证码、客户端取消。
 func (e *Engine) recordError(acc *model.Account, kind, detail string) {
-	RecordAccountError(e.Store, acc.Provider, acc.ID, kind, detail, e.now())
+	RecordAccountError(e.Store, acc, kind, detail, e.now())
 }
 
 // markRateLimited 瞬时限流的递进冷却，返回（本次冷却秒数, 累加后的连续次数）。
@@ -951,13 +950,13 @@ func (e *Engine) recordError(acc *model.Account, kind, detail string) {
 // store 内的 live 对象，读 acc.RateLimitStreak 只会拿到旧值（线上曾把「第 1 次」
 // 打成「第 0 次」；asyncpool 侧一直用的就是返回值）。
 func (e *Engine) markRateLimited(acc *model.Account, errMsg string) (int, int) {
-	return MarkRateLimited(e.Store, acc.Provider, acc.ID, errMsg, e.now())
+	return MarkRateLimited(e.Store, acc, errMsg, e.now())
 }
 
 // markUpstreamUnavailable 上游 503 的递进冷却，返回（本次冷却秒数, 累加后的连续次数）。
 // 与 markRateLimited 同理：streak 只能取返回值（acc 是 Select 交出的副本）。
 func (e *Engine) markUpstreamUnavailable(acc *model.Account, errMsg string) (int, int) {
-	return MarkUpstreamUnavailable(e.Store, acc.Provider, acc.ID, errMsg, e.now())
+	return MarkUpstreamUnavailable(e.Store, acc, errMsg, e.now())
 }
 
 // MarkSuccess 记录一次成功调用：累计调用次数与最后使用时间、清零三个「连续失败」
@@ -969,11 +968,15 @@ func (e *Engine) markUpstreamUnavailable(acc *model.Account, errMsg string) (int
 // ⚠️ 三个 Reset*Streak 是本仓库相对上游的实现（上游版本只记 UseCount/LastUsedAt
 // 与状态复位）。任何上游同步都不得把它们删掉：漏掉后「冷却到期 + 一次成功」不会
 // 把限流/风控/503 的连续计数归零，下一次失败会直接跳到高位冷却档。
-func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
+func MarkSuccess(st *store.Store, expected *model.Account, now time.Time) {
 	ts := float64(now.UnixNano()) / 1e9
-	_, _ = st.Update(provider, id, func(live *model.Account) {
+	_, _ = st.Update(expected.Provider, expected.ID, func(live *model.Account) {
 		live.UseCount++
 		live.LastUsedAt = &ts
+		// 已完成调用照常计数；旧凭据成功不能证明新身份恢复，也不能解除人工操作。
+		if !live.AcceptsRequestResult(expected) {
+			return
+		}
 		// 迟到的成功不能证明账号已恢复：请求在冷却生效**之前**选中账号、在冷却期间才
 		// 返回 200（同账号并发很常见，async 的窗口更是整条流的时长）。此时照旧复位
 		// 会冲掉并发请求刚施加的风控/限流/503 冷却与连击，阶梯永远升不上去
@@ -999,7 +1002,7 @@ func MarkSuccess(st *store.Store, provider, id string, now time.Time) {
 // （对齐 Python 200 成功路径的 create_task(_safe_refresh)）。
 // 额度刷新仍只属于 engine：async 池不触发额度轮询。
 func (e *Engine) success(acc *model.Account) {
-	MarkSuccess(e.Store, acc.Provider, acc.ID, e.now())
+	MarkSuccess(e.Store, acc, e.now())
 	e.fireRefresh(acc)
 }
 
@@ -1011,7 +1014,7 @@ func (e *Engine) success(acc *model.Account) {
 // 保持 last_error 语义不变（store 侧用 last_error == nil 表示账号已恢复健康）。
 func (e *Engine) bumpFail(acc *model.Account, kind string) {
 	now := e.now()
-	_, _ = e.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+	_, _ = e.Store.UpdateForRequest(acc, func(live *model.Account) {
 		live.FailCount++
 		StampAccountError(live, kind, "", now)
 	})

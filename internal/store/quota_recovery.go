@@ -113,7 +113,7 @@ func (s *Store) MarkQuotaExhausted(expected *model.Account, name, detail string,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	live := s.findLocked(expected.Provider, expected.ID)
-	if live == nil || live.Mode != expected.Mode || live.Secret() != expected.Secret() {
+	if !live.AcceptsRequestResult(expected) {
 		return nil
 	}
 	pending := live.Clone()

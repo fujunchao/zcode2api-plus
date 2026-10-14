@@ -260,6 +260,19 @@ func (a *Account) Secret() string {
 	return derefString(a.APIKey)
 }
 
+// SameCredential 判断请求快照是否仍属于当前凭据，不将相同账号 ID 等同于相同登录态。
+// 调用方负责在存储锁内读取当前对象；快照在整个请求期间保持不变。
+func (a *Account) SameCredential(expected *Account) bool {
+	return a != nil && expected != nil && a.ID == expected.ID && a.Provider == expected.Provider &&
+		a.Mode == expected.Mode && a.Secret() == expected.Secret()
+}
+
+// AcceptsRequestResult 限制上游健康结果的回写；人工停用/归档不由在途结果改写。
+// 用量属于已经发生的账号历史，不使用这个判据丢弃统计。
+func (a *Account) AcceptsRequestResult(expected *Account) bool {
+	return a.SameCredential(expected) && a.Enabled && a.Status != StatusDisabled && a.ArchivedAt == nil
+}
+
 // DeviceMidOr 返回账号的设备指纹；未分配时回退 fallback（通常是全局固定值）。
 // 回退值由调用方传入：model 包刻意不依赖 config，以保持只依赖标准库。
 func (a *Account) DeviceMidOr(fallback string) string {

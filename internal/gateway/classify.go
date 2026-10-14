@@ -81,8 +81,8 @@ func transientCoolingSeconds(streak int) int {
 // 按 ID 定位并在 store 锁内改「当前」对象：调用方持有的是账号副本（Select 返回
 // 深拷贝），直接改它既不会落库、也会与并发读写相撞。连续次数的自增也必须在锁内，
 // 否则两路并发限流会各自基于旧值算出同一个档位。
-func MarkRateLimited(st *store.Store, provider, idOrName, errMsg string, now time.Time) (secs, streak int) {
-	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+func MarkRateLimited(st *store.Store, expected *model.Account, errMsg string, now time.Time) (secs, streak int) {
+	_, _ = st.UpdateForRequest(expected, func(acc *model.Account) {
 		acc.RateLimitStreak++
 		streak = acc.RateLimitStreak
 		secs = transientCoolingSeconds(streak)
@@ -131,8 +131,8 @@ func StampAccountError(acc *model.Account, kind, detail string, now time.Time) {
 // 取消）。若该出口已经会调 MarkAccount / MarkModelExhausted / bumpFail，请把 kind 并进
 // 那一次写入，否则同一分支会两次 store.Update、两次落库。两次是顺序调用而非嵌套，
 // 不会自锁，但白白多一倍持久化 IO。
-func RecordAccountError(st *store.Store, provider, idOrName, kind, detail string, now time.Time) {
-	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+func RecordAccountError(st *store.Store, expected *model.Account, kind, detail string, now time.Time) {
+	_, _ = st.UpdateForRequest(expected, func(acc *model.Account) {
 		StampAccountError(acc, kind, detail, now)
 	})
 }
@@ -228,7 +228,7 @@ func RecordUpstreamTruncate(st *store.Store, acc *model.Account, now time.Time) 
 	total := RecordStreamTruncate(st, acc.Provider, acc.ID)
 	if avoid := st.LineTruncateAvoidSeconds(); avoid > 0 {
 		until := float64(now.Add(time.Duration(avoid)*time.Second).UnixNano()) / 1e9
-		_, _ = st.Update(acc.Provider, acc.ID, func(live *model.Account) {
+		_, _ = st.UpdateForRequest(acc, func(live *model.Account) {
 			live.TruncateAvoidUntil = until
 		})
 	}
@@ -304,8 +304,8 @@ func upstream503CoolingSeconds(st *store.Store, streak int) int {
 // FailCount 的递增折在同一次 Update 里：旧实现在调用点是「先 bumpFail 再 mark」
 // 两次落库，语义完全等价（503 恒 ErrorKindUpstreamUnavailable、FailCount 恒 +1），
 // 合并后少一半持久化 IO，也不会再出现两路只调其一的漂移。
-func MarkUpstreamUnavailable(st *store.Store, provider, idOrName, errMsg string, now time.Time) (secs, streak int) {
-	_, _ = st.Update(provider, idOrName, func(acc *model.Account) {
+func MarkUpstreamUnavailable(st *store.Store, expected *model.Account, errMsg string, now time.Time) (secs, streak int) {
+	_, _ = st.UpdateForRequest(expected, func(acc *model.Account) {
 		acc.FailCount++
 		acc.Upstream503Streak++
 		streak = acc.Upstream503Streak

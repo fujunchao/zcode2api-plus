@@ -623,7 +623,7 @@ func (p *Pool) attemptUpstream(
 			return false, err
 		}
 		if rateAttempt >= gateway.MaxRateLimitRetries {
-			secs, streak := gateway.MarkRateLimited(p.Store, acc.Provider, acc.ID, "上游限流 HTTP 429", time.Now())
+			secs, streak := gateway.MarkRateLimited(p.Store, acc, "上游限流 HTTP 429", time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次被限流，冷却 %d s 后切换下一个",
 				acc.Name, streak, secs))
 			return false, errNetwork{rl.body}
@@ -708,14 +708,14 @@ func (p *Pool) attemptUpstreamOnce(
 		if gateway.IsCaptchaError(bodyText, resp.StatusCode, resp.Header) {
 			// 验证码被拒：令牌作废，由调用方在内层循环内换令牌重试
 			p.Captcha.Invalidate()
-			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindCaptchaFailed,
+			gateway.RecordAccountError(p.Store, acc, model.ErrorKindCaptchaFailed,
 				fmt.Sprintf("上游拒絕驗證碼 HTTP %d", resp.StatusCode), time.Now())
 			return false, errCaptchaRejected
 		}
 
 		// 401/403 → 账号失效，换号
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			gateway.MarkAccount(p.Store, acc.Provider, acc.ID, model.StatusInvalid, model.ErrorKindAuthFailed,
+			gateway.MarkAccount(p.Store, acc, model.StatusInvalid, model.ErrorKindAuthFailed,
 				fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 鉴权失败 %d，切换下一个%s", acc.Name, resp.StatusCode, gateway.ErrorDetail(bodyText)))
 			return false, errNetwork{bodyText}
@@ -723,7 +723,7 @@ func (p *Pool) attemptUpstreamOnce(
 
 		// 402 → 该模型额度用完
 		if resp.StatusCode == http.StatusPaymentRequired {
-			gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
+			gateway.MarkModelExhausted(p.Store, acc, modelName,
 				fmt.Sprintf("%s 額度已用完", orCurrent(modelName)), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 額度用完，切換下一個%s", acc.Name, orCurrent(modelName), gateway.ErrorDetail(bodyText)))
 			return false, errNetwork{bodyText}
@@ -731,7 +731,7 @@ func (p *Pool) attemptUpstreamOnce(
 
 		// 3008/3009/3010：交由独立有限预算处理，不按普通429冷却账号。
 		if gateway.IsModelConcurrencyLimit(resp.StatusCode, bodyText) {
-			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindModelBusy,
+			gateway.RecordAccountError(p.Store, acc, model.ErrorKindModelBusy,
 				"模型并发准入受限 HTTP 429 code="+gateway.ModelConcurrencyCode(resp.StatusCode, bodyText), time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 模型并发准入受限，保留账号状态%s", acc.Name, gateway.ErrorDetail(bodyText)))
 			return false, errModelBusy{bodyText}
@@ -748,7 +748,7 @@ func (p *Pool) attemptUpstreamOnce(
 			if code == "" {
 				code = "-"
 			}
-			gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindUpstreamOverload,
+			gateway.RecordAccountError(p.Store, acc, model.ErrorKindUpstreamOverload,
 				fmt.Sprintf("上游平台过载 HTTP %d code=%s", resp.StatusCode, code), time.Now())
 			return false, errOverloaded{bodyText}
 		}
@@ -756,7 +756,7 @@ func (p *Pool) attemptUpstreamOnce(
 		// 429：额度上限码族 → 该模型耗尽
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if gateway.IsQuotaExhaustedCode(bodyText) {
-				gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
+				gateway.MarkModelExhausted(p.Store, acc, modelName,
 					fmt.Sprintf("%s 額度/用量上限已達", orCurrent(modelName)), time.Now())
 				web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 觸發用量上限，切換下一個%s", acc.Name, orCurrent(modelName), gateway.ErrorDetail(bodyText)))
 				return false, errNetwork{bodyText}
@@ -769,7 +769,7 @@ func (p *Pool) attemptUpstreamOnce(
 		// 默认 30/60/120s 可后台配置，超阶梯封顶 CoolingSeconds）。日志带 body 预览。
 		if resp.StatusCode == http.StatusServiceUnavailable {
 			errMsg := "上游服務不可用 HTTP 503: " + gateway.ErrorPreview(bodyText)
-			secs, streak := gateway.MarkUpstreamUnavailable(p.Store, acc.Provider, acc.ID, errMsg, time.Now())
+			secs, streak := gateway.MarkUpstreamUnavailable(p.Store, acc, errMsg, time.Now())
 			web.Warn(ticketID, fmt.Sprintf("账号 %s 上游返回 503（連續第 %d 次），冷卻 %d s 並切換下一個: %s",
 				acc.Name, streak, secs, gateway.ErrorPreview(bodyText)))
 			return false, errNetwork{bodyText}
@@ -861,7 +861,7 @@ func (p *Pool) handleUpstreamJSON(
 	switch code := gateway.UpstreamBusinessCode(text); {
 	case code == "1005":
 		// 每日额度耗尽：标该模型耗尽后换号（与 sync 同）。
-		gateway.MarkModelExhausted(p.Store, acc.Provider, acc.ID, modelName,
+		gateway.MarkModelExhausted(p.Store, acc, modelName,
 			fmt.Sprintf("%s 每日額度已用完", orCurrent(modelName)), time.Now())
 		web.Warn(ticketID, fmt.Sprintf("账号 %s 的 %s 每日額度用完，切換下一個%s", acc.Name, orCurrent(modelName), gateway.ErrorDetail(text)))
 		return false, errNetwork{text}
@@ -869,7 +869,7 @@ func (p *Pool) handleUpstreamJSON(
 	case code == "3007":
 		// 验证码失效：令牌作废，由调用方换令牌重试（不换号）。
 		p.Captcha.Invalidate()
-		gateway.RecordAccountError(p.Store, acc.Provider, acc.ID, model.ErrorKindCaptchaFailed,
+		gateway.RecordAccountError(p.Store, acc, model.ErrorKindCaptchaFailed,
 			"上游拒絕驗證碼 code=3007", time.Now())
 		return false, errCaptchaRejected
 
@@ -952,7 +952,7 @@ func (e errOverloaded) Error() string { return e.body }
 // 「带可读文案的失败原因」，由 MarkAccount / MarkModelExhausted / MarkRateLimited 负责写。
 func (p *Pool) bumpFail(acc *model.Account, kind string) {
 	now := time.Now()
-	_, _ = p.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+	_, _ = p.Store.UpdateForRequest(acc, func(live *model.Account) {
 		live.FailCount++
 		gateway.StampAccountError(live, kind, "", now)
 	})
@@ -1063,7 +1063,7 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	// async 流量，且冷却已到期的账号即使这里已成功也仍停在 cooling，要等下一轮
 	// 额度轮询（默认 60s）才回到调度。
 	// ⚠️ 必须是独立的第二次 Update：Store.Update 持锁内不可再调（自锁）。
-	gateway.MarkSuccess(p.Store, acc.Provider, acc.ID, time.Now())
+	gateway.MarkSuccess(p.Store, acc, time.Now())
 	// 完整成功交付：清零该线路的「连续断流」计数（与 sync 的 finishDelivery
 	// 成功分支同口径；不能进 MarkSuccess，见 gateway.ResetLineTruncate 注释）。
 	gateway.ResetLineTruncate(p.Store, acc)

@@ -70,7 +70,7 @@ func (s *RiskScope) Accounts() int {
 // 「请求级」两种语义（本文件头注释），但冷却动作相同 —— 请求级时账号同样被上游标记，
 // 本地冷却必须保留。snapshot 为本次请求的出口快照，避免迟到响应重复换线。
 func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, now time.Time, attempt ...RiskAttempt) (secs, streak int, invalid bool) {
-	_, _ = st.Update(snapshot.Provider, snapshot.ID, func(acc *model.Account) {
+	_, _ = st.UpdateForRequest(snapshot, func(acc *model.Account) {
 		acc.RiskControlStreak++
 		streak = acc.RiskControlStreak
 		// 保留观测历史；只有显式配置 RiskSilentHours > 0 时才额外叠加静默隔离。
@@ -89,7 +89,7 @@ func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, no
 		StampAccountError(acc, model.ErrorKindRiskControl, errMsg, now)
 	})
 	if streak == 0 {
-		// 账号已被删除（并发删除）：不落库，但仍给日志一个可用的档位。
+		// 已删除、人工停用或已换凭据：不更新状态/换线，仍给日志一个可用的档位。
 		secs, invalid = riskControlCoolingSeconds(st, 1)
 		return secs, streak, invalid
 	}

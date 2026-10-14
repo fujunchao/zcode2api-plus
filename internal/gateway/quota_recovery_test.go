@@ -104,7 +104,7 @@ func TestAPIKeyQuotaRecoveryPrefersHealthyAndLimitsProbes(t *testing.T) {
 		base := time.Now().Add(-time.Hour)
 		bad, _ := f.st.AddAccount(model.ProviderZai, "bad", "sk-synthetic-bad")
 		good, _ := f.st.AddAccount(model.ProviderZai, "good", "sk-synthetic-good")
-		MarkModelExhausted(f.st, bad.Provider, bad.ID, "GLM-5.3", "quota", base)
+		MarkModelExhausted(f.st, bad, "GLM-5.3", "quota", base)
 		f.respond = jsonResp(200, quotaRecoveryMessage)
 		status, _ := f.post(t, msgBody(), "sk-test")
 		if status != 200 || f.lastCall().Header.Get("x-api-key") != good.Secret() {
@@ -116,7 +116,7 @@ func TestAPIKeyQuotaRecoveryPrefersHealthyAndLimitsProbes(t *testing.T) {
 		base := time.Now().Add(-time.Hour)
 		for _, secret := range []string{"sk-synthetic-a", "sk-synthetic-b"} {
 			a, _ := f.st.AddAccount(model.ProviderZai, secret, secret)
-			MarkModelExhausted(f.st, a.Provider, a.ID, "GLM-5.3", "quota", base)
+			MarkModelExhausted(f.st, a, "GLM-5.3", "quota", base)
 		}
 		f.respond = jsonResp(429, `{"code":1310,"msg":"still exhausted"}`)
 		if status, _ := f.post(t, msgBody(), "sk-test"); status != 503 || f.callCount() != 1 {
@@ -147,7 +147,7 @@ func TestAPIKeyQuotaRecoveryRequiresValidUncancelledDelivery(t *testing.T) {
 			now := base.Add(5 * time.Minute)
 			f.eng.SetNow(func() time.Time { return now })
 			a, _ := f.st.AddAccount(model.ProviderZai, "delivery", "sk-synthetic-delivery")
-			MarkModelExhausted(f.st, a.Provider, a.ID, "GLM-5.3", "quota", base)
+			MarkModelExhausted(f.st, a, "GLM-5.3", "quota", base)
 			f.respond = func(int, *http.Request) (int, http.Header, string) {
 				return 200, http.Header{"Content-Type": []string{tc.contentType}}, tc.body
 			}
@@ -183,7 +183,7 @@ func TestAPIKeyQuotaRecoveryRequiresValidUncancelledDelivery(t *testing.T) {
 func TestAPIKeyQuotaRecoveryDoesNotUseJWTQuotaProbe(t *testing.T) {
 	f := newFixture(t)
 	a, _ := f.st.AddAccount(model.ProviderZai, "jwt", "synthetic.payload.signature")
-	MarkModelExhausted(f.st, a.Provider, a.ID, "GLM-5.3", "quota", time.Now().Add(-24*time.Hour))
+	MarkModelExhausted(f.st, a, "GLM-5.3", "quota", time.Now().Add(-24*time.Hour))
 	probe, err := f.st.AcquireQuotaProbe(a.Provider, nil, "GLM-5.3", time.Now())
 	if probe != nil || err != nil {
 		t.Fatalf("JWT 仍只经余额刷新恢复: %v %v", probe, err)

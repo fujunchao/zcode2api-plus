@@ -250,12 +250,13 @@ func (s *Service) quotaRequestFailure(ctx context.Context, acc *model.Account, c
 // 保护放在统一回写边界，覆盖失败、405 幂等、空额度和耗尽等所有路径，而不只在
 // 成功分支判断 LastErrorKind——否则先前的查询失败会覆盖原因，下一次成功就误解封。
 func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
-	_, _ = s.Store.Update(acc.Provider, acc.ID, func(live *model.Account) {
+	_, _ = s.Store.UpdateForRequest(acc, func(live *model.Account) {
 		// 任何实际查询先废弃同出口的旧证据，只有完整成功响应才能重新建立。
-		// 出口已改变时不让迟到响应污染新线路的证据。
-		if model.NewStartPlanObservation(acc, 1, false).Matches(live) {
-			live.StartPlanObservation = model.StartPlanObservation{}
+		// 出口已改变时，额度/状态同样不能再由旧查询覆盖，而不仅仅保护证据字段。
+		if !model.NewStartPlanObservation(acc, 1, false).Matches(live) {
+			return
 		}
+		live.StartPlanObservation = model.StartPlanObservation{}
 		protectInvalid := model.IsRiskControlInvalid(live)
 		protectCooling := live.Status == model.StatusCooling &&
 			(live.CoolingUntil == nil || *live.CoolingUntil > float64(s.now().UnixNano())/1e9)

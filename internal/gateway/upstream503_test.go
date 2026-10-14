@@ -24,7 +24,7 @@ func TestUpstream503CoolingEscalates(t *testing.T) {
 
 	want := []int{30, 60, 120, config.CoolingSeconds}
 	for i, secs := range want {
-		got, streak := MarkUpstreamUnavailable(st, model.ProviderZai, acc.ID, "上游服務不可用 HTTP 503", now)
+		got, streak := MarkUpstreamUnavailable(st, acc, "上游服務不可用 HTTP 503", now)
 		if got != secs {
 			t.Fatalf("第 %d 次 503 冷却应为 %ds，实得 %ds", i+1, secs, got)
 		}
@@ -34,7 +34,7 @@ func TestUpstream503CoolingEscalates(t *testing.T) {
 	}
 	// 超出阶梯长度后封顶在 CoolingSeconds，账号不得被判失效
 	for range 3 {
-		got, _ := MarkUpstreamUnavailable(st, model.ProviderZai, acc.ID, "上游服務不可用 HTTP 503", now)
+		got, _ := MarkUpstreamUnavailable(st, acc, "上游服務不可用 HTTP 503", now)
 		if got != config.CoolingSeconds {
 			t.Fatalf("超出阶梯应封顶在 %ds: %d", config.CoolingSeconds, got)
 		}
@@ -48,7 +48,7 @@ func TestUpstream503CoolingEscalates(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := MarkUpstreamUnavailable(st, model.ProviderZai, acc.ID, "上游服務不可用 HTTP 503", now); got != 30 {
+	if got, _ := MarkUpstreamUnavailable(st, acc, "上游服務不可用 HTTP 503", now); got != 30 {
 		t.Fatalf("成功调用后应回到最低档 30s: %d", got)
 	}
 }

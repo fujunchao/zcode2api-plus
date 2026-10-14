@@ -70,7 +70,7 @@ func TestRecordAccountError(t *testing.T) {
 	}
 
 	now := time.Unix(1700000000, 500000000)
-	RecordAccountError(st, model.ProviderZai, acc.ID, model.ErrorKindClientCanceled, "", now)
+	RecordAccountError(st, acc, model.ErrorKindClientCanceled, "", now)
 
 	got := st.Find(model.ProviderZai, acc.ID)
 	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindClientCanceled {
@@ -87,7 +87,7 @@ func TestRecordAccountError(t *testing.T) {
 	}
 
 	// detail 非空 → 覆盖文案，归类同步更新。
-	RecordAccountError(st, model.ProviderZai, acc.ID, model.ErrorKindRateLimited, "上游限流 HTTP 429", now)
+	RecordAccountError(st, acc, model.ErrorKindRateLimited, "上游限流 HTTP 429", now)
 	got = st.Find(model.ProviderZai, acc.ID)
 	if got.LastError == nil || *got.LastError != "上游限流 HTTP 429" {
 		t.Fatalf("detail 非空应覆盖 last_error: %v", got.LastError)
