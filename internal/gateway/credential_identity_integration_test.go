@@ -41,6 +41,8 @@ func TestCredentialIdentityLateAuthentication(t *testing.T) {
 					f.waitDone(t, done)
 					if relogin {
 						f.assertNewIdentity(t)
+						// 旧结果被隔离后，新凭据必须能真正发起下一次请求。
+						f.waitDone(t, f.run(t, true))
 					} else {
 						got := f.st.FindAny(f.account.ID)
 						if got.Status != model.StatusInvalid || got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindAuthFailed {
@@ -50,6 +52,72 @@ func TestCredentialIdentityLateAuthentication(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestCredentialIdentityLateFailures(t *testing.T) {
+	for _, entry := range []string{"sync", "async"} {
+		for _, status := range []int{402, 429, 503, 405} {
+			t.Run(fmt.Sprintf("%s/%d", entry, status), func(t *testing.T) {
+				f := newCredentialFixture(t, entry, status)
+				done := f.start(t)
+				f.waitStarted(t)
+				f.relogin(t)
+				f.release()
+				f.waitDone(t, done)
+				f.assertNewIdentity(t)
+				if got := f.st.FindAny(f.account.ID); len(got.ExhaustedModels) != 0 || got.RiskControlStreak != 0 || got.RateLimitStreak != 0 || got.Upstream503Streak != 0 {
+					t.Fatal("旧身份错误污染了新身份的模型标记或失败阶梯")
+				}
+			})
+		}
+	}
+}
+
+func TestCredentialIdentityLateSuccess(t *testing.T) {
+	for _, entry := range []string{"sync", "async", "quota"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newCredentialFixture(t, entry, http.StatusOK)
+			done := f.run(t, true)
+			f.waitStarted(t)
+			f.relogin(t)
+			// 模拟新身份已独立取得的额度/健康状态；旧成功不能充当新身份恢复证明。
+			_, err := f.st.Update(f.account.Provider, f.account.ID, func(a *model.Account) {
+				a.Status = model.StatusExhausted
+				a.RateLimitStreak, a.RiskControlStreak, a.Upstream503Streak = 2, 3, 4
+				a.Quota = map[string]map[string]any{"new-identity": {"remaining": float64(17)}}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.release()
+			f.waitDone(t, done)
+			got := f.st.FindAny(f.account.ID)
+			if got.Status != model.StatusExhausted || got.RateLimitStreak != 2 || got.RiskControlStreak != 3 || got.Upstream503Streak != 4 || got.Quota["new-identity"]["remaining"] != float64(17) {
+				t.Fatalf("旧成功覆盖了新身份状态：status=%s quota=%v", got.Status, got.Quota)
+			}
+			if entry != "quota" && (got.UseCount != 1 || got.TotalInputTokens != 5 || got.TotalOutputTokens != 7) {
+				t.Fatalf("旧身份已经消费的用量仍须按同账号累计：use=%d input=%d output=%d", got.UseCount, got.TotalInputTokens, got.TotalOutputTokens)
+			}
+		})
+	}
+}
+
+func TestCredentialIdentityKeepsAdministrativeDisable(t *testing.T) {
+	for _, entry := range []string{"sync", "async", "quota"} {
+		t.Run(entry, func(t *testing.T) {
+			f := newCredentialFixture(t, entry, http.StatusUnauthorized)
+			done := f.start(t)
+			f.waitStarted(t)
+			if _, err := f.st.SetEnabled(f.account.Provider, f.account.ID, false); err != nil {
+				t.Fatal(err)
+			}
+			f.release()
+			f.waitDone(t, done)
+			if got := f.st.FindAny(f.account.ID); got.Enabled || got.Status != model.StatusDisabled {
+				t.Fatal("在途结果覆盖了管理员停用状态")
+			}
+		})
 	}
 }
 
@@ -98,6 +166,10 @@ func newCredentialFixture(t *testing.T, entry string, oldStatus int) *credential
 	var calls atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
+		if r.Header.Get("Authorization") == "Bearer "+f.newJWT {
+			credentialSuccess(w, entry)
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer "+f.oldJWT {
 			t.Error("本回归的在途请求必须携带旧合成 JWT")
 		}
@@ -109,9 +181,17 @@ func newCredentialFixture(t *testing.T, entry string, oldStatus int) *credential
 		case <-r.Context().Done():
 			return
 		}
+		if oldStatus == http.StatusOK {
+			credentialSuccess(w, entry)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(oldStatus)
-		_, _ = io.WriteString(w, `{"error":{"type":"authentication_error","message":"synthetic expired token"}}`)
+		if oldStatus == 405 {
+			_, _ = io.WriteString(w, `{"error":{"message":"request has been blocked due to unusual activity"}}`)
+		} else {
+			_, _ = io.WriteString(w, `{"error":{"type":"authentication_error","message":"synthetic expired token"}}`)
+		}
 	}))
 	t.Cleanup(up.Close)
 	config.UpstreamZai, config.UpstreamZaiFallback, config.ZcodeBillingBase = up.URL, up.URL, up.URL
@@ -120,8 +200,12 @@ func newCredentialFixture(t *testing.T, entry string, oldStatus int) *credential
 		return captcha.Config{Enabled: true, SkipModelRequest: true}, nil
 	})
 	engine := gateway.NewEngine(st, cm, up.Client())
+	engine.RateLimitRetryDelay = 0
+	engine.BusyRetryDelays, engine.OverloadRetryDelays = nil, nil
 	pool := asyncpool.NewPool(st, auth.New(st), cm)
 	pool.Client = up.Client()
+	pool.RateLimitRetryDelay = 0
+	pool.BusyRetryDelays, pool.OverloadRetryDelays = nil, nil
 	t.Cleanup(pool.Close)
 	f.qs = quota.NewService(st)
 	f.qs.Client = up.Client()
@@ -139,13 +223,32 @@ func newCredentialFixture(t *testing.T, entry string, oldStatus int) *credential
 }
 
 func (f *credentialFixture) start(t *testing.T) <-chan error {
+	return f.run(t, false)
+}
+
+func credentialSuccess(w http.ResponseWriter, entry string) {
+	w.Header().Set("Content-Type", "application/json")
+	switch entry {
+	case "quota":
+		_, _ = io.WriteString(w, `{"code":0,"data":{"plans":[],"balances":[{"model":"GLM-5.3","remaining_units":100,"available_units":100,"total_units":100,"used_units":0}]}}`)
+	case "async":
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n"+
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n"+
+			"data: {\"type\":\"message_stop\"}\n\n")
+	default:
+		_, _ = io.WriteString(w, `{"id":"synthetic","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":7}}`)
+	}
+}
+
+func (f *credentialFixture) run(t *testing.T, success bool) <-chan error {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() {
 		if f.entry == "quota" {
 			result, _ := f.qs.FetchQuotaFresh(f.ctx, f.account)
-			if result["error"] == nil {
-				done <- fmt.Errorf("旧认证失败必须返回查询错误")
+			if (result["error"] == nil) != success {
+				done <- fmt.Errorf("额度结果不符合预期：success=%t result=%v", success, result)
 				return
 			}
 			done <- nil
@@ -170,8 +273,11 @@ func (f *credentialFixture) start(t *testing.T) <-chan error {
 		}
 		defer resp.Body.Close()
 		raw, err := io.ReadAll(resp.Body)
-		if err == nil && !strings.Contains(string(raw), "error") {
-			err = fmt.Errorf("旧认证请求应以错误结束：status=%d body=%s", resp.StatusCode, raw)
+		if err == nil && strings.Contains(string(raw), "error") == success {
+			err = fmt.Errorf("模型结果不符合预期：success=%t status=%d body=%s", success, resp.StatusCode, raw)
+		}
+		if success && err == nil && (resp.StatusCode != http.StatusOK || (f.entry == "async" && !strings.Contains(string(raw), "event: done"))) {
+			err = fmt.Errorf("成功请求必须完整交付：status=%d body=%s", resp.StatusCode, raw)
 		}
 		done <- err
 	}()
