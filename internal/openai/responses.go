@@ -455,7 +455,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if result.Delivered {
 		return
 	}
-	gateway.WriteJSON(w, result.Status, result.Body)
+	gateway.WriteRunResult(w, result)
 }
 
 // deliverResponsesJSON 非流式交付。

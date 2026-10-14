@@ -77,7 +77,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	// 引擎错误体已是 {"error":{message,type,code}} 形态，OpenAI 客户端兼容
-	gateway.WriteJSON(w, result.Status, result.Body)
+	gateway.WriteRunResult(w, result)
 }
 
 // deliverJSON 非流式交付：读上游 Anthropic JSON → 转换为 OpenAI 形态回写。

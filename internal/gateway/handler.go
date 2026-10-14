@@ -59,7 +59,7 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if result.Delivered {
 		return
 	}
-	WriteJSON(w, result.Status, result.Body)
+	WriteRunResult(w, result)
 }
 
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {

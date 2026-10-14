@@ -377,7 +377,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		diag.ReplayBlocked, diag.ReplayWait = true, remaining
 		diag.ErrText = "risk_control_cooldown"
 		web.ReqErr(ticketID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
-		p.emitError(ctx, ticketID, "相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容", "risk_control_cooldown")
+		p.emitErrorWithDetails(ctx, ticketID, "相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容", "risk_control_cooldown", gateway.RetryAdvice(remaining))
 		return
 	}
 	// 归因标识**按票算一次**：出站头与 body 的 metadata.user_id.session_id 必须共享

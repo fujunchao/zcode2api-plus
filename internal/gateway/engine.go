@@ -122,9 +122,10 @@ func defaultUpstreamClient() *http.Client {
 // runResult 循环结束状态：Delivered=true 表示已通过 deliver 交付上游 200
 // （handler 不得再写响应）；否则 Status/Body 是要回给客户端的错误 JSON。
 type runResult struct {
-	Delivered bool
-	Status    int
-	Body      any
+	Delivered  bool
+	Status     int
+	Body       any
+	RetryAfter time.Duration
 }
 
 // attemptResult 单次账号尝试的出路：retrySame（同账号再试一次）、
@@ -189,8 +190,8 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		diag.ReplayBlocked, diag.ReplayWait = true, remaining
 		diag.ErrText = "risk_control_cooldown"
 		web.ReqErr(reqID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
-		return errResult(http.StatusServiceUnavailable, "risk_control_cooldown",
-			"相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容")
+		return withRetryAdvice(errResult(http.StatusServiceUnavailable, "risk_control_cooldown",
+			"相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容"), remaining)
 	}
 	web.Req(reqID, orDash(modelName), stream)
 
@@ -661,10 +662,10 @@ func (e *Engine) handleUpstreamError(
 				web.Warn(reqID, fmt.Sprintf("已達本地風控重試保護閾值（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（本地階梯保護，%d s），同內容 %d s 內直接拒絕",
 					scope.Accounts(), resp.StatusCode, preview, secs, ReplayGuardTTL))
 			}
-			return attemptResult{final: runResult{
+			return attemptResult{final: withRetryAdvice(runResult{
 				Status: resp.StatusCode,
 				Body:   passthroughBodyWithType(text, "upstream_error"),
-			}}
+			}, e.replay.Remaining(scope.ContentKey()))}
 		}
 		secs, streak, invalid := MarkRiskControl(e.Store, acc,
 			"上游风控拦截 HTTP 405: "+preview, e.now(), RiskAttempt{RequestID: reqID, Egress: egress})
