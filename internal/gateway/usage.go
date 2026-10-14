@@ -135,6 +135,9 @@ func (u *UsageCollector) markFinalIfComplete(payload, usage map[string]any) {
 // （见 docs/analysis-flash-30min-stream-cut.md §5）。
 func (u *UsageCollector) UsageComplete() bool { return u.final }
 
+// ResponseComplete 供异步发送点判断完整成功，不把200响应头或部分usage当成功。
+func (u *UsageCollector) ResponseComplete() bool { return u.responseComplete() }
+
 // StreamError 在 Finish 后检查 SSE 的协议终态；正常 EOF 但没有 message_stop
 // 仍是断流。非 SSE 返回 nil，不改变非流式响应的交付语义。
 func (u *UsageCollector) StreamError() error {

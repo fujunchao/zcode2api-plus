@@ -27,7 +27,7 @@ func TestStrictProxyComparableSuccessDeletesFailedIdentity(t *testing.T) {
 	now := time.Now()
 	for i := 0; i < 2; i++ {
 		snapshot := s.FindAny(acc.ID)
-		d, err := s.ObserveProxyOutcome(snapshot, s.ProxyEgress(snapshot), ProxyObservation{RequestID: fmt.Sprintf("fail-%d", i), TargetOrigin: "https://model.example.test", Model: "glm-test", ContentRef: "content-a", ProfileRef: "desktop-v1", SessionRef: "session-a", DeviceRef: "device-a", BusinessCode: "3012", Status: 405, At: now.Add(time.Duration(i) * time.Second)})
+		d, err := s.ObserveProxyOutcome(snapshot, s.ProxyEgress(snapshot), ProxyObservation{RequestID: fmt.Sprintf("fail-%d", i), EntryRef: fmt.Sprintf("entry-%d", i), TargetOrigin: "https://model.example.test", TargetPath: "/api/anthropic/v1/messages", Method: "POST", Model: "glm-test", ContentRef: "content-a", ProfileRef: "desktop-v1", SessionRef: "session-a", DeviceRef: "device-a", BusinessCode: "3012", Status: 405, At: now.Add(time.Duration(i) * time.Second)})
 		if err != nil || len(d.Removed) != 0 {
 			t.Fatalf("没有完整成功对照不能删除: %+v, %v", d, err)
 		}
@@ -36,7 +36,7 @@ func TestStrictProxyComparableSuccessDeletesFailedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := s.FindAny(acc.ID)
-	d, err := s.ObserveProxyOutcome(snapshot, s.ProxyEgress(snapshot), ProxyObservation{RequestID: "success", TargetOrigin: "https://model.example.test", Model: "glm-test", ContentRef: "content-a", ProfileRef: "desktop-v1", SessionRef: "session-a", DeviceRef: "device-a", Status: 200, Complete: true, At: now.Add(2 * time.Second)})
+	d, err := s.ObserveProxyOutcome(snapshot, s.ProxyEgress(snapshot), ProxyObservation{RequestID: "success", EntryRef: "success-entry", TargetOrigin: "https://model.example.test", TargetPath: "/api/anthropic/v1/messages", Method: "POST", Model: "glm-test", ContentRef: "content-a", ProfileRef: "desktop-v1", SessionRef: "session-a", DeviceRef: "device-a", Status: 200, Complete: true, At: now.Add(2 * time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,6 +22,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/store"
 	"zcode2api/internal/web"
 )
 
@@ -79,6 +80,7 @@ const (
 
 // Service 领取服务：captcha 求解 + billing HTTP（账号代理生效）。
 type Service struct {
+	Store   *store.Store
 	Context context.Context
 	Captcha *captcha.Manager
 	// Client 测试注入；nil 时按账号代理构造（25s 超时，短请求语义）。
@@ -112,9 +114,17 @@ func (s *Service) clientFor(acc *model.Account) (HTTPClient, error) {
 		return s.Client, nil
 	}
 	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
-		return proxy.ClientFor(*acc.ProxyURL, 25*time.Second)
+		client, err := proxy.ClientFor(*acc.ProxyURL, 25*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		if s.Store != nil {
+			client = s.Store.GuardProxyClient(client, acc, s.Store.ProxyEgress(acc))
+		}
+		return client, nil
 	}
-	return &http.Client{Timeout: 25 * time.Second}, nil
+	// 空线路表示明确直连/自动直连回退，不继承进程环境代理。
+	return proxy.ClientFor("", 25*time.Second)
 }
 
 func (s *Service) proxyFailureError(acc *model.Account, err *ClaimError, reason string) *ClaimError {

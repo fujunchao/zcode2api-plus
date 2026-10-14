@@ -45,21 +45,17 @@ func TransportFor(raw string) (*http.Transport, error) {
 // ⚠️ 需要给"带超时的客户端"时应使用本函数而非 ClientFor：ClientFor 设的是
 // http.Client.Timeout（整体超时），对 SSE 长连接等于给流设了上限。
 func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http.Transport, error) {
-	normalized, err := NormalizeProxyURL(raw)
+	canonical, err := CanonicalRoute(raw)
 	if err != nil {
 		return nil, err
 	}
-	key := ""
-	if normalized != nil {
-		key = *normalized
-	}
-	key = fmt.Sprintf("%s\x00%d", key, responseHeaderTimeout)
+	key := fmt.Sprintf("%s\x00%d", canonical, responseHeaderTimeout)
 	transportMu.Lock()
 	defer transportMu.Unlock()
 	if t, ok := transportPrec[key]; ok {
 		return t, nil
 	}
-	t, err := NewTransport(raw, responseHeaderTimeout)
+	t, err := NewTransport(canonical, responseHeaderTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -77,14 +73,14 @@ func TransportForTimeout(raw string, responseHeaderTimeout time.Duration) (*http
 
 // ForgetTransport 退役端点的所有超时变体；已有请求仍持有自己的 Transport。
 func ForgetTransport(raw string) {
-	normalized, err := NormalizeProxyURL(raw)
-	if err != nil || normalized == nil {
+	canonical, err := CanonicalRoute(raw)
+	if err != nil || canonical == "" {
 		return
 	}
 	transportMu.Lock()
 	defer transportMu.Unlock()
 	for key, t := range transportPrec {
-		if strings.HasPrefix(key, *normalized+"\x00") {
+		if strings.HasPrefix(key, canonical+"\x00") {
 			delete(transportPrec, key)
 			t.CloseIdleConnections()
 		}

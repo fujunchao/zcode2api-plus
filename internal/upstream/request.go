@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/textproto"
 	"regexp"
 	"strings"
@@ -44,10 +45,28 @@ func ZcodeSystemBlocks() []any {
 		}
 		zcodeStaticBlocks = blocks
 	})
-	if config.UpstreamInjectEnvironment {
-		return appendEnvironmentBlock(zcodeStaticBlocks)
+	// 缓存布局只调整桌面回退；每次复制块对象，不能改写共享静态 map。
+	desktop := config.ZcodeClientProfile().SourceTitle == "electron"
+	blocks := make([]any, 0, len(zcodeStaticBlocks))
+	for i, raw := range zcodeStaticBlocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			blocks = append(blocks, raw)
+			continue
+		}
+		block = maps.Clone(block)
+		if cache, ok := block["cache_control"].(map[string]any); ok {
+			block["cache_control"] = maps.Clone(cache)
+		}
+		if i == 0 && desktop {
+			delete(block, "cache_control")
+		}
+		blocks = append(blocks, block)
 	}
-	return append([]any(nil), zcodeStaticBlocks...)
+	if config.UpstreamInjectEnvironment {
+		return appendEnvironmentBlock(blocks)
+	}
+	return blocks
 }
 
 // dropHeaders 透传客户端 header 时需要剔除的字段（对齐 agent.py _DROP_HEADERS）。
@@ -123,26 +142,18 @@ var querySourcePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 // 透传循环里对 x-zcode-* 的一刀切丢弃因此不会伤到它们（写测试时别把两件事混起来：
 // 改那处过滤不会让本函数的行为变化）。
 func NewAttribution(incoming map[string]string, bodySessionID string) Attribution {
+	incoming = ValidatedAttributionHeaders(incoming)
 	pick := func(name string) string {
-		if v := strings.TrimSpace(incoming[name]); v != "" {
-			return v
-		}
-		// 透传头的键形态不受控（可能全小写），再按大小写不敏感找一遍。
-		for k, v := range incoming {
-			if strings.EqualFold(k, name) {
-				if trimmed := strings.TrimSpace(v); trimmed != "" {
-					return trimmed
-				}
-			}
-		}
-		return ""
+		return incoming[name]
 	}
 
 	requestID := config.NewUUIDv4()
 	sessionID := stripInternalPrefixes(pick("X-Session-Id"), "sess_", "subagent_agent_")
 	if sessionID == "" {
-		// 头里没有就用下游 body 里声明的会话；再没有才回落到本次请求 id。
-		sessionID = strings.TrimSpace(bodySessionID)
+		// 合法头优先；正文来源遵守相同预算和别名规则，不能把换行等非法值放进头。
+		if validAttributionValue(bodySessionID) {
+			sessionID = stripInternalPrefixes(strings.TrimSpace(bodySessionID), "sess_", "subagent_agent_")
+		}
 	}
 	if sessionID == "" {
 		sessionID = requestID
@@ -196,8 +207,9 @@ func (a Attribution) Headers() map[string]string {
 // 官方语义（CLI 日志实证，model.retry.delay.resolved 事件）：同一轮次（queryId 不变）
 // 内**每次上游 HTTP 尝试都换新 requestId**——重试 4 次可见 4 个不同的 id；而
 // session/trace/query 保持。本网关的换号重试发生在同一轮次里，若整轮共享一个
-// request-id，上游会看到「同一个请求 id 出现在多个账号上」——那是官方从不出现的
-// 形态，且直接暴露多账号同源。
+// request-id，会把不同 HTTP 尝试错误地标成同一个尝试。
+// 换号时继续保留逻辑身份是当前透明模式的既有契约；是否为换号重建 session/query/trace
+// 需要独立证据和决策，不以官方正常同号重试样本替代这项判断。
 //
 // body 不含 request-id（metadata 只有 device_id/account_uuid/session_id），因此
 // 刷新它不影响 body 与内容视图指纹。

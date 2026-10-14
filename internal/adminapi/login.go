@@ -14,6 +14,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/oauth"
 	"zcode2api/internal/proxy"
+	"zcode2api/internal/store"
 	"zcode2api/internal/web"
 )
 
@@ -90,6 +91,11 @@ func (h *Handler) resolveLoginProxy(payload map[string]any) (string, string, boo
 	if raw != "" {
 		for _, p := range h.Store.ListProxyProfiles() {
 			if p.ID == raw {
+				release, err := h.Store.AcquireProxyProfileDispatch(p)
+				if err != nil {
+					return "", "", false, errBadRequest("选定代理不可用，请选择自动或直连")
+				}
+				release()
 				return p.URL, p.ID, false, nil
 			}
 		}
@@ -102,6 +108,11 @@ func (h *Handler) resolveLoginProxy(payload map[string]any) (string, string, boo
 	if normalized == nil {
 		return "", "", false, nil
 	}
+	release, dispatchErr := h.Store.AcquireRawProxyDispatch(*normalized)
+	if dispatchErr != nil {
+		return "", "", false, errBadRequest("选定代理已淘汰，请选择自动或直连")
+	}
+	release()
 	return *normalized, "", false, nil
 }
 
@@ -204,7 +215,7 @@ func (h *Handler) handleLoginComplete(w http.ResponseWriter, r *http.Request) {
 	if session.proxyID != "" {
 		h.refreshLoginProxy(session)
 	}
-	account, apiErr := h.saveOAuthAccount(session.exchanged, session)
+	account, apiErr := h.saveOAuthAccountContext(ctx, session.exchanged, session)
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
 		return
@@ -228,6 +239,10 @@ func (h *Handler) writeCompletedLogin(w http.ResponseWriter, session *loginSessi
 // 兑换 API Key 回填同账号 → 首次额度查询 + 自动领取。真正新号领取后再补查一次。
 // 兑换/刷新失败不影响 JWT 已入池（对齐 Python _save_oauth_account）。
 func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginSession) (*model.Account, *apiError) {
+	return h.saveOAuthAccountContext(h.backgroundContext(), result, session)
+}
+
+func (h *Handler) saveOAuthAccountContext(ctx context.Context, result *oauth.ExchangeResult, session *loginSession) (*model.Account, *apiError) {
 	email := ""
 	if result.Email != nil {
 		email = strings.TrimSpace(*result.Email)
@@ -272,8 +287,13 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 		accountProxy = *account.ProxyURL
 	}
 	if result.AccessToken != "" {
-		if apiKey, err := oauth.ExchangeAPIKey(result.AccessToken, accountProxy); err == nil && apiKey != "" {
-			_, _ = h.Store.SetAPIKey(account.Provider, account.ID, apiKey)
+		route := h.Store.ProxyEgress(account)
+		keyCtx := oauth.WithDispatchGuard(ctx, func() (func(), error) {
+			return h.Store.AcquireProxyDispatch(account, route)
+		})
+		if apiKey, err := oauth.ExchangeAPIKeyContext(keyCtx, result.AccessToken, accountProxy); err == nil && apiKey != "" {
+			// 兑换期间管理员可能已重新登录/替换凭据，旧 OAuth 结果不可写回新身份。
+			_, _ = h.Store.UpdateForRequest(account, func(live *model.Account) { live.APIKey = &apiKey })
 		} else if err != nil {
 			web.Warn("adminapi", fmt.Sprintf("兑换 API Key 失败: %v", err))
 		}
@@ -294,12 +314,36 @@ func (h *Handler) saveOAuthAccount(result *oauth.ExchangeResult, session *loginS
 	return account, nil
 }
 
+// loginProxyProfile 固定本次实际出站的配置代次，失败收尾不可重新读取新版本。
+func (h *Handler) loginProxyProfile(id, raw string) (store.ProxyProfile, bool) {
+	for _, profile := range h.Store.ListProxyProfiles() {
+		if profile.ID == id && profile.URL == raw {
+			return profile, true
+		}
+	}
+	return store.ProxyProfile{}, false
+}
+
 // applyLoginProxy 把登录时选定的线路写到账号上；未指定时保持账号原有指派不动
 // （重新登录不该把已有线路清掉）。
 func (h *Handler) applyLoginProxy(account *model.Account, session *loginSession) *apiError {
 	if session != nil && session.direct {
 		if _, err := h.Store.AssignProxyProfile(account.ID, ""); err != nil {
 			return errUpstream(fmt.Sprintf("清除代理失败: %v", err))
+		}
+		return nil
+	}
+	if session != nil && session.auto {
+		var selected *store.ProxyProfile
+		if session.proxyID != "" {
+			profile, ok := h.loginProxyProfile(session.proxyID, session.proxyURL)
+			if !ok {
+				return errBadRequest("自动登录的线路已改变，请重新提交原回调")
+			}
+			selected = &profile
+		}
+		if _, err := h.Store.AssignAutomaticLoginProxy(account, selected); err != nil {
+			return errUpstream(fmt.Sprintf("保存自动登录线路失败: %v", err))
 		}
 		return nil
 	}

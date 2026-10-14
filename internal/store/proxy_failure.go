@@ -4,13 +4,16 @@ import "zcode2api/internal/model"
 
 // PurgeFailedAccountProxy 处理已经确认的代理端点故障，与新号空额度规则无关。
 // expected 必须是失败请求实际使用的不可变快照；旧凭据/旧绑定的迟到失败不能误删新线路。
-func (s *Store) PurgeFailedAccountProxy(expected *model.Account) (bool, ProxyReassign, error) {
+func (s *Store) PurgeFailedAccountProxy(expected *model.Account, route ...ProxyEgress) (bool, ProxyReassign, error) {
 	empty := ProxyReassign{Assigned: map[string]string{}}
 	if expected == nil || derefStr(expected.ProxyID) == "" || derefStr(expected.ProxyURL) == "" {
 		return false, empty, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(route) > 0 && !s.proxyDispatchCurrentLocked(expected, route[0]) {
+		return false, empty, nil
+	}
 	live := s.findLocked(expected.Provider, expected.ID)
 	if !model.NewStartPlanObservation(expected, 1, false).Matches(live) {
 		return false, empty, nil

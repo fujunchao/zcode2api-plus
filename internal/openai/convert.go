@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/upstream"
 )
 
 // convertError 请求转换失败（对应 HTTP 400，OpenAI 错误形态）。
@@ -25,6 +26,7 @@ func ConvertRequest(body map[string]any) (map[string]any, error) {
 	}
 
 	out := map[string]any{}
+	upstream.CopyMetadataSession(out, body)
 	if m, ok := body["model"].(string); ok && m != "" {
 		out["model"] = m
 	}

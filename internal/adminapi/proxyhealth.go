@@ -201,21 +201,13 @@ spawn:
 			"全部 %d 条线路不可用，但直连 z.ai 可达——判定为线路自身失效，照常移除", len(profiles)))
 	}
 
-	// 探测期间线路表可能已被人工改动：只移除「现在仍然启用」的失败线路。
-	// 刚被人工停用的不动——停用表达的是「想保留但暂不使用」。
-	stillEnabled := map[string]bool{}
-	for _, p := range s.store.ListProxyProfiles() {
-		if p.Enabled {
-			stillEnabled[p.ID] = true
-		}
-	}
-	purgeIDs := make([]string, 0, len(failed))
+	// 带探测前的 URL/代次进入同一删除事务；不能先在锁外查一次再仅按 ID 删除。
+	// 停用、换地址或 A→B→A 的人工变更，都必须让迟到探测失去删除权限。
+	purgeSnapshots := make([]store.ProxyProfile, 0, len(failed))
 	for _, f := range failed {
-		if stillEnabled[f.profile.ID] {
-			purgeIDs = append(purgeIDs, f.profile.ID)
-		}
+		purgeSnapshots = append(purgeSnapshots, f.profile)
 	}
-	if len(purgeIDs) == 0 {
+	if len(purgeSnapshots) == 0 {
 		web.Ok(tagProxyHealth, "失败线路在探测期间已被停用或删除，本轮无需移除")
 		return
 	}
@@ -223,7 +215,7 @@ spawn:
 	if s.ctx.Err() != nil {
 		return
 	}
-	purged, reassign, err := s.store.PurgeProxyProfiles(purgeIDs)
+	purged, reassign, err := s.store.PurgeProxyProfilesIfCurrent(purgeSnapshots)
 	if err != nil {
 		web.Err(tagProxyHealth, "移除不可用线路失败: "+err.Error())
 		return

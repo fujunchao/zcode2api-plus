@@ -13,6 +13,7 @@ import (
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
+	"zcode2api/internal/upstream"
 )
 
 // ConvertResponsesRequest 把 Responses 请求体转换为 Anthropic Messages 请求体。
@@ -22,6 +23,7 @@ func ConvertResponsesRequest(body map[string]any) (map[string]any, error) {
 	}
 
 	out := map[string]any{}
+	upstream.CopyMetadataSession(out, body)
 	if m, ok := body["model"].(string); ok && m != "" {
 		out["model"] = m
 	}

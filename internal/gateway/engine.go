@@ -91,7 +91,7 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 func (e *Engine) SetNow(fn func() time.Time) { e.now = fn }
 
 // clientFor 返回账号出站客户端：配置了代理（proxy_url，含代理线路指派）时
-// 走代理 Transport，否则用引擎默认客户端。代理构造失败回退直连并记日志。
+// 走代理 Transport，否则用引擎默认客户端。构造失败仍须由派发准入拒绝，不能静默换路。
 func (e *Engine) clientFor(acc *model.Account) (*http.Client, store.ProxyEgress) {
 	egress := e.Store.ProxyEgress(acc)
 	if acc == nil || acc.ProxyURL == nil || *acc.ProxyURL == "" {
@@ -99,8 +99,7 @@ func (e *Engine) clientFor(acc *model.Account) (*http.Client, store.ProxyEgress)
 	}
 	t, err := proxy.TransportFor(*acc.ProxyURL)
 	if err != nil {
-		web.Warn("gateway", fmt.Sprintf("账号 %s 代理无效，回退直连", acc.Name))
-		return e.Client, store.ProxyEgress{Label: "direct", Endpoint: "direct", Mode: "direct_fallback"}
+		return e.Client, e.Store.DirectEgress(acc, "direct_fallback")
 	}
 	return &http.Client{Transport: t}, egress
 }
@@ -163,6 +162,10 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	//（reqID 本就在函数内生成，三个外部调用点无需改动）。
 	diag := NewReqDiag(reqID, orDash(modelName), stream, body, e.now)
 	diag.SetTrace(ctx)
+	if diag.GatewayRequestID == "" {
+		// 直接调用引擎也冻结一次入口身份，换号/重试不能冒充独立内容输入。
+		diag.GatewayRequestID = config.NewUUIDv4()
+	}
 	// 重放防护（P1-3）：同一份内容刚刚被判定请求级风控 ⇒ TTL 内直接快速失败。
 	// 上游 405 是两段式（内容触发 + 账号标记），请求级判定成立时每个被尝试的账号都
 	// 已被服务端标记；窗口期内继续接同内容请求只会把下一个健康账号再标记一个
@@ -374,6 +377,19 @@ func (e *Engine) tryAccount(
 		}
 
 		client, egress := e.clientFor(acc)
+		client = ModelAttemptClient(client)
+		entry := ""
+		if diag != nil {
+			entry = diag.GatewayRequestID
+		}
+		attemptCtx, release, permitErr := BeginProxyAttempt(ctx, e.Store, acc, egress, httpReq, actualBody, entry)
+		if permitErr != nil {
+			// 未取得许可就没有出站，不记账号故障、不以另一条代理掩盖人工配置错误。
+			web.Warn(reqID, "选定路由不可用或快照已过期，本次未派发")
+			return attemptResult{final: errResult(http.StatusServiceUnavailable, "selected_proxy_unavailable", "选定路由不可用，请检查代理配置后重试")}
+		}
+		defer release()
+		httpReq = httpReq.WithContext(attemptCtx)
 		if diag != nil {
 			// 首字节延迟与耗时的基准点：紧贴出站调用。
 			diag.UpstreamStart = diag.Now()
@@ -386,6 +402,7 @@ func (e *Engine) tryAccount(
 		resp, err := client.Do(httpReq)
 		finishAttempt(resp, err)
 		if err != nil {
+			release()
 			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
 				// ——换号只会白烧另一个账号的额度。
@@ -399,13 +416,15 @@ func (e *Engine) tryAccount(
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
 		}
+		ConfirmProxyAttemptResponse(attemptCtx, resp)
 
 		if diag != nil {
 			diag.Status = resp.StatusCode
 		}
 
 		if resp.StatusCode >= 400 {
-			res := e.handleUpstreamError(ctx, reqID, acc, modelName, isJWT, resp, &b, scope, egress, diag)
+			res := e.handleUpstreamError(attemptCtx, reqID, acc, modelName, isJWT, resp, &b, scope, egress, diag)
+			release()
 			if res.retrySame {
 				continue
 			}
@@ -440,7 +459,8 @@ func (e *Engine) tryAccount(
 				return attemptResult{final: errResult(http.StatusBadGateway, "upstream_response_too_large",
 					fmt.Sprintf("上游 JSON 响应超过 %d 字节上限", limit))}
 			}
-			res := e.handleUpstreamJSON(ctx, reqID, acc, modelName, isJWT, stream, resp, buffered, &b, deliver, diag)
+			res := e.handleUpstreamJSON(attemptCtx, reqID, acc, modelName, isJWT, stream, resp, buffered, &b, deliver, diag)
+			release()
 			if res.retrySame {
 				continue
 			}
@@ -448,7 +468,7 @@ func (e *Engine) tryAccount(
 		}
 
 		// SSE 成功：tee 读取流，交付完整后计入 usage
-		return e.deliverStream(ctx, reqID, acc, contentType, resp, deliver, diag)
+		return e.deliverStream(attemptCtx, reqID, acc, contentType, resp, deliver, diag)
 	}
 
 	// 预算耗尽（防御分支：每个 continue 都已各自记账，正常路径不会走到这里）
@@ -481,7 +501,7 @@ func (e *Engine) handleUpstreamError(
 	egress store.ProxyEgress,
 	diag *ReqDiag,
 ) attemptResult {
-	body, err := ReadErrorResponse(resp, diag, "error_body")
+	body, complete, err := ReadErrorResponseWithCompletion(resp, diag, "error_body")
 	_ = resp.Body.Close()
 	if err != nil {
 		if isClientGone(ctx) {
@@ -495,6 +515,9 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 	text := string(body)
+	if complete {
+		ObserveProxyAttempt(ctx, resp.StatusCode, UpstreamBusinessCode(text), false, e.now())
+	}
 
 	// 1) 验证码挑战（响应头 / code=3007 / F001 与文本仅限 400/403）
 	// 即使配置允许跳过，真实挑战仍按验证码错误有界重试，不能误标账号鉴权失败。
@@ -784,6 +807,10 @@ func (e *Engine) deliverStream(ctx context.Context, reqID string, acc *model.Acc
 // （线上曾漏计一次 57,352 output token 的生成，详见
 // docs/analysis-flash-30min-stream-cut.md §5）。usage 不完整时仍旧不计入。
 func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Account, usage *UsageCollector, err error, diag *ReqDiag) attemptResult {
+	var attemptEgress []store.ProxyEgress
+	if egress, ok := ProxyAttemptEgress(ctx); ok {
+		attemptEgress = append(attemptEgress, egress)
+	}
 	// 中断也须冲刷已经收齐但没有尾空行的事件；半截 JSON 不会被算成终值。
 	usage.Finish()
 	if err != nil {
@@ -812,7 +839,7 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 		// 上游 error 事件同样不计：它能完整到达说明线路没有掐断（见 UpstreamErrorEvent）。
 		upstreamEvent := IsUpstreamErrorEvent(err)
 		if !isClientGone(ctx) && !upstreamEvent {
-			diag.TruncTotal = RecordUpstreamTruncate(e.Store, acc, e.now())
+			diag.TruncTotal = RecordUpstreamTruncate(e.Store, acc, e.now(), attemptEgress...)
 			e.fireRefresh(acc)
 		}
 		label := "流传输中断"
@@ -832,7 +859,8 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 	diag.UsageComplete = usage.UsageComplete()
 	// 完整成功交付：清零该线路的「连续断流」计数（熔断以「无一次完整成功的连击」
 	// 为判据）。必须在这里而不是 MarkSuccess——后者在流开始读取前被调用。
-	ResetLineTruncate(e.Store, acc)
+	ResetLineTruncate(e.Store, acc, attemptEgress...)
+	ObserveProxyAttempt(ctx, http.StatusOK, "", usage.responseComplete(), e.now())
 	web.ReqOk(reqID, got.Output)
 	return attemptResult{final: runResult{Delivered: true}, quotaRecovered: ctx.Err() == nil && usage.responseComplete()}
 }

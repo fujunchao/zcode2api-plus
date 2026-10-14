@@ -67,7 +67,7 @@ func TestAttemptLogRedactsCredentialsAndClassifiesErrors(t *testing.T) {
 	}
 }
 
-func TestRiskProxyInvalidConfigFallbackDoesNotBlameUnusedProxy(t *testing.T) {
+func TestRiskProxyInvalidManualConfigFailsBeforeDispatch(t *testing.T) {
 	f := newFixture(t)
 	f.respond = jsonResp(405, `{"error":{"message":"blocked due to unusual activity"}}`)
 	a, _ := f.st.AddAccount(model.ProviderZai, "invalid-proxy", "sk-invalid-proxy")
@@ -77,12 +77,13 @@ func TestRiskProxyInvalidConfigFallbackDoesNotBlameUnusedProxy(t *testing.T) {
 	buf := &syncBuffer{}
 	web.SetOut(buf)
 	t.Cleanup(func() { web.SetOut(nil) })
-	_, _ = f.post(t, msgBody(), "sk-test")
+	status, body := f.post(t, msgBody(), "sk-test")
 	logs := stripANSI(buf.String())
-	if !strings.Contains(logs, "mode=direct_fallback") || !strings.Contains(logs, "result=egress_override") || strings.Contains(logs, "secret-sentinel") {
-		t.Fatalf("直连回退应如实记录且不得泄密：%s", logs)
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "selected_proxy_unavailable") || f.callCount() != 0 || strings.Contains(logs, "event=start req=") && strings.Contains(logs, "[attempt]") || strings.Contains(logs, "secret-sentinel") {
+		t.Fatalf("手工无效路由必须明确拒绝、零出站且不泄密：status=%d calls=%d body=%s logs=%s", status, f.callCount(), body, logs)
 	}
-	if *f.st.FindAny(a.ID).ProxyURL != bad {
-		t.Fatal("未使用的代理不应被风控改派")
+	current := f.st.FindAny(a.ID)
+	if *current.ProxyURL != bad || current.Status != model.StatusActive || current.FailCount != 0 || current.LastRiskControlAt != nil {
+		t.Fatal("未使用的代理不应被风控改派，也不得惩罚账号")
 	}
 }

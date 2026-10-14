@@ -37,7 +37,7 @@ func (s *Store) retireProxyTransportsLocked(oldProfiles, profiles []ProxyProfile
 		used[p.URL] = true
 	}
 	for _, a := range s.allAccountsLocked() {
-		if a.ProxyURL != nil {
+		if a.ProxyURL != nil && !s.strictProxyBlockedLocked(*a.ProxyURL) {
 			used[*a.ProxyURL] = true
 		}
 	}
@@ -56,6 +56,24 @@ func (s *Store) removeProxiesLocked(ids map[string]bool, excludedURL string, rea
 		excluded[excludedURL] = true
 	}
 	return s.removeProxiesAvoidingLocked(ids, excluded, reasons...)
+}
+
+// PurgeProxyProfilesIfCurrent 供巡检使用：失败证据和删除检查在同一配置代次上。
+// 与只接收 ID 的管理删除不同，旧 URL/旧启停代次的探测绝不能误删新配置。
+func (s *Store) PurgeProxyProfilesIfCurrent(expected []ProxyProfile) ([]string, ProxyReassign, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wanted := map[string]bool{}
+	for _, p := range s.listProxyProfilesLocked() {
+		for _, snapshot := range expected {
+			if p.ID == snapshot.ID && p.Enabled && snapshot.Enabled && p.Generation == snapshot.Generation &&
+				strictProxyIdentity(p.URL) == strictProxyIdentity(snapshot.URL) {
+				wanted[p.ID] = true
+				break
+			}
+		}
+	}
+	return s.removeProxiesLocked(wanted, "")
 }
 
 func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[string]bool, reasons ...string) ([]string, ProxyReassign, error) {
@@ -88,6 +106,11 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 		if !ok {
 			result.Direct = append(result.Direct, a.ID)
 			setStrictIntent(&next, a, "auto_pending_proxy")
+			for raw, skip := range excluded {
+				if skip {
+					next.PendingAvoid[a.ID] = append(next.PendingAvoid[a.ID], strictProxyIdentity(raw))
+				}
+			}
 			continue
 		}
 		id, url := p.ID, p.URL

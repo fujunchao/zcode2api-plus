@@ -169,23 +169,42 @@ func (f loginRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func (f *loginFailoverFixture) fakeDirect(t *testing.T, succeeds bool) *atomic.Int32 {
 	t.Helper()
-	old := http.DefaultTransport
 	var calls atomic.Int32
-	http.DefaultTransport = loginRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Host != "zcode.z.ai" || r.URL.Path != "/api/v1/oauth/token" {
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "zcode.z.ai" || r.URL.Path != "/api/v1/oauth/token" {
 			t.Error("非预期的直连请求")
-			return nil, errors.New("unexpected request")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		body := f.body
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}))
+	transport, err := proxy.TransportFor("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.CloseIdleConnections()
+	oldDial, oldTLS := transport.DialContext, transport.TLSClientConfig
+	transport.TLSClientConfig = backend.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	transport.TLSClientConfig.ServerName = "example.com"
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != "zcode.z.ai:443" {
+			return nil, fmt.Errorf("回归拒绝非预期直连目标 %s", addr)
 		}
 		calls.Add(1)
 		if !succeeds {
 			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("synthetic direct failure")}
 		}
-		f.mu.Lock()
-		body := f.body
-		f.mu.Unlock()
-		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		return (&net.Dialer{}).DialContext(ctx, network, backend.Listener.Addr().String())
+	}
+	t.Cleanup(func() {
+		transport.CloseIdleConnections()
+		transport.DialContext, transport.TLSClientConfig = oldDial, oldTLS
+		backend.Close()
 	})
-	t.Cleanup(func() { http.DefaultTransport = old })
 	return &calls
 }
 

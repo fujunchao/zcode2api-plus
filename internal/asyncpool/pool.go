@@ -46,11 +46,14 @@ type ticketEvent struct {
 
 // ticket 单个异步请求的票务状态。
 type ticket struct {
-	status    string
-	body      map[string]any
-	queue     chan ticketEvent
-	createdAt time.Time
-	cancel    context.CancelFunc // 中止后台任务（释放票务时调用）
+	status string
+	body   map[string]any
+	// attribution 只保存已经验证的逻辑身份，不保存凭据或整份入站头。
+	// nil 表示升级前的内存票据；第一次领取时原子补齐，此后重试不能重建身份。
+	attribution *upstream.AttributionSnapshot
+	queue       chan ticketEvent
+	createdAt   time.Time
+	cancel      context.CancelFunc // 中止后台任务（释放票务时调用）
 
 	// shortID 6 位十六进制短标识，与 sync 路径的 reqID 同构。async 此前只用 36 字符
 	// ticketID，与 sync 的 6 hex 风格不一致，排查时无法用同一套检索习惯对照两条路径。
@@ -156,15 +159,22 @@ func (p *Pool) handleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 异步不透传调用方头，也不能把其权益请求悄悄转成普通计费请求。
-	if err := upstream.ValidateAccountContextHeaders(gateway.IncomingHeaders(r)); err != nil {
+	// 异步只保留归因白名单；不能把调用方权益请求悄悄转成普通计费请求。
+	incoming := gateway.IncomingHeaders(r)
+	if err := upstream.ValidateAccountContextHeaders(incoming); err != nil {
 		writeJSONStatus(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{"message": err.Error(), "type": "unsupported_account_context"},
 		})
 		return
 	}
 
-	ticketID := p.newTicketContext(r.Context(), body)
+	ticketID := p.newTicketWithAttribution(r.Context(), body, incoming)
+	if ticketID == "" {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{
+			"error": map[string]any{"message": "异步队列正在关闭", "type": "queue_closed"},
+		})
+		return
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
@@ -254,16 +264,22 @@ func (p *Pool) newTicket(body map[string]any) string {
 }
 
 func (p *Pool) newTicketContext(parent context.Context, body map[string]any) string {
+	return p.newTicketWithAttribution(parent, body, nil)
+}
+
+func (p *Pool) newTicketWithAttribution(parent context.Context, body map[string]any, incoming map[string]string) string {
 	p.sweepExpiredTickets()
 	ticketID := newUUID()
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
+	snapshot := upstream.NewAttributionSnapshot(incoming, upstream.MetadataSessionID(body))
 	tk := &ticket{
-		status:    "pending",
-		body:      body,
-		queue:     make(chan ticketEvent, 256),
-		createdAt: time.Now(),
-		cancel:    cancel,
-		shortID:   gateway.RequestShortID(parent),
+		status:      "pending",
+		body:        body,
+		attribution: &snapshot,
+		queue:       make(chan ticketEvent, 256),
+		createdAt:   time.Now(),
+		cancel:      cancel,
+		shortID:     gateway.RequestShortID(parent),
 	}
 	p.mu.Lock()
 	if p.closed {
@@ -283,7 +299,9 @@ func (p *Pool) Close() {
 	p.mu.Lock()
 	p.closed = true
 	for _, tk := range p.tickets {
-		tk.cancel()
+		if tk.cancel != nil {
+			tk.cancel()
+		}
 	}
 	clear(p.tickets)
 	p.mu.Unlock()
@@ -295,6 +313,36 @@ func (p *Pool) getTicket(ticketID string) *ticket {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.tickets[ticketID]
+}
+
+// claimTicket 保证同票只有一个生产者。旧票据只在首次领取时迁移缺省归因，
+// 已完成/取消票不能通过再次调用 processTicket 重新执行上游请求。
+func (p *Pool) claimTicket(ticketID string) (*ticket, upstream.AttributionSnapshot) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tk := p.tickets[ticketID]
+	if tk == nil || (tk.status != "pending" && tk.status != "") {
+		return nil, upstream.AttributionSnapshot{}
+	}
+	tk.status = "processing"
+	if tk.attribution == nil {
+		snapshot := upstream.NewAttributionSnapshot(nil, upstream.MetadataSessionID(tk.body))
+		tk.attribution = &snapshot
+	}
+	return tk, *tk.attribution
+}
+
+func (p *Pool) finishTicketWork(ticketID string, tk *ticket, canceled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.tickets[ticketID] != tk || tk.status != "processing" {
+		return
+	}
+	// 正常 done/error 已由 emit 设置终态；其余退出不能恢复成 pending 自动重放。
+	tk.status = "failed"
+	if canceled {
+		tk.status = "canceled"
+	}
 }
 
 // releaseTicket 移除 ticket 并中止仍在运行的后台任务。
@@ -330,12 +378,25 @@ func (p *Pool) sweepExpiredTickets() {
 
 // emit 投递事件；票务已释放或上下文取消时返回 false（调用方应停止工作）。
 func (p *Pool) emit(ctx context.Context, ticketID string, ev ticketEvent) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	tk := p.getTicket(ticketID)
 	if tk == nil {
 		return false
 	}
 	select {
 	case tk.queue <- ev:
+		if ev.Type == "done" || ev.Type == "error" {
+			p.mu.Lock()
+			if p.tickets[ticketID] == tk {
+				tk.status = "completed"
+				if ev.Type == "error" {
+					tk.status = "failed"
+				}
+			}
+			p.mu.Unlock()
+		}
 		return true
 	case <-ctx.Done():
 		return false
@@ -347,8 +408,17 @@ func (p *Pool) emit(ctx context.Context, ticketID string, ev ticketEvent) bool {
 // processTicket 后台执行 ticket 请求。JWT 走主网关同一套验证码续期；
 // 429/503 与网络异常换号重试（指数退避 2^n），已发 chunk 的流中断终止票务。
 func (p *Pool) processTicket(ctx context.Context, ticketID string) {
-	tk := p.getTicket(ticketID)
+	tk, snapshot := p.claimTicket(ticketID)
 	if tk == nil {
+		return
+	}
+	defer func() { p.finishTicketWork(ticketID, tk, ctx.Err() != nil) }()
+	if ctx.Err() != nil {
+		return
+	}
+	attr, err := snapshot.Restore()
+	if err != nil {
+		p.emitError(ctx, ticketID, err.Error(), "invalid_attribution_snapshot")
 		return
 	}
 	body := tk.body
@@ -380,24 +450,30 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		p.emitErrorWithDetails(ctx, ticketID, "相同请求内容刚刚被上游风控拦截，请稍后重试或修改请求内容", "risk_control_cooldown", gateway.RetryAdvice(remaining))
 		return
 	}
-	// 归因标识**按票算一次**：出站头与 body 的 metadata.user_id.session_id 必须共享
-	// 同一个会话 id（官方恒等），两处各算一次必然分叉。换号重试沿用同一份 ——
-	// 它仍是同一张票。async 没有下游头可沿用，会话 id 只能合成（见 NewAttribution）。
-	attr := upstream.NewAttribution(nil, upstream.MetadataSessionID(body))
+	// 逻辑身份已在入队时冻结。验证码、原地重试和换号都保留 session/trace/query/用途，
+	// 每次实际 HTTP 构造更新 request ID；这里不按账号重建会话，也不启用托管身份。
 
 	retries := 0
 	announcedReady := false
 	tried := map[string]bool{}
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		// async 仅支持 JWT 账号，但池中可以混有 apiKey 账号：Select 是 round-robin，
 		// 轮到 apiKey 账号时必须跳过并继续找下一个，而不是直接终止整张票——否则池里
 		// 明明有可用 JWT 账号，请求却与账号状态无关地间歇性失败。
 		// 先记 tried 再判断：漏记会让下一次轮询又选中同一账号。
-		acc := p.Store.Select(model.ProviderZai, tried, modelName)
+		selectAccount := p.Store.Select
+		if p.Store.AsyncForceDirect() {
+			// 强制直连不使用绑定代理，不能因该代理已退役而跳过仍健康的账号。
+			selectAccount = p.Store.SelectForDirect
+		}
+		acc := selectAccount(model.ProviderZai, tried, modelName)
 		for acc != nil && acc.Mode != "jwt" {
 			tried[acc.ID] = true
-			acc = p.Store.Select(model.ProviderZai, tried, modelName)
+			acc = selectAccount(model.ProviderZai, tried, modelName)
 		}
 		if acc == nil {
 			// 与 sync 路径同口径：选不出号要如实说明「为什么」——冷却/风控/停用
@@ -495,11 +571,16 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			if errors.Is(streamErr, errDelivered) {
 				return
 			}
+			if errors.Is(streamErr, store.ErrInvalidProxyRoute) || errors.Is(streamErr, store.ErrProxyRetired) || errors.Is(streamErr, store.ErrStrictProxyPaused) {
+				// 选定路由未获许可不代表账号失败；尤其不能把手工无效路由悄悄换成直连/另一账号。
+				p.emitError(ctx, ticketID, "选定路由不可用，请检查代理配置或明确选择自动分配/直连", "selected_proxy_unavailable")
+				return
+			}
 			// 请求级风控：不得换号。上游原文交给客户端后终止本票——与 errDelivered 同一条
 			// 出路，区别是这条还要把上游错误体投递出去（errDelivered 表示已经投递过）。
 			var reqLevelRisk errRequestLevelRisk
 			if errors.As(streamErr, &reqLevelRisk) {
-				p.emitError(ctx, ticketID, reqLevelRisk.body, "upstream_error")
+				p.emitErrorWithDetails(ctx, ticketID, reqLevelRisk.body, "upstream_error", gateway.RetryAdvice(p.replay.Remaining(scope.ContentKey())))
 				return
 			}
 			if ctx.Err() != nil {
@@ -669,6 +750,20 @@ func (p *Pool) attemptUpstreamOnce(
 	httpReq.Header.Set("X-Request-Id", config.NewUUIDv4())
 
 	client, egress := p.clientFor(acc)
+	client = gateway.ModelAttemptClient(client)
+	var observationBody map[string]any
+	_ = json.Unmarshal(payload, &observationBody)
+	entry := ticketID
+	if diag != nil {
+		entry = diag.GatewayRequestID
+	}
+	attemptCtx, release, permitErr := gateway.BeginProxyAttempt(ctx, p.Store, acc, egress, httpReq, observationBody, entry)
+	if permitErr != nil {
+		return false, permitErr
+	}
+	defer release()
+	ctx = attemptCtx
+	httpReq = httpReq.WithContext(ctx)
 	riskAttempt := gateway.RiskAttempt{Ticket: ticketID, Egress: egress}
 	if diag != nil {
 		riskAttempt.RequestID = diag.ReqID
@@ -689,6 +784,7 @@ func (p *Pool) attemptUpstreamOnce(
 	if err != nil {
 		return false, err
 	}
+	gateway.ConfirmProxyAttemptResponse(ctx, resp)
 	defer resp.Body.Close()
 	if diag != nil {
 		diag.Status = resp.StatusCode
@@ -697,11 +793,14 @@ func (p *Pool) attemptUpstreamOnce(
 	if resp.StatusCode != http.StatusOK {
 		// 限长：错误体要整段读进内存做分类，上游或代理异常时可能回一个任意大的
 		// body。正常路径是流式转发，不受此限。
-		text, readErr := gateway.ReadErrorResponse(resp, diag, "error_body")
+		text, complete, readErr := gateway.ReadErrorResponseWithCompletion(resp, diag, "error_body")
 		if readErr != nil {
 			return false, readErr
 		}
 		bodyText := string(text)
+		if complete {
+			gateway.ObserveProxyAttempt(ctx, resp.StatusCode, gateway.UpstreamBusinessCode(bodyText), false, time.Now())
+		}
 
 		// 分类顺序与 engine.handleUpstreamError 一致（PLAN §5.2），
 		// 同一账号在两条路径下必须标出相同状态。
@@ -968,6 +1067,10 @@ func (p *Pool) bumpFail(acc *model.Account, kind string) {
 // 所以这两个指标必须在各自路径上单独采集。
 func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Response, acc *model.Account, diag *gateway.ReqDiag) (bool, error) {
 	usage := gateway.NewUsageCollector(true)
+	var attemptEgress []store.ProxyEgress
+	if egress, ok := gateway.ProxyAttemptEgress(ctx); ok {
+		attemptEgress = []store.ProxyEgress{egress}
+	}
 	var decoder sse.Decoder
 	chunksSent := 0
 	// 转发与用量统计共用成帧规则，各自处理完整事件，不再逐 data 行解码。
@@ -1035,7 +1138,7 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 		// 诊断行只是展示，账号计数与线路熔断必须照常发生）。
 		// 上游 error 事件不计：它能完整到达说明线路没有掐断（见 gateway.UpstreamErrorEvent）。
 		if ctx.Err() == nil && !gateway.IsUpstreamErrorEvent(err) {
-			total := gateway.RecordUpstreamTruncate(p.Store, acc, time.Now())
+			total := gateway.RecordUpstreamTruncate(p.Store, acc, time.Now(), attemptEgress...)
 			if diag != nil {
 				diag.TruncTotal = total
 			}
@@ -1066,7 +1169,8 @@ func (p *Pool) forwardSSE(ctx context.Context, ticketID string, resp *http.Respo
 	gateway.MarkSuccess(p.Store, acc, time.Now())
 	// 完整成功交付：清零该线路的「连续断流」计数（与 sync 的 finishDelivery
 	// 成功分支同口径；不能进 MarkSuccess，见 gateway.ResetLineTruncate 注释）。
-	gateway.ResetLineTruncate(p.Store, acc)
+	gateway.ResetLineTruncate(p.Store, acc, attemptEgress...)
+	gateway.ObserveProxyAttempt(ctx, http.StatusOK, "", usage.ResponseComplete(), time.Now())
 	p.emit(ctx, ticketID, ticketEvent{Type: "done"})
 	return false, nil
 }
@@ -1126,7 +1230,8 @@ const asyncResponseHeaderTimeout = 180 * time.Second
 // 与网关一致：账号配置了 proxy_url 时走对应代理。README 与 PLAN 都承诺「该账号的
 // 网关请求、额度查询与套餐领取均走对应代理」——async 曾漏掉这一条，配置代理的账号
 // 在这条路径上以服务器真实 IP 直连上游（泄露部署 IP、正是配置代理要规避的）。
-// 代理无效时回退直连并记日志，与 engine.clientFor / quota.clientFor 同语义。
+// 无绑定时允许直连。非空手工 URL 无效时仅构造占位客户端，真实派发前的统一准入
+// 会明确拒绝该 direct_fallback，不能悄悄把人工指定路线替换成直连。
 //
 // ⚠️ 只能用 proxy.TransportForTimeout（Transport 层 ResponseHeaderTimeout），
 // 不能用 proxy.ClientFor——后者设的是 http.Client.Timeout（整体超时），
@@ -1148,18 +1253,17 @@ func (p *Pool) clientFor(acc *model.Account) (*http.Client, store.ProxyEgress) {
 	}
 	t, err := proxy.TransportForTimeout(raw, asyncResponseHeaderTimeout)
 	if err != nil {
-		// 仅当账号配了非法代理才会失败；回退直连（TransportForTimeout 对空 URL
-		// 永不报错，故下面的 t 一定非 nil）。
-		web.Warn("async", fmt.Sprintf("账号 %s 代理无效，回退直连", acc.Name))
+		// 保留占位客户端的返回契约，BeginProxyAttempt 必须在 client.Do 前拒绝此路由。
+		// 此处尚未派发，不能把占位客户端记录成已经发生的直连回退。
+		web.Warn("async", fmt.Sprintf("账号 %s 代理配置无效，等待统一派发准入处理", acc.Name))
 		t, _ = proxy.TransportForTimeout("", asyncResponseHeaderTimeout)
-		return &http.Client{Transport: t}, store.ProxyEgress{Label: "direct", Endpoint: "direct", Mode: "direct_fallback"}
+		return &http.Client{Transport: t}, p.Store.DirectEgress(acc, "direct_fallback")
 	}
 	if raw == "" {
-		mode := "direct"
 		if forceDirect {
-			mode = "forced_direct"
+			return &http.Client{Transport: t}, p.Store.DirectEgress(acc, "forced_direct")
 		}
-		return &http.Client{Transport: t}, store.ProxyEgress{Label: "direct", Endpoint: "direct", Mode: mode}
+		return &http.Client{Transport: t}, p.Store.ProxyEgress(acc)
 	}
 	return &http.Client{Transport: t}, p.Store.ProxyEgress(acc)
 }

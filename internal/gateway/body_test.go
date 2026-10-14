@@ -55,7 +55,7 @@ func TestNormalizeBodyContentBridge(t *testing.T) {
 
 func TestNormalizeBodySystemInjection(t *testing.T) {
 	useLegacyClientContext(t)
-	blocks := upstream.ZcodeSystemBlocks()
+	blocks := upstream.ZcodeFallbackSystemBlocks()
 
 	// 键不存在 → 注入 blocks
 	body := map[string]any{}
@@ -108,12 +108,10 @@ func TestNormalizeBodySystemInjection(t *testing.T) {
 // 通过 JSON 往返模拟下游重新提交同一请求，不依赖 Go 对象的指针身份。
 func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
 	useLegacyClientContext(t)
-	blocks := upstream.ZcodeSystemBlocks()
+	blocks := upstream.ZcodeFallbackSystemBlocks()
 	const prefix = "You are ZCode, an interactive coding agent"
-	known := map[string]any{
-		"type": "text", "text": prefix,
-		"cache_control": map[string]any{"type": "ephemeral"},
-	}
+	// 当前 profile 的精确标准块去重；缓存/扩展不同的调用者块继续保留。
+	known := blocks[0]
 	user := map[string]any{"type": "text", "text": "保留调用者的原始指令"}
 	tail := []any{
 		user, user, // 不对任意相同用户段落去重。
@@ -202,7 +200,7 @@ func TestNormalizeBodyOfficialSystemIsIdempotent(t *testing.T) {
 // 「官方块前置 + 精确去重」——上游从第 0 字节逐字节校验到身份段末尾，缺前缀
 // 必然 3012。2026-10-12 事件回归守卫：把保留条件放宽回「有 system 就保留」即变红。
 func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
-	blocks := upstream.ZcodeSystemBlocks()
+	blocks := upstream.ZcodeFallbackSystemBlocks()
 	foreign := []any{
 		map[string]any{"type": "text", "text": "You are an AI agent powered by DeepSeek Harness."},
 		map[string]any{"type": "text", "text": "第三方补充指令"},
@@ -238,7 +236,7 @@ func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
 
 // 字符串形态的第三方 system 同样回退前置合并，并排在官方块之后。
 func TestNormalizeBodyForeignStringSystemGetsOfficialPrefix(t *testing.T) {
-	blocks := upstream.ZcodeSystemBlocks()
+	blocks := upstream.ZcodeFallbackSystemBlocks()
 	body := map[string]any{"model": "GLM-5.3", "system": "第三方指令"}
 	NormalizeBody(body, true)
 	system := body["system"].([]any)

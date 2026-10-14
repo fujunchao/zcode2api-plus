@@ -74,6 +74,9 @@ type Store struct {
 	strictEvidence    []strictProxyEvidence
 	strictDispatch    map[string]int
 	strictJournalPath string
+	strictRetryCancel context.CancelFunc
+	strictRetryDone   chan struct{}
+	strictClosed      bool
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -122,6 +125,16 @@ func New() (*Store, error) {
 // Close 关闭数据库连接。
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.strictClosed = true
+		if s.strictRetryCancel != nil {
+			s.strictRetryCancel()
+		}
+		done := s.strictRetryDone
+		s.mu.Unlock()
+		if done != nil {
+			<-done
+		}
 		s.closeErr = s.db.Close()
 		if s.processLock != nil {
 			s.closeErr = errors.Join(s.closeErr, s.processLock.Close())
@@ -305,6 +318,9 @@ func (s *Store) load() error {
 	if err := s.migrateAccountIdentity(); err != nil {
 		return err
 	}
+	if err := s.migrateStrictProxyVersions(); err != nil {
+		return err
+	}
 	return s.RecoverStrictProxyRetirements()
 }
 
@@ -345,6 +361,13 @@ func (s *Store) migrateAccountIdentity() error {
 // ── 持久化（调用方须持有 s.mu）──────────────────────────────────────────────
 
 func (s *Store) persistAccountLocked(acc *model.Account) error {
+	if s.strictProxy.Credentials != nil && (s.strictProxy.Credentials[acc.ID].Digest != strictCredential(acc) ||
+		s.strictProxy.RouteVersions[acc.ID].Digest != strictDigest(derefStr(acc.ProxyID), strictProxyIdentity(derefStr(acc.ProxyURL)))) {
+		next := s.cloneStrictProxyLocked()
+		if trackStrictAccountVersions(&next, acc) {
+			return s.persistAccountVersionLocked(acc, next)
+		}
+	}
 	data, err := marshalJSON(acc)
 	if err != nil {
 		return err
@@ -701,10 +724,11 @@ func (s *Store) ProxyHealthIntervalMinutes() int {
 
 // ProxyProfile 命名代理出口（設定以 JSON 儲存在 meta 表中）。
 type ProxyProfile struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Enabled bool   `json:"enabled"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	URL        string `json:"url"`
+	Enabled    bool   `json:"enabled"`
+	Generation uint64 `json:"-"` // 进程读快照附带持久代次，不允许 API 提交覆盖。
 }
 
 // ListProxyProfiles 列出全部代理线路。
@@ -726,6 +750,7 @@ func (s *Store) listProxyProfilesLocked() []ProxyProfile {
 	}
 	for _, p := range profiles {
 		if p.ID != "" && p.URL != "" {
+			p.Generation = s.strictProxy.Generations[p.ID]
 			out = append(out, p)
 		}
 	}
@@ -786,6 +811,9 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, e
 	if s.strictProxyBlockedLocked(*normalized) {
 		return ProxyProfile{}, ErrProxyRetired
 	}
+	if s.strictProxy.ImportPaused {
+		return ProxyProfile{}, errors.New("严格禁止记录达到容量预算，暂停新增代理")
+	}
 	profiles := s.listProxyProfilesLocked()
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -798,7 +826,11 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, e
 	}
 	profile := ProxyProfile{ID: "proxy-" + randomHex(4), Name: name, URL: *normalized, Enabled: enabled}
 	profiles = append(profiles, profile)
-	return profile, s.saveProxyProfilesLocked(profiles)
+	if err := s.saveProxyProfilesLocked(profiles); err != nil {
+		return ProxyProfile{}, err
+	}
+	profile.Generation = s.strictProxy.Generations[profile.ID]
+	return profile, nil
 }
 
 // UpdateProxyProfile 更新代理线路；同步指派了该线路的账号。
@@ -850,6 +882,7 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 		return ProxyProfile{}, err
 	}
 
+	profiles[target].Generation = s.strictProxy.Generations[profileID]
 	return profiles[target], nil
 }
 
@@ -1343,7 +1376,7 @@ type AccountEdit struct {
 
 // EditAccount 按补丁替换账号字段并落库。
 func (s *Store) EditAccount(provider, idOrName string, edit AccountEdit) (bool, error) {
-	return s.Update(provider, idOrName, func(acc *model.Account) {
+	return s.editAccountProxyIntent(provider, idOrName, edit, func(acc *model.Account) {
 		if edit.Name != nil {
 			acc.Name = *edit.Name
 		}
@@ -1619,13 +1652,22 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 //
 // skipIDs 保证同一次请求不会重复尝试已失败的账号。
 func (s *Store) Select(provider string, skipIDs map[string]bool, modelName string) *model.Account {
+	return s.selectAccount(provider, skipIDs, modelName, false)
+}
+
+// SelectForDirect 仅用于显式强制直连。只忽略代理绑定准入，账号、模型和冷却规则不变。
+func (s *Store) SelectForDirect(provider string, skipIDs map[string]bool, modelName string) *model.Account {
+	return s.selectAccount(provider, skipIDs, modelName, true)
+}
+
+func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelName string, forceDirect bool) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
 	window := config.RiskSilentWindow()
 	var base []*model.Account
 	for _, a := range s.accounts[provider] {
-		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (derefStr(a.ProxyURL) == "" || !s.strictProxyBlockedLocked(derefStr(a.ProxyURL))) {
+		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (forceDirect || s.proxyBindingAvailableLocked(a)) {
 			base = append(base, a)
 		}
 	}

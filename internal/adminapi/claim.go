@@ -124,10 +124,10 @@ func claimCooldownUntil(outcomes []map[string]any, now time.Time, captchaSec, re
 //
 // acc 是**领取用的账号副本**，不能拿它整体回写（领取期间 store 可能已改过该账号，
 // 例如删除线路改派了 ProxyURL；整体回写会用副本的旧值把它覆盖回去）。因此只把
-// 领取状态这一个字段经 UpdateClaimState 落到 store 的当前对象上；读取当前状态
-// 与替换也在该方法的锁内完成，避免与另一路领取任务互相覆盖。
+// 领取状态这一个字段经 UpdateForRequest 落到同凭据的当前对象上；读取当前状态
+// 与替换也在该方法的锁内完成，避免与另一路领取任务或重新登录互相覆盖。
 // ClaimState 视为不可变：基于副本生成新对象、整体替换。
-func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]any, now time.Time) {
+func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]any, now time.Time, route ...store.ProxyEgress) {
 	captchaSec, retrySec, _ := h.Store.ClaimCooldowns()
 	nextAt := claimCooldownUntil(outcomes, now, captchaSec, retrySec)
 	succeeded := false
@@ -137,7 +137,11 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 			break
 		}
 	}
-	if _, err := h.Store.UpdateClaimState(acc.Provider, acc.ID, func(cur *model.ClaimState) *model.ClaimState {
+	if _, err := h.Store.UpdateForRequest(acc, func(live *model.Account) {
+		cur := live.ClaimView()
+		if cur == nil {
+			cur = &model.ClaimState{}
+		}
 		next := *cur
 		next.NextAt = nextAt
 		if succeeded {
@@ -149,13 +153,13 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 				next.LastError = &msg
 			}
 		}
-		return &next
+		live.SetClaimState(&next)
 	}); err != nil {
 		web.Warn("claim", "领取状态落库失败: "+err.Error())
 		return
 	}
 	// 单次空额度仍不能淘汰老号代理；实际连接故障/可疑请求则适用于新老账号。
-	proxyguard.ApplyClaimFailures(h.backgroundContext(), h.Store, acc, outcomes)
+	proxyguard.ApplyClaimFailures(h.backgroundContext(), h.Store, acc, outcomes, route...)
 }
 
 // numberOf 宽松取数值（JSON 解析一律 float64，代码内构造的可能是 int）。
@@ -270,11 +274,13 @@ func (h *Handler) claimUnderGateWithInitial(ctx context.Context, acc *model.Acco
 		return false
 	}
 	svc := claim.NewServiceContext(ctx, h.Captcha)
+	svc.Store = h.Store
+	route := h.Store.ProxyEgress(snap)
 	outcomes := svc.AutoClaimAllPlans(snap)
 	if ctx.Err() != nil {
 		return false
 	}
-	h.applyClaimOutcome(snap, outcomes, time.Now())
+	h.applyClaimOutcome(snap, outcomes, time.Now(), route)
 	if initial != nil {
 		// 本次领取结束后再真实出站；保留槽位至检测结束，下一新号再读取最新指派。
 		h.finishNewAccountQuotaCheck(ctx, snap, *initial)
@@ -443,6 +449,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 		ids = []string{v}
 	}
 	svc := claim.NewServiceContext(h.backgroundContext(), h.Captcha)
+	svc.Store = h.Store
 	now := time.Now()
 	_, _, previewSec := h.Store.ClaimCooldowns()
 	out := []map[string]any{}
@@ -452,6 +459,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 		if acc == nil {
 			continue
 		}
+		route := h.Store.ProxyEgress(acc)
 		if claimBlockedByCooling(acc, now) {
 			out = append(out, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "plans": []any{},
@@ -485,7 +493,7 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			entry["error"] = err.Error()
 			failure := claim.FailureOutcome(acc, "", err)
-			proxyguard.ApplyClaimFailures(h.backgroundContext(), h.Store, acc, []map[string]any{failure})
+			proxyguard.ApplyClaimFailures(h.backgroundContext(), h.Store, acc, []map[string]any{failure}, route)
 			for _, key := range []string{"proxy_failure", "proxy_removed", "proxy_reassigned", "proxy_direct_fallback", "proxy_remove_error"} {
 				if value, ok := failure[key]; ok {
 					entry[key] = value
@@ -523,12 +531,14 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// 激活上报与 Claim 共用同一个 Service：两者的出站都经 clientFor(acc) 走账号
 	// 线路（此前事件是独立的裸直连客户端，同一 device_mid 两个出口 IP）。
 	svc := claim.NewServiceContext(h.backgroundContext(), h.Captcha)
+	svc.Store = h.Store
 	for _, acc := range candidates {
 		// 新号检测或巡检可能已淘汰共享线路；批量后续账号必须用改派后的出口。
 		acc = h.Store.SnapshotAccount(acc.Provider, acc.ID)
 		if acc == nil {
 			continue
 		}
+		route := h.Store.ProxyEgress(acc)
 		// 用 claimBlockedByCooling 判断（与 preview 同一函数）：EffectiveStatus 把
 		// 「冷却已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、
 		// claim 被拒，用户看到自相矛盾的结果。
@@ -563,7 +573,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 			web.Warn("claim", "账号 "+acc.Name+" 领取失败: "+err.Error())
 			outcome := claim.FailureOutcome(acc, planID, err)
 			outcomes = append(outcomes, outcome)
-			h.applyClaimOutcome(acc, []map[string]any{outcome}, now)
+			h.applyClaimOutcome(acc, []map[string]any{outcome}, now, route)
 			continue
 		}
 		h.Quota.RefreshAccounts([]*model.Account{acc})
@@ -574,7 +584,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 			outcome[k] = v
 		}
 		outcomes = append(outcomes, outcome)
-		h.applyClaimOutcome(acc, []map[string]any{outcome}, now)
+		h.applyClaimOutcome(acc, []map[string]any{outcome}, now, route)
 	}
 	ok := 0
 	for _, o := range outcomes {

@@ -92,7 +92,7 @@ func TestAsyncClientContextReachesActualUpstream(t *testing.T) {
 	case actual := <-calls:
 		// 非官方前缀的调用者 system 在出站前会前置官方标准块（2026-10-12 前缀感知修复），
 		// 客户端原文必须原样保留在标准块之后；工具与采样参数不受影响。
-		blocks := upstream.ZcodeSystemBlocks()
+		blocks := upstream.ZcodeFallbackSystemBlocks()
 		system, ok := actual.body["system"].([]any)
 		if !ok || len(system) != len(blocks)+1 {
 			t.Fatalf("异步出站 system 应为「官方块 + 客户端原文」: %v", actual.body["system"])

@@ -198,6 +198,7 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[
 	checkedAt := float64(s.now().UnixNano()) / 1e9
 	// queryQuotaContext 已将实际出站快照和合并/缓存身份一并固定，不能在这里再换快照。
 	proxied := s.Client == nil && snap.ProxyID != nil && *snap.ProxyID != "" && snap.ProxyURL != nil && *snap.ProxyURL != ""
+	route := s.Store.ProxyEgress(snap)
 
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeClientVersion)
@@ -208,14 +209,14 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[
 		for k, v := range authHeaders(snap) {
 			req.Header.Set(k, v)
 		}
-		client, clientErr := s.clientFor(snap)
+		client, clientErr := s.clientFor(snap, route)
 		if clientErr != nil {
-			return s.quotaRequestFailure(ctx, snap, checkedAt, "账号代理配置无效，无法发起额度查询", proxied), model.StartPlanObservation{}
+			return s.quotaRequestFailure(ctx, snap, checkedAt, "账号代理配置无效，无法发起额度查询", proxied, route), model.StartPlanObservation{}
 		}
 		var resp *http.Response
 		resp, err = client.Do(req)
 		if err == nil {
-			result := s.handleBillingResponseForRequest(ctx, snap, checkedAt, resp, proxied)
+			result := s.handleBillingResponseForRequest(ctx, snap, checkedAt, resp, proxied, route)
 			var observation model.StartPlanObservation
 			if resp.StatusCode == http.StatusOK {
 				payload, _ := result["balance"].(map[string]any)
@@ -228,17 +229,17 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[
 		return map[string]any{"error": ctx.Err().Error()}, model.StartPlanObservation{}
 	}
 	msg := "额度查询网络错误: " + err.Error()
-	return s.quotaRequestFailure(ctx, snap, checkedAt, msg, proxied && proxy.IsEndpointUnreachable(ctx, err)), model.StartPlanObservation{}
+	return s.quotaRequestFailure(ctx, snap, checkedAt, msg, proxied && proxy.IsEndpointUnreachable(ctx, err), route), model.StartPlanObservation{}
 }
 
-func (s *Service) quotaRequestFailure(ctx context.Context, acc *model.Account, checkedAt float64, message string, proxyFailure bool) map[string]any {
+func (s *Service) quotaRequestFailure(ctx context.Context, acc *model.Account, checkedAt float64, message string, proxyFailure bool, route ...store.ProxyEgress) map[string]any {
 	if ctx.Err() != nil {
 		return map[string]any{"error": ctx.Err().Error()}
 	}
 	s.fail(acc, checkedAt, message, model.ErrorKindQuotaQueryFailed, "")
 	out := map[string]any{"error": message}
 	if proxyFailure {
-		maps.Copy(out, proxyguard.Purge(ctx, s.Store, acc, proxy.FailureEndpointUnreachable))
+		maps.Copy(out, proxyguard.Purge(ctx, s.Store, acc, proxy.FailureEndpointUnreachable, route...))
 	}
 	return out
 }
@@ -311,14 +312,26 @@ func textPreview(text string) string {
 
 // clientFor 返回账号出站客户端；配置了代理时走代理传输（20s 超时，短请求）。
 // 已配置代理无效时返回错误，不能悄悄直连后把结果归因到原代理。
-func (s *Service) clientFor(acc *model.Account) (HTTPClient, error) {
+func (s *Service) clientFor(acc *model.Account, route ...store.ProxyEgress) (HTTPClient, error) {
 	if s.Client != nil {
 		return s.Client, nil
 	}
 	if acc != nil && acc.ProxyURL != nil && *acc.ProxyURL != "" {
-		return proxy.ClientFor(*acc.ProxyURL, 20*time.Second)
+		client, err := proxy.ClientFor(*acc.ProxyURL, 20*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		if s.Store != nil {
+			egress := s.Store.ProxyEgress(acc)
+			if len(route) > 0 {
+				egress = route[0]
+			}
+			client = s.Store.GuardProxyClient(client, acc, egress)
+		}
+		return client, nil
 	}
-	return &http.Client{Timeout: 20 * time.Second}, nil
+	// 账号直连必须与模型派发保持一致，不能被 HTTP(S)_PROXY 隐式改路。
+	return proxy.ClientFor("", 20*time.Second)
 }
 
 // handleBillingResponse 处理计费端点响应：错误分类、快照解析与状态回写。
@@ -331,13 +344,13 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 	return s.handleBillingResponseForRequest(s.ctx, acc, checkedAt, resp, false)
 }
 
-func (s *Service) handleBillingResponseForRequest(ctx context.Context, acc *model.Account, checkedAt float64, resp *http.Response, proxied bool) map[string]any {
+func (s *Service) handleBillingResponseForRequest(ctx context.Context, acc *model.Account, checkedAt float64, resp *http.Response, proxied bool, route ...store.ProxyEgress) map[string]any {
 	defer resp.Body.Close()
 	if ctx.Err() != nil {
 		return map[string]any{"error": ctx.Err().Error()}
 	}
 	if resp.StatusCode == http.StatusProxyAuthRequired {
-		return s.quotaRequestFailure(ctx, acc, checkedAt, "代理认证失败 HTTP 407", proxied)
+		return s.quotaRequestFailure(ctx, acc, checkedAt, "代理认证失败 HTTP 407", proxied, route...)
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
@@ -386,7 +399,7 @@ func (s *Service) handleBillingResponseForRequest(ctx context.Context, acc *mode
 	}
 	if err != nil {
 		msg := "额度查询网络错误: " + err.Error()
-		return s.quotaRequestFailure(ctx, acc, checkedAt, msg, proxied && proxy.IsEndpointUnreachable(ctx, err))
+		return s.quotaRequestFailure(ctx, acc, checkedAt, msg, proxied && proxy.IsEndpointUnreachable(ctx, err), route...)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {

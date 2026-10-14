@@ -44,7 +44,21 @@ func MetadataSessionID(body map[string]any) string {
 		return ""
 	}
 	session, _ := parsed[metadataKeySessionID].(string)
+	if !validAttributionValue(session) {
+		return ""
+	}
 	return strings.TrimSpace(session)
+}
+
+// CopyMetadataSession 供协议转换保留唯一支持的正文会话来源。
+// OpenAI metadata 的任意业务键、user 字段及伪造设备信息不自动转成 Anthropic metadata。
+// 两个容器都是新建的；最终设备身份仍由所选账号的 InjectDeviceMetadata 写入。
+func CopyMetadataSession(destination, source map[string]any) {
+	if session := MetadataSessionID(source); session != "" {
+		destination["metadata"] = map[string]any{
+			"user_id": "{" + quoteJSON(metadataKeySessionID) + ":" + quoteJSON(session) + "}",
+		}
+	}
 }
 
 // InjectDeviceMetadata 写入官方形态的 metadata.user_id。

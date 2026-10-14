@@ -51,7 +51,7 @@ func TestJWTModelCaptchaSkipWithoutSolver(t *testing.T) {
 		t.Fatalf("JWT 路径及鉴权必须保留: %s %v", call.Path, call.Header)
 	}
 	system, ok := call.Body["system"].([]any)
-	if !ok || len(system) != len(upstream.ZcodeSystemBlocks()) {
+	if !ok || len(system) != len(upstream.ZcodeFallbackSystemBlocks()) {
 		t.Fatalf("跳过验证码不能丢失 JWT 的标准 system 块: %v", call.Body["system"])
 	}
 	metadata, ok := call.Body["metadata"].(map[string]any)

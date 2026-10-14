@@ -26,10 +26,10 @@ func TestJWTKeepsCallerSystemOverHTTP(t *testing.T) {
 		system any
 		want   any
 	}{
-		{"foreign_text", foreignText, append(upstream.ZcodeSystemBlocks(), map[string]any{"type": "text", "text": foreignText})},
+		{"foreign_text", foreignText, append(upstream.ZcodeFallbackSystemBlocks(), map[string]any{"type": "text", "text": foreignText})},
 		{"empty_text", "", ""},
 		{"empty_blocks", []any{}, []any{}},
-		{"foreign_blocks_with_extensions", foreignBlocks, append(upstream.ZcodeSystemBlocks(), foreignBlocks...)},
+		{"foreign_blocks_with_extensions", foreignBlocks, append(upstream.ZcodeFallbackSystemBlocks(), foreignBlocks...)},
 		{"complete_client_context", []any{
 			map[string]any{"type": "text", "text": "You are ZCode, an interactive coding agent", "cache_control": map[string]any{"type": "ephemeral"}},
 			map[string]any{"type": "text", "text": "这是客户端提供的扩展身份与交互规则。"},

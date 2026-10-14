@@ -17,7 +17,7 @@ func TestDiagnosticShapeSourcesAndCounts(t *testing.T) {
 	// 网关注入的标准块数由 config.UpstreamInjectEnvironment 决定（默认两块，
 	// 关掉 # Environment 后就是两块），派生而不是写死：写死会让「切换注入开关」
 	// 与「裁剪 Environment 段」这两件事互相打架。
-	injected := len(upstream.ZcodeSystemBlocks())
+	injected := len(upstream.ZcodeFallbackSystemBlocks())
 	for _, tc := range []struct {
 		name          string
 		preserve, jwt bool

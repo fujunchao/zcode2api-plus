@@ -13,14 +13,14 @@ import (
 )
 
 // Purge 只接受出站层确认的两类故障；取消、直连或无命名绑定不执行删除。
-func Purge(ctx context.Context, st *store.Store, acc *model.Account, reason string) map[string]any {
+func Purge(ctx context.Context, st *store.Store, acc *model.Account, reason string, route ...store.ProxyEgress) map[string]any {
 	out := map[string]any{}
 	if ctx.Err() != nil || acc == nil || acc.ProxyID == nil || *acc.ProxyID == "" || acc.ProxyURL == nil || *acc.ProxyURL == "" ||
 		(reason != proxy.FailureEndpointUnreachable && reason != proxy.FailureClaimSuspicious) {
 		return out
 	}
 	out["proxy_failure"] = reason
-	removed, reassign, err := st.PurgeFailedAccountProxy(acc)
+	removed, reassign, err := st.PurgeFailedAccountProxy(acc, route...)
 	if err != nil {
 		out["proxy_remove_error"] = err.Error()
 		web.Warn("proxy-failure", fmt.Sprintf("账号 %s 的故障代理 %s 删除失败，保留原绑定: %v", acc.ID, *acc.ProxyID, err))
@@ -43,11 +43,11 @@ func Purge(ctx context.Context, st *store.Store, acc *model.Account, reason stri
 }
 
 // ApplyClaimFailures 只处理本轮第一个已确认的代理故障；即使此前有套餐领取成功也不忽略。
-func ApplyClaimFailures(ctx context.Context, st *store.Store, acc *model.Account, outcomes []map[string]any) {
+func ApplyClaimFailures(ctx context.Context, st *store.Store, acc *model.Account, outcomes []map[string]any, route ...store.ProxyEgress) {
 	for _, outcome := range outcomes {
 		reason, _ := outcome["proxy_failure"].(string)
 		if reason == proxy.FailureEndpointUnreachable || reason == proxy.FailureClaimSuspicious {
-			maps.Copy(outcome, Purge(ctx, st, acc, reason))
+			maps.Copy(outcome, Purge(ctx, st, acc, reason, route...))
 			return
 		}
 	}

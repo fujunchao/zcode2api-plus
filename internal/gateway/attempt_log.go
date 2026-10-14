@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"time"
 
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
@@ -25,6 +26,7 @@ func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgr
 	d.upstreamAttempts++
 	base := fmt.Sprintf("req=%q ticket=%q attempt=%d selection=%d acc_id=%q route_id=%q route=%q endpoint=%q mode=%s",
 		d.ReqID, d.Ticket, d.upstreamAttempts, d.Attempts, acc.ID, egress.ID, egress.Label, egress.Endpoint, egress.Mode)
+	base += fmt.Sprintf(" proxy_generation=%d binding_generation=%d credential_generation=%d route_reason=%q", egress.ConfigurationGeneration(), egress.BindingGeneration(), egress.CredentialGeneration(), egress.Reason)
 	trace := fmt.Sprintf(" gateway_request_id=%q protocol=%s", d.GatewayRequestID, d.Protocol)
 	d.lastAttemptBase = base + trace
 	d.shape.mcsDeclared = request != nil && hasMCSDeclaration(request.Header.Get("Anthropic-Beta"))
@@ -84,9 +86,12 @@ func attemptRequestSummary(acc *model.Account, request *http.Request) string {
 		mode, origin, requestID, attemptIDRef(session), attemptIDRef(trace), attemptIDRef(query))
 }
 
-// 会话/追踪/轮次值可能来自下游，不把原值写日志；短哈希只用于同轮诊断关联。
+// 会话/追踪/轮次值可能来自下游，只用本进程限时 HMAC 关联，不输出原值。
 func attemptIDRef(value string) string {
-	return diagnosticBytesRef([]byte(value))
+	if value == "" {
+		return "-"
+	}
+	return privateReference(value, time.Now())[:12]
 }
 
 func diagnosticBytesRef(value []byte) string {

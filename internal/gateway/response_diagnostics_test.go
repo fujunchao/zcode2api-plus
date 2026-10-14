@@ -130,3 +130,23 @@ func TestDiagnosticReadErrorClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestStrictProxyErrorBodyCompletionDoesNotTrustJSONPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		complete   bool
+	}{
+		{"完整", strictRiskJSON, true},
+		{"恰好上限", strictRiskJSON + strings.Repeat(" ", maxErrorBodyBytes-len(strictRiskJSON)), true},
+		{"长尾截断", strictRiskJSON + strings.Repeat(" ", maxErrorBodyBytes), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: 405, Body: io.NopCloser(strings.NewReader(tc.body))}
+			body, complete, err := ReadErrorResponseWithCompletion(resp, nil, "error_body")
+			_ = resp.Body.Close()
+			if err != nil || complete != tc.complete || UpstreamBusinessCode(string(body)) != "3012" {
+				t.Fatalf("分类前缀与完整证据必须分离: complete=%t err=%v", complete, err)
+			}
+		})
+	}
+}

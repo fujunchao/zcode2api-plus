@@ -135,8 +135,12 @@ func TestSystemBlocksShape(t *testing.T) {
 				if !strings.HasPrefix(text, want) {
 					t.Fatalf("第 %d 段前缀不符：\n got=%q\nwant前缀=%q", i, text[:min(60, len(text))], want)
 				}
-				if _, ok := m["cache_control"]; !ok {
-					t.Fatalf("第 %d 段缺 cache_control", i)
+				if i == 0 && config.ZcodeClientSourceTitle == "electron" {
+					if _, ok := m["cache_control"]; ok {
+						t.Fatal("桌面固定前缀不得附 cache_control")
+					}
+				} else if cache, ok := m["cache_control"].(map[string]any); !ok || cache["type"] != "ephemeral" {
+					t.Fatalf("第 %d 段必须保留 ephemeral cache_control", i)
 				}
 			}
 		})

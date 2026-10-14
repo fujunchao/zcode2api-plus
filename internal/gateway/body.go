@@ -62,7 +62,7 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 		if config.PreserveClientContext && upstream.ShouldPreserveCallerSystem(body) {
 			return body
 		}
-		blocks := upstream.ZcodeSystemBlocks()
+		blocks := upstream.ZcodeFallbackSystemBlocks()
 		switch existing := body["system"].(type) {
 		case nil:
 			// 键不存在或为 null（对应 Python existing_system is None）

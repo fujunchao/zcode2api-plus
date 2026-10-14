@@ -117,6 +117,14 @@ func (s *Store) RotateAccountProxyAt(expected *model.Account, now time.Time) (Pr
 		copy.ProxyID, copy.ProxyURL = nil, nil
 		next := s.cloneStrictProxyLocked()
 		setStrictIntent(&next, copy, "auto_pending_proxy")
+		for _, p := range s.listProxyProfilesLocked() {
+			for _, failure := range history[live.ID] {
+				if failure.ProxyID == p.ID || failure.URLHash == proxyURLHash(p.URL) {
+					next.PendingAvoid[live.ID] = append(next.PendingAvoid[live.ID], strictProxyIdentity(p.URL))
+					break
+				}
+			}
+		}
 		if err := s.commitProxyBundleStrictLocked(context.Background(), nil, []*model.Account{copy}, history, nil, &next); err != nil {
 			result.Reason = "persist_failed"
 			return result, err

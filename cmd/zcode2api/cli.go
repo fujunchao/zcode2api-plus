@@ -214,8 +214,11 @@ func cmdLogin(args []string) {
 
 // claimCLIAccount 将 CLI 领取与后台相同的代理故障收尾绑定，便于离线验证真实调用边界。
 func claimCLIAccount(st *store.Store, acc *model.Account, cm *captcha.Manager) []map[string]any {
-	outcomes := claim.NewService(cm).AutoClaimAllPlans(acc)
-	proxyguard.ApplyClaimFailures(context.Background(), st, acc, outcomes)
+	svc := claim.NewService(cm)
+	svc.Store = st
+	route := st.ProxyEgress(acc)
+	outcomes := svc.AutoClaimAllPlans(acc)
+	proxyguard.ApplyClaimFailures(context.Background(), st, acc, outcomes, route)
 	return outcomes
 }
 

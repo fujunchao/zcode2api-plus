@@ -12,12 +12,17 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"zcode2api/internal/proxy"
 )
 
 // 所有 api.z.ai 请求只允许连接本地 TLS 服务；不改生产端点，不发送真实账号材料。
 func routeAPIKeyExchangeToLocalTLS(t *testing.T, handler http.Handler) {
+	routeOAuthToLocalTLS(t, "api.z.ai", handler)
+}
+
+func routeOAuthToLocalTLS(t *testing.T, allowedHost string, handler http.Handler) {
 	t.Helper()
 	server := httptest.NewTLSServer(handler)
 	t.Cleanup(server.Close)
@@ -30,14 +35,19 @@ func routeAPIKeyExchangeToLocalTLS(t *testing.T, handler http.Handler) {
 	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	transport.TLSClientConfig.ServerName = host
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if addr != "api.z.ai:443" {
+		if addr != allowedHost+":443" {
 			return nil, fmt.Errorf("回归拒绝非预期的网络目标：%s", addr)
 		}
 		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
 	}
-	old := http.DefaultTransport
-	http.DefaultTransport = transport
-	t.Cleanup(func() { http.DefaultTransport = old; transport.CloseIdleConnections() })
+	old := httpClientFor
+	httpClientFor = func(raw string, timeout time.Duration) (*http.Client, error) {
+		if raw != "" {
+			return nil, fmt.Errorf("合成直连回归拒绝非空代理")
+		}
+		return &http.Client{Transport: transport, Timeout: timeout}, nil
+	}
+	t.Cleanup(func() { httpClientFor = old; transport.CloseIdleConnections() })
 }
 
 func TestBatch2APIKeyBusinessUnauthorizedIsNotMissingOrganization(t *testing.T) {

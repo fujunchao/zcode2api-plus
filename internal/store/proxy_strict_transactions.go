@@ -2,8 +2,60 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 )
+
+// 编辑入口把人工意图与账号补丁同事务保存，避免单独清除 pending 产生竞态。
+func (s *Store) editAccountProxyIntent(provider, id string, edit AccountEdit, apply func(*model.Account)) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := s.findLocked(provider, id)
+	if live == nil {
+		return false, nil
+	}
+	a := live.Clone()
+	apply(a)
+	if edit.SetProxyURL && derefStr(a.ProxyURL) != "" && s.strictProxyBlockedLocked(derefStr(a.ProxyURL)) {
+		return false, ErrProxyRetired
+	}
+	next := s.cloneStrictProxyLocked()
+	trackStrictAccountVersions(&next, a)
+	if edit.SetProxyURL {
+		intent := "manual_proxy"
+		if derefStr(a.ProxyURL) == "" {
+			intent = "explicit_direct"
+		}
+		setStrictIntent(&next, a, intent)
+	}
+	if edit.SetSecret {
+		delete(next.Pending, a.ID)
+		delete(next.PendingAvoid, a.ID)
+	}
+	raw, err := json.Marshal(next)
+	if err != nil {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := persistAccountOnTx(tx, a); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", strictProxyStateKey, string(raw)); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	apply(live)
+	s.strictProxy = next
+	return true, nil
+}
 
 // rebindStrictPendingLocked 在新增/启用线路事务内补绑；显式直连及旧空绑定不在等待集合。
 func (s *Store) rebindStrictPendingLocked(profiles []ProxyProfile, pending []*model.Account, next *strictProxyState) []*model.Account {
@@ -29,9 +81,23 @@ func (s *Store) rebindStrictPendingLocked(profiles []ProxyProfile, pending []*mo
 		}
 		if credential != strictCredential(a) || next.Intents[a.ID] != "auto_pending_proxy" || derefStr(a.ProxyID) != "" || derefStr(a.ProxyURL) != "" {
 			delete(next.Pending, a.ID)
+			delete(next.PendingAvoid, a.ID)
 			continue
 		}
-		p, ok := s.chooseProxyLocked(profiles, occupancy, "", "")
+		allowed := make([]ProxyProfile, 0, len(profiles))
+		for _, p := range profiles {
+			blocked := false
+			for _, identity := range next.PendingAvoid[a.ID] {
+				if strictProxyIdentity(p.URL) == identity {
+					blocked = true
+					break
+				}
+			}
+			if !blocked {
+				allowed = append(allowed, p)
+			}
+		}
+		p, ok := s.chooseProxyLocked(allowed, occupancy, "", "")
 		if !ok {
 			continue
 		}
@@ -42,6 +108,7 @@ func (s *Store) rebindStrictPendingLocked(profiles []ProxyProfile, pending []*mo
 		}
 		occupancy[p.ID]++
 		delete(next.Pending, a.ID)
+		delete(next.PendingAvoid, a.ID)
 		next.Intents[a.ID] = "auto_proxy"
 	}
 	return pending
@@ -50,6 +117,7 @@ func (s *Store) rebindStrictPendingLocked(profiles []ProxyProfile, pending []*mo
 func setStrictIntent(next *strictProxyState, a *model.Account, intent string) {
 	next.Intents[a.ID] = intent
 	delete(next.Pending, a.ID)
+	delete(next.PendingAvoid, a.ID)
 	if intent == "auto_pending_proxy" {
 		next.Pending[a.ID] = strictCredential(a)
 	}
@@ -82,9 +150,15 @@ func (s *Store) retireStrictIdentityLocked(identity string) (ProxyDecision, erro
 	}
 	next := s.cloneStrictProxyLocked()
 	var pending []*model.Account
+	var manualEndpoints []string
 	occupancy := s.proxyOccupancyLocked()
 	for _, live := range s.allAccountsLocked() {
 		if strictProxyIdentity(derefStr(live.ProxyURL)) != identity {
+			continue
+		}
+		// 裸 URL 是人工选定路由：保留原值并由派发准入明确拒绝，不悄悄换线。
+		if derefStr(live.ProxyID) == "" {
+			manualEndpoints = append(manualEndpoints, derefStr(live.ProxyURL))
 			continue
 		}
 		a := live.Clone()
@@ -97,11 +171,17 @@ func (s *Store) retireStrictIdentityLocked(identity string) (ProxyDecision, erro
 		} else {
 			setStrictIntent(&next, a, "auto_pending_proxy")
 			result.Direct++
+			result.Pending++
 		}
 		pending = append(pending, a)
 	}
 	b.State = "removed"
 	next.Blocks[identity] = b
+	next.Audit = append(next.Audit, fmt.Sprintf("retire:%s:rule=%s:reason=%s:removed=%d:assigned=%d:direct=%d:pending=%d", b.DecisionID, b.RuleVersion, b.Reason,
+		len(result.Removed), result.Assigned, result.Direct, result.Pending))
+	if len(next.Audit) > 256 {
+		next.Audit = next.Audit[len(next.Audit)-256:]
+	}
 	sub, err := s.subscriptionMutationLocked(remaining, "strict_3012")
 	if err == nil {
 		err = s.commitProxyBundleStrictLocked(context.Background(), remaining, pending, nil, sub, &next)
@@ -111,6 +191,9 @@ func (s *Store) retireStrictIdentityLocked(identity string) (ProxyDecision, erro
 	}
 	for _, id := range result.Removed {
 		s.clearLineTruncateLocked(id)
+	}
+	for _, endpoint := range manualEndpoints {
+		proxy.ForgetTransport(endpoint)
 	}
 	// SQL 已是权威 removed 状态；旧日志重启合并时不得覆盖它。
 	if err := s.writeStrictJournalLocked(s.strictProxy.Blocks); err != nil {

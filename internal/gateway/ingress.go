@@ -37,7 +37,7 @@ func ObserveRequests(protocol string, next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set(NewAPIRequestIDHeader, trace.ID)
 		base := fmt.Sprintf("req=%q gateway_request_id=%q protocol=%s", shortID, trace.ID, protocol)
 		started := time.Now()
-		web.Ingress(shortID, "event=start "+base+" ts="+diagnosticTime(started))
+		web.Ingress(shortID, "event=start "+base+ingressAttributionSummary(r.Header)+" ts="+diagnosticTime(started))
 
 		writer := &diagnosticResponseWriter{ResponseWriter: w}
 		returned := false
@@ -59,6 +59,24 @@ func ObserveRequests(protocol string, next http.HandlerFunc) http.HandlerFunc {
 		next(output, r.WithContext(ctx))
 		returned = true
 	}
+}
+
+// 入站/出站在同一进程用同一限时 HMAC 比较，先区分缺值、多值和明确透传。
+// 只读五个逻辑归因头；不会把 Authorization、Cookie 或其它任意扩展值带入日志。
+func ingressAttributionSummary(headers http.Header) string {
+	out := ""
+	for _, item := range []struct{ key, field string }{
+		{"X-Session-Id", "session"}, {"X-Zcode-Trace-Id", "trace"}, {"X-Query-Id", "query"},
+		{"X-Zcode-Session-Type", "session_type"}, {"X-Zcode-Query-Source", "query_source"},
+	} {
+		values := headers.Values(item.key)
+		ref := "-"
+		if len(values) == 1 && len(values[0]) <= 4096 {
+			ref = attemptIDRef(values[0])
+		}
+		out += fmt.Sprintf(" incoming_%s_present=%t incoming_%s_multiple=%t incoming_%s_ref=%q", item.field, len(values) > 0, item.field, len(values) > 1, item.field, ref)
+	}
+	return out
 }
 
 // RequestShortID 保留旧日志的六位短 ID；完整关联必须使用 GatewayRequestIDHeader。

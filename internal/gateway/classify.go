@@ -224,7 +224,7 @@ func RecordStreamTruncate(st *store.Store, provider, idOrName string) (total int
 //
 // sync 与 async 两条请求路径都必须经由本入口，否则会出现「一边熔断、一边只计数」
 // 的分歧。裸 ProxyURL / 直连账号无处熔断，只做账号级计数与回避。
-func RecordUpstreamTruncate(st *store.Store, acc *model.Account, now time.Time) int {
+func RecordUpstreamTruncate(st *store.Store, acc *model.Account, now time.Time, observed ...store.ProxyEgress) int {
 	total := RecordStreamTruncate(st, acc.Provider, acc.ID)
 	if avoid := st.LineTruncateAvoidSeconds(); avoid > 0 {
 		until := float64(now.Add(time.Duration(avoid)*time.Second).UnixNano()) / 1e9
@@ -232,17 +232,20 @@ func RecordUpstreamTruncate(st *store.Store, acc *model.Account, now time.Time) 
 			live.TruncateAvoidUntil = until
 		})
 	}
-	if acc.ProxyID == nil || *acc.ProxyID == "" {
+	egress := st.ProxyEgress(acc)
+	if len(observed) > 0 {
+		egress = observed[0]
+	}
+	if egress.Mode != "proxy" || egress.ID == "" {
 		return total
 	}
-	lineID := *acc.ProxyID
 	// 先取标签再熔断：移除后 ProxyLabel 只能给出 proxy-id:<id>，日志里就丢了线路名。
-	label := st.ProxyLabel(acc)
-	streak := st.BumpLineTruncate(lineID)
+	label := egress.Label
+	streak := st.BumpLineTruncateForAttempt(acc, egress)
 	if threshold := st.LineTruncateStrikes(); threshold > 0 && streak >= threshold {
-		if purged, reassign, err := st.PurgeProxyProfiles([]string{lineID}); err != nil {
+		if removed, reassign, err := st.PurgeFailedAccountProxy(acc, egress); err != nil {
 			web.Warn("line-guard", fmt.Sprintf("线路 %s 连续 %d 次上游断流，但移除失败: %v", label, streak, err))
-		} else if len(purged) > 0 {
+		} else if removed {
 			web.Warn("line-guard", fmt.Sprintf("线路 %s 连续 %d 次上游断流，已移除；改派 %d 个账号、%d 个退直连",
 				label, streak, len(reassign.Assigned), len(reassign.Direct)))
 		}
@@ -255,13 +258,16 @@ func RecordUpstreamTruncate(st *store.Store, acc *model.Account, now time.Time) 
 // ⚠️ 必须在「交付完成」处调用（engine.finishDelivery 成功分支 / async forwardSSE
 // 成功路径），不能塞进 MarkSuccess：engine 的 success 在流开始读取之前调用，
 // 「每次正常开头、~300s 处被切」的链会刚复位又被计入，永远凑不满熔断连击。
-// acc 的 ProxyID 是选号时的快照；若线路在流期间被改派，清的是旧线路的计数——
-// 该线路已无此账号，多清一次只会让它晚一档熔断，无害。
-func ResetLineTruncate(st *store.Store, acc *model.Account) {
-	if acc == nil || acc.ProxyID == nil || *acc.ProxyID == "" {
+// 使用实际派发快照；旧配置的完整成功不能清除后来新配置的失败计数。
+func ResetLineTruncate(st *store.Store, acc *model.Account, observed ...store.ProxyEgress) {
+	if acc == nil {
 		return
 	}
-	st.ResetLineTruncate(*acc.ProxyID)
+	egress := st.ProxyEgress(acc)
+	if len(observed) > 0 {
+		egress = observed[0]
+	}
+	st.ResetLineTruncateForAttempt(acc, egress)
 }
 
 // ── 上游 503 冷却阶梯 ─────────────────────────────────────────────────────────

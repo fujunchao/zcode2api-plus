@@ -5,6 +5,24 @@ import (
 	"zcode2api/internal/model"
 )
 
+func (s *Store) proxyBindingAvailableLocked(a *model.Account) bool {
+	if derefStr(a.ProxyURL) == "" {
+		return derefStr(a.ProxyID) == ""
+	}
+	if s.strictProxyBlockedLocked(derefStr(a.ProxyURL)) {
+		return false
+	}
+	if derefStr(a.ProxyID) == "" {
+		return true // 裸 URL 的语法错误由真实派发入口明确报告，不悄悄改线。
+	}
+	for _, p := range s.listProxyProfilesLocked() {
+		if p.ID == *a.ProxyID {
+			return p.Enabled && strictProxyIdentity(p.URL) == strictProxyIdentity(derefStr(a.ProxyURL))
+		}
+	}
+	return false
+}
+
 // proxyOccupancyLocked 统计所有账号的线路绑定，包括停用和归档账号。
 // 手工 ProxyURL 不占用命名线路，与后台绑定数口径一致。
 func (s *Store) proxyOccupancyLocked() map[string]int {

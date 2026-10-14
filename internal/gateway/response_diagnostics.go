@@ -61,13 +61,20 @@ func diagnosticResponseID(value string) (id, ref string) {
 // ReadErrorResponse 保留原错误分类的 64 KiB 前缀输入，多读一个字节仅用于确认超限。
 // 关闭响应体仍由原调用方负责，诊断不改变错误传播或重试策略。
 func ReadErrorResponse(resp *http.Response, diag *ReqDiag, phase string) ([]byte, error) {
+	raw, _, err := ReadErrorResponseWithCompletion(resp, diag, phase)
+	return raw, err
+}
+
+// ReadErrorResponseWithCompletion 另行报告错误体是否完整；截断前缀仍供旧分类器使用，
+// 但不能作为严格线路淘汰证据。即使前缀恰好是合法 JSON，也不能推断正文已读完。
+func ReadErrorResponseWithCompletion(resp *http.Response, diag *ReqDiag, phase string) ([]byte, bool, error) {
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
 	truncated := len(raw) > maxErrorBodyBytes
 	diag.ObserveResponseBody(resp, raw, err, truncated, phase)
 	if truncated {
 		raw = raw[:maxErrorBodyBytes]
 	}
-	return raw, err
+	return raw, !truncated && err == nil, err
 }
 
 // ObserveResponseBody 在读完/读断之后记录独立事件，不能用 headers 的 err_kind 推断它。

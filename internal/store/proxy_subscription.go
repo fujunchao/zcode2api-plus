@@ -12,11 +12,8 @@ import (
 
 func (s *Store) subscriptionLocked() (proxysub.State, error) {
 	raw := s.settings[proxysub.StateKey]
-	if raw == "" {
-		return proxysub.NewState(), nil
-	}
-	var state proxysub.State
-	if json.Unmarshal([]byte(raw), &state) != nil || state.Version != 1 || state.Config.Validate() != nil || state.Registry == nil || state.Blocks == nil {
+	state := proxysub.NewState()
+	if raw != "" && (json.Unmarshal([]byte(raw), &state) != nil || state.Version != 1 || state.Config.Validate() != nil || state.Registry == nil || state.Blocks == nil) {
 		return state, proxysub.ErrState
 	}
 	// 旧版本回退后可能更改过线路；只保留 ID 和地址仍匹配的来源记录。
@@ -29,6 +26,13 @@ func (s *Store) subscriptionLocked() (proxysub.State, error) {
 			delete(state.Registry, id)
 		}
 	}
+	// 开始拉取/探测之前就与独立严格墓碑合并，不只在最终导入时才发现退役。
+	for _, b := range s.strictProxy.Blocks {
+		if b.SubscriptionKey != "" {
+			state.Blocks[b.SubscriptionKey] = proxysub.Block{Key: b.SubscriptionKey, Reason: "strict_3012:" + b.Reason, CreatedAt: b.CreatedAt, Until: 0}
+		}
+	}
+	state.ImportPaused = state.ImportPaused || s.strictProxy.Paused || s.strictProxy.ImportPaused
 	return state, nil
 }
 
@@ -263,7 +267,7 @@ func (s *Store) subscriptionMutationLocked(profiles []ProxyProfile, reason strin
 			state.Blocks[b.SubscriptionKey] = proxysub.Block{Key: b.SubscriptionKey, Reason: "strict_3012:" + b.Reason, CreatedAt: b.CreatedAt, Until: 0}
 		}
 	}
-	if s.strictProxy.Paused {
+	if s.strictProxy.Paused || s.strictProxy.ImportPaused {
 		state.ImportPaused = true
 	}
 	return &state, nil
@@ -282,18 +286,30 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 		next := s.cloneStrictProxyLocked()
 		strict = &next
 	}
+	for _, a := range pending {
+		trackStrictAccountVersions(strict, a)
+	}
 	if profiles != nil {
 		old := map[string]ProxyProfile{}
+		newEligible := false
 		for _, p := range s.listProxyProfilesLocked() {
 			old[p.ID] = p
 		}
 		for _, p := range profiles {
 			previous, ok := old[p.ID]
+			if p.Enabled && (!ok || !previous.Enabled || strictProxyIdentity(previous.URL) != strictProxyIdentity(p.URL)) {
+				newEligible = true
+			}
 			if !ok || strictProxyIdentity(previous.URL) != strictProxyIdentity(p.URL) || previous.Enabled != p.Enabled {
 				strict.Generations[p.ID]++
 			}
 		}
-		pending = s.rebindStrictPendingLocked(profiles, pending, strict)
+		if newEligible {
+			pending = s.rebindStrictPendingLocked(profiles, pending, strict)
+		}
+	}
+	for _, a := range pending {
+		trackStrictAccountVersions(strict, a)
 	}
 	values := map[string]string{}
 	strictRaw, err := marshalJSON(strict)

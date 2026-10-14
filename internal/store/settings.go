@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -17,6 +18,9 @@ func (s *Store) SetSettings(values map[string]string) error {
 	defer s.mu.Unlock()
 	keys := make([]string, 0, len(values))
 	for key := range values {
+		if key == strictProxyStateKey || key == "proxy_profiles" {
+			return errors.New("代理内部状态不可通过普通设置修改，请使用受控线路入口")
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)

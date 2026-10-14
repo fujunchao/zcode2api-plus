@@ -126,8 +126,14 @@ func fetchConfigHTTP(ctx context.Context) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	req.Header.Set("User-Agent", config.UserAgent)
-	client := &http.Client{Timeout: 15 * time.Second}
+	// 公开配置与账号无关。来源档案可以发送，JWT/API Key、Cookie、模型归因不可发送。
+	for key, value := range config.ZcodeSourceHeaders() {
+		req.Header.Set(key, value)
+	}
+	// 官方公共配置拒绝重定向，避免来源信息跟随到不同目标。
+	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return Config{}, err

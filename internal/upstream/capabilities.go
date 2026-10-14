@@ -8,6 +8,25 @@ import (
 
 const midConversationSystemBeta = "mid-conversation-system-2026-04-07"
 
+// 这段只描述网关回退上下文的实际能力，不复制采集机路径，也不凭空增加工具。
+const desktopFallbackCapabilitiesText = "# Gateway Desktop Capabilities\n" +
+	"This gateway fallback context has no Gen UI output directory or built-in Gen UI rendering capability. " +
+	"Return results as text or Markdown unless the caller explicitly supplies suitable tools. " +
+	"Use only the tools declared in this request; do not assume desktop filesystem or preview tools are available."
+
+// ZcodeFallbackSystemBlocks 只用于网关自行补齐 system 的分支。
+// 调用者自带完整官方/GUI 上下文、显式空值或 MCS 时不应调用；非桌面档案保持原样。
+func ZcodeFallbackSystemBlocks() []any {
+	blocks := ZcodeSystemBlocks()
+	if config.ZcodeClientProfile().SourceTitle != "electron" {
+		return blocks
+	}
+	return append(blocks, map[string]any{
+		"type": "text", "text": desktopFallbackCapabilitiesText,
+		"cache_control": map[string]any{"type": "ephemeral"},
+	})
+}
+
 // HasSystemMessages 只检查消息序列，不把顶层 system 当成中途系统消息。
 func HasSystemMessages(body map[string]any) bool {
 	messages, _ := body["messages"].([]any)

@@ -618,6 +618,7 @@ func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"claim_retry_cooldown":        retrySec,
 		"claim_preview_cooldown":      previewSec,
 		"proxy_health_enabled":        h.Store.ProxyHealthEnabled(),
+		store.StrictProxyEnabledKey:   h.Store.StrictProxyEnabled(),
 		"proxy_health_interval":       h.Store.ProxyHealthIntervalMinutes(),
 		"risk_cooling_steps":          h.Store.RiskCoolingStepsString(),
 		"upstream_503_cooling_steps":  h.Store.Upstream503CoolingStepsString(),
@@ -723,6 +724,15 @@ func (h *Handler) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		updates["proxy_health_interval"] = strconv.Itoa(n)
+	}
+	// 只停用新判定；已经确认的退役/禁止回流记录不随开关自动解除。
+	if v, ok := payload[store.StrictProxyEnabledKey]; ok {
+		b, valid := v.(bool)
+		if !valid {
+			writeAPIError(w, errBadRequest("严格代理新判定开关必须为布尔值"))
+			return
+		}
+		updates[store.StrictProxyEnabledKey] = boolText(b)
 	}
 	// ── Async 出口强制直連 ── 排障用的控制開關：開啟後 async 池忽略帳號代理、
 	// 恆直連上游。用於保留「線路 vs 直連」的斷流歸因對照組（見 store.AsyncForceDirect）。

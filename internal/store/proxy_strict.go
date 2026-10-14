@@ -7,26 +7,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxy"
 	"zcode2api/internal/proxysub"
 )
 
 const strictProxyStateKey = "strict_proxy_v3"
-const StrictProxyRuleVersion = "proxy-3012-v3.1"
+const StrictProxyRuleVersion = "proxy-3012-v3.2"
+const StrictProxyEnabledKey = "strict_proxy_enabled"
 const strictProxyWindow = 10 * time.Minute
 const strictProxyEvidenceLimit = 4096
 
 var ErrProxyRetired = errors.New("选定代理已淘汰或路由快照已过期")
 var ErrStrictProxyPaused = errors.New("严格代理恢复尚未完成，暂停代理准入")
+var ErrInvalidProxyRoute = errors.New("选定代理路由不可用，请选择自动分配或显式直连")
+var ErrStrictDecisionConflict = errors.New("严格代理决定已更新，请重新查看并复核")
 
 // ProxyObservation 仅接收真实模型 HTTP 尝试的去敏归因；Complete 表示完整成功。
 type ProxyObservation struct {
@@ -34,8 +36,10 @@ type ProxyObservation struct {
 	Status                                                                                      int
 	Complete                                                                                    bool
 	At                                                                                          time.Time
-	// EntryRef 关联同一网关入口的多号重试；未提供时仅用于兼容旧调用。
+	// EntryRef 关联同一网关入口的多号重试；缺失时不能作为独立输入证据。
 	EntryRef string
+	// 与 Origin 分开保存真实模型端点和方法，不把同域的登录/额度响应混作对照。
+	TargetPath, Method string
 	// InvalidRequest 是构造/目标/鉴权检查已明确失败的排除信号。
 	InvalidRequest bool
 }
@@ -48,37 +52,58 @@ type ProxyDecision struct {
 	RuleVersion string
 	Assigned    int
 	Direct      int
+	Pending     int
 }
 
 type strictProxyBlock struct {
-	Identity, DecisionID, State, Reason, TargetOrigin, SubscriptionKey string
-	CreatedAt                                                          int64
-	Evidence                                                           []string
+	Identity, DecisionID, State, Reason, TargetOrigin, SubscriptionKey, RuleVersion string
+	CreatedAt                                                                       int64
+	Evidence                                                                        []string
 }
 
 type strictProxyState struct {
 	Version int
 	Blocks  map[string]strictProxyBlock
 	// 意图不迁移旧空绑定；只有明确自动操作产生 pending。
-	Intents     map[string]string
-	Pending     map[string]string
-	Generations map[string]uint64
-	Audit       []string
-	Paused      bool
+	Intents       map[string]string
+	Pending       map[string]string
+	PendingAvoid  map[string][]string
+	Generations   map[string]uint64
+	Credentials   map[string]strictCredentialVersion
+	RouteVersions map[string]strictRouteVersion
+	Audit         []string
+	Paused        bool
+	// 容量保护只暂停导入，不能把仍然健康的存量线路也停用。
+	ImportPaused bool
+}
+
+type strictCredentialVersion struct {
+	Digest     string
+	Generation uint64
+}
+
+type strictRouteVersion struct {
+	Digest     string
+	Generation uint64
 }
 
 type strictProxyEvidence struct {
 	ProxyObservation
-	Identity, Credential, Provider string
+	Identity, Credential, Provider, AccountID, ProxyID string
+	CredentialGeneration, ProxyGeneration              uint64
 }
 
 // StrictProxyStatus 只提供维护所需的去敏摘要，不输出账号或输入引用。
 type StrictProxyStatus struct {
-	RuleVersion  string                    `json:"rule_version"`
-	Blocks       []StrictProxyBlockSummary `json:"blocks"`
-	Pending      int                       `json:"pending"`
-	Retiring     int                       `json:"retiring"`
-	ImportPaused bool                      `json:"import_paused"`
+	RuleVersion     string                    `json:"rule_version"`
+	Blocks          []StrictProxyBlockSummary `json:"blocks"`
+	Pending         int                       `json:"pending"`
+	Retiring        int                       `json:"retiring"`
+	ImportPaused    bool                      `json:"import_paused"`
+	DispatchPaused  bool                      `json:"dispatch_paused"`
+	DecisionEnabled bool                      `json:"decision_enabled"`
+	ActiveDispatch  int                       `json:"active_dispatch"`
+	Audit           []string                  `json:"audit"`
 }
 
 type StrictProxyBlockSummary struct {
@@ -89,10 +114,11 @@ type StrictProxyBlockSummary struct {
 	TargetOrigin  string `json:"target_origin"`
 	CreatedAt     int64  `json:"created_at"`
 	EvidenceCount int    `json:"evidence_count"`
+	RuleVersion   string `json:"rule_version"`
 }
 
 func newStrictProxyState() strictProxyState {
-	return strictProxyState{Version: 1, Blocks: map[string]strictProxyBlock{}, Intents: map[string]string{}, Pending: map[string]string{}, Generations: map[string]uint64{}}
+	return strictProxyState{Version: 1, Blocks: map[string]strictProxyBlock{}, Intents: map[string]string{}, Pending: map[string]string{}, PendingAvoid: map[string][]string{}, Generations: map[string]uint64{}, Credentials: map[string]strictCredentialVersion{}, RouteVersions: map[string]strictRouteVersion{}}
 }
 
 func (s *Store) cloneStrictProxyLocked() strictProxyState {
@@ -120,31 +146,14 @@ func strictProxyIdentity(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	if canonical, err := proxysub.Canonical(raw); err == nil {
-		return proxysub.Fingerprint(canonical)
-	}
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Host == "" {
+	canonical, err := proxy.CanonicalRoute(raw)
+	if err != nil {
 		return strictDigest(raw)
 	}
-	u.Scheme = strings.ToLower(u.Scheme)
-	host, port := strings.ToLower(u.Hostname()), u.Port()
-	if port == "" {
-		switch u.Scheme {
-		case "http":
-			port = "80"
-		case "https":
-			port = "443"
-		case "socks4", "socks5", "socks5h":
-			port = "1080"
-		}
+	if subscriptionURL, err := proxysub.Canonical(canonical); err == nil {
+		return proxysub.Fingerprint(subscriptionURL)
 	}
-	u.Host = net.JoinHostPort(host, port)
-	if u.Path == "/" {
-		u.Path = ""
-	}
-	u.Fragment = ""
-	return strictDigest(u.String())
+	return strictDigest(canonical)
 }
 
 func (s *Store) loadStrictProxy(raw string) error {
@@ -157,17 +166,32 @@ func (s *Store) loadStrictProxy(raw string) error {
 			return errors.New("严格代理状态版本或结构无效")
 		}
 	}
+	if s.strictProxy.PendingAvoid == nil {
+		s.strictProxy.PendingAvoid = map[string][]string{}
+	}
+	if s.strictProxy.Credentials == nil {
+		s.strictProxy.Credentials = map[string]strictCredentialVersion{}
+	}
+	if s.strictProxy.RouteVersions == nil {
+		s.strictProxy.RouteVersions = map[string]strictRouteVersion{}
+	}
 	journal, err := os.ReadFile(s.strictJournalPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("读取严格删除意图失败: %w", err)
+	}
+	if err == nil && len(journal) == 0 {
+		return errors.New("严格删除意图为空，拒绝恢复代理调度")
 	}
 	if len(journal) > 0 {
 		var blocks map[string]strictProxyBlock
 		if err := json.Unmarshal(journal, &blocks); err != nil {
 			return fmt.Errorf("严格删除意图损坏，拒绝恢复代理调度: %w", err)
 		}
+		if blocks == nil {
+			return errors.New("严格删除意图结构无效，拒绝恢复代理调度")
+		}
 		for key, b := range blocks {
-			if key == "" || b.Identity != key {
+			if key == "" || b.Identity != key || (b.State != "retiring" && b.State != "removed") || b.DecisionID == "" || b.RuleVersion == "" {
 				return errors.New("严格删除意图身份无效")
 			}
 			if _, ok := s.strictProxy.Blocks[key]; !ok {
@@ -178,7 +202,8 @@ func (s *Store) loadStrictProxy(raw string) error {
 	return nil
 }
 
-// 先 fsync 独立意图再改 SQL；即使数据库完全不可写，重启也不会重新准入旧线路。
+// 先 fsync 独立意图再改 SQL；数据库不可写时仍可由可写的恢复日志阻止回流。
+// 两种持久介质同时不可写时只能在当前进程闭锁，并明确返回恢复失败。
 func (s *Store) writeStrictJournalLocked(blocks map[string]strictProxyBlock) error {
 	raw, err := json.Marshal(blocks)
 	if err != nil {
@@ -202,7 +227,10 @@ func (s *Store) writeStrictJournalLocked(blocks map[string]strictProxyBlock) err
 	if err = f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, s.strictJournalPath)
+	if err = os.Rename(name, s.strictJournalPath); err != nil {
+		return err
+	}
+	return syncStrictJournalDirectory(filepath.Dir(s.strictJournalPath))
 }
 
 func (s *Store) strictProxyBlockedLocked(raw string) bool {
@@ -211,6 +239,7 @@ func (s *Store) strictProxyBlockedLocked(raw string) bool {
 }
 
 func (s *Store) strictSuspectLocked(identity string, now time.Time) bool {
+	s.pruneStrictEvidenceLocked(now)
 	for _, e := range s.strictEvidence {
 		if e.Identity == identity && e.Status == 405 && e.BusinessCode == "3012" && !e.At.Before(now.Add(-strictProxyWindow)) {
 			return true
@@ -223,8 +252,15 @@ func (s *Store) strictSuspectLocked(identity string, now time.Time) bool {
 func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]int, excludeID, excludeURL string) (ProxyProfile, bool) {
 	allowed := make([]ProxyProfile, 0, len(profiles))
 	now := time.Now()
+	s.pruneStrictEvidenceLocked(now)
+	suspects := map[string]bool{}
+	for _, e := range s.strictEvidence {
+		if strictFailure(e) {
+			suspects[e.Identity] = true
+		}
+	}
 	for _, p := range profiles {
-		if !p.Enabled || p.ID == excludeID || (excludeURL != "" && strictProxyIdentity(p.URL) == strictProxyIdentity(excludeURL)) || s.strictProxyBlockedLocked(p.URL) || s.strictSuspectLocked(strictProxyIdentity(p.URL), now) {
+		if !p.Enabled || p.ID == excludeID || (excludeURL != "" && strictProxyIdentity(p.URL) == strictProxyIdentity(excludeURL)) || s.strictProxyBlockedLocked(p.URL) || suspects[strictProxyIdentity(p.URL)] {
 			continue
 		}
 		allowed = append(allowed, p)
@@ -233,7 +269,7 @@ func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]
 }
 
 func comparable(a, b strictProxyEvidence) bool {
-	return a.Provider == b.Provider && a.TargetOrigin == b.TargetOrigin && a.Model == b.Model && a.ProfileRef == b.ProfileRef
+	return a.Provider == b.Provider && a.TargetOrigin == b.TargetOrigin && a.TargetPath == b.TargetPath && a.Method == b.Method && a.Model == b.Model && a.ProfileRef == b.ProfileRef
 }
 
 func strictFailure(e strictProxyEvidence) bool { return e.Status == 405 && e.BusinessCode == "3012" }
@@ -249,8 +285,21 @@ func strictDecisionFor(identity string, evidence []strictProxyEvidence) (string,
 		}
 		var failures, successes []strictProxyEvidence
 		contradiction := false
+		latest := seed.At
+		lastFailure := map[string]time.Time{}
 		for _, e := range evidence {
 			if !comparable(seed, e) {
+				continue
+			}
+			if e.At.After(latest) {
+				latest = e.At
+			}
+			if strictFailure(e) && e.At.After(lastFailure[e.Identity]) {
+				lastFailure[e.Identity] = e.At
+			}
+		}
+		for _, e := range evidence {
+			if !comparable(seed, e) || e.At.Before(latest.Add(-strictProxyWindow)) {
 				continue
 			}
 			if e.Identity == identity {
@@ -260,7 +309,7 @@ func strictDecisionFor(identity string, evidence []strictProxyEvidence) (string,
 				if strictFailure(e) {
 					failures = append(failures, e)
 				}
-			} else if strictSuccess(e) {
+			} else if strictSuccess(e) && !e.At.Before(lastFailure[e.Identity]) {
 				successes = append(successes, e)
 			}
 		}
@@ -274,9 +323,6 @@ func strictDecisionFor(identity string, evidence []strictProxyEvidence) (string,
 			for _, bad := range failures {
 				if bad.Credential == good.Credential && bad.DeviceRef != "" && bad.DeviceRef == good.DeviceRef && bad.SessionRef != "" && bad.SessionRef == good.SessionRef && bad.ContentRef == good.ContentRef {
 					entry := bad.EntryRef
-					if entry == "" {
-						entry = bad.RequestID
-					}
 					if !entries[entry] {
 						entries[entry] = true
 						refs = append(refs, bad.RequestID)
@@ -288,14 +334,16 @@ func strictDecisionFor(identity string, evidence []strictProxyEvidence) (string,
 			}
 		}
 		credentials, entries, contents := map[string]bool{}, map[string]bool{}, map[string]bool{}
+		credentialContents := map[string]map[string]bool{}
 		refs := []string{}
 		for _, bad := range failures {
 			credentials[bad.Credential] = true
 			contents[bad.ContentRef] = true
-			entry := bad.EntryRef
-			if entry == "" {
-				entry = bad.RequestID
+			if credentialContents[bad.Credential] == nil {
+				credentialContents[bad.Credential] = map[string]bool{}
 			}
+			credentialContents[bad.Credential][bad.ContentRef] = true
+			entry := bad.EntryRef
 			entries[entry] = true
 			refs = append(refs, bad.RequestID)
 		}
@@ -305,7 +353,7 @@ func strictDecisionFor(identity string, evidence []strictProxyEvidence) (string,
 			if credentials[good.Credential] {
 				controlled[good.Credential] = true
 				refs = append(refs, good.RequestID)
-				if contents[good.ContentRef] {
+				if credentialContents[good.Credential][good.ContentRef] {
 					contentControl = true
 				}
 			}
@@ -319,43 +367,54 @@ func strictDecisionFor(identity string, evidence []strictProxyEvidence) (string,
 
 func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o ProxyObservation) (ProxyDecision, error) {
 	result := ProxyDecision{Reason: "ignored", RuleVersion: StrictProxyRuleVersion}
-	if acc == nil || egress.Mode != "proxy" || o.InvalidRequest || o.RequestID == "" || o.TargetOrigin == "" || o.Model == "" || o.ContentRef == "" || o.ProfileRef == "" {
+	isProxy := egress.Mode == "proxy"
+	isDirect := egress.Mode == "direct" || egress.Mode == "direct_fallback" || egress.Mode == "forced_direct"
+	if acc == nil || (!isProxy && !isDirect) || o.InvalidRequest || o.RequestID == "" || o.EntryRef == "" ||
+		o.TargetOrigin == "" || o.TargetPath == "" || o.Method != "POST" || o.Model == "" || o.ContentRef == "" || o.ProfileRef == "" {
 		return result, nil
 	}
 	u, err := url.Parse(o.TargetOrigin)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return result, nil
 	}
 	o.TargetOrigin = strings.ToLower(u.Scheme + "://" + u.Host)
-	if !((o.Status == 405 && o.BusinessCode == "3012") || (o.Complete && o.Status >= 200 && o.Status < 300)) {
+	path, err := url.ParseRequestURI(o.TargetPath)
+	if err != nil || path.IsAbs() || path.Host != "" || path.RawQuery != "" || path.Fragment != "" || !strings.HasPrefix(o.TargetPath, "/") {
 		return result, nil
 	}
+	if !((isProxy && o.Status == 405 && o.BusinessCode == "3012") || (o.Complete && o.Status >= 200 && o.Status < 300 && o.BusinessCode == "")) {
+		return result, nil
+	}
+	now := time.Now()
 	if o.At.IsZero() {
-		o.At = time.Now()
+		o.At = now
+	}
+	if o.At.Before(now.Add(-strictProxyWindow)) || o.At.After(now.Add(time.Minute)) {
+		return result, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	live := s.findLocked(acc.Provider, acc.ID)
-	if !live.SameCredential(acc) || egress.identity == "" || egress.identity != strictProxyIdentity(derefStr(acc.ProxyURL)) || !s.egressVersionCurrentLocked(acc, egress) {
+	if !s.strictCredentialCurrentLocked(acc, egress) || (isProxy && (egress.identity == "" || egress.identity != strictProxyIdentity(derefStr(acc.ProxyURL)) || !s.egressVersionCurrentLocked(acc, egress))) {
 		result.Reason = "stale_snapshot"
 		return result, nil
 	}
-	if _, blocked := s.strictProxy.Blocks[egress.identity]; blocked {
+	if _, blocked := s.strictProxy.Blocks[egress.identity]; isProxy && blocked {
 		result.Reason = "already_retired"
 		return result, nil
 	}
-	filtered := make([]strictProxyEvidence, 0, len(s.strictEvidence)+1)
+	s.pruneStrictEvidenceLocked(now)
 	for _, e := range s.strictEvidence {
-		if e.At.Before(o.At.Add(-strictProxyWindow)) || e.At.After(o.At.Add(strictProxyWindow)) {
-			continue
-		}
 		if e.RequestID == o.RequestID {
 			result.Reason = "duplicate"
 			return result, nil
 		}
-		filtered = append(filtered, e)
 	}
-	filtered = append(filtered, strictProxyEvidence{ProxyObservation: o, Identity: egress.identity, Credential: strictCredential(acc), Provider: acc.Provider})
+	identity := egress.identity
+	if isDirect {
+		identity = "direct"
+	}
+	filtered := append(s.strictEvidence, strictProxyEvidence{ProxyObservation: o, Identity: identity, Credential: s.strictCredentialRefLocked(acc), Provider: acc.Provider,
+		AccountID: acc.ID, ProxyID: egress.ID, ProxyGeneration: egress.Generation, CredentialGeneration: s.strictProxy.Credentials[acc.ID].Generation})
 	if len(filtered) > strictProxyEvidenceLimit {
 		filtered = filtered[len(filtered)-strictProxyEvidenceLimit:]
 	}
@@ -363,6 +422,11 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 	result.Reason = "suspect"
 	if o.Complete {
 		result.Reason = "observed_success"
+	}
+	// 关闭仅停止产生新决定；墓碑、在途许可和恢复事务不受回滚开关影响。
+	if !s.StrictProxyEnabled() {
+		result.Reason = "decision_disabled"
+		return result, nil
 	}
 	identities := map[string]bool{}
 	for _, e := range filtered {
@@ -374,47 +438,68 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 		if _, blocked := s.strictProxy.Blocks[identity]; blocked {
 			continue
 		}
-		reason, refs, target := strictDecisionFor(identity, filtered)
+		s.pruneStrictEvidenceLocked(now)
+		reason, refs, target := strictDecisionFor(identity, s.strictEvidence)
 		if reason == "" {
 			continue
 		}
-		b := strictProxyBlock{Identity: identity, DecisionID: "decision-" + randomHex(12), State: "retiring", Reason: reason, TargetOrigin: target, CreatedAt: o.At.UnixMilli(), Evidence: refs}
+		b := strictProxyBlock{Identity: identity, DecisionID: "decision-" + randomHex(12), State: "retiring", Reason: reason, TargetOrigin: target, CreatedAt: o.At.UnixMilli(), Evidence: refs, RuleVersion: StrictProxyRuleVersion}
+		// 无认证订阅端点直接使用同一身份键；即使只有裸 URL 也不能靠首次启用订阅回流。
 		for _, p := range s.listProxyProfilesLocked() {
 			if strictProxyIdentity(p.URL) == identity {
-				if _, err := proxysub.Canonical(p.URL); err == nil {
-					b.SubscriptionKey = proxysub.Fingerprint(p.URL)
+				if canonical, err := proxy.CanonicalRoute(p.URL); err == nil {
+					if _, err := proxysub.Canonical(canonical); err == nil {
+						b.SubscriptionKey = identity
+					}
 				}
 				break
 			}
 		}
+		if b.SubscriptionKey == "" && identity == egress.identity {
+			if canonical, err := proxy.CanonicalRoute(derefStr(acc.ProxyURL)); err == nil {
+				if _, err := proxysub.Canonical(canonical); err == nil {
+					b.SubscriptionKey = identity
+				}
+			}
+		}
 		s.strictProxy.Blocks[identity] = b // 与新许可同锁线性化，即使持久化失败也不准入。
 		if len(s.strictProxy.Blocks) >= proxysub.MaxBlocks {
-			s.strictProxy.Paused = true
+			s.strictProxy.ImportPaused = true
 		}
 		if err := s.writeStrictJournalLocked(s.strictProxy.Blocks); err != nil {
 			s.strictProxy.Paused = true
 			result.Reason = "persist_failed"
-			return result, fmt.Errorf("持久化严格删除意图失败: %w", err)
+			// 文件系统恢复日志失败时再尝试 SQL 意图；任一路径成功即可跨重启闭锁。
+			next := s.cloneStrictProxyLocked()
+			dbErr := s.commitProxyBundleStrictLocked(context.Background(), nil, nil, nil, nil, &next)
+			s.scheduleStrictProxyRecoveryLocked()
+			return result, fmt.Errorf("持久化严格删除日志失败，代理准入已暂停: %w", errors.Join(err, dbErr))
 		}
 		d, err := s.retireStrictIdentityLocked(identity)
-		if err != nil {
-			result.Reason = "persist_failed"
-			return result, err
-		}
 		result.Removed = append(result.Removed, d.Removed...)
 		result.Reason = d.Reason
 		result.DecisionID = d.DecisionID
 		result.Assigned += d.Assigned
 		result.Direct += d.Direct
+		result.Pending += d.Pending
+		if err != nil {
+			result.Reason = "persist_failed"
+			s.scheduleStrictProxyRecoveryLocked()
+			return result, err
+		}
 	}
 	return result, nil
+}
+
+func (s *Store) StrictProxyEnabled() bool {
+	return s.claimBool(StrictProxyEnabledKey, true)
 }
 
 func (s *Store) egressVersionCurrentLocked(acc *model.Account, e ProxyEgress) bool {
 	if e.ID != "" {
 		for _, p := range s.listProxyProfilesLocked() {
 			if p.ID == e.ID {
-				return p.Enabled && strictProxyIdentity(p.URL) == e.identity && s.strictProxy.Generations[p.ID] == e.generation
+				return p.Enabled && strictProxyIdentity(p.URL) == e.identity && s.strictProxy.Generations[p.ID] == e.Generation
 			}
 		}
 		return false
@@ -424,41 +509,40 @@ func (s *Store) egressVersionCurrentLocked(acc *model.Account, e ProxyEgress) bo
 
 // AcquireProxyDispatch 与严格删除共享线性化点；已获许可流不被删除动作取消。
 func (s *Store) AcquireProxyDispatch(acc *model.Account, egress ProxyEgress) (func(), error) {
-	if egress.Mode != "proxy" {
+	if egress.Mode == "custom_client" {
 		return func() {}, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if acc == nil || egress.identity == "" || s.strictProxyBlockedLocked(derefStr(acc.ProxyURL)) || !s.egressVersionCurrentLocked(acc, egress) {
+	if egress.Mode != "proxy" {
+		if egress.Mode != "direct" && egress.Mode != "direct_fallback" && egress.Mode != "forced_direct" {
+			return nil, ErrInvalidProxyRoute
+		}
+		if egress.Mode != "forced_direct" && acc != nil && derefStr(acc.ProxyURL) != "" {
+			return nil, ErrInvalidProxyRoute
+		}
+		if acc != nil && !s.strictCredentialCurrentLocked(acc, egress) {
+			return nil, ErrProxyRetired
+		}
+		return func() {}, nil
+	}
+	if !s.proxyDispatchCurrentLocked(acc, egress) {
 		return nil, ErrProxyRetired
 	}
-	live := s.findLocked(acc.Provider, acc.ID)
-	if live != nil && (!live.SameCredential(acc) || derefStr(live.ProxyID) != derefStr(acc.ProxyID) || strictProxyIdentity(derefStr(live.ProxyURL)) != egress.identity) {
-		return nil, ErrProxyRetired
-	}
-	if s.strictDispatch == nil {
-		s.strictDispatch = map[string]int{}
-	}
-	s.strictDispatch[egress.identity]++
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			s.strictDispatch[egress.identity]--
-			if s.strictDispatch[egress.identity] == 0 {
-				delete(s.strictDispatch, egress.identity)
-			}
-		})
-	}, nil
+	return s.acquireStrictLeaseLocked(egress.identity), nil
 }
 
 func (s *Store) StrictProxySummary() (StrictProxyStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := StrictProxyStatus{RuleVersion: StrictProxyRuleVersion, Blocks: []StrictProxyBlockSummary{}, Pending: len(s.strictProxy.Pending), ImportPaused: s.strictProxy.Paused}
+	out := StrictProxyStatus{RuleVersion: StrictProxyRuleVersion, Blocks: []StrictProxyBlockSummary{}, Pending: len(s.strictProxy.Pending),
+		ImportPaused: s.strictProxy.Paused || s.strictProxy.ImportPaused, DispatchPaused: s.strictProxy.Paused,
+		DecisionEnabled: s.StrictProxyEnabled(), Audit: append([]string(nil), s.strictProxy.Audit...)}
+	for _, count := range s.strictDispatch {
+		out.ActiveDispatch += count
+	}
 	for _, b := range s.strictProxy.Blocks {
-		out.Blocks = append(out.Blocks, StrictProxyBlockSummary{Identity: b.Identity, DecisionID: b.DecisionID, State: b.State, Reason: b.Reason, TargetOrigin: b.TargetOrigin, CreatedAt: b.CreatedAt, EvidenceCount: len(b.Evidence)})
+		out.Blocks = append(out.Blocks, StrictProxyBlockSummary{Identity: b.Identity, DecisionID: b.DecisionID, State: b.State, Reason: b.Reason, TargetOrigin: b.TargetOrigin, CreatedAt: b.CreatedAt, EvidenceCount: len(b.Evidence), RuleVersion: b.RuleVersion})
 		if b.State == "retiring" {
 			out.Retiring++
 		}
@@ -467,12 +551,15 @@ func (s *Store) StrictProxySummary() (StrictProxyStatus, error) {
 	return out, nil
 }
 
-func (s *Store) UnblockStrictProxy(identity string) error {
+func (s *Store) UnblockStrictProxy(identity string, expectedDecision ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, ok := s.strictProxy.Blocks[identity]
 	if !ok {
 		return ErrNotFound
+	}
+	if len(expectedDecision) > 0 && expectedDecision[0] != b.DecisionID {
+		return ErrStrictDecisionConflict
 	}
 	if b.State != "removed" {
 		return errors.New("严格删除事务未完成，请先恢复删除")
@@ -484,7 +571,7 @@ func (s *Store) UnblockStrictProxy(identity string) error {
 		next.Audit = next.Audit[len(next.Audit)-256:]
 	}
 	if len(next.Blocks) < proxysub.MaxBlocks {
-		next.Paused = false
+		next.ImportPaused = false
 	}
 	sub, err := s.subscriptionLocked()
 	if err != nil {
@@ -492,6 +579,9 @@ func (s *Store) UnblockStrictProxy(identity string) error {
 	}
 	if b.SubscriptionKey != "" {
 		delete(sub.Blocks, b.SubscriptionKey)
+	}
+	if !next.Paused && !next.ImportPaused && len(sub.Blocks)+len(sub.Registry) < proxysub.MaxBlocks {
+		sub.ImportPaused = false
 	}
 	// 先写新意图日志，SQL 失败时恢复旧日志，绝不把未提交解除发布到内存。
 	if err := s.writeStrictJournalLocked(next.Blocks); err != nil {
@@ -514,6 +604,17 @@ func (s *Store) UnblockStrictProxy(identity string) error {
 func (s *Store) RecoverStrictProxyRetirements() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.strictProxy.Paused {
+		// 只有恢复介质重新可写且内部暂停状态已落库，才解除调度闭锁。
+		if err := s.writeStrictJournalLocked(s.strictProxy.Blocks); err != nil {
+			return err
+		}
+		next := s.cloneStrictProxyLocked()
+		next.Paused = false
+		if err := s.commitProxyBundleStrictLocked(context.Background(), nil, nil, nil, nil, &next); err != nil {
+			return err
+		}
+	}
 	for identity, b := range s.strictProxy.Blocks {
 		if b.State == "retiring" {
 			if _, err := s.retireStrictIdentityLocked(identity); err != nil {

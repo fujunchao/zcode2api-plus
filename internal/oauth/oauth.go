@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/proxy"
 )
 
@@ -32,13 +33,11 @@ const exchangeTimeout = 30 * time.Second
 
 // clientFor 构造登录链路的出站客户端。
 // 指定代理时走代理（http/https/socks4/socks5，与账号出站口径一致）；
-// 未指定时返回零值客户端——保留环境变量 HTTP_PROXY 的既有语义，不要改成
-// proxy.ClientFor("")，那会显式关掉环境代理。
+// 空地址是明确直连，不能被 HTTP(S)_PROXY 隐式改写为未记录的出口。
+var httpClientFor = proxy.ClientFor // 隔离 HTTP/TLS 回归可替换工厂，不访问真实服务。
+
 func clientFor(proxyURL string, timeout time.Duration) (*http.Client, error) {
-	if strings.TrimSpace(proxyURL) == "" {
-		return &http.Client{Timeout: timeout}, nil
-	}
-	return proxy.ClientFor(proxyURL, timeout)
+	return httpClientFor(proxyURL, timeout)
 }
 
 // requestError 统一网络错误文案；经代理时附带（已脱敏的）代理地址，
@@ -189,6 +188,7 @@ func (f *Flow) ExchangeCodeContext(ctx context.Context, code, state, proxyURL st
 		return nil, errors.New("OAuth state 校验失败")
 	}
 	payload := map[string]string{
+		"provider":     "zai",
 		"code":         code,
 		"redirect_uri": f.RedirectURI,
 		"state":        state,
@@ -264,12 +264,18 @@ func codeIsZero(code any) bool {
 // ExchangeAPIKey OAuth access_token → 业务 token → 机构/项目 → API Key
 // （对齐 Python exchange_api_key 的完整链路）。proxyURL 语义同 ExchangeCode。
 func ExchangeAPIKey(accessToken, proxyURL string) (string, error) {
+	return ExchangeAPIKeyContext(context.Background(), accessToken, proxyURL)
+}
+
+// ExchangeAPIKeyContext 的每个步骤共享取消信号与同一份路由派发契约。
+func ExchangeAPIKeyContext(ctx context.Context, accessToken, proxyURL string) (string, error) {
 	client, err := clientFor(proxyURL, exchangeTimeout)
 	if err != nil {
 		return "", err
 	}
+	client = guardClient(ctx, client)
 	bizToken, err := func() (string, error) {
-		body, err := postJSON("https://api.z.ai/api/auth/z/login", map[string]string{"token": accessToken}, proxyURL)
+		body, err := postJSONContext(ctx, "https://api.z.ai/api/auth/z/login", map[string]string{"token": accessToken}, proxyURL)
 		if err != nil {
 			return "", err
 		}
@@ -290,7 +296,7 @@ func ExchangeAPIKey(accessToken, proxyURL string) (string, error) {
 	}
 
 	// ZCode 3.15.3：客户信息使用裸业务 token；后续个人 Key 管理仍使用 Bearer。
-	info, err := getJSONWithAuthorization(client, "https://api.z.ai/api/biz/customer/getCustomerInfo", bizToken, proxyURL)
+	info, err := getJSONWithAuthorizationContext(ctx, client, "https://api.z.ai/api/biz/customer/getCustomerInfo", bizToken, proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -309,14 +315,14 @@ func ExchangeAPIKey(accessToken, proxyURL string) (string, error) {
 	projID, _ := proj["projectId"].(string)
 	keyURL := fmt.Sprintf("https://api.z.ai/api/biz/v1/organization/%s/projects/%s/api_keys", orgID, projID)
 
-	keys, err := getJSON(client, keyURL, bizToken, proxyURL)
+	keys, err := getJSONWithAuthorizationContext(ctx, client, keyURL, "Bearer "+bizToken, proxyURL)
 	if err != nil {
 		return "", err
 	}
 	keyList, _ := keys["data"].([]any)
 	keyObj := findNamed(keyList, "zcode-api-key")
 	if keyObj == nil {
-		created, err := postJSONAuth(client, keyURL, bizToken, map[string]string{"name": "zcode-api-key"}, proxyURL)
+		created, err := postJSONAuthContext(ctx, client, keyURL, bizToken, map[string]string{"name": "zcode-api-key"}, proxyURL)
 		if err != nil {
 			return "", err
 		}
@@ -326,7 +332,7 @@ func ExchangeAPIKey(accessToken, proxyURL string) (string, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return "", errors.New("获取 API Key 失败")
 	}
-	copied, err := getJSON(client, keyURL+"/copy/"+apiKey, bizToken, proxyURL)
+	copied, err := getJSONWithAuthorizationContext(ctx, client, keyURL+"/copy/"+apiKey, "Bearer "+bizToken, proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -386,8 +392,14 @@ func postJSONContext(ctx context.Context, endpoint string, payload any, proxyURL
 	if err != nil {
 		return nil, err
 	}
+	// 官方 NodeApiClient 仅对 ZCode 同源端点补来源头；业务 api.z.ai 不适用。
+	if endpoint == tokenURL {
+		for key, value := range config.ZcodeSourceHeaders() {
+			req.Header.Set(key, value)
+		}
+	}
 	req.Header.Set("Content-Type", "application/json")
-	res, err := client.Do(req)
+	res, err := guardClient(ctx, client).Do(req)
 	if err != nil {
 		return nil, requestError(proxyURL, err)
 	}
@@ -413,8 +425,12 @@ func postJSONContext(ctx context.Context, endpoint string, payload any, proxyURL
 
 // postJSONAuth 带鉴权头的 POST（创建 API Key 用）。
 func postJSONAuth(client *http.Client, endpoint, token string, payload any, proxyURL string) (map[string]any, error) {
+	return postJSONAuthContext(context.Background(), client, endpoint, token, payload, proxyURL)
+}
+
+func postJSONAuthContext(ctx context.Context, client *http.Client, endpoint, token string, payload any, proxyURL string) (map[string]any, error) {
 	data, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +458,11 @@ func getJSON(client *http.Client, endpoint, token, proxyURL string) (map[string]
 
 // getJSONWithAuthorization 按端点契约接收完整认证值，避免全局改变 Key 管理头格式。
 func getJSONWithAuthorization(client *http.Client, endpoint, authorization, proxyURL string) (map[string]any, error) {
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	return getJSONWithAuthorizationContext(context.Background(), client, endpoint, authorization, proxyURL)
+}
+
+func getJSONWithAuthorizationContext(ctx context.Context, client *http.Client, endpoint, authorization, proxyURL string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}

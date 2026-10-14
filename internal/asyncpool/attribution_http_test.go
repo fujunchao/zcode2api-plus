@@ -86,6 +86,9 @@ func TestAsyncRequestIDsRefreshAcrossInPlaceRetries(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", "synthetic-gateway-key")
+	req.Header.Set("X-Zcode-Trace-Id", "synthetic-inbound-trace")
+	req.Header.Set("X-Query-Id", "query_inbound-turn")
+	req.Header.Set("X-Zcode-Query-Source", "compact")
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -110,10 +113,13 @@ func TestAsyncRequestIDsRefreshAcrossInPlaceRetries(t *testing.T) {
 			t.Fatalf("第 %d 次出站须使用全新 UUID 请求 ID，实际 %q", i+1, id)
 		}
 		seen[id] = true
-		for _, key := range []string{"X-Session-Id", "X-Zcode-Trace-Id", "X-Query-Id", "X-Zcode-Session-Type"} {
+		for _, key := range []string{"X-Session-Id", "X-Zcode-Trace-Id", "X-Query-Id", "X-Zcode-Session-Type", "X-Zcode-Query-Source"} {
 			if value := call.headers.Get(key); value == "" || value != observed[0].headers.Get(key) {
 				t.Fatalf("同一票的 %s 不应因原地重试变化", key)
 			}
+		}
+		if call.headers.Get("X-Zcode-Trace-Id") != "synthetic-inbound-trace" || call.headers.Get("X-Query-Id") != "inbound-turn" || call.headers.Get("X-Zcode-Query-Source") != "compact" {
+			t.Fatal("入站归因必须入票保存，并跨瞬时限流/平台过载重试保留")
 		}
 		if call.headers.Get("X-Session-Id") != "synthetic-session-for-retry" || call.body != observed[0].body {
 			t.Fatal("刷新请求 ID 不应改变会话身份或请求正文")

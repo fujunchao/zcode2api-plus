@@ -95,15 +95,15 @@ func TestExchangeCodeFailsFastOnDeadProxy(t *testing.T) {
 	}
 }
 
-func TestClientForKeepsEnvProxyWhenUnset(t *testing.T) {
-	// 不指定代理时必须用零值客户端（nil Transport → DefaultTransport），
-	// 否则会静默关掉环境变量 HTTP_PROXY 的既有行为。
+func TestClientForUsesExplicitDirectWhenUnset(t *testing.T) {
+	// v3 的直连/自动直连回退不能被环境变量改写成未声明的另一条代理。
 	direct, err := clientFor("", exchangeTimeout)
 	if err != nil {
 		t.Fatalf("构造直连客户端失败: %v", err)
 	}
-	if direct.Transport != nil {
-		t.Fatal("未指定代理时 Transport 应为 nil，以沿用 DefaultTransport")
+	transport, ok := direct.Transport.(*http.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Fatal("未指定代理时必须显式关闭环境代理")
 	}
 	viaProxy, err := clientFor("http://1.2.3.4:8080", exchangeTimeout)
 	if err != nil {
