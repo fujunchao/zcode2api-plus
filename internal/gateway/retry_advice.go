@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"maps"
 	"net/http"
 	"strconv"
 	"time"
@@ -22,17 +21,7 @@ func withRetryAdvice(result runResult, remaining time.Duration) runResult {
 		return result
 	}
 	result.RetryAfter = remaining
-	if original, ok := result.Body.(map[string]any); ok {
-		body := maps.Clone(original)
-		if originalError, ok := body["error"].(map[string]any); ok {
-			errBody := maps.Clone(originalError)
-			maps.Copy(errBody, advice)
-			body["error"] = errBody
-		} else {
-			maps.Copy(body, advice)
-		}
-		result.Body = body
-	}
+	// 原始上游错误必须逐字段保真；同步建议通过受限响应头表达。
 	return result
 }
 
