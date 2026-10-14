@@ -102,7 +102,7 @@ func TestZcode2apiAttributionContractAdaptersAndPreciseOverrides(t *testing.T) {
 					}
 					var adapter channel.Adaptor = &openai.Adaptor{}
 					if route.claude {
-						info.ChannelType = constant.ChannelTypeClaude
+						info.ChannelType = constant.ChannelTypeAnthropic
 						adapter = &claude.Adaptor{}
 					}
 					adapter.Init(info)

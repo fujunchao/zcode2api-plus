@@ -548,8 +548,8 @@ func TestMaskURL(t *testing.T) {
 			}
 		})
 	}
-	// 解析失败时原样返回（此时也没有密码可泄）。
-	if got := MaskURL("://bad"); got != "://bad" {
-		t.Fatalf("解析失败应原样返回: %q", got)
+	// 解析失败也可能含凭据，使用固定占位；格式合法的四组行为保持不变。
+	if got := MaskURL("://bad"); got != "invalid-proxy" {
+		t.Fatalf("解析失败应返回固定去敏占位: %q", got)
 	}
 }

@@ -278,10 +278,10 @@ func TestEditAccountValidation(t *testing.T) {
 		}
 	}
 
-	// 不支持的代理协议（normalize 错误消息含允许清单后缀，查前缀即可）
+	// 不支持的协议应拒绝并给出允许清单，不把任意输入片段回显到错误文案。
 	code, body := do(t, mux, st, http.MethodPut, "/admin/api/accounts/"+accountID,
 		map[string]any{"proxy_url": "ftp://x"})
-	if code != http.StatusBadRequest || !strings.HasPrefix(str(t, body["detail"]), "不支持的代理协议: ftp") {
+	if code != http.StatusBadRequest || str(t, body["detail"]) != "不支持的代理协议，允许: http, https, socks4, socks5, socks5h" {
 		t.Fatalf("ftp 代理应 400: %d %v", code, body)
 	}
 
