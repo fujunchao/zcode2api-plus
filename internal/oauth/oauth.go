@@ -289,7 +289,8 @@ func ExchangeAPIKey(accessToken, proxyURL string) (string, error) {
 		return "", err
 	}
 
-	info, err := getJSON(client, "https://api.z.ai/api/biz/customer/getCustomerInfo", bizToken, proxyURL)
+	// ZCode 3.15.3：客户信息使用裸业务 token；后续个人 Key 管理仍使用 Bearer。
+	info, err := getJSONWithAuthorization(client, "https://api.z.ai/api/biz/customer/getCustomerInfo", bizToken, proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -436,11 +437,16 @@ func postJSONAuth(client *http.Client, endpoint, token string, payload any, prox
 
 // getJSON 带鉴权头的 GET。
 func getJSON(client *http.Client, endpoint, token, proxyURL string) (map[string]any, error) {
+	return getJSONWithAuthorization(client, endpoint, "Bearer "+token, proxyURL)
+}
+
+// getJSONWithAuthorization 按端点契约接收完整认证值，避免全局改变 Key 管理头格式。
+func getJSONWithAuthorization(client *http.Client, endpoint, authorization, proxyURL string) (map[string]any, error) {
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", authorization)
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, requestError(proxyURL, err)
