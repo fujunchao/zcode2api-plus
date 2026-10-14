@@ -54,6 +54,7 @@ func (s *Store) editAccountProxyIntent(provider, id string, edit AccountEdit, ap
 	}
 	apply(live)
 	s.strictProxy = next
+	live.CredentialGeneration = next.Credentials[live.ID].Generation
 	return true, nil
 }
 

@@ -367,6 +367,7 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 		s.riskProxyHistory = history
 	}
 	s.strictProxy = *strict
+	s.publishCredentialGenerationsLocked()
 	for key, value := range values {
 		if key == strictProxyStateKey || key == riskProxyHistoryKey {
 			continue

@@ -55,5 +55,6 @@ func (s *Store) SaveOAuthAccount(name, token, email string) (*model.Account, boo
 		return nil, false, err
 	}
 	apply(live)
+	live.CredentialGeneration = next.CredentialGeneration
 	return live.Clone(), false, nil
 }

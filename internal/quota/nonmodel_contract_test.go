@@ -4,6 +4,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"zcode2api/internal/config"
@@ -68,15 +70,39 @@ func TestQuotaNativeHTTPContract(t *testing.T) {
 }
 
 func TestQuotaEmptyProxyUsesExplicitDirect(t *testing.T) {
-	svc, _, _ := setup(t)
+	svc, st, _ := setup(t)
 	t.Cleanup(svc.Close)
 	svc.Client = nil
-	client, err := svc.clientFor(&model.Account{})
+	acc, err := st.AddAccount(model.ProviderZai, "合成直连账号", "synthetic-api-key")
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport, ok := client.(*http.Client).Transport.(*http.Transport)
-	if !ok || transport.Proxy != nil {
-		t.Fatal("额度明确直连不能被环境代理改路")
+	var directCalls, proxyCalls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directCalls.Add(1)
+		_, _ = io.WriteString(w, balancePayload(100))
+	}))
+	t.Cleanup(origin.Close)
+	trap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(trap.Close)
+	trapURL, err := url.Parse(trap.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 默认传输明确配置为代理，避免 http.ProxyFromEnvironment 对环回地址的特殊绕过。
+	// 验证真实路由，不依赖 Store 许可包装器内部的具体 Transport 类型。
+	oldDefault, oldBase := http.DefaultTransport, config.ZcodeBillingBase
+	defaultProxyTransport := &http.Transport{Proxy: http.ProxyURL(trapURL)}
+	http.DefaultTransport, config.ZcodeBillingBase = defaultProxyTransport, origin.URL
+	t.Cleanup(func() {
+		http.DefaultTransport, config.ZcodeBillingBase = oldDefault, oldBase
+		defaultProxyTransport.CloseIdleConnections()
+	})
+	result := svc.FetchQuota(acc)
+	if result["error"] != nil || directCalls.Load() != 1 || proxyCalls.Load() != 0 {
+		t.Fatalf("原生额度入口必须明确直连，不消费默认代理：result=%v direct=%d proxy=%d", result, directCalls.Load(), proxyCalls.Load())
 	}
 }

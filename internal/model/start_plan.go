@@ -6,18 +6,19 @@ import "crypto/sha256"
 // 同时绑定出口与凭据，避免旧线路/旧令牌的空额度被拿来淘汰新线路。
 // 重启后归零，必须先重新查询额度；不能从 LastCheckedAt 推断查询成功。
 type StartPlanObservation struct {
-	AccountID      string
-	Provider       string
-	CheckedAt      float64
-	Missing        bool
-	ProxyID        string
-	ProxyURL       string
-	CredentialHash [32]byte
+	AccountID            string
+	Provider             string
+	CheckedAt            float64
+	Missing              bool
+	ProxyID              string
+	ProxyURL             string
+	CredentialHash       [32]byte
+	CredentialGeneration uint64
 }
 
 func NewStartPlanObservation(a *Account, checkedAt float64, missing bool) StartPlanObservation {
 	o := StartPlanObservation{AccountID: a.ID, Provider: a.Provider, CheckedAt: checkedAt,
-		Missing: missing, CredentialHash: sha256.Sum256([]byte(a.Secret()))}
+		Missing: missing, CredentialHash: sha256.Sum256([]byte(a.Secret())), CredentialGeneration: a.CredentialGeneration}
 	if a.ProxyID != nil {
 		o.ProxyID = *a.ProxyID
 	}

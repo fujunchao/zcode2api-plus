@@ -36,11 +36,13 @@
 - 登录命名线路使用 `ProxyProfile.Generation`；裸 URL 也校验严格淘汰集合。自动登录允许一次零出站的本地重选，手工退役线路明确拒绝。
 - OAuth Key 兑换的五步链均共享取消与准入；失败收尾传原始线路代次，不能用迟到错误删除 A→B→A 后的新版本。
 - 自动登录直连保存 `auto_pending_proxy`，不在登录成功后重新挑线；显式人工直连仍保留。已有有效人工绑定不会被自动收尾覆盖。
-- `ClaimState` 和 OAuth Key 回写改为 `UpdateForRequest`，账号 ID 相同但凭据已变时不应用旧结果。
+- `ClaimState` 和 OAuth Key 回写改为 `UpdateForRequest`；账号快照携带不进入 JSON 的凭据代次，统一比较凭据字节与代次，A→B→A 也不能让旧结果重新生效。quota 的在途合并和缓存身份同样包含代次，不从响应到达后的 live 状态补写旧快照。
 - 双次空额度判据继续要求真正新号、两次独立完整观察、未使用等条件，并关联两次查询的进程内代次证明；不以相同 URL 字符串代替相同线路版本。
 
 ## 回归与验收口径
 
 新增 `internal/{claim,quota,captcha,oauth}/nonmodel_contract_test.go` 覆盖实际 HTTP 目标、认证隔离、来源档案、代理/直连、公共配置重定向，以及 OAuth 各步骤准入/释放。`internal/adminapi/claim_contract_test.go` 固定旧身份领取结果不能覆盖新登录状态。已有 HTTP 407、3007、业务 401、风控失效/冷却、取消和并发回归继续保留。
+
+收尾追加 `internal/quota/credential_aba_test.go`：真实本地 HTTP 的旧额度成功/401 不改新代次健康，普通缓存和等待中的查询也不得跨 ABA 复用。`internal/adminapi/login_contract_test.go` 使用本地 CONNECT/TLS，在最后一步 API Key 响应前执行 A→B→A，固定旧 Key 不覆盖新状态。以上新增项仍必须通过对应提交的远端 CI，不以静态阅读视为通过。
 
 本地只做编辑、gofmt 和差异检查，不运行测试/构建。最终以当前发布提交的完整 GitHub Actions 结果为准；单个新增测试、旧提交绿灯、或该文档本身均不是验收通过证明。

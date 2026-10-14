@@ -103,6 +103,87 @@ func TestCredentialIdentityLateSuccess(t *testing.T) {
 	}
 }
 
+// A→B→A 回到相同凭据字节，也不是原来那一代请求。
+// 复用真实 HTTP 的 channel 闸门，同时保留未换凭据的正对照，防止全面丢弃回写来过关。
+func TestCredentialIdentityLateABAResults(t *testing.T) {
+	for _, entry := range []string{"sync", "async"} {
+		for _, status := range []int{http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusMethodNotAllowed, http.StatusOK} {
+			for _, aba := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%d/aba=%t", entry, status, aba), func(t *testing.T) {
+					f := newCredentialFixture(t, entry, status)
+					initial := f.st.FindAny(f.account.ID)
+					if initial.CredentialGeneration == 0 {
+						t.Fatal("真实入池账号必须具备冻结凭据代次")
+					}
+					done := f.run(t, status == http.StatusOK)
+					f.waitStarted(t)
+					if aba {
+						f.relogin(t)
+						next, isNew, err := f.st.SaveOAuthAccount("synthetic-user", f.oldJWT, "synthetic@example.invalid")
+						if err != nil || isNew || next.ID != initial.ID || next.Secret() != initial.Secret() || next.CredentialGeneration != initial.CredentialGeneration+2 || next.SameCredential(initial) {
+							t.Fatalf("A→B→A 必须沿用账号但撤销旧请求代次：isNew=%t err=%v", isNew, err)
+						}
+					}
+					expectedGeneration := f.st.FindAny(f.account.ID).CredentialGeneration
+					if status == http.StatusOK {
+						// 新一代已取得的健康/额度状态不能被旧成功解除；同代成功则仍须正常复位。
+						if _, err := f.st.Update(f.account.Provider, f.account.ID, func(a *model.Account) {
+							a.Status = model.StatusExhausted
+							a.RateLimitStreak, a.RiskControlStreak, a.Upstream503Streak = 2, 3, 4
+							a.Quota = map[string]map[string]any{"current-generation": {"remaining": float64(17)}}
+						}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					f.release()
+					f.waitDone(t, done)
+					got := f.st.FindAny(f.account.ID)
+					if got.Secret() != initial.Secret() || got.CredentialGeneration != expectedGeneration {
+						t.Fatal("旧请求回写不得回退凭据或代次")
+					}
+					if status == http.StatusOK {
+						if got.UseCount != 1 || got.TotalInputTokens != 5 || got.TotalOutputTokens != 7 || got.Quota["current-generation"]["remaining"] != float64(17) {
+							t.Fatalf("已消费用量仍须按账号累计且不覆盖新额度：use=%d input=%d output=%d quota=%v", got.UseCount, got.TotalInputTokens, got.TotalOutputTokens, got.Quota)
+						}
+						if aba {
+							if got.Status != model.StatusExhausted || got.RateLimitStreak != 2 || got.RiskControlStreak != 3 || got.Upstream503Streak != 4 {
+								t.Fatal("旧代成功不能恢复 ABA 后的新身份或清零失败阶梯")
+							}
+						} else if got.Status != model.StatusActive || got.RateLimitStreak != 0 || got.RiskControlStreak != 0 || got.Upstream503Streak != 0 {
+							t.Fatal("未换凭据的完整成功仍须正常恢复健康状态")
+						}
+						return
+					}
+					if aba {
+						if got.Status != model.StatusActive || got.LastError != nil || got.LastErrorKind != nil || got.LastErrorAt != nil || got.CoolingUntil != nil || got.LastRiskControlAt != nil ||
+							len(got.ExhaustedModels) != 0 || got.RiskControlStreak != 0 || got.RateLimitStreak != 0 || got.Upstream503Streak != 0 || got.FailCount != 0 {
+							t.Fatalf("旧401/耗尽/风控不能污染 ABA 后的新身份：status=%s kind=%v exhausted=%v risk=%d", got.Status, got.LastErrorKind, got.ExhaustedModels, got.RiskControlStreak)
+						}
+						return
+					}
+					if got.LastErrorKind == nil {
+						t.Fatal("未换凭据的失败仍须正常记录错误")
+					}
+					switch status {
+					case http.StatusUnauthorized:
+						if got.Status != model.StatusInvalid || *got.LastErrorKind != model.ErrorKindAuthFailed {
+							t.Fatal("未换凭据的401仍须标记认证失效")
+						}
+					case http.StatusPaymentRequired:
+						if got.ModelAvailability("GLM-5.3") != "exhausted" || *got.LastErrorKind != model.ErrorKindQuotaExhausted {
+							t.Fatal("未换凭据的402仍须标记当前模型耗尽")
+						}
+					case http.StatusMethodNotAllowed:
+						if got.Status != model.StatusCooling || got.CoolingUntil == nil || got.RiskControlStreak != 1 || *got.LastErrorKind != model.ErrorKindRiskControl {
+							t.Fatal("未换凭据的风控仍须推进账号保护阶梯")
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestCredentialIdentityKeepsAdministrativeDisable(t *testing.T) {
 	for _, entry := range []string{"sync", "async", "quota"} {
 		t.Run(entry, func(t *testing.T) {

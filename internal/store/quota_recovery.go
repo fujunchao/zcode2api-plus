@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"math"
+	"strconv"
 	"time"
 
 	"zcode2api/internal/model"
@@ -39,7 +40,7 @@ type QuotaProbe struct {
 }
 
 func quotaCredentialHash(a *model.Account) string {
-	sum := sha256.Sum256([]byte(a.Provider + "\x00" + a.Mode + "\x00" + a.Secret()))
+	sum := sha256.Sum256([]byte(a.Provider + "\x00" + a.Mode + "\x00" + a.Secret() + "\x00" + strconv.FormatUint(a.CredentialGeneration, 10)))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -261,7 +262,7 @@ func (s *Store) FinishQuotaProbe(probe *QuotaProbe, confirmed bool, now time.Tim
 	delete(s.quotaProbes, key)
 	live := s.findLocked(expected.Provider, expected.ID)
 	state := s.quotaRecovery[expected.ID][probe.model]
-	if !confirmed || live == nil || state.Generation != probe.generation ||
+	if !confirmed || !live.SameCredential(expected) || state.Generation != probe.generation ||
 		quotaCredentialHash(live) != quotaCredentialHash(expected) ||
 		derefStr(live.ProxyID) != derefStr(expected.ProxyID) || derefStr(live.ProxyURL) != derefStr(expected.ProxyURL) ||
 		live.DeviceMidOr("") != expected.DeviceMidOr("") || !quotaProbeEligible(live, probe.model, now) {

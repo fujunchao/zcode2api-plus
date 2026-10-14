@@ -255,6 +255,9 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 		return res, err
 	}
 	s.strictProxy = next
+	for _, a := range fresh {
+		a.CredentialGeneration = next.Credentials[a.ID].Generation
+	}
 	s.accounts[provider] = append(s.accounts[provider], fresh...)
 	return res, nil
 }

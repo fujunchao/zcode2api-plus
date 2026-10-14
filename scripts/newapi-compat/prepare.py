@@ -9,8 +9,9 @@ PIN = "2035a82aeb5414253a728bd937d4b8f97aa99b9b"
 HERE = Path(__file__).resolve().parent
 ANCHOR = "\tCloseResponseBodyGracefully(resp)\n\tvar errResponse dto.GeneralErrorResponse\n"
 PATCHED = "\tCloseResponseBodyGracefully(resp)\n\tdefer func() { applyZcode2apiRetryAdvice(ctx, resp, responseBody, newApiErr) }()\n\tvar errResponse dto.GeneralErrorResponse\n"
-CONTROLLER_ANCHOR = "\t\tc.Request.Body = io.NopCloser(bodyStorage)\n"
-CONTROLLER_PATCHED = CONTROLLER_ANCHOR + "\t\tc.Request = c.Request.WithContext(service.Zcode2apiRetryContext(c))\n"
+# rc.41 普通 relay 与异步 submit 都恢复 bodyStorage；只匹配紧邻 relayFormat 分派的同步入口。
+CONTROLLER_ANCHOR = "\t\tc.Request.Body = io.NopCloser(bodyStorage)\n\n\t\tswitch relayFormat {\n"
+CONTROLLER_PATCHED = "\t\tc.Request.Body = io.NopCloser(bodyStorage)\n\t\tc.Request = c.Request.WithContext(service.Zcode2apiRetryContext(c))\n\n\t\tswitch relayFormat {\n"
 ATTRIBUTION_ANCHOR = "\t\tclientHeaderValue := c.Request.Header.Get(name)\n"
 ATTRIBUTION_PATCHED = "\t\tif value, include, handled := zcode2apiAttributionPlaceholder(c, name); handled {\n\t\t\treturn value, include, nil\n\t\t}\n" + ATTRIBUTION_ANCHOR
 

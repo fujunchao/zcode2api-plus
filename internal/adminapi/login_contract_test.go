@@ -30,6 +30,12 @@ func TestOAuthManualDeletedProxyDoesNotSilentlySwitch(t *testing.T) {
 }
 
 func TestOAuthLateAPIKeyResponseCannotOverwriteNewCredential(t *testing.T) {
+	for _, aba := range []bool{false, true} {
+		t.Run(map[bool]string{false: "replace", true: "aba"}[aba], func(t *testing.T) { testOAuthLateAPIKeyResponse(t, aba) })
+	}
+}
+
+func testOAuthLateAPIKeyResponse(t *testing.T, aba bool) {
 	st := newClaimStore(t)
 	if err := st.SetSetting("claim_auto_enabled", "false"); err != nil {
 		t.Fatal(err)
@@ -56,6 +62,11 @@ func TestOAuthLateAPIKeyResponseCannotOverwriteNewCredential(t *testing.T) {
 			})
 			if updateErr != nil {
 				t.Error(updateErr)
+			}
+			if aba {
+				if _, err := st.Update(acc.Provider, acc.ID, func(live *model.Account) { live.JWTToken = &token }); err != nil {
+					t.Error(err)
+				}
 			}
 			body = `{"code":0,"data":{"secretKey":"synthetic-old-secret"}}`
 		default:
@@ -85,7 +96,11 @@ func TestOAuthLateAPIKeyResponseCannotOverwriteNewCredential(t *testing.T) {
 		t.Fatal(apiErr)
 	}
 	current := st.FindAny(acc.ID)
-	if current.APIKey == nil || *current.APIKey != newKey || current.JWTToken == nil || *current.JWTToken != newToken {
+	wantToken := newToken
+	if aba {
+		wantToken = token
+	}
+	if current.APIKey == nil || *current.APIKey != newKey || current.JWTToken == nil || *current.JWTToken != wantToken {
 		t.Fatal("OAuth 旧响应覆盖了新登录的凭据")
 	}
 }

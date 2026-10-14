@@ -181,6 +181,10 @@ type Account struct {
 	TruncateAvoidUntil float64 `json:"-"`
 
 	StartPlanObservation StartPlanObservation `json:"-"` // 新账号双次额度检测使用的运行期查询证据
+
+	// CredentialGeneration 由 Store 从独立 meta 注入请求快照，不能通过 Account JSON 传入。
+	// A→B→A 即使凭据字节相同也是新代次，旧健康/领取/兑换回包不得回写。
+	CredentialGeneration uint64 `json:"-"`
 }
 
 // Create 对应 Python 版 Account.create：按凭证形态判定 jwt/apiKey 模式。
@@ -264,7 +268,7 @@ func (a *Account) Secret() string {
 // 调用方负责在存储锁内读取当前对象；快照在整个请求期间保持不变。
 func (a *Account) SameCredential(expected *Account) bool {
 	return a != nil && expected != nil && a.ID == expected.ID && a.Provider == expected.Provider &&
-		a.Mode == expected.Mode && a.Secret() == expected.Secret()
+		a.Mode == expected.Mode && a.Secret() == expected.Secret() && a.CredentialGeneration == expected.CredentialGeneration
 }
 
 // AcceptsRequestResult 限制上游健康结果的回写；人工停用/归档不由在途结果改写。
@@ -365,6 +369,7 @@ func (a *Account) Clone() *Account {
 		Upstream503Streak:    a.Upstream503Streak,
 		StreamTruncateCount:  a.StreamTruncateCount,
 		TruncateAvoidUntil:   a.TruncateAvoidUntil,
+		CredentialGeneration: a.CredentialGeneration,
 	}
 }
 

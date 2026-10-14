@@ -74,9 +74,17 @@ func (s *Store) migrateStrictProxyVersions() error {
 		}
 	}
 	if !changed {
+		s.publishCredentialGenerationsLocked()
 		return nil
 	}
 	return s.commitProxyBundleStrictLocked(context.Background(), nil, nil, nil, nil, &next)
+}
+
+// 在发布 Store 状态的同一把锁内更新 live；外部请求只能从 Clone 取得冻结的代次。
+func (s *Store) publishCredentialGenerationsLocked() {
+	for _, a := range s.allAccountsLocked() {
+		a.CredentialGeneration = s.strictProxy.Credentials[a.ID].Generation
+	}
 }
 
 func (s *Store) persistAccountVersionLocked(a *model.Account, next strictProxyState) error {
@@ -99,6 +107,7 @@ func (s *Store) persistAccountVersionLocked(a *model.Account, next strictProxySt
 		return err
 	}
 	s.strictProxy = next
+	a.CredentialGeneration = next.Credentials[a.ID].Generation
 	return nil
 }
 

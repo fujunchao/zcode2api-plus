@@ -20,7 +20,8 @@ func NormalizeProxyURL(raw string) (*string, error) {
 	}
 	parsed, err := url.Parse(trimmed)
 	if err != nil {
-		return nil, fmt.Errorf("代理 URL 无效: %v", err)
+		// url.Error 包含原始 URL，即使地址非法仍可能带用户名/密码。
+		return nil, fmt.Errorf("代理 URL 格式无效")
 	}
 	scheme := strings.ToLower(parsed.Scheme)
 	allowed := false
@@ -31,7 +32,7 @@ func NormalizeProxyURL(raw string) (*string, error) {
 		}
 	}
 	if !allowed {
-		return nil, fmt.Errorf("不支持的代理协议: %s，允许: %s", scheme, strings.Join(AllowedSchemes, ", "))
+		return nil, fmt.Errorf("不支持的代理协议，允许: %s", strings.Join(AllowedSchemes, ", "))
 	}
 	if parsed.Host == "" {
 		return nil, fmt.Errorf("代理 URL 缺少主机地址")
@@ -40,13 +41,16 @@ func NormalizeProxyURL(raw string) (*string, error) {
 }
 
 // MaskURL 隐藏代理 URL 里的密码，供错误文案与日志使用。
-// 代理凭据不该出现在对使用者展示的报错里；解析失败时原样返回（此时也没有密码可泄）。
+// 代理凭据不该出现在日志里；解析失败时也可能含密码，必须返回固定占位而不是原文。
 //
 // 手工拼装而不是改写 u.User 再 u.String()：url.UserPassword 会把 * 转义成 %2A，
 // 展示出来是 http://user:%2A%2A%2A@host 这种看不出意图的东西。
 func MaskURL(raw string) string {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.User == nil {
+	if err != nil {
+		return "invalid-proxy"
+	}
+	if parsed.User == nil {
 		return raw
 	}
 	if _, hasPassword := parsed.User.Password(); !hasPassword {

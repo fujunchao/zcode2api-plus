@@ -84,7 +84,7 @@ func TestLateUsageMatchesJSONAccounting(t *testing.T) {
 		"data: {\"type\":\"message_stop\"}\n\n"))
 	sse.Finish()
 	buffered := NewUsageCollector(false)
-	buffered.Feed([]byte(strings.Join([]string{`{"type":"message","role":"assistant","content":[],"stop_reason":"end_turn","usage":`, usage, `}`}, "")))
+	buffered.Feed([]byte(strings.Join([]string{`{"id":"msg_late_usage","type":"message","role":"assistant","content":[],"stop_reason":"end_turn","usage":`, usage, `}`}, "")))
 	buffered.Finish()
 	if sse.AsDict() != buffered.AsDict() || !sse.responseComplete() || !buffered.responseComplete() {
 		t.Fatalf("同一用量在 SSE/JSON 不应不同：sse=%+v json=%+v", sse.AsDict(), buffered.AsDict())

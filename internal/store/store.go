@@ -379,6 +379,9 @@ func (s *Store) persistAccountLocked(acc *model.Account) error {
 			(id, provider, name, mode, status, enabled, created_at, data)
 			VALUES (?,?,?,?,?,?,?,?)`, accountsTable),
 		acc.ID, acc.Provider, acc.Name, acc.Mode, acc.Status, boolToInt(acc.Enabled), acc.CreatedAt, string(data))
+	if err == nil {
+		acc.CredentialGeneration = s.strictProxy.Credentials[acc.ID].Generation
+	}
 	return err
 }
 
