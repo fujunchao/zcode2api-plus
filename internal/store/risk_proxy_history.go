@@ -63,6 +63,13 @@ func (s *Store) RotateAccountProxyAt(expected *model.Account, now time.Time) (Pr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	live := s.findLocked(expected.Provider, expected.ID)
+	if s.initializationManagedLocked(expected.ID) {
+		result.Reason = "initializing"
+		if s.initializations[expected.ID].GrantedAt > 0 {
+			result.Reason = "fixed_proxy"
+		}
+		return result, nil
+	}
 	if !live.AcceptsRequestResult(expected) || derefStr(live.ProxyID) != derefStr(expected.ProxyID) ||
 		derefStr(live.ProxyURL) != derefStr(expected.ProxyURL) {
 		return result, nil

@@ -52,7 +52,7 @@ func (h *Handler) handleStreamTestProxy(w http.ResponseWriter, r *http.Request) 
 	//（max_tokens=16）；探测本身不写任何账号状态、不入用量账。
 	var probeAcc *model.Account
 	for _, a := range h.Store.ListAccounts(model.ProviderZai) {
-		if !a.Enabled || a.ArchivedAt != nil || a.Mode != "jwt" || a.JWTToken == nil {
+		if a.InitializationBlocked() || !a.Enabled || a.ArchivedAt != nil || a.Mode != "jwt" || a.JWTToken == nil {
 			continue
 		}
 		if a.ProxyID != nil && *a.ProxyID == profileID {
@@ -64,12 +64,12 @@ func (h *Handler) handleStreamTestProxy(w http.ResponseWriter, r *http.Request) 
 		writeAPIError(w, errBadRequest("该线路没有绑定启用的 JWT 账号，无法做流式探测"))
 		return
 	}
-	writeJSON(w, http.StatusOK, streamProbeLine(*profile, probeAcc))
+	writeJSON(w, http.StatusOK, streamProbeLine(*profile, probeAcc, h.Store))
 }
 
 // streamProbeLine 经指定线路发最小流式请求并给出判定。永不 panic、不落任何状态；
 // 全部结论通过返回的 map 交给后台展示。
-func streamProbeLine(profile store.ProxyProfile, acc *model.Account) map[string]any {
+func streamProbeLine(profile store.ProxyProfile, acc *model.Account, guards ...*store.Store) map[string]any {
 	start := time.Now()
 	result := map[string]any{
 		"profile":  profile.Name,
@@ -129,7 +129,15 @@ func streamProbeLine(profile store.ProxyProfile, acc *model.Account) map[string]
 	if err != nil {
 		return fail("线路地址无效", err.Error())
 	}
-	resp, err := (&http.Client{Transport: transport}).Do(httpReq)
+	if len(guards) > 0 {
+		release, err := guards[0].AcquireModelDispatch(acc, guards[0].ProxyEgress(acc))
+		if err != nil {
+			return fail("选定账号或线路尚未就绪", err.Error())
+		}
+		defer release()
+	}
+	client := gateway.ModelAttemptClient(&http.Client{Transport: transport})
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return fail("线路不可达或上游无响应", err.Error())
 	}

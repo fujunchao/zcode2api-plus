@@ -927,6 +927,7 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 
 // ProxyReassign 删除线路后对「原本绑定它的账号」的处置结果。
 type ProxyReassign struct {
+	Waiting  []string          // 托管账号等待专用出口，不是直连回退。
 	Assigned map[string]string // accountID → 改派到的新线路 ID
 	Direct   []string          // 已无可用候选、退回直连的 accountID
 }
@@ -1391,6 +1392,9 @@ func (s *Store) Update(provider, idOrName string, fn func(*model.Account)) (bool
 	if acc == nil {
 		return false, nil
 	}
+	if s.initializationManagedLocked(acc.ID) {
+		return s.updateManagedAccountLocked(acc, fn, false)
+	}
 	fn(acc)
 	failed := s.persistAccountLocked(acc)
 	logPersistFailure("update", provider+"/"+idOrName, failed)
@@ -1649,6 +1653,9 @@ func (s *Store) SetEnabled(provider, idOrName string, enabled bool) (bool, error
 	if acc == nil {
 		return false, nil
 	}
+	if s.initializationManagedLocked(acc.ID) {
+		return s.updateManagedAccountLocked(acc, func(a *model.Account) { applyEnabled(a, enabled) }, false)
+	}
 	applyEnabled(acc, enabled)
 	if err := s.persistAccountLocked(acc); err != nil {
 		return false, err
@@ -1664,6 +1671,17 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 	acc := s.findLocked(provider, idOrName)
 	if acc == nil {
 		return false, nil
+	}
+	if s.initializationManagedLocked(acc.ID) {
+		return s.updateManagedAccountLocked(acc, func(a *model.Account) {
+			if archived {
+				now := float64(time.Now().UnixNano()) / 1e9
+				a.ArchivedAt = &now
+				applyEnabled(a, false)
+			} else {
+				a.ArchivedAt = nil
+			}
+		}, false)
 	}
 	if archived {
 		now := float64(time.Now().UnixNano()) / 1e9

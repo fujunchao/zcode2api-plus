@@ -97,9 +97,10 @@ func (h *Handler) handleDeleteProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":              true,
-		"reassigned":      len(reassign.Assigned),
-		"direct_fallback": len(reassign.Direct),
+		"ok":                     true,
+		"reassigned":             len(reassign.Assigned),
+		"direct_fallback":        len(reassign.Direct),
+		"waiting_initialization": len(reassign.Waiting),
 	})
 }
 

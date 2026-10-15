@@ -39,3 +39,40 @@ func (h *Handler) handleSaveNewAccountPolicy(w http.ResponseWriter, r *http.Requ
 		h.Initialization.Wake()
 	}
 }
+
+func (h *Handler) handleInitializationAction(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("account_id")
+	if h.Store.Initialization(id) == nil {
+		writeAPIError(w, errNotFound("该账号没有初始化任务"))
+		return
+	}
+	var payload struct {
+		Revision          uint64 `json:"revision"`
+		UseCurrentDefault bool   `json:"use_current_default"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeAPIError(w, errBadRequest("任务操作格式无效"))
+		return
+	}
+	action := r.PathValue("action")
+	var err error
+	if action == "bind-default" {
+		_, err = h.Store.BindInitialization(id, payload.Revision, payload.UseCurrentDefault)
+	} else {
+		err = h.Store.ChangeInitialization(id, payload.Revision, action)
+	}
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, store.ErrInitializationConflict) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "initialization": h.Store.FindAny(id).Initialization})
+	if h.Initialization != nil {
+		h.Initialization.Wake()
+	}
+}

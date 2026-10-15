@@ -367,6 +367,13 @@ func (s *Store) BindInitialization(id string, revision uint64, currentDefault bo
 	if old.State == "completed" && !currentDefault {
 		return true, nil
 	}
+	policy, policyErr := s.initializationPolicyLocked()
+	if policyErr != nil {
+		return false, policyErr
+	}
+	if !policy.Enabled || !s.ClaimAutoEnabled() {
+		return false, ErrInitializationUnavailable
+	}
 	live := s.findAnyLocked(id)
 	if !initializationHealthy(live, time.Now()) || live.CredentialGeneration != old.CredentialGeneration {
 		return false, ErrInitializationUnavailable

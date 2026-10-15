@@ -17,6 +17,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
+	"zcode2api/internal/initialization"
 	"zcode2api/internal/model"
 	"zcode2api/internal/oauth"
 	"zcode2api/internal/proxyguard"
@@ -214,6 +215,29 @@ func cmdLogin(args []string) {
 
 // claimCLIAccount 将 CLI 领取与后台相同的代理故障收尾绑定，便于离线验证真实调用边界。
 func claimCLIAccount(st *store.Store, acc *model.Account, cm *captcha.Manager) []map[string]any {
+	if acc.IsInitializing() {
+		qs := quota.NewService(st)
+		defer qs.Close()
+		manager := initialization.New(context.Background(), st, qs, cm, nil)
+		defer manager.Close()
+		for {
+			before := st.Initialization(acc.ID)
+			if before == nil || before.Paused || before.State == "waiting" || before.State == "completed" || !before.Managed {
+				break
+			}
+			if err := manager.Step(context.Background(), acc.ID); err != nil {
+				break
+			}
+			after := st.Initialization(acc.ID)
+			if after == nil || after.Revision == before.Revision {
+				break
+			}
+		}
+		if state := st.Initialization(acc.ID); state != nil {
+			fmt.Printf("初始化状态: %s（%s），目标代理: %s\n", state.State, state.Reason, state.DefaultProxyID)
+		}
+		return nil
+	}
 	svc := claim.NewService(cm)
 	svc.Store = st
 	route := st.ProxyEgress(acc)
@@ -228,7 +252,7 @@ func saveCLILogin(st *store.Store, result *oauth.ExchangeResult) (*model.Account
 	if result.Email != nil {
 		email = strings.TrimSpace(*result.Email)
 	}
-	return st.SaveOAuthAccount("oauth-login", result.Token, email)
+	return st.SaveOAuthAccount("oauth-login", result.Token, email, store.AccountCreationOptions{InitializeProxy: true, Source: "cli_login"})
 }
 
 func min(a, b int) int {
@@ -247,7 +271,7 @@ func cmdAddAccount(args []string) {
 	}
 	st := openStore()
 	defer func() { _ = st.Close() }()
-	acc, err := st.AddAccount(args[0], args[1], args[2])
+	acc, _, err := st.AddAccountWithIdentity(args[0], args[1], args[2], "", store.AccountCreationOptions{InitializeProxy: true, Source: "cli_add"})
 	if err != nil {
 		fmt.Println(web.Red + "❌ 添加失败: " + err.Error() + web.Reset)
 		return

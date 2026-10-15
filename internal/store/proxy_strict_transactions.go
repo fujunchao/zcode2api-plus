@@ -16,6 +16,9 @@ func (s *Store) editAccountProxyIntent(provider, id string, edit AccountEdit, ap
 	if live == nil {
 		return false, nil
 	}
+	if s.initializationManagedLocked(live.ID) {
+		return s.updateManagedAccountLocked(live, apply, edit.SetProxyURL)
+	}
 	a := live.Clone()
 	apply(a)
 	if edit.SetProxyURL && derefStr(a.ProxyURL) != "" && s.strictProxyBlockedLocked(derefStr(a.ProxyURL)) {
@@ -72,6 +75,11 @@ func (s *Store) rebindStrictPendingLocked(profiles []ProxyProfile, pending []*mo
 		occupancy[derefStr(a.ProxyID)]++
 	}
 	for _, live := range s.allAccountsLocked() {
+		if s.initializationManagedLocked(live.ID) {
+			delete(next.Pending, live.ID)
+			delete(next.PendingAvoid, live.ID)
+			continue
+		}
 		credential, waiting := next.Pending[live.ID]
 		if !waiting {
 			continue
@@ -164,6 +172,16 @@ func (s *Store) retireStrictIdentityLocked(identity string) (ProxyDecision, erro
 		}
 		a := live.Clone()
 		a.ProxyID, a.ProxyURL = nil, nil
+		if s.initializationManagedLocked(a.ID) {
+			intent := initializationIntent
+			if s.initializations[a.ID].GrantedAt > 0 {
+				intent = fixedProxyIntent
+			}
+			setStrictIntent(&next, a, intent)
+			result.Pending++
+			pending = append(pending, a)
+			continue
+		}
 		if p, ok := s.chooseProxyLocked(remaining, occupancy, "", ""); ok {
 			a.ProxyID, a.ProxyURL = &p.ID, &p.URL
 			occupancy[p.ID]++

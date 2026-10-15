@@ -312,6 +312,7 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 		trackStrictAccountVersions(strict, a)
 	}
 	values := map[string]string{}
+	initializations := s.initializationProxyMutationsLocked(profiles, pending, strict)
 	strictRaw, err := marshalJSON(strict)
 	if err != nil {
 		return err
@@ -357,6 +358,11 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 			return err
 		}
 	}
+	for _, task := range initializations {
+		if err = persistInitializationOnTx(tx, task); err != nil {
+			return err
+		}
+	}
 	if err = ctx.Err(); err != nil {
 		return err
 	}
@@ -367,6 +373,9 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 		s.riskProxyHistory = history
 	}
 	s.strictProxy = *strict
+	for id, task := range initializations {
+		s.initializations[id] = task
+	}
 	s.publishCredentialGenerationsLocked()
 	for key, value := range values {
 		if key == strictProxyStateKey || key == riskProxyHistoryKey {

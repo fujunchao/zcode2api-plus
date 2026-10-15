@@ -426,6 +426,22 @@ func (s *Store) BatchSetEnabled(ids []string, enabled, missingOK bool) (BatchRes
 	if len(targets) == 0 {
 		return res, nil
 	}
+	jobs := map[string]*InitializationTask{}
+	if !enabled {
+		for _, a := range targets {
+			if s.initializationManagedLocked(a.ID) {
+				job := s.initializations[a.ID].Clone()
+				job.Paused = true
+				job.RunID = ""
+				job.Revision++
+				if job.GrantedAt == 0 {
+					job.State = "waiting"
+					job.Reason = "account_disabled"
+				}
+				jobs[a.ID] = job
+			}
+		}
+	}
 
 	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {
@@ -441,6 +457,11 @@ func (s *Store) BatchSetEnabled(ids []string, enabled, missingOK bool) (BatchRes
 			_ = tx.Rollback()
 			return res, err
 		}
+		if err := persistInitializationOnTx(tx, jobs[acc.ID]); err != nil {
+			markBatchRollback(&res, err)
+			_ = tx.Rollback()
+			return res, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		logPersistFailure("batch-update", "batch", err)
@@ -449,6 +470,9 @@ func (s *Store) BatchSetEnabled(ids []string, enabled, missingOK bool) (BatchRes
 	}
 	for _, acc := range targets {
 		applyEnabled(acc, enabled)
+	}
+	for id, job := range jobs {
+		s.initializations[id] = job
 	}
 	return res, nil
 }

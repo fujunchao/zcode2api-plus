@@ -103,6 +103,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/refresh", guard(h.handleRefreshAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/reset-stats", guard(h.handleResetStats))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/recover", guard(h.handleRecoverAccount))
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/initialization/{action}", guard(h.handleInitializationAction))
 	// 批量管理端点（docs/plan-account-batch-management.md）：字面量段 batch
 	// 不会被 {account_id} 通配吞掉——现有通配路由的尾段都是具体字面量
 	// （enabled/archived/refresh/reset-stats/recover），与 batch/* 不相交。
@@ -258,7 +259,7 @@ func (h *Handler) accountSnapshot() ([]map[string]any, map[string]any) {
 // poolStats 概览统计。固定**全量口径**：不受列表过滤/分页参数影响——概览面板
 // 回答「池子整体怎么样」，条件查询回答「我筛出来的有哪些」，两者语义分离。
 func (h *Handler) poolStats(now time.Time) map[string]any {
-	var active, exhausted, cooling, invalid, disabled, archivedCount int
+	var active, exhausted, cooling, invalid, disabled, archivedCount, initializing int
 	var calls, fail, tokensIn, tokensOut, tokensCache int
 	total := 0
 	for _, a := range h.Store.ListAccounts("") {
@@ -267,7 +268,12 @@ func (h *Handler) poolStats(now time.Time) map[string]any {
 			continue
 		}
 		total++
-		switch a.EffectiveStatus(now) {
+		status := a.EffectiveStatus(now)
+		if a.InitializationBlocked() {
+			initializing++
+			status = "initializing"
+		}
+		switch status {
 		case model.StatusActive:
 			active++
 		case model.StatusExhausted:
@@ -288,6 +294,7 @@ func (h *Handler) poolStats(now time.Time) map[string]any {
 	return map[string]any{
 		"total":        total,
 		"active":       active,
+		"initializing": initializing,
 		"exhausted":    exhausted,
 		"cooling":      cooling,
 		"invalid":      invalid,

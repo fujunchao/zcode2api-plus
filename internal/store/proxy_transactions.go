@@ -102,6 +102,15 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 		}
 	}
 	for _, a := range pending {
+		if s.initializationManagedLocked(a.ID) {
+			intent := initializationIntent
+			if s.initializations[a.ID].GrantedAt > 0 {
+				intent = fixedProxyIntent
+			}
+			setStrictIntent(&next, a, intent)
+			result.Waiting = append(result.Waiting, a.ID)
+			continue
+		}
 		p, ok := s.chooseProxyLocked(assignable, occupancy, "", "")
 		if !ok {
 			result.Direct = append(result.Direct, a.ID)

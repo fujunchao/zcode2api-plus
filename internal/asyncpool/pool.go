@@ -1242,7 +1242,7 @@ func (p *Pool) clientFor(acc *model.Account) (*http.Client, store.ProxyEgress) {
 	// 用途是保留「线路 vs 直连」的归因对照组——修好代理路由后这根本可复现的控制臂
 	// 会消失，改由显式开关声明，而不是继续依赖实现缺陷。
 	raw := ""
-	forceDirect := p.Store.AsyncForceDirect()
+	forceDirect := p.Store.AsyncForceDirect() && !acc.UsesFixedProxy()
 	if acc != nil && acc.ProxyURL != nil && !forceDirect {
 		raw = *acc.ProxyURL
 	}

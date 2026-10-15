@@ -49,6 +49,13 @@ func (s *Store) SaveOAuthAccount(name, token, email string, options ...AccountCr
 			a.Name = *candidate.Email
 		}
 	}
+	if s.initializationManagedLocked(live.ID) {
+		_, err := s.updateManagedAccountLocked(live, apply, false)
+		if err != nil {
+			return nil, false, err
+		}
+		return s.snapshotLocked(s.findAnyLocked(live.ID)), false, nil
+	}
 	next := live.Clone()
 	apply(next)
 	if err := s.persistAccountLocked(next); err != nil {

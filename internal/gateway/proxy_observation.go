@@ -61,7 +61,7 @@ func observationRef(value string) string {
 
 // BeginProxyAttempt 获取本次派发许可并冻结去敏证据；不让日志容器承担调度职责。
 func BeginProxyAttempt(ctx context.Context, st *store.Store, acc *model.Account, egress store.ProxyEgress, request *http.Request, body map[string]any, entry string) (context.Context, func(), error) {
-	release, err := st.AcquireProxyDispatch(acc, egress)
+	release, err := st.AcquireModelDispatch(acc, egress)
 	if err != nil {
 		return ctx, nil, err
 	}
