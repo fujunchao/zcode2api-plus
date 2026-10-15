@@ -41,7 +41,8 @@ func initializationFailure(err error) InitializationOutcome {
 	return out
 }
 
-func (s *Service) RunInitialization(acc *model.Account) InitializationOutcome {
+func (s *Service) RunInitialization(acc *model.Account) (out InitializationOutcome) {
+	defer func() { out.NextAt = max(out.NextAt, s.retryAfter) }()
 	if message := s.ReportActivationEvents(acc); message != "" {
 		return InitializationOutcome{Reason: "activation_failed"}
 	}
@@ -52,7 +53,7 @@ func (s *Service) RunInitialization(acc *model.Account) InitializationOutcome {
 	if len(plans) == 0 {
 		return InitializationOutcome{Reason: "no_plans"}
 	}
-	out := InitializationOutcome{Reason: "claimed"}
+	out = InitializationOutcome{Reason: "claimed"}
 	for _, plan := range plans {
 		if s.context().Err() != nil {
 			return out

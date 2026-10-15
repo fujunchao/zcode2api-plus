@@ -81,6 +81,7 @@ const (
 // Service 领取服务：captcha 求解 + billing HTTP（账号代理生效）。
 type Service struct {
 	Initialization *store.InitializationAttempt
+	retryAfter     int64
 	Store          *store.Store
 	Context        context.Context
 	Captcha        *captcha.Manager
@@ -280,6 +281,9 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 		return nil, failure
 	}
 	defer res.Body.Close()
+	if s.Initialization != nil {
+		s.retryAfter = max(s.retryAfter, model.RetryAfterDeadline(res.Header.Get("Retry-After"), time.Now()))
+	}
 	if s.context().Err() != nil {
 		return nil, &ClaimError{msg: s.context().Err().Error()}
 	}
@@ -318,6 +322,10 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 		}
 		_, endsAt := parsePlanWindow(body)
 		return nil, s.proxyFailureError(acc, &ClaimError{msg: msg, code: code, nextAt: endsAt, riskControl: true, httpStatus: res.StatusCode}, proxy.FailureClaimSuspicious)
+	}
+	if s.Initialization != nil && (res.StatusCode < 200 || res.StatusCode >= 300) {
+		_, endsAt := parsePlanWindow(body)
+		return nil, &ClaimError{msg: fmt.Sprintf("领取请求返回 HTTP %d", res.StatusCode), code: code, httpStatus: res.StatusCode, nextAt: endsAt}
 	}
 	if res.StatusCode == 401 || res.StatusCode == 403 {
 		text := lower(raw)

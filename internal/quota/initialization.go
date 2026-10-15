@@ -23,6 +23,7 @@ func (s *Service) ObserveInitialization(ctx context.Context, a *store.Initializa
 	}
 	result, evidence := reader.fetchQuotaOnce(ctx, a.Account)
 	out := model.InitialQuotaObservation{Kind: "unknown", Snapshot: view, CheckedAt: evidence.CheckedAt}
+	out.NextAt = reader.observationNextAt
 	if message, ok := result["error"].(string); ok {
 		out.Error = message
 	}
@@ -37,36 +38,40 @@ func (s *Service) ObserveInitialization(ctx context.Context, a *store.Initializa
 	payload, _ := result["balance"].(map[string]any)
 	data, _ := payload["data"].(map[string]any)
 	balances, _ := data["balances"].([]any)
+	known, unknown, allocated := 0, false, false
 	for _, raw := range balances {
 		balance, ok := raw.(map[string]any)
 		if !ok {
+			unknown = true
 			continue
 		}
 		name := firstNonEmptyString(balance["model"], balance["show_name"])
 		if strings.TrimSpace(name) == "" {
+			unknown = true
 			continue
 		}
 		value, exists := balance["available_units"]
 		if !exists || value == nil {
 			value = balance["remaining_units"]
 		}
-		if n, ok := asNumber(value); ok && n > 0 && !math.IsInf(n, 0) && !math.IsNaN(n) {
-			out.Kind = "available"
-			return out
+		if n, ok := asNumber(value); ok && n >= 0 && !math.IsInf(n, 0) && !math.IsNaN(n) {
+			known++
+			if n > 0 {
+				out.Kind = "available"
+				return out
+			}
+		} else {
+			unknown = true
 		}
-	}
-	// 已有套餐或分配/使用痕迹，只能证明不是从未分配，不能声称当前可用。
-	if plans, _ := data["plans"].([]any); len(plans) > 0 {
-		out.Kind = "allocated"
-	}
-	for _, raw := range balances {
-		if balance, ok := raw.(map[string]any); ok {
-			for _, key := range []string{"total_units", "used_units"} {
-				if n, ok := asNumber(balance[key]); ok && n > 0 && !math.IsInf(n, 0) && !math.IsNaN(n) {
-					out.Kind = "allocated"
-				}
+		for _, key := range []string{"total_units", "used_units"} {
+			if n, ok := asNumber(balance[key]); ok && n > 0 && !math.IsInf(n, 0) && !math.IsNaN(n) {
+				allocated = true
 			}
 		}
+	}
+	// 套餐名称或总量不证明当前已经耗尽；余额缺失时继续隔离，不能释放临时出口。
+	if allocated && known > 0 && !unknown {
+		out.Kind = "allocated"
 	}
 	return out
 }

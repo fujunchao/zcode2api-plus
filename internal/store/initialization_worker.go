@@ -70,9 +70,10 @@ func (s *Store) commitInitializationLocked(t *InitializationTask, a *model.Accou
 func (s *Store) initializationCandidatesLocked(t *InitializationTask) []InitializationCandidate {
 	var candidates []InitializationCandidate
 	seen := map[string]bool{}
+	currentDefault := s.initializationDefaultIdentityLocked(t)
 	for _, p := range s.listProxyProfilesLocked() {
 		identity := strictProxyIdentity(p.URL)
-		if p.ID == t.DefaultProxyID || identity == t.DefaultIdentity || seen[identity] ||
+		if p.ID == t.DefaultProxyID || identity == t.DefaultIdentity || identity == currentDefault || seen[identity] ||
 			(t.Policy.PoolMode == "selected" && !slices.Contains(t.Policy.ProxyIDs, p.ID)) {
 			continue
 		}
@@ -90,6 +91,15 @@ func (s *Store) initializationCandidatesLocked(t *InitializationTask) []Initiali
 		candidates = candidates[:t.Policy.MaxAttempts]
 	}
 	return candidates
+}
+
+func (s *Store) initializationDefaultIdentityLocked(t *InitializationTask) string {
+	for _, p := range s.listProxyProfilesLocked() {
+		if p.ID == t.DefaultProxyID {
+			return strictProxyIdentity(p.URL)
+		}
+	}
+	return t.DefaultIdentity
 }
 
 func initializationHealthy(a *model.Account, now time.Time) bool {
@@ -179,8 +189,9 @@ func (s *Store) BeginInitialization(id string, now time.Time) (*InitializationAt
 			return wait("no_candidates")
 		}
 		var selected *ProxyProfile
+		currentDefault := s.initializationDefaultIdentityLocked(t)
 		for _, candidate := range t.Candidates {
-			if slices.Contains(t.Tried, candidate.Identity) {
+			if slices.Contains(t.Tried, candidate.Identity) || candidate.Identity == currentDefault || candidate.Identity == t.DefaultIdentity {
 				continue
 			}
 			for _, profile := range s.listProxyProfilesLocked() {
@@ -275,12 +286,18 @@ func (s *Store) ObserveInitialization(a *InitializationAttempt, observation mode
 	if observation.Kind == "unknown" || observation.Snapshot == nil || observation.CheckedAt <= 0 {
 		return nil
 	}
+	if !observation.Snapshot.SameCredential(a.Account) {
+		return ErrInitializationConflict
+	}
 	t := s.initializations[a.Task.AccountID].Clone()
 	live := s.findAnyLocked(t.AccountID).Clone()
 	value := observation.Snapshot.Clone()
 	live.Quota, live.Plans, live.Plan = value.Quota, value.Plans, value.Plan
 	live.LastCheckedAt = &observation.CheckedAt
 	live.SyncExhaustedModels()
+	if observation.Kind == "allocated" && live.Status == model.StatusActive {
+		live.Status = model.StatusExhausted
+	}
 	if observation.Kind == "available" {
 		t.GrantedAt = time.Now().UnixMilli()
 		t.Uncertain = false

@@ -34,14 +34,15 @@ type HTTPClient interface {
 
 // Service 额度查询服务：inflight 去重 + 短缓存 + 账号状态回写。
 type Service struct {
-	observationOnly *model.Account // 仅初始化查询的私有实例使用，不改变共享 Service。
-	initialization  *store.InitializationAttempt
-	ctx             context.Context
-	cancel          context.CancelFunc
-	tasks           sync.WaitGroup
-	closed          bool
-	Store           *store.Store
-	Client          HTTPClient // nil 时使用 20s 总超时的默认客户端（对齐 make_async_client(timeout=20)）
+	observationOnly   *model.Account // 仅初始化查询的私有实例使用，不改变共享 Service。
+	initialization    *store.InitializationAttempt
+	observationNextAt int64
+	ctx               context.Context
+	cancel            context.CancelFunc
+	tasks             sync.WaitGroup
+	closed            bool
+	Store             *store.Store
+	Client            HTTPClient // nil 时使用 20s 总超时的默认客户端（对齐 make_async_client(timeout=20)）
 
 	mu       sync.Mutex
 	inflight map[string]*inflightCall
@@ -368,6 +369,9 @@ func (s *Service) handleBillingResponse(acc *model.Account, checkedAt float64, r
 
 func (s *Service) handleBillingResponseForRequest(ctx context.Context, acc *model.Account, checkedAt float64, resp *http.Response, proxied bool, route ...store.ProxyEgress) map[string]any {
 	defer resp.Body.Close()
+	if s.observationOnly != nil {
+		s.observationNextAt = model.RetryAfterDeadline(resp.Header.Get("Retry-After"), s.now())
+	}
 	if ctx.Err() != nil {
 		return map[string]any{"error": ctx.Err().Error()}
 	}

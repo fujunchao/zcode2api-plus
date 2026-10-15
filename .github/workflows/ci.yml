@@ -133,7 +133,7 @@ jobs:
           go test ./internal/store -run 'TestDeleteProxy|TestConcurrentDeleteProxies' -count=20 -timeout=180s
           go test ./internal/adminapi -run '^TestDeleteProxySharesOccupiedProxy$' -count=20 -timeout=60s
 
-      # 新号领取、缓存失效、双次空额度原子改派与老账号保护均使用隔离数据和本地服务。
+      # 新号持久初始化、固定出口、事务/重启/ABA、等待头与老账号保护使用隔离数据和本地服务。
       - name: Test new account quota regression (repeat)
         run: go test ./internal/adminapi ./internal/quota ./internal/store -run 'TestNewAccount|TestExistingAccount.*(ClaimRisk|EmptyQuota|Relogin)|TestExistingBatchClaim|TestImportedAccounts|TestFetchQuotaFresh|TestRefreshAccountsObserved' -count=20 -timeout=180s
 

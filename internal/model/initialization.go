@@ -25,6 +25,7 @@ type InitialQuotaObservation struct {
 	CheckedAt    float64
 	Error        string
 	ProxyFailure bool
+	NextAt       int64
 }
 
 func (v *InitializationView) Clone() *InitializationView {

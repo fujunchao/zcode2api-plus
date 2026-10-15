@@ -72,6 +72,9 @@ func (m *Manager) loop() {
 
 // Step 一次只尝试一条代理，释放共享领取槽位后才轮到下一账号/下一候选。
 func (m *Manager) Step(ctx context.Context, id string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	t := m.Store.Initialization(id)
 	if t == nil || !t.Managed || t.Paused {
 		return nil
@@ -86,6 +89,9 @@ func (m *Manager) Step(ctx context.Context, id string) error {
 			return err
 		}
 		defer release()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	a, err := m.Store.BeginInitialization(id, time.Now())
 	if err != nil || a == nil {
@@ -115,13 +121,13 @@ func (m *Manager) Step(ctx context.Context, id string) error {
 		return m.bind(id)
 	}
 	if a.Task.State == "verifying" || a.Task.Uncertain {
-		return m.Store.EndInitialization(a, "quota_pending", "先前请求结果仍未确认，请复查后重试", 0, false)
+		return m.Store.EndInitialization(a, "quota_pending", "先前请求结果仍未确认，请复查后重试", first.NextAt, false)
 	}
 	if first.Kind == "allocated" || a.Account.UseCount > 0 || (a.Account.ClaimView() != nil && a.Account.ClaimView().ClaimedAt != nil) {
 		return m.Store.EndInitialization(a, "historical_quota", "已有套餐或使用记录，不作为未激活新号重领", 0, false)
 	}
 	if first.Kind != "missing" {
-		return m.Store.EndInitialization(a, "quota_unknown", "未取得有效额度证据", 0, first.ProxyFailure)
+		return m.Store.EndInitialization(a, "quota_unknown", "未取得有效额度证据", first.NextAt, first.ProxyFailure && first.NextAt == 0)
 	}
 	svc := claim.NewServiceContext(ctx, m.Captcha)
 	svc.Store = m.Store
@@ -167,7 +173,10 @@ func (m *Manager) Step(ctx context.Context, id string) error {
 		}
 	}
 	retry := (outcome.Reason == "no_plans" && last.Kind == "missing") || outcome.Reason == "proxy_unreachable"
-	nextAt := outcome.NextAt
+	nextAt := max(outcome.NextAt, last.NextAt)
+	if last.NextAt > time.Now().UnixMilli() {
+		retry = false
+	}
 	if retry {
 		nextAt = 0
 	}
