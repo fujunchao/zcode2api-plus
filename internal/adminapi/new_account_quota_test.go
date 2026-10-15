@@ -318,8 +318,15 @@ func TestNewAccountClaimFailureOrNoPlanStillRefreshes(t *testing.T) {
 			a := f.login(t, "claim-not-successful")
 			f.wait(t)
 			got := f.h.Store.FindAny(a.ID)
-			if got.ProxyID == nil || *got.ProxyID != f.good.ID || len(f.h.Store.ListProxyProfiles()) != 1 {
-				t.Fatal("领取失败或无套餐也必须补查；双次确证空额度才在收尾淘汰")
+			wantID, wantCount := f.bad.ID, 2
+			if mode == "领取风控" {
+				wantID, wantCount = f.good.ID, 1
+			}
+			if got.ProxyID == nil || *got.ProxyID != wantID || len(f.h.Store.ListProxyProfiles()) != wantCount {
+				t.Fatal("普通失败或无套餐不得删线；旧模式的明确领取风控仍沿用独立故障处置")
+			}
+			if f.balances[a.Secret()] != 2 {
+				t.Fatal("领取失败或无套餐也必须真实补查额度")
 			}
 		})
 	}
