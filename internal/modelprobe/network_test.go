@@ -14,6 +14,82 @@ import (
 	"zcode2api/internal/store"
 )
 
+func TestUnifiedNetworkModelConnectionFailureDoesNotReplayModel(t *testing.T) {
+	f := newFixture(t)
+	var modelCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(200)
+			return
+		}
+		modelCalls.Add(1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer server.Close()
+	if _, err := f.st.UpdateProxyProfile(f.target.ID, "连接复核", server.URL, true); err != nil {
+		t.Fatal(err)
+	}
+	p := f.st.ModelProbeSettings()
+	p.NetworkEnabled = true
+	if _, err := f.st.SaveModelProbeSettings(p, f.now); err != nil {
+		t.Fatal(err)
+	}
+	m := modelprobe.NewWithNetworkTargets(context.Background(), f.st, func() []string { return []string{"http://model.invalid/"} }, func() time.Time { return f.now })
+	defer m.Close()
+	if _, err := f.st.QueueModelProbe(f.target.ID, "manual", f.now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if modelCalls.Load() != 1 {
+		t.Fatal("应有一次真实模型连接失败")
+	}
+	if _, err := m.RunNetworkDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if worked, err := m.RunDue(context.Background()); err != nil || worked {
+		t.Fatalf("网络复核不能自动重放模型请求：worked=%t err=%v", worked, err)
+	}
+	if len(f.st.ListProxyProfiles()) != 2 {
+		t.Fatal("浅请求正常时不能因模型连接失败删代理")
+	}
+}
+
+func TestUnifiedNetworkPreflightFailureDoesNotConsumeModelBudget(t *testing.T) {
+	f := newFixture(t)
+	var modelCalls atomic.Int32
+	f.respond = func(route, secret string, n int) (int, string) {
+		if secret != "" {
+			modelCalls.Add(1)
+		}
+		return 403, "Just a moment"
+	}
+	p := f.st.ModelProbeSettings()
+	p.NetworkEnabled = true
+	if _, err := f.st.SaveModelProbeSettings(p, f.now); err != nil {
+		t.Fatal(err)
+	}
+	m := modelprobe.NewWithNetworkTargets(context.Background(), f.st, func() []string { return []string{"http://model.invalid/"} }, func() time.Time { return f.now })
+	defer m.Close()
+	if _, err := f.st.QueueModelProbe(f.target.ID, "manual", f.now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := f.st.ModelProbeSummary(f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.UsedRequests != 0 || modelCalls.Load() != 0 {
+		t.Fatal("网络未通过不得发送模型或扣模型请求预算")
+	}
+}
+
 type networkFixture struct {
 	st        *store.Store
 	m         *modelprobe.Manager
