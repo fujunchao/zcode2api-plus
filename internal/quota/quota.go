@@ -34,12 +34,14 @@ type HTTPClient interface {
 
 // Service 额度查询服务：inflight 去重 + 短缓存 + 账号状态回写。
 type Service struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	tasks  sync.WaitGroup
-	closed bool
-	Store  *store.Store
-	Client HTTPClient // nil 时使用 20s 总超时的默认客户端（对齐 make_async_client(timeout=20)）
+	observationOnly *model.Account // 仅初始化查询的私有实例使用，不改变共享 Service。
+	initialization  *store.InitializationAttempt
+	ctx             context.Context
+	cancel          context.CancelFunc
+	tasks           sync.WaitGroup
+	closed          bool
+	Store           *store.Store
+	Client          HTTPClient // nil 时使用 20s 总超时的默认客户端（对齐 make_async_client(timeout=20)）
 
 	mu       sync.Mutex
 	inflight map[string]*inflightCall
@@ -199,6 +201,9 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[
 	// queryQuotaContext 已将实际出站快照和合并/缓存身份一并固定，不能在这里再换快照。
 	proxied := s.Client == nil && snap.ProxyID != nil && *snap.ProxyID != "" && snap.ProxyURL != nil && *snap.ProxyURL != ""
 	route := s.Store.ProxyEgress(snap)
+	if s.initialization != nil {
+		route = s.initialization.Egress
+	}
 
 	query := url.Values{}
 	query.Set("app_version", config.ZcodeClientVersion)
@@ -222,7 +227,7 @@ func (s *Service) fetchQuotaOnce(ctx context.Context, snap *model.Account) (map[
 				payload, _ := result["balance"].(map[string]any)
 				observation = startPlanObservation(snap, checkedAt, payload)
 				// 双次空额度清理还须匹配两次真实查询的凭据/线路代次，不能只比较 URL 字节。
-				if proxied {
+				if proxied && s.observationOnly == nil {
 					s.Store.RecordStartPlanProxyObservation(snap, route, observation)
 				}
 			}
@@ -243,7 +248,11 @@ func (s *Service) quotaRequestFailure(ctx context.Context, acc *model.Account, c
 	s.fail(acc, checkedAt, message, model.ErrorKindQuotaQueryFailed, "")
 	out := map[string]any{"error": message}
 	if proxyFailure {
-		maps.Copy(out, proxyguard.Purge(ctx, s.Store, acc, proxy.FailureEndpointUnreachable, route...))
+		if s.observationOnly != nil {
+			out["proxy_failure"] = proxy.FailureEndpointUnreachable
+		} else {
+			maps.Copy(out, proxyguard.Purge(ctx, s.Store, acc, proxy.FailureEndpointUnreachable, route...))
+		}
 	}
 	return out
 }
@@ -255,6 +264,10 @@ func (s *Service) quotaRequestFailure(ctx context.Context, acc *model.Account, c
 // 保护放在统一回写边界，覆盖失败、405 幂等、空额度和耗尽等所有路径，而不只在
 // 成功分支判断 LastErrorKind——否则先前的查询失败会覆盖原因，下一次成功就误解封。
 func (s *Service) apply(acc *model.Account, fn func(live *model.Account)) {
+	if s.observationOnly != nil {
+		fn(s.observationOnly)
+		return
+	}
 	_, _ = s.Store.UpdateForRequest(acc, func(live *model.Account) {
 		// 任何实际查询先废弃同出口的旧证据，只有完整成功响应才能重新建立。
 		// 出口已改变时，额度/状态同样不能再由旧查询覆盖，而不仅仅保护证据字段。
@@ -330,6 +343,9 @@ func (s *Service) clientFor(acc *model.Account, route ...store.ProxyEgress) (HTT
 		return nil, err
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if s.initialization != nil {
+		return s.Store.GuardInitializationClient(client, s.initialization), nil
+	}
 	if s.Store != nil {
 		egress := s.Store.ProxyEgress(acc)
 		if len(route) > 0 {
@@ -596,6 +612,9 @@ func (s *Service) queryQuotaContext(ctx context.Context, acc *model.Account, fre
 		requestAccount = s.Store.SnapshotAccount(acc.Provider, acc.ID)
 		if requestAccount == nil {
 			return map[string]any{"error": "账号已不存在"}, model.StartPlanObservation{}
+		}
+		if requestAccount.InitializationBlocked() {
+			return map[string]any{"error": "账号初始化或固定出口尚未就绪"}, model.StartPlanObservation{}
 		}
 		s.mu.Lock()
 		if s.closed || ctx.Err() != nil || s.ctx.Err() != nil {

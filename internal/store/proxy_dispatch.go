@@ -110,14 +110,21 @@ func (s *Store) GuardProxyClient(client *http.Client, acc *model.Account, egress
 }
 
 type strictProxyTransport struct {
-	store   *Store
-	account *model.Account
-	egress  ProxyEgress
-	base    http.RoundTripper
+	initialization *InitializationAttempt
+	store          *Store
+	account        *model.Account
+	egress         ProxyEgress
+	base           http.RoundTripper
 }
 
 func (t *strictProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	release, err := t.store.AcquireProxyDispatch(t.account, t.egress)
+	var release func()
+	var err error
+	if t.initialization != nil {
+		release, err = t.store.AcquireInitializationDispatch(t.initialization)
+	} else {
+		release, err = t.store.AcquireProxyDispatch(t.account, t.egress)
+	}
 	if err != nil {
 		return nil, err
 	}

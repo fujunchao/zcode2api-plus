@@ -215,10 +215,17 @@ func (h *Handler) postAddAccounts(provider string, added []string, autoAssign bo
 		addedSet[id] = true
 	}
 	fresh := []*model.Account{}
+	initializing := false
 	for _, a := range h.Store.ListAccounts(provider) {
+		if addedSet[a.ID] && a.IsInitializing() {
+			initializing = true
+		}
 		if addedSet[a.ID] && a.Mode == "jwt" && !a.IsInitializing() {
 			fresh = append(fresh, a)
 		}
+	}
+	if initializing && h.Initialization != nil {
+		h.Initialization.Wake()
 	}
 	if len(fresh) > 0 {
 		_, observations := h.Quota.RefreshAccountsObserved(fresh)

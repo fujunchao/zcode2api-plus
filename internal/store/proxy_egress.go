@@ -25,6 +25,10 @@ type ProxyEgress struct {
 func (s *Store) ProxyEgress(acc *model.Account) ProxyEgress {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.proxyEgressLocked(acc)
+}
+
+func (s *Store) proxyEgressLocked(acc *model.Account) ProxyEgress {
 	e := ProxyEgress{Label: "direct", Endpoint: "direct", Mode: "direct"}
 	if acc != nil {
 		e.credentialRef = s.strictCredentialRefLocked(acc)

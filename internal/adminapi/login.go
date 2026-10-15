@@ -317,6 +317,9 @@ func (h *Handler) saveOAuthAccountContext(ctx context.Context, result *oauth.Exc
 	if session != nil {
 		session.createdAccountID = ""
 	}
+	if account.IsInitializing() && h.Initialization != nil {
+		h.Initialization.Wake()
+	}
 	return account, nil
 }
 

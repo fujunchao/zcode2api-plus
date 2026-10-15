@@ -20,6 +20,9 @@ func Purge(ctx context.Context, st *store.Store, acc *model.Account, reason stri
 		return out
 	}
 	out["proxy_failure"] = reason
+	if task := st.Initialization(acc.ID); task != nil && task.Managed && task.State != "completed" {
+		return out
+	}
 	removed, reassign, err := st.PurgeFailedAccountProxy(acc, route...)
 	if err != nil {
 		out["proxy_remove_error"] = err.Error()

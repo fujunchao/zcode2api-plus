@@ -18,6 +18,15 @@ type InitializationView struct {
 	LastError      string `json:"last_error,omitempty"`
 }
 
+// InitialQuotaObservation 仅在真实成功查询中产生；Snapshot 只提供待提交的额度字段。
+type InitialQuotaObservation struct {
+	Kind         string // unknown / missing / allocated / available
+	Snapshot     *Account
+	CheckedAt    float64
+	Error        string
+	ProxyFailure bool
+}
+
 func (v *InitializationView) Clone() *InitializationView {
 	if v == nil {
 		return nil

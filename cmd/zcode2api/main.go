@@ -126,6 +126,7 @@ func serve() int {
 	gw.Register(mux)
 	admin := adminapi.New(st, authSvc, cm, qs, ctx)
 	admin.Register(mux)
+	admin.Initialization.Start()
 
 	// OpenAI 兼容层：/v1/chat/completions 复用同一引擎（M4）
 	openai.New(engine, authSvc).Register(mux)

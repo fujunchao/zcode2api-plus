@@ -541,11 +541,15 @@ func (s *Store) egressVersionCurrentLocked(acc *model.Account, e ProxyEgress) bo
 
 // AcquireProxyDispatch 与严格删除共享线性化点；已获许可流不被删除动作取消。
 func (s *Store) AcquireProxyDispatch(acc *model.Account, egress ProxyEgress) (func(), error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acquireProxyDispatchLocked(acc, egress)
+}
+
+func (s *Store) acquireProxyDispatchLocked(acc *model.Account, egress ProxyEgress) (func(), error) {
 	if egress.Mode == "custom_client" {
 		return func() {}, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if egress.Mode != "proxy" {
 		if egress.Mode != "direct" && egress.Mode != "direct_fallback" && egress.Mode != "forced_direct" {
 			return nil, ErrInvalidProxyRoute

@@ -15,6 +15,7 @@ import (
 
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
+	"zcode2api/internal/initialization"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxysub"
 	"zcode2api/internal/quota"
@@ -23,17 +24,18 @@ import (
 
 // Handler 后台管理 HTTP 层。
 type Handler struct {
-	Subscription *proxysub.Manager
-	ctx          context.Context
-	cancel       context.CancelFunc
-	autoMu       sync.Mutex
-	autoClosed   bool
-	autoTasks    sync.WaitGroup
-	Store        *store.Store
-	Auth         *auth.Service
-	Captcha      *captcha.Manager
-	Quota        *quota.Service
-	StartedAt    time.Time
+	Initialization *initialization.Manager
+	Subscription   *proxysub.Manager
+	ctx            context.Context
+	cancel         context.CancelFunc
+	autoMu         sync.Mutex
+	autoClosed     bool
+	autoTasks      sync.WaitGroup
+	Store          *store.Store
+	Auth           *auth.Service
+	Captcha        *captcha.Manager
+	Quota          *quota.Service
+	StartedAt      time.Time
 }
 
 // New 创建后台管理处理器（StartedAt 对齐 Python 版模块导入时刻 _STARTED_AT）。
@@ -43,7 +45,16 @@ func New(st *store.Store, au *auth.Service, cm *captcha.Manager, qs *quota.Servi
 		parent = parents[0]
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &Handler{ctx: ctx, cancel: cancel, Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now(), Subscription: proxysub.New(st, ctx)}
+	h := &Handler{ctx: ctx, cancel: cancel, Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now(), Subscription: proxysub.New(st, ctx)}
+	h.Initialization = initialization.New(ctx, st, qs, cm, func(ctx context.Context) (func(), error) {
+		select {
+		case claimSlot <- struct{}{}:
+			return claimSlot.release, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	return h
 }
 
 func (h *Handler) backgroundContext() context.Context {
@@ -62,6 +73,9 @@ func (h *Handler) Close() {
 	}
 	h.autoMu.Unlock()
 	h.autoTasks.Wait()
+	if h.Initialization != nil {
+		h.Initialization.Close()
+	}
 	if h.Subscription != nil {
 		h.Subscription.Close()
 	}

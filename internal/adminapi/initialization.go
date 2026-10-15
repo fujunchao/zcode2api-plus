@@ -35,4 +35,7 @@ func (h *Handler) handleSaveNewAccountPolicy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, saved)
+	if h.Initialization != nil {
+		h.Initialization.Wake()
+	}
 }

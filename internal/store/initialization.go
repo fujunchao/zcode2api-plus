@@ -135,6 +135,7 @@ type InitializationTask struct {
 	Reason                 string                    `json:"reason"`
 	Policy                 NewAccountProxyPolicy     `json:"policy"`
 	DefaultProxyID         string                    `json:"default_proxy_id"`
+	DefaultIdentity        string                    `json:"default_identity"`
 	CredentialGeneration   uint64                    `json:"credential_generation"`
 	RouteGeneration        uint64                    `json:"route_generation"`
 	CurrentProxyID         string                    `json:"current_proxy_id"`
@@ -174,6 +175,11 @@ func (s *Store) newInitializationLocked(a *model.Account, options []AccountCreat
 		return nil, err
 	}
 	t := &InitializationTask{Version: 1, AccountID: a.ID, Source: options[0].Source, Revision: 1, Managed: true, State: "queued", Reason: "queued", Policy: p, DefaultProxyID: p.DefaultProxyID, CreatedAt: time.Now().UnixMilli()}
+	for _, profile := range s.listProxyProfilesLocked() {
+		if profile.ID == p.DefaultProxyID {
+			t.DefaultIdentity = strictProxyIdentity(profile.URL)
+		}
+	}
 	if selected := options[0].LoginProxy; selected != nil {
 		for _, current := range s.listProxyProfilesLocked() {
 			if current.ID == selected.ID && current.Generation == selected.Generation && current.URL == selected.URL {

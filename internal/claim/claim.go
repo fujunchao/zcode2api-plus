@@ -80,9 +80,10 @@ const (
 
 // Service 领取服务：captcha 求解 + billing HTTP（账号代理生效）。
 type Service struct {
-	Store   *store.Store
-	Context context.Context
-	Captcha *captcha.Manager
+	Initialization *store.InitializationAttempt
+	Store          *store.Store
+	Context        context.Context
+	Captcha        *captcha.Manager
 	// Client 测试注入；nil 时按账号代理构造（25s 超时，短请求语义）。
 	Client HTTPClient
 }
@@ -124,6 +125,9 @@ func (s *Service) clientFor(acc *model.Account) (HTTPClient, error) {
 	}
 	// 领取认证/验证码只能发给明确目标，不自动把认证头或 POST 正文转到 Location。
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if s.Initialization != nil {
+		return s.Store.GuardInitializationClient(client, s.Initialization), nil
+	}
 	if s.Store != nil {
 		client = s.Store.GuardProxyClient(client, acc, s.Store.ProxyEgress(acc))
 	}
@@ -259,6 +263,13 @@ func (s *Service) billingRequest(acc *model.Account, method, path string, header
 	client, err := s.clientFor(acc)
 	if err != nil {
 		return nil, s.proxyFailureError(acc, &ClaimError{msg: "账号代理配置无效，无法发起领取请求", endpointUnreachable: true}, proxy.FailureEndpointUnreachable)
+	}
+	if s.Initialization != nil && method == http.MethodPost && path == "/billing/claim" {
+		var data map[string]string
+		_ = json.Unmarshal(payload, &data)
+		if err := s.Store.RecordInitializationClaim(s.Initialization, data["plan_id"]); err != nil {
+			return nil, err
+		}
 	}
 	res, err := client.Do(req)
 	if err != nil {

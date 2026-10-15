@@ -66,6 +66,7 @@ type Store struct {
 	closeErr              error
 	accounts              map[string][]*model.Account
 	initializations       map[string]*InitializationTask
+	initializationRuns    map[string]string
 	settings              map[string]string
 	rotation              map[string]int
 	riskProxyHistory      riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
@@ -109,15 +110,16 @@ func New() (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		Requests:          requeststats.New(),
-		db:                db,
-		accounts:          map[string][]*model.Account{model.ProviderZai: {}},
-		settings:          map[string]string{},
-		initializations:   map[string]*InitializationTask{},
-		rotation:          map[string]int{},
-		lineTruncStrikes:  map[string]int{},
-		lineTruncTotals:   map[string]int{},
-		strictJournalPath: config.DBPath + ".strict-proxy.json",
+		Requests:           requeststats.New(),
+		db:                 db,
+		accounts:           map[string][]*model.Account{model.ProviderZai: {}},
+		settings:           map[string]string{},
+		initializations:    map[string]*InitializationTask{},
+		initializationRuns: map[string]string{},
+		rotation:           map[string]int{},
+		lineTruncStrikes:   map[string]int{},
+		lineTruncTotals:    map[string]int{},
+		strictJournalPath:  config.DBPath + ".strict-proxy.json",
 	}
 	if err := s.init(); err != nil {
 		_ = db.Close()

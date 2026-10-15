@@ -460,6 +460,10 @@ func (h *Handler) handleClaimPreview(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		route := h.Store.ProxyEgress(acc)
+		if acc.InitializationBlocked() {
+			out = append(out, map[string]any{"account_id": acc.ID, "plans": []any{}, "error": "账号正在初始化或等待固定代理", "activated": false})
+			continue
+		}
 		if claimBlockedByCooling(acc, now) {
 			out = append(out, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "plans": []any{},
@@ -542,7 +546,7 @@ func (h *Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 		// 用 claimBlockedByCooling 判断（与 preview 同一函数）：EffectiveStatus 把
 		// 「冷却已到期」视为 active，只看原始 Status 会让同一账号 preview 可查、
 		// claim 被拒，用户看到自相矛盾的结果。
-		if claimBlockedByCooling(acc, time.Now()) {
+		if acc.InitializationBlocked() || claimBlockedByCooling(acc, time.Now()) {
 			outcomes = append(outcomes, map[string]any{
 				"account_id": acc.ID, "account_name": acc.Name, "ok": false,
 				"message": "賬號冷卻中（風控/限流），已跳過領取",
