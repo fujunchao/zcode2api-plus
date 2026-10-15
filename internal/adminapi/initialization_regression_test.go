@@ -154,6 +154,15 @@ func TestNewAccountEmptyQuotaNeverDeletesSharedProxy(t *testing.T) {
 }
 
 func TestNewAccountInitializationRotatesThenPinsDefault(t *testing.T) {
+	testNewAccountInitializationRoute(t, "/admin/api/accounts")
+}
+
+func TestNewAccountInitializationImportRotatesThenPinsDefault(t *testing.T) {
+	testNewAccountInitializationRoute(t, "/admin/api/import")
+}
+
+func testNewAccountInitializationRoute(t *testing.T, path string) {
+	t.Helper()
 	f := newAccountQuotaFixture(t, newAccountEmptyBalance, newAccountEmptyBalance)
 	fixed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("固定业务代理不应参与取额请求")
@@ -193,7 +202,11 @@ func TestNewAccountInitializationRotatesThenPinsDefault(t *testing.T) {
 	if status, body := do(t, mux, f.h.Store, http.MethodPut, "/admin/api/proxies/new-account-policy", policy); status != http.StatusOK {
 		t.Fatalf("配置失败：%d %v", status, body)
 	}
-	if status, body := do(t, mux, f.h.Store, http.MethodPost, "/admin/api/accounts", map[string]any{"tokens": []string{jwtTokenFor("rotate-new")}, "proxy_id": "__auto__"}); status != http.StatusOK {
+	payload := map[string]any{"tokens": []string{jwtTokenFor("rotate-new")}, "proxy_id": "__auto__"}
+	if path == "/admin/api/import" {
+		payload = map[string]any{"providers": map[string]any{"zai": []map[string]any{{"name": "导入轮询", "secret": jwtTokenFor("rotate-new"), "disabled_models": []string{"other-model"}}}}}
+	}
+	if status, body := do(t, mux, f.h.Store, http.MethodPost, path, payload); status != http.StatusOK {
 		t.Fatalf("新增失败：%d %v", status, body)
 	}
 	deadline := time.After(5 * time.Second)
