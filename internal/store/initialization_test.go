@@ -174,6 +174,23 @@ func TestNewAccountInitializationPolicyRevisionAndUnavailableDisable(t *testing.
 	}
 }
 
+func TestNewAccountInitializationExcludesUpdatedDefaultAliases(t *testing.T) {
+	s, a, trial, fixed := initializationStoreFixture(t)
+	if _, err := s.UpdateProxyProfile(fixed.ID, fixed.Name, trial.URL, true); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := s.BeginInitialization(a.ID, time.Now())
+	if attempt != nil {
+		s.ReleaseInitialization(attempt)
+	}
+	if err != nil || attempt != nil {
+		t.Fatalf("默认节点地址更新后，也不能通过别名拿它取额：%v", err)
+	}
+	if s.Initialization(a.ID).Reason != "no_candidates" {
+		t.Fatal("应等待不同出口的取额节点")
+	}
+}
+
 func initializationStoreFixture(t *testing.T) (*Store, *model.Account, ProxyProfile, ProxyProfile) {
 	t.Helper()
 	s := newTestStore(t)
