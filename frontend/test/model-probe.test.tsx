@@ -64,3 +64,15 @@ test('未启用和405都不能显示为模型健康，手动请求不能绕过�
   expect(mock.api.mock.calls.some(([method]) => method === 'POST')).toBe(false)
   client.clear()
 })
+
+test('统一巡检允许不启用模型而配置网络复核时间', async () => {
+  const data = { ...summary(), settings: { ...summary().settings, network_enabled: true, network_interval_minutes: 30, network_confirm_seconds: 10 } }
+  const client = mount(data)
+  fireEvent.click(await screen.findByRole('button', { name: /配置.*巡检/ }))
+  const input = await screen.findByLabelText('网络复核等待（秒）')
+  expect((input as HTMLInputElement).value).toBe('10')
+  fireEvent.change(input, { target: { value: '7' } })
+  fireEvent.submit(screen.getByRole('form', { name: /巡检配置/ }))
+  await waitFor(() => expect(mock.api).toHaveBeenCalledWith('PUT', '/proxies/model-probe/settings', expect.objectContaining({ network_confirm_seconds: 7, network_enabled: true, enabled: false })))
+  client.clear()
+})
