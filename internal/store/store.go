@@ -2005,7 +2005,7 @@ type ImportPayload struct {
 
 // ImportAccounts 导入账号，返回导入数量与本次「新建」的账号 ID。
 // 命中既有记录（重复导入）时计数仍递增，但不计入 newIDs —— 调用方据此只给新号
-// 分配代理线路，不会去动老号已有的线路指派。
+// 分配代理线路，不会去动老号已有的线路指派。策略开启时，新 JWT 同事务登记初始化。
 func (s *Store) ImportAccounts(payload ImportPayload) (int, []string, error) {
 	count := 0
 	newIDs := []string{}
@@ -2018,12 +2018,12 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, []string, error) {
 			if secret == "" {
 				continue
 			}
-			acc, isNew, err := s.AddAccountWithIdentity(provider, item.Name, secret, "")
+			acc, isNew, err := s.AddAccountWithIdentity(provider, item.Name, secret, "", AccountCreationOptions{InitializeProxy: true, Source: "import", DisabledModels: item.DisabledModels})
 			if err != nil {
 				return count, newIDs, err
 			}
-			if item.DisabledModels != nil {
-				if _, err := s.SetDisabledModels(provider, acc.ID, item.DisabledModels); err != nil {
+			if !isNew && item.DisabledModels != nil {
+				if err := s.setImportedDisabledModels(provider, acc.ID, item.DisabledModels); err != nil {
 					return count, newIDs, err
 				}
 			}
@@ -2034,6 +2034,23 @@ func (s *Store) ImportAccounts(payload ImportPayload) (int, []string, error) {
 		}
 	}
 	return count, newIDs, nil
+}
+
+// 已有初始化任务不受重复导入的元数据回填影响；否则普通 Update 会撤销执行权。
+func (s *Store) setImportedDisabledModels(provider, id string, models []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := s.findLocked(provider, id)
+	if live == nil || s.initializations[live.ID] != nil {
+		return nil
+	}
+	copy := live.Clone()
+	copy.SetDisabledModels(models)
+	if err := s.persistAccountLocked(copy); err != nil {
+		return err
+	}
+	live.SetDisabledModels(copy.DisabledModels)
+	return nil
 }
 
 // ── 内部工具 ────────────────────────────────────────────────────────────────

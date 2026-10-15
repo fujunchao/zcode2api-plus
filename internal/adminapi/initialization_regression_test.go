@@ -77,12 +77,12 @@ func TestNewAccountInitializationPolicyDoesNotAdoptExistingAccounts(t *testing.T
 	if f.h.Store.Initialization(old.ID) != nil || *f.h.Store.FindAny(old.ID).ProxyID != f.bad.ID {
 		t.Fatal("重复添加接管了旧号")
 	}
-	if status, _ := do(t, mux, f.h.Store, http.MethodPost, "/admin/api/import", map[string]any{"providers": map[string]any{"zai": []map[string]string{{"name": "备份", "secret": jwtTokenFor("backup-policy")}}}}); status != http.StatusOK {
+	if status, _ := do(t, mux, f.h.Store, http.MethodPost, "/admin/api/import", map[string]any{"providers": map[string]any{"zai": []map[string]string{{"name": "重复备份", "secret": old.Secret()}, {"name": "API Key", "secret": "synthetic-api-key"}}}}); status != http.StatusOK {
 		t.Fatal(status)
 	}
 	for _, a := range f.h.Store.ListAccounts("") {
 		if f.h.Store.Initialization(a.ID) != nil {
-			t.Fatal("备份导入登记了新号任务")
+			t.Fatal("重复导入或 API Key 不应登记新号任务")
 		}
 	}
 }

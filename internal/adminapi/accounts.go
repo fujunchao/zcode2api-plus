@@ -862,15 +862,25 @@ func (h *Handler) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	count, newIDs, err := h.Store.ImportAccounts(payload)
+	initializing := 0
+	for _, id := range newIDs {
+		if task := h.Store.Initialization(id); task != nil && task.Managed {
+			initializing++
+		}
+	}
+	if initializing > 0 && h.Initialization != nil {
+		h.Initialization.Wake()
+	}
 	if err != nil {
 		writeError500(w, err)
 		return
 	}
-	// 导入的账号同样按空闲优先、最少绑定自动分配线路（只针对本次新建的，重复导入不会动老号）；
-	// 无启用线路或分配失败时保持直连并通过 direct_fallback 回报，供前端提示。
+	// AutoAssignProxies 会跳过已登记初始化的账号，不能覆盖其临时/固定出口策略。
+	// 其余新建账号保持原有分配语义，重复导入不改派。
 	assigned, fallback := h.Store.AutoAssignProxies(newIDs)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"count":    count,
+		"count":   count,
+		"created": len(newIDs), "duplicated": count - len(newIDs), "initializing": initializing,
 		"assigned": len(assigned), "direct_fallback": len(fallback),
 	})
 }

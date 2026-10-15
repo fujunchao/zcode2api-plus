@@ -115,6 +115,7 @@ type AccountCreationOptions struct {
 	InitializeProxy bool
 	Source          string
 	LoginProxy      *ProxyProfile
+	DisabledModels  []string // 导入的新号元数据必须与账号、任务一起提交。
 }
 
 type InitializationCandidate struct {
@@ -205,6 +206,9 @@ func persistInitializationOnTx(tx *sql.Tx, task *InitializationTask) error {
 }
 
 func (s *Store) persistCreatedAccountLocked(a *model.Account, options []AccountCreationOptions) error {
+	if len(options) > 0 && options[0].DisabledModels != nil {
+		a.SetDisabledModels(options[0].DisabledModels)
+	}
 	task, err := s.newInitializationLocked(a, options)
 	if err != nil {
 		return err

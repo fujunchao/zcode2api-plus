@@ -462,6 +462,15 @@ func cmdImport(args []string) {
 	// 导入的新号同样按空闲优先、最少绑定自动分配线路（只针对本次新建，重复导入不动老号）。
 	assigned, fallback := st.AutoAssignProxies(newIDs)
 	fmt.Println(web.Green + fmt.Sprintf("✔ 已导入 %d 个账号", count) + web.Reset)
+	initializing := 0
+	for _, id := range newIDs {
+		if task := st.Initialization(id); task != nil && task.Managed {
+			initializing++
+		}
+	}
+	if initializing > 0 {
+		fmt.Printf("  %d 个新 JWT 已登记初始化，启动 serve 后继续取额与固定绑定\n", initializing)
+	}
 	if len(newIDs) > 0 {
 		fmt.Println(web.Dim + fmt.Sprintf("  已自動指派線路 %d 條，%d 個帳號使用直連",
 			len(assigned), len(fallback)) + web.Reset)
