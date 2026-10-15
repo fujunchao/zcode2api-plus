@@ -42,6 +42,7 @@ type newAccountFixture struct {
 	preview, claimBody        string
 	claimStatus               int
 	onRequest                 func(*http.Request, newAccountRequest)
+	response                  func(newAccountRequest) (int, string)
 }
 
 func newAccountQuotaFixture(t *testing.T, before, after string) *newAccountFixture {
@@ -80,6 +81,9 @@ func newAccountQuotaFixture(t *testing.T, before, after string) *newAccountFixtu
 				body, status = f.claimBody, f.claimStatus
 			}
 			f.requests = append(f.requests, request)
+			if f.response != nil {
+				status, body = f.response(request)
+			}
 			onRequest := f.onRequest
 			f.mu.Unlock()
 			if onRequest != nil {
