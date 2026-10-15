@@ -125,6 +125,7 @@ export interface ModelProbeRun {
 }
 
 export interface ModelProbeSummary {
+  evidence_incomplete_until?: number
   observed_targets?: number
   total_targets?: number
   storage_error?: boolean

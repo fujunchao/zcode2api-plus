@@ -251,7 +251,8 @@ func (s *Store) retireModelProbeLocked(r *ModelProbeRun, now time.Time) error {
 		r.Reason = "decision_disabled"
 		return s.persistModelProbeRunLocked(r)
 	}
-	if now.UnixMilli() < s.strictProxy.EvidenceIncompleteUntil {
+	if now.UnixMilli() < s.strictProxy.EvidenceIncompleteUntil || now.UnixMilli() < s.modelProbe.EvidenceIncompleteUntil {
+		r.Verdict = "inconclusive"
 		r.Reason = "evidence_incomplete"
 		return s.persistModelProbeRunLocked(r)
 	}

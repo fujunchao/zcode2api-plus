@@ -433,6 +433,9 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 		s.modelProbe.runs[copy.ID] = &copy
 		return err
 	}
+	if err := s.boundModelProbeEvidenceLocked(now); err != nil {
+		return err
+	}
 	if copy.Verdict == "route_correlated" {
 		return s.retireModelProbeLocked(&copy, now)
 	}

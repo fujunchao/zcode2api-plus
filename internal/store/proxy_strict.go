@@ -263,6 +263,9 @@ func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]
 	now := s.strictObservationNow()
 	s.pruneStrictEvidenceLocked(now)
 	suspects := map[string]bool{}
+	for identity := range s.modelProbeSuspectsLocked(now) {
+		suspects[identity] = true
+	}
 	for _, e := range s.strictEvidence {
 		if strictFailure(e) {
 			suspects[e.Identity] = true

@@ -118,6 +118,7 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
         <span>近 30 分钟已观测 {data.observed_targets ?? 0}/{data.total_targets ?? data.settings.target_proxy_ids.length} 条</span>
       </div>
       {data.storage_error && <p role="alert" className="text-sm text-destructive">巡检结果保存失败，已暂停新探测。修复存储后重新保存配置或重启；旧请求不会自动重放。</p>}
+      {(data.evidence_incomplete_until ?? 0) > Date.now() && <p role="status" className="text-xs text-muted-foreground">短窗口证据因重启或容量裁剪不完整，新的严格删除暂停至 {time(data.evidence_incomplete_until)}；已有禁止记录不受影响。</p>}
       {data.paused_until > Date.now() && <p role="status" className="text-sm text-amber-700">参考组不可用，主动对照暂停至 {time(data.paused_until)}；不会因此清空代理池。</p>}
       {data.settings.target_proxy_ids.length === 0 ? <Empty>尚未选择目标。先配置少量探测账号、目标与独立参考线路。</Empty> : <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead><tr className="border-b text-muted-foreground"><th className="pb-2 font-medium">目标线路</th><th className="pb-2 font-medium">模型结论</th><th className="pb-2 font-medium">最近记录／下一次</th><th className="pb-2 text-right font-medium">操作</th></tr></thead><tbody>
         {data.settings.target_proxy_ids.map((id) => {

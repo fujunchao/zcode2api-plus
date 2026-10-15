@@ -60,11 +60,12 @@ func (p ModelProbeSettings) clone() ModelProbeSettings {
 }
 
 type modelProbePersistent struct {
-	Version       int                `json:"version"`
-	Policy        ModelProbeSettings `json:"policy"`
-	NextDue       map[string]int64   `json:"next_due"`
-	LastDiagnosis map[string]int64   `json:"last_diagnosis"`
-	PausedUntil   int64              `json:"paused_until"`
+	Version                 int                `json:"version"`
+	Policy                  ModelProbeSettings `json:"policy"`
+	NextDue                 map[string]int64   `json:"next_due"`
+	LastDiagnosis           map[string]int64   `json:"last_diagnosis"`
+	PausedUntil             int64              `json:"paused_until"`
+	EvidenceIncompleteUntil int64              `json:"evidence_incomplete_until"`
 }
 
 type modelProbeState struct {
@@ -185,6 +186,12 @@ func (s *Store) loadModelProbe() error {
 		if probeRunOpen(&r) {
 			r.State, r.Reason, r.Verdict = "interrupted", "process_restarted", "inconclusive"
 		}
+		// 历史只作展示。重启丢掉了私有可比证据，不能靠新样本宣称整个窗口没有反证。
+		for _, sample := range r.Samples {
+			if sample.Status > 0 {
+				s.modelProbe.EvidenceIncompleteUntil = max(s.modelProbe.EvidenceIncompleteUntil, sample.At+int64((10*time.Minute+time.Millisecond)/time.Millisecond))
+			}
+		}
 		s.modelProbe.runs[r.ID] = &r
 	}
 	if err := rows.Err(); err != nil {
@@ -200,7 +207,7 @@ func (s *Store) loadModelProbe() error {
 		}
 	}
 	s.publishModelProbeRolesLocked()
-	return nil
+	return s.persistProbeStateLocked()
 }
 
 func (s *Store) ModelProbeSettings() ModelProbeSettings {
@@ -382,17 +389,18 @@ func (s *Store) modelProbeHistoryLocked(target string, offset, limit int) []Mode
 }
 
 type ModelProbeSummary struct {
-	ObservedTargets   int                `json:"observed_targets"`
-	TotalTargets      int                `json:"total_targets"`
-	StorageError      bool               `json:"storage_error"`
-	Settings          ModelProbeSettings `json:"settings"`
-	Runs              []ModelProbeRun    `json:"runs"`
-	UsedRequests      int                `json:"used_requests"`
-	RemainingRequests int                `json:"remaining_requests"`
-	PausedUntil       int64              `json:"paused_until"`
-	NextDue           map[string]int64   `json:"next_due"`
-	Active            int                `json:"active"`
-	RuleVersion       string             `json:"rule_version"`
+	EvidenceIncompleteUntil int64              `json:"evidence_incomplete_until"`
+	ObservedTargets         int                `json:"observed_targets"`
+	TotalTargets            int                `json:"total_targets"`
+	StorageError            bool               `json:"storage_error"`
+	Settings                ModelProbeSettings `json:"settings"`
+	Runs                    []ModelProbeRun    `json:"runs"`
+	UsedRequests            int                `json:"used_requests"`
+	RemainingRequests       int                `json:"remaining_requests"`
+	PausedUntil             int64              `json:"paused_until"`
+	NextDue                 map[string]int64   `json:"next_due"`
+	Active                  int                `json:"active"`
+	RuleVersion             string             `json:"rule_version"`
 }
 
 func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
@@ -425,37 +433,58 @@ func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 			}
 		}
 	}
-	return ModelProbeSummary{ObservedTargets: observed, TotalTargets: len(s.modelProbe.Policy.TargetProxyIDs), StorageError: s.modelProbe.storageError, Settings: s.modelProbe.Policy.clone(), Runs: views, UsedRequests: used, RemainingRequests: max(0, s.modelProbe.Policy.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion}, nil
+	return ModelProbeSummary{EvidenceIncompleteUntil: s.modelProbe.EvidenceIncompleteUntil, ObservedTargets: observed, TotalTargets: len(s.modelProbe.Policy.TargetProxyIDs), StorageError: s.modelProbe.storageError, Settings: s.modelProbe.Policy.clone(), Runs: views, UsedRequests: used, RemainingRequests: max(0, s.modelProbe.Policy.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion}, nil
 }
 
 // 清理展示历史不影响仍在滚动预算窗口内的尝试登记。
 func (s *Store) pruneModelProbeLocked(now time.Time) error {
 	cutoff := now.Add(-7 * 24 * time.Hour).UnixMilli()
-	if _, err := s.db.Exec("DELETE FROM model_probe_attempts WHERE started_at<?", now.Add(-24*time.Hour).UnixMilli()); err != nil {
+	var completed []*ModelProbeRun
+	for _, r := range s.modelProbe.runs {
+		if !probeRunOpen(r) {
+			completed = append(completed, r)
+		}
+	}
+	sort.Slice(completed, func(i, j int) bool {
+		if completed[i].CreatedAt == completed[j].CreatedAt {
+			return completed[i].ID < completed[j].ID
+		}
+		return completed[i].CreatedAt < completed[j].CreatedAt
+	})
+	remove := []string{}
+	size := len(s.modelProbe.runs)
+	for _, r := range completed {
+		if r.CreatedAt >= cutoff && size < 10000 {
+			break
+		}
+		remove = append(remove, r.ID)
+		size--
+		for _, e := range r.proofs {
+			s.modelProbe.EvidenceIncompleteUntil = max(s.modelProbe.EvidenceIncompleteUntil, e.At.Add(10*time.Minute+time.Millisecond).UnixMilli())
+		}
+	}
+	// 禁止窗口先落盘，即使随后清理失败也不能从缺失的缓存产生决定。
+	if err := s.persistProbeStateLocked(); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec("DELETE FROM model_probe_runs WHERE created_at<? OR id NOT IN (SELECT id FROM model_probe_runs ORDER BY created_at DESC LIMIT 10000)", cutoff); err != nil {
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
 		return err
 	}
-	if len(s.modelProbe.runs) > 10000 {
-		var expired []*ModelProbeRun
-		for _, r := range s.modelProbe.runs {
-			if !probeRunOpen(r) {
-				expired = append(expired, r)
-			}
-		}
-		sort.Slice(expired, func(i, j int) bool { return expired[i].CreatedAt < expired[j].CreatedAt })
-		for _, r := range expired {
-			if len(s.modelProbe.runs) <= 10000 {
-				break
-			}
-			delete(s.modelProbe.runs, r.ID)
+	defer tx.Rollback()
+	if _, err = tx.Exec("DELETE FROM model_probe_attempts WHERE started_at<?", now.Add(-24*time.Hour).UnixMilli()); err != nil {
+		return err
+	}
+	for _, id := range remove {
+		if _, err = tx.Exec("DELETE FROM model_probe_runs WHERE id=?", id); err != nil {
+			return err
 		}
 	}
-	for id, r := range s.modelProbe.runs {
-		if !probeRunOpen(r) && r.CreatedAt < cutoff {
-			delete(s.modelProbe.runs, id)
-		}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	for _, id := range remove {
+		delete(s.modelProbe.runs, id)
 	}
 	return nil
 }
