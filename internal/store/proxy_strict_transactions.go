@@ -75,7 +75,7 @@ func (s *Store) rebindStrictPendingLocked(profiles []ProxyProfile, pending []*mo
 		occupancy[derefStr(a.ProxyID)]++
 	}
 	for _, live := range s.allAccountsLocked() {
-		if s.initializationManagedLocked(live.ID) {
+		if s.initializationManagedLocked(live.ID) || s.isModelProbeAccountLocked(live.ID) {
 			delete(next.Pending, live.ID)
 			delete(next.PendingAvoid, live.ID)
 			continue

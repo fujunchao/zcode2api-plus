@@ -8,6 +8,9 @@ func (a *Account) LocalSchedulingBarrier(now time.Time, extraRiskWindow time.Dur
 	if a == nil {
 		return "missing", nil
 	}
+	if a.ModelProbeOnly {
+		return "model_probe_only", nil
+	}
 	if a.ArchivedAt != nil {
 		return "archived", nil
 	}

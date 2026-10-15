@@ -293,6 +293,7 @@ func (s *Store) snapshotLocked(a *model.Account) *model.Account {
 	copy := a.Clone()
 	if copy != nil {
 		copy.Initialization = s.initializationViewLocked(a)
+		copy.ModelProbeOnly = s.isModelProbeAccountLocked(a.ID)
 	}
 	return copy
 }

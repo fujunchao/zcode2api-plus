@@ -120,6 +120,8 @@ type Account struct {
 	// CI 的 -race 实测抓到过竞态。
 	Claim          *ClaimState         `json:"claim"`
 	Initialization *InitializationView `json:"-"`
+	// ModelProbeOnly 是 Store 发布的专用角色，不进入账号导出；普通选号和自动领取排除。
+	ModelProbeOnly bool `json:"-"`
 
 	// claimMu 保护 Claim 指针的替换与读取。Account 一律按指针使用、从不按值复制，
 	// 故可内嵌锁；已发布的 ClaimState 视为不可变（改动一律生成新快照整体替换）。
@@ -364,6 +366,7 @@ func (a *Account) Clone() *Account {
 		VirtualDeviceMid: a.VirtualDeviceMid,
 		Claim:            a.ClaimView(),
 		Initialization:   a.Initialization.Clone(),
+		ModelProbeOnly:   a.ModelProbeOnly,
 
 		RateLimitStreak:      a.RateLimitStreak,
 		RiskControlStreak:    a.RiskControlStreak,
@@ -504,7 +507,7 @@ func (a *Account) IsQuotaRefreshTarget() bool {
 
 // IsAutoClaimTarget 检查自动领取资格；额度耗尽仍允许领新套餐。
 func (a *Account) IsAutoClaimTarget(now time.Time) bool {
-	if a.InitializationBlocked() || a.Mode != "jwt" || a.JWTToken == nil || *a.JWTToken == "" ||
+	if a.ModelProbeOnly || a.InitializationBlocked() || a.Mode != "jwt" || a.JWTToken == nil || *a.JWTToken == "" ||
 		a.ArchivedAt != nil || !a.Enabled || !IsManageable(a.Status) {
 		return false
 	}
@@ -515,6 +518,9 @@ func (a *Account) IsAutoClaimTarget(now time.Time) bool {
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。
 // 已归档账号一律不可选（归档即停止调用）。
 func (a *Account) IsSelectable(now time.Time) bool {
+	if a.ModelProbeOnly {
+		return false
+	}
 	if a.InitializationBlocked() {
 		return false
 	}

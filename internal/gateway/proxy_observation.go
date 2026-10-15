@@ -69,6 +69,15 @@ func BeginProxyAttempt(ctx context.Context, st *store.Store, acc *model.Account,
 		return ctx, release, nil
 	}
 	acc = acc.Clone()
+	value := ModelRequestObservation(acc, request, body, entry)
+	return context.WithValue(ctx, proxyObservationKey{}, &proxyAttemptObservation{store: st, account: acc, egress: egress, value: value, targetRef: observationRef(request.URL.String())}), release, nil
+}
+
+// ModelRequestObservation 共用真实模型请求的去敏校验；不获取许可，也不产生调度副作用。
+func ModelRequestObservation(acc *model.Account, request *http.Request, body map[string]any, entry string) store.ProxyObservation {
+	if acc == nil || request == nil || request.URL == nil {
+		return store.ProxyObservation{InvalidRequest: true}
+	}
 	profile := map[string]string{}
 	for _, key := range []string{"User-Agent", "X-Zcode-App-Version", "X-Title", "X-Zcode-Agent", "X-Release-Channel", "X-Client-Language", "X-Client-Timezone", "X-Platform", "X-Os-Category", "X-Os-Version", "HTTP-Referer", "Content-Type", "Accept", "Accept-Language", "Anthropic-Version", "Anthropic-Beta", "X-Zcode-Session-Type", "X-Zcode-Query-Source"} {
 		profile[key] = request.Header.Get(key)
@@ -94,7 +103,7 @@ func BeginProxyAttempt(ctx context.Context, st *store.Store, acc *model.Account,
 	if value.TargetPath == "" {
 		value.TargetPath = "/"
 	}
-	return context.WithValue(ctx, proxyObservationKey{}, &proxyAttemptObservation{store: st, account: acc, egress: egress, value: value, targetRef: observationRef(request.URL.String())}), release, nil
+	return value
 }
 
 func validObservationTarget(acc *model.Account, request *http.Request) bool {

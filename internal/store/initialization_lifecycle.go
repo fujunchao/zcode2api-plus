@@ -113,6 +113,9 @@ func (s *Store) updateManagedAccountLocked(live *model.Account, apply func(*mode
 func (s *Store) AcquireModelDispatch(acc *model.Account, egress ProxyEgress) (func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if acc != nil && s.isModelProbeAccountLocked(acc.ID) {
+		return nil, ErrModelProbeUnavailable
+	}
 	if acc != nil && s.initializationManagedLocked(acc.ID) {
 		live := s.snapshotLocked(s.findLocked(acc.Provider, acc.ID))
 		if live == nil || live.InitializationBlocked() || !live.IsSelectable(time.Now()) {

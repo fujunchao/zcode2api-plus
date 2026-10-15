@@ -17,6 +17,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/initialization"
 	"zcode2api/internal/model"
+	"zcode2api/internal/modelprobe"
 	"zcode2api/internal/proxysub"
 	"zcode2api/internal/quota"
 	"zcode2api/internal/store"
@@ -24,6 +25,7 @@ import (
 
 // Handler 后台管理 HTTP 层。
 type Handler struct {
+	ModelProbe     *modelprobe.Manager
 	Initialization *initialization.Manager
 	Subscription   *proxysub.Manager
 	ctx            context.Context
@@ -46,6 +48,7 @@ func New(st *store.Store, au *auth.Service, cm *captcha.Manager, qs *quota.Servi
 	}
 	ctx, cancel := context.WithCancel(parent)
 	h := &Handler{ctx: ctx, cancel: cancel, Store: st, Auth: au, Captcha: cm, Quota: qs, StartedAt: time.Now(), Subscription: proxysub.New(st, ctx)}
+	h.ModelProbe = modelprobe.New(ctx, st)
 	h.Initialization = initialization.New(ctx, st, qs, cm, func(ctx context.Context) (func(), error) {
 		select {
 		case claimSlot <- struct{}{}:
@@ -73,6 +76,9 @@ func (h *Handler) Close() {
 	}
 	h.autoMu.Unlock()
 	h.autoTasks.Wait()
+	if h.ModelProbe != nil {
+		h.ModelProbe.Close()
+	}
 	if h.Initialization != nil {
 		h.Initialization.Close()
 	}
@@ -123,6 +129,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/proxies/subscription/blocks", guard(h.handleSubscriptionBlocks))
 	mux.HandleFunc("DELETE /admin/api/proxies/subscription/blocks/{fingerprint}", guard(h.handleUnblockSubscription))
 	mux.HandleFunc("GET /admin/api/proxies", guard(h.handleListProxies))
+	mux.HandleFunc("GET /admin/api/proxies/model-probe/settings", guard(h.handleModelProbeSettings))
+	mux.HandleFunc("PUT /admin/api/proxies/model-probe/settings", guard(h.handleModelProbeSettings))
+	mux.HandleFunc("GET /admin/api/proxies/model-probe", guard(h.handleModelProbeSummary))
+	mux.HandleFunc("POST /admin/api/proxies/{profile_id}/model-probe", guard(h.handleStartModelProbe))
+	mux.HandleFunc("GET /admin/api/proxies/{profile_id}/model-probe/history", guard(h.handleModelProbeHistory))
 	mux.HandleFunc("GET /admin/api/proxies/new-account-policy", guard(h.handleGetNewAccountPolicy))
 	mux.HandleFunc("PUT /admin/api/proxies/new-account-policy", guard(h.handleSaveNewAccountPolicy))
 	mux.HandleFunc("GET /admin/api/proxies/strict", guard(h.handleStrictProxyStatus))

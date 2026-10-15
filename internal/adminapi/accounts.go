@@ -60,6 +60,7 @@ func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	views := make([]map[string]any, 0, len(matched))
 	for _, a := range matched {
 		view := a.PublicView(now)
+		view["model_probe_only"] = a.ModelProbeOnly
 		barrier, recheck := a.LocalSchedulingBarrier(now, config.RiskSilentWindow())
 		view["local_scheduling_reason"], view["local_recheck_at"] = barrier, recheck
 		view["risk_extra_window_hours"] = max(0, config.RiskSilentHours)

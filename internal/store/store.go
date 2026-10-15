@@ -81,6 +81,7 @@ type Store struct {
 	strictClosed          bool
 	strictStartPlanProofs map[string][]startPlanProxyProof
 	strictNow             func() time.Time // 仅替换严格证据的时钟，供确定性窗口回归。
+	modelProbe            modelProbeState
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -333,6 +334,9 @@ func (s *Store) load() error {
 		return err
 	}
 	if err := s.migrateStrictProxyVersions(); err != nil {
+		return err
+	}
+	if err := s.loadModelProbe(); err != nil {
 		return err
 	}
 	return s.RecoverStrictProxyRetirements()
@@ -1090,7 +1094,7 @@ func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]stri
 	var pending []*model.Account
 	next := s.cloneStrictProxyLocked()
 	for _, id := range dedupeIDs(accountIDs) {
-		if s.initializationManagedLocked(id) {
+		if s.initializationManagedLocked(id) || s.isModelProbeAccountLocked(id) {
 			continue
 		}
 		acc := s.findAnyLocked(id).Clone()

@@ -71,22 +71,7 @@ func (s *RiskScope) Accounts() int {
 // 本地冷却必须保留。snapshot 为本次请求的出口快照，避免迟到响应重复换线。
 func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, now time.Time, attempt ...RiskAttempt) (secs, streak int, invalid bool) {
 	_, _ = st.UpdateForRequest(snapshot, func(acc *model.Account) {
-		acc.RiskControlStreak++
-		streak = acc.RiskControlStreak
-		// 保留观测历史；只有显式配置 RiskSilentHours > 0 时才额外叠加静默隔离。
-		nowF := float64(now.UnixNano()) / 1e9
-		acc.LastRiskControlAt = &nowF
-		secs, invalid = riskControlCoolingSeconds(st, streak)
-		if invalid {
-			acc.Status = model.StatusInvalid
-			acc.CoolingUntil = nil
-			StampAccountError(acc, model.ErrorKindRiskControl, errMsg, now)
-			return
-		}
-		until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
-		acc.Status = model.StatusCooling
-		acc.CoolingUntil = &until
-		StampAccountError(acc, model.ErrorKindRiskControl, errMsg, now)
+		secs, streak, invalid = model.ApplyRiskControl(acc, errMsg, now, st.RiskCoolingSteps())
 	})
 	if streak == 0 {
 		// 已删除、人工停用或已换凭据：不更新状态/换线，仍给日志一个可用的档位。

@@ -29,6 +29,24 @@ func IsRiskControlBody(text string) bool {
 		strings.Contains(low, "risk")
 }
 
+// ApplyRiskControl 只在持有账号写锁时调用：共享阶梯算法，不包含代理换线或落库。
+func ApplyRiskControl(acc *Account, detail string, now time.Time, steps []int) (secs, streak int, invalid bool) {
+	acc.RiskControlStreak++
+	streak = acc.RiskControlStreak
+	ts := float64(now.UnixNano()) / 1e9
+	acc.LastRiskControlAt = &ts
+	kind := ErrorKindRiskControl
+	acc.LastErrorKind, acc.LastErrorAt, acc.LastError = &kind, &ts, &detail
+	if streak > len(steps) {
+		acc.Status, acc.CoolingUntil = StatusInvalid, nil
+		return 0, streak, true
+	}
+	secs = steps[streak-1]
+	until := float64(now.Add(time.Duration(secs)*time.Second).UnixNano()) / 1e9
+	acc.Status, acc.CoolingUntil = StatusCooling, &until
+	return secs, streak, false
+}
+
 // IsRiskControlInvalid 账号是否因上游风控被置为失效（账号级终态）。
 //
 // 与 IsRiskControlBody（判断一次响应是不是风控拦截）互补：这个判断的是「账号
