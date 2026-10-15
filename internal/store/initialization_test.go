@@ -191,6 +191,27 @@ func TestNewAccountInitializationExcludesUpdatedDefaultAliases(t *testing.T) {
 	}
 }
 
+func TestNewAccountInitializationPauseAfterQuotaPreventsAutomaticBind(t *testing.T) {
+	s, a, _, _ := initializationStoreFixture(t)
+	attempt, err := s.BeginInitialization(a.ID, time.Now())
+	if err != nil || attempt == nil {
+		t.Fatal(err)
+	}
+	defer s.ReleaseInitialization(attempt)
+	if err := s.ObserveInitialization(attempt, model.InitialQuotaObservation{Kind: "available", Snapshot: attempt.Account, CheckedAt: float64(time.Now().Unix())}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ChangeInitialization(a.ID, s.Initialization(a.ID).Revision, "pause"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.BindInitialization(a.ID, s.Initialization(a.ID).Revision, false); err == nil || ok {
+		t.Fatal("到账后被人工暂停的任务仍被后台完成了绑定")
+	}
+	if !s.FindAny(a.ID).InitializationBlocked() {
+		t.Fatal("暂停被当成了业务就绪")
+	}
+}
+
 func initializationStoreFixture(t *testing.T) (*Store, *model.Account, ProxyProfile, ProxyProfile) {
 	t.Helper()
 	s := newTestStore(t)
