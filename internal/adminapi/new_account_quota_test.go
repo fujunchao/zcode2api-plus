@@ -43,6 +43,7 @@ type newAccountFixture struct {
 	claimStatus               int
 	onRequest                 func(*http.Request, newAccountRequest)
 	response                  func(newAccountRequest) (int, string)
+	headers                   http.Header
 }
 
 func newAccountQuotaFixture(t *testing.T, before, after string) *newAccountFixture {
@@ -85,11 +86,15 @@ func newAccountQuotaFixture(t *testing.T, before, after string) *newAccountFixtu
 				status, body = f.response(request)
 			}
 			onRequest := f.onRequest
+			headers := f.headers.Clone()
 			f.mu.Unlock()
 			if onRequest != nil {
 				onRequest(r, request)
 			}
 			w.Header().Set("Content-Type", "application/json")
+			for key, values := range headers {
+				w.Header()[key] = values
+			}
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(body))
 		}

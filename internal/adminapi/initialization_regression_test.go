@@ -87,6 +87,44 @@ func TestNewAccountInitializationPolicyDoesNotAdoptExistingAccounts(t *testing.T
 	}
 }
 
+func TestNewAccountInitializationHonorsUpstreamRetryAfter(t *testing.T) {
+	for _, stage := range []string{"quota", "claim"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newAccountQuotaFixture(t, newAccountEmptyBalance, newAccountEmptyBalance)
+			f.mu.Lock()
+			f.headers = http.Header{"Retry-After": []string{"7200"}}
+			if stage == "quota" {
+				f.beforeStatus = http.StatusTooManyRequests
+			} else {
+				f.claimStatus = http.StatusTooManyRequests
+				f.claimBody = `{"code":1005,"msg":"capacity reached"}`
+			}
+			f.mu.Unlock()
+			policy := store.DefaultNewAccountProxyPolicy()
+			policy.Enabled = true
+			policy.DefaultProxyID = f.good.ID
+			if _, err := f.h.Store.SaveNewAccountProxyPolicy(policy); err != nil {
+				t.Fatal(err)
+			}
+			a, _, err := f.h.Store.AddAccountWithIdentity(model.ProviderZai, "等待", jwtTokenFor("retry-after"), "", store.AccountCreationOptions{InitializeProxy: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now()
+			if err := f.h.Initialization.Step(context.Background(), a.ID); err != nil {
+				t.Fatal(err)
+			}
+			task := f.h.Store.Initialization(a.ID)
+			if task.NextAt < start.Add(119*time.Minute).UnixMilli() {
+				t.Fatalf("不得忽略上游两小时等待：%+v", task)
+			}
+			if err := f.h.Store.ChangeInitialization(a.ID, task.Revision, "retry"); err == nil {
+				t.Fatal("重试按钮清除了上游等待")
+			}
+		})
+	}
+}
+
 // 通过新增端点验证共享线路保护；上游和凭据均来自隔离夹具。
 func TestNewAccountEmptyQuotaNeverDeletesSharedProxy(t *testing.T) {
 	f := newAccountQuotaFixture(t, newAccountEmptyBalance, newAccountEmptyBalance)
