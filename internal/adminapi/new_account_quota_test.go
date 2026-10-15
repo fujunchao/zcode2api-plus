@@ -174,13 +174,13 @@ func TestNewAccountRefreshesQuotaAfterAllClaims(t *testing.T) {
 	}
 }
 
-func TestNewAccountDoubleEmptyQuotaReassignsProxy(t *testing.T) {
+func TestNewAccountDoubleEmptyQuotaKeepsProxy(t *testing.T) {
 	f := newAccountQuotaFixture(t, newAccountEmptyBalance, newAccountEmptyBalance)
 	a := f.login(t, "fresh-without-quota")
 	f.wait(t)
 	got := f.h.Store.FindAny(a.ID)
-	if len(f.h.Store.ListProxyProfiles()) != 1 || got.ProxyID == nil || *got.ProxyID != f.good.ID {
-		t.Fatal("新号两次确认未获初始额度后，应删除原代理并按现有策略改派")
+	if len(f.h.Store.ListProxyProfiles()) != 2 || got.ProxyID == nil || *got.ProxyID != f.bad.ID {
+		t.Fatal("新号两次空额度不能删除业务代理或改派账号")
 	}
 	if got.ClaimView() == nil || got.ClaimView().ClaimedAt == nil || got.ClaimView().NextAt == nil {
 		t.Fatal("换线不能清除本次领取结果和冷却")

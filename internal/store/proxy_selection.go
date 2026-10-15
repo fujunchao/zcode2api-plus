@@ -92,35 +92,8 @@ func (s *Store) RotateAccountProxy(expected *model.Account) (ProxyProfile, bool,
 	return result.Next, result.Reason == "changed", err
 }
 
-// PurgeEmptyNewAccountProxy 仅供本次真正新建账号的领取收尾调用。
-// initial/final 是领取前后的独立查询证据，expected 是领取开始前的账号快照。
-// 全部关联账号按空闲优先/最少绑定原子改派；不改领取状态，也不在新线路循环检测。
+// PurgeEmptyNewAccountProxy 保留旧调用契约，但空额度不再授权共享代理删除。
+// 资格与业务线路健康是独立事实；即使迟到的旧调用仍持有两次空观察也不能删线。
 func (s *Store) PurgeEmptyNewAccountProxy(expected *model.Account, initial, final model.StartPlanObservation, route ...ProxyEgress) (bool, ProxyReassign, error) {
-	empty := ProxyReassign{Assigned: map[string]string{}}
-	if !expected.MissingStartPlanEvidence() || initial.ProxyID == "" || !initial.Missing || !final.Missing ||
-		!initial.Matches(expected) || !final.Matches(expected) || final.CheckedAt <= initial.CheckedAt ||
-		final.CheckedAt <= expected.StartPlanObservation.CheckedAt {
-		return false, empty, nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(route) > 0 && (!s.proxyDispatchCurrentLocked(expected, route[0]) ||
-		!s.startPlanProxyProofCurrentLocked(expected, initial, route[0]) ||
-		!s.startPlanProxyProofCurrentLocked(expected, final, route[0])) {
-		return false, empty, nil
-	}
-	live := s.findLocked(expected.Provider, expected.ID)
-	// 本次领取成功允许检测，但历史使用、并发新快照、凭据/出口变更都要保护。
-	// final 必须仍是最新观测；不能拿迟到的空回包覆盖后来的有效额度。
-	if live == nil || !live.IsAutoClaimTarget(time.Now()) || live.UseCount > 0 ||
-		len(live.Plans) > 0 || len(live.Plan) > 0 || live.StartPlanObservation != final || !final.Matches(live) {
-		return false, empty, nil
-	}
-	for _, p := range s.listProxyProfilesLocked() {
-		if p.ID == initial.ProxyID && p.URL == initial.ProxyURL && p.Enabled {
-			removed, reassign, err := s.removeProxiesLocked(map[string]bool{p.ID: true}, p.URL)
-			return len(removed) > 0, reassign, err
-		}
-	}
-	return false, empty, nil
+	return false, ProxyReassign{Assigned: map[string]string{}}, nil
 }

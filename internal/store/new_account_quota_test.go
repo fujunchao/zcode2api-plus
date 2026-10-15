@@ -66,14 +66,14 @@ func TestNewAccountQuotaProxyProofRejectsCredentialAndRouteABA(t *testing.T) {
 				t.Fatal("真实末次快照应建立代次证明")
 			}
 			removed, _, err := s.PurgeEmptyNewAccountProxy(a, initial, final, route)
-			if err != nil || removed != (kind == "unchanged") {
-				t.Fatalf("两次证据必须同代，不能因 A→B→A 恢复：%s removed=%v err=%v", kind, removed, err)
+			if err != nil || removed {
+				t.Fatalf("任何代次的空额度都不能授权共享删除：%s removed=%v err=%v", kind, removed, err)
 			}
 		})
 	}
 }
 
-func TestNewAccountQuotaPurgeReassignsAllBindings(t *testing.T) {
+func TestNewAccountQuotaPurgeKeepsAllBindings(t *testing.T) {
 	for _, shared := range []bool{false, true} {
 		t.Run(fmt.Sprintf("共享=%v", shared), func(t *testing.T) {
 			s := newTestStore(t)
@@ -91,13 +91,13 @@ func TestNewAccountQuotaPurgeReassignsAllBindings(t *testing.T) {
 			}
 			snap, initial, final := newAccountQuotaEvidence(t, s, a.ID)
 			removed, result, err := s.PurgeEmptyNewAccountProxy(snap, initial, final)
-			if err != nil || !removed || len(result.Assigned) != 2 || len(result.Direct) != 0 {
-				t.Fatalf("应原子移除并改派全部关联账号: %v %v %v", removed, result, err)
+			if err != nil || removed || len(result.Assigned) != 0 || len(result.Direct) != 0 {
+				t.Fatalf("空额度不得改变任何关联账号: %v %v %v", removed, result, err)
 			}
 			for _, id := range []string{a.ID, peer.ID} {
 				got := s.FindAny(id)
-				if derefStr(got.ProxyID) != best.ID || derefStr(got.ProxyURL) != best.URL {
-					t.Fatal("应按最少绑定均衡改派")
+				if derefStr(got.ProxyID) != bad.ID || derefStr(got.ProxyURL) != bad.URL {
+					t.Fatal("应保留既有绑定")
 				}
 			}
 			reopened, err := New()
@@ -105,8 +105,8 @@ func TestNewAccountQuotaPurgeReassignsAllBindings(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer reopened.Close()
-			if len(reopened.ListProxyProfiles()) != 3 || derefStr(reopened.FindAny(a.ID).ProxyID) != best.ID {
-				t.Fatal("代理移除与账号改派必须一起落库")
+			if len(reopened.ListProxyProfiles()) != 4 || derefStr(reopened.FindAny(a.ID).ProxyID) != bad.ID {
+				t.Fatal("重启仍保留代理与账号绑定")
 			}
 		})
 	}
@@ -175,8 +175,8 @@ func TestNewAccountQuotaPurgeFailureIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed, _, err := s.PurgeEmptyNewAccountProxy(snap, initial, final); err == nil || removed {
-		t.Fatal("事务失败不得报告移除成功")
+	if removed, _, err := s.PurgeEmptyNewAccountProxy(snap, initial, final); err != nil || removed {
+		t.Fatal("空额度检测不应启动任何删除事务")
 	}
 	if !reflect.DeepEqual(beforeProfiles, s.ListProxyProfiles()) || !reflect.DeepEqual(beforeAccounts, s.ListAccounts("")) {
 		t.Fatal("事务失败不得发布部分内存状态")
@@ -216,8 +216,8 @@ func TestNewAccountQuotaPurgeConcurrentOnlyOnce(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if count.Load() != 1 || len(s.ListProxyProfiles()) != 1 {
-		t.Fatal("并发/重复检测只应淘汰原线路一次")
+	if count.Load() != 0 || len(s.ListProxyProfiles()) != 2 {
+		t.Fatal("并发/重复空额度检测不应淘汰任何线路")
 	}
 }
 
@@ -227,12 +227,12 @@ func TestNewAccountQuotaPurgeWithoutAlternatives(t *testing.T) {
 	a := addSelectionAccount(t, s, "new", bad.ID)
 	snap, initial, final := newAccountQuotaEvidence(t, s, a.ID)
 	removed, result, err := s.PurgeEmptyNewAccountProxy(snap, initial, final)
-	if err != nil || !removed || len(result.Direct) != 1 {
-		t.Fatalf("无替代线路应明确回报直连: %v %v %v", removed, result, err)
+	if err != nil || removed || len(result.Direct) != 0 {
+		t.Fatalf("无替代线路也不能因空额度退直连: %v %v %v", removed, result, err)
 	}
 	got := s.FindAny(a.ID)
-	if got.ProxyID != nil || got.ProxyURL != nil {
-		t.Fatal("必须清除已删除代理的地址")
+	if derefStr(got.ProxyID) != bad.ID || derefStr(got.ProxyURL) != bad.URL {
+		t.Fatal("必须保留代理地址")
 	}
 }
 
@@ -244,11 +244,11 @@ func TestNewAccountQuotaPurgeDoesNotReassignSameURL(t *testing.T) {
 	a := addSelectionAccount(t, s, "new", bad.ID)
 	snap, initial, final := newAccountQuotaEvidence(t, s, a.ID)
 	removed, result, err := s.PurgeEmptyNewAccountProxy(snap, initial, final)
-	if err != nil || !removed || result.Assigned[a.ID] != good.ID {
-		t.Fatalf("补位不得重新选择原代理的同 URL 配置: %v %v %v", removed, result, err)
+	if err != nil || removed || len(result.Assigned) != 0 {
+		t.Fatalf("空额度不得改派到别名或其他代理: %v %v %v", removed, result, err)
 	}
-	if len(s.ListProxyProfiles()) != 2 || alias.ID == good.ID {
-		t.Fatal("仅淘汰命中线路，不扩大删除范围")
+	if len(s.ListProxyProfiles()) != 3 || alias.ID == good.ID {
+		t.Fatal("不得删除任何线路")
 	}
 }
 
@@ -290,7 +290,7 @@ func TestNewAccountQuotaPurgeRequiresTwoIndependentObservations(t *testing.T) {
 func TestNewAccountQuotaPurgePreservesSuccessfulClaim(t *testing.T) {
 	s := newTestStore(t)
 	bad := addSelectionProxy(t, s, "bad", 18080, true)
-	good := addSelectionProxy(t, s, "good", 18081, true)
+	addSelectionProxy(t, s, "good", 18081, true)
 	a := addSelectionAccount(t, s, "new", bad.ID)
 	snap, initial, final := newAccountQuotaEvidence(t, s, a.ID)
 	claimedAt, nextAt := initial.CheckedAt+0.5, final.CheckedAt+3600
@@ -301,12 +301,12 @@ func TestNewAccountQuotaPurgePreservesSuccessfulClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	removed, _, err := s.PurgeEmptyNewAccountProxy(snap, initial, final)
-	if err != nil || !removed {
-		t.Fatalf("领取接口成功但两次确实没有初始配额，仍应按新号规则改派：%v %v", removed, err)
+	if err != nil || removed {
+		t.Fatalf("领取结果不确定时不能删除共享代理：%v %v", removed, err)
 	}
 	got := s.FindAny(a.ID)
 	state := got.ClaimView()
-	if derefStr(got.ProxyID) != good.ID || state == nil || state.ClaimedAt == nil || *state.ClaimedAt != claimedAt || state.NextAt == nil || *state.NextAt != nextAt {
-		t.Fatal("改派必须完整保留刚记录的领取结果与冷却")
+	if derefStr(got.ProxyID) != bad.ID || state == nil || state.ClaimedAt == nil || *state.ClaimedAt != claimedAt || state.NextAt == nil || *state.NextAt != nextAt {
+		t.Fatal("必须完整保留绑定、领取结果与冷却")
 	}
 }
