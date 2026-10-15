@@ -157,3 +157,23 @@ func TestNewAccountInitializationImportMetadataAndTaskCommitTogether(t *testing.
 		t.Fatal("导入元数据在登记任务之后进行了二次回写")
 	}
 }
+
+func TestNewAccountInitializationImportRegistrationFailureRollsBackAccount(t *testing.T) {
+	s, _, _, _ := initializationStoreFixture(t)
+	before := s.ListAccounts("")
+	if _, err := s.db.Exec(`CREATE TRIGGER reject_import_task BEFORE INSERT ON account_initializations WHEN json_extract(NEW.data,'$.source')='import' BEGIN SELECT RAISE(ABORT,'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	count, ids, err := s.ImportAccounts(ImportPayload{Providers: map[string][]importItem{"zai": {{Name: "rollback", Secret: jwtFor("rollback"), DisabledModels: []string{"other-model"}}}}})
+	if err == nil || count != 0 || len(ids) != 0 || !reflect.DeepEqual(before, s.ListAccounts("")) {
+		t.Fatal("初始化登记失败仍留下了新导入账号")
+	}
+	reopened, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if len(reopened.ListAccounts("")) != len(before) {
+		t.Fatal("重启出现部分导入数据")
+	}
+}

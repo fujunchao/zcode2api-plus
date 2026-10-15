@@ -2,6 +2,8 @@ package adminapi
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"zcode2api/internal/model"
@@ -79,5 +81,32 @@ func TestNewAccountInitializationManualEnrollIsExplicitAndScoped(t *testing.T) {
 	status, body = do(t, mux, f.h.Store, http.MethodPost, "/admin/api/accounts/batch/initialize", map[string]any{"ids": []string{a.ID}, "confirm_proxy_takeover": true})
 	if status != http.StatusOK || body["duplicated"] != float64(1) || f.h.Store.Initialization(a.ID).Revision != revision {
 		t.Fatalf("重复补入不应重建任务：%d %v", status, body)
+	}
+}
+
+func TestNewAccountInitializationManualEnrollRequiresAuthAndConfirmation(t *testing.T) {
+	f := newAccountQuotaFixture(t, newAccountEmptyBalance, newAccountEmptyBalance)
+	a, _, err := f.h.Store.AddAccountWithIdentity(model.ProviderZai, "确认", jwtTokenFor("confirmation"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := store.DefaultNewAccountProxyPolicy()
+	policy.Enabled = true
+	policy.DefaultProxyID = f.good.ID
+	if _, err := f.h.Store.SaveNewAccountProxyPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	f.h.Register(mux)
+	unauthorized := httptest.NewRecorder()
+	mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodPost, "/admin/api/accounts/batch/initialize", strings.NewReader(`{"ids":["unused"],"confirm_proxy_takeover":true}`)))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("补入入口未鉴权：%d", unauthorized.Code)
+	}
+	for _, confirmation := range []any{false, nil, "true"} {
+		status, body := do(t, mux, f.h.Store, http.MethodPost, "/admin/api/accounts/batch/initialize", map[string]any{"ids": []string{a.ID}, "confirm_proxy_takeover": confirmation})
+		if status != http.StatusBadRequest || f.h.Store.Initialization(a.ID) != nil {
+			t.Fatalf("未明确确认仍创建任务：%d %v", status, body)
+		}
 	}
 }
