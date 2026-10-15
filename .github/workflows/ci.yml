@@ -133,9 +133,9 @@ jobs:
           go test ./internal/store -run 'TestDeleteProxy|TestConcurrentDeleteProxies' -count=20 -timeout=180s
           go test ./internal/adminapi -run '^TestDeleteProxySharesOccupiedProxy$' -count=20 -timeout=60s
 
-      # 新号持久初始化、固定出口、事务/重启/ABA、等待头与老账号保护使用隔离数据和本地服务。
+      # 新号持久初始化、导入/手动补入、固定出口、事务/重启/ABA 与老账号保护使用隔离数据。
       - name: Test new account quota regression (repeat)
-        run: go test ./internal/adminapi ./internal/quota ./internal/store -run 'TestNewAccount|TestExistingAccount.*(ClaimRisk|EmptyQuota|Relogin)|TestExistingBatchClaim|TestImportedAccounts|TestFetchQuotaFresh|TestRefreshAccountsObserved' -count=20 -timeout=180s
+        run: go test ./internal/adminapi ./internal/quota ./internal/store ./cmd/zcode2api -run 'TestNewAccount|TestCLIImport|TestExistingAccount.*(ClaimRisk|EmptyQuota|Relogin)|TestExistingBatchClaim|TestImportedAccounts|TestFetchQuotaFresh|TestRefreshAccountsObserved' -count=20 -timeout=180s
 
       # 真实本地代理覆盖断连、响应中断、代理鉴权、超时与可疑请求；普通错误不得误删。
       - name: Test proxy endpoint failure regression (repeat)
