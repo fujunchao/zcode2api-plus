@@ -154,6 +154,9 @@ func (m *Manager) Close() {
 	m.cancel()
 	m.mu.Unlock()
 	m.wg.Wait()
+	if err := m.store.ClearInterruptedNetworkHealth(); err != nil {
+		web.Warn("proxy-health", "网络巡检关停记录保存失败，重启将废弃旧复核")
+	}
 	if err := m.store.StopModelProbes(m.now()); err != nil {
 		web.Warn("model-probe", "关停巡检状态保存失败，重启后将终止旧任务")
 	}

@@ -84,7 +84,8 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
       draft.accept(version)
       void qc.invalidateQueries({ queryKey: ['accounts'] })
       void qc.invalidateQueries({ queryKey: ['model-probe'] })
-      toast.success('模型巡检配置已保存，后续轮次使用新间隔')
+      void qc.invalidateQueries({ queryKey: ['network-health'] })
+      toast.success('健康巡检配置已保存，后续轮次使用新间隔')
     } catch (e) { toast.error('保存失败：' + errMsg(e)) }
     finally { setSaving(false) }
   }
@@ -92,9 +93,9 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
   function confirmSave() {
     if (!data?.settings) return
     const rolesChanged = !sameIDs(value.account_ids, data.settings.account_ids)
-    const destructive = value.enabled && value.mode === 'auto_retire' && (!data.settings.enabled || data.settings.mode !== 'auto_retire')
+    const destructive = (value.enabled || value.network_enabled) && value.mode === 'auto_retire' && ((!data.settings.enabled && !data.settings.network_enabled) || data.settings.mode !== 'auto_retire')
     if (rolesChanged || destructive || (value.allow_direct_control && !data.settings.allow_direct_control)) {
-      confirm({ title: '确认模型巡检策略', description: '选中的探测专用账号将退出普通业务选号，关闭巡检不会自动恢复其业务角色。跨线路检查不修改持久绑定；自动处置仅在两轮对照达标后严格退役目标，固定出口账号届时等待。', confirmText: '确认并保存', danger: destructive, onConfirm: save })
+      confirm({ title: '确认健康巡检策略', description: '选中的探测专用账号将退出普通业务选号。自动模式会处理经过二次复核的网络故障，或严格对照达标的模型 405；固定出口账号仍等待，不擅自换线。仅观察同时约束网络和模型巡检。', confirmText: '确认并保存', danger: !!destructive, onConfirm: save })
     } else void save()
   }
 

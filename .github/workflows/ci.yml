@@ -158,6 +158,9 @@ jobs:
       - name: Repeat model probe contracts
         run: go test ./internal/modelprobe ./internal/adminapi -run '^TestModelProbe' -count=10 -timeout=240s
 
+      - name: Repeat unified proxy health contracts
+        run: go test ./internal/modelprobe ./internal/adminapi -run 'TestUnified|TestProxyHealth' -count=10 -timeout=240s
+
   # 真实客户端只连接 httptest，不读取账号、不访问真实模型；SDK 依赖安装在临时目录。
   sdk-compat:
     runs-on: ubuntu-latest
