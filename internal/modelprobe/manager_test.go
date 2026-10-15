@@ -29,6 +29,7 @@ type fixture struct {
 	mu                sync.Mutex
 	requests          []string
 	respond           func(string, string, int) (int, string)
+	contentType       map[string]string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -69,6 +70,9 @@ func newFixture(t *testing.T) *fixture {
 				status, body = f.respond(route, account, len(f.requests))
 			}
 			w.Header().Set("Content-Type", "application/json")
+			if value := f.contentType[route]; value != "" {
+				w.Header().Set("Content-Type", value)
+			}
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(body))
 		}))

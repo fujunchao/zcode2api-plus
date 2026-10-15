@@ -24,6 +24,7 @@ export interface TotalTokens {
 export type AccountStatus = 'active' | 'exhausted' | 'cooling' | 'invalid' | 'disabled'
 
 export interface Account {
+  model_probe_only?: boolean
   initialization?: InitializationState
   id: string
   name: string
@@ -66,6 +67,69 @@ export interface Account {
   user_id: string | null
   virtual_device_mid: string | null
   claim: ClaimState | null
+}
+
+/** 独立的模型业务巡检；不能以连通性探测的 ok 代替这里的完整结果。 */
+export interface ModelProbeSettings {
+  enabled: boolean
+  mode: 'observe' | 'auto_retire'
+  model: string
+  interval_minutes: number
+  concurrency: number
+  timeout_seconds: number
+  global_daily_limit: number
+  account_daily_limit: number
+  account_ids: string[]
+  target_proxy_ids: string[]
+  reference_proxy_ids: string[]
+  egress_groups: Record<string, string>
+  allow_direct_control: boolean
+  revision: number
+}
+
+export interface ModelProbeSample {
+  request_id: string
+  account_ref: string
+  route_id: string
+  role: string
+  round: number
+  at: number
+  status: number
+  business_code: string
+  kind: string
+  complete: boolean
+  stale: boolean
+  usage: { Input?: number; Output?: number; CacheCreation?: number; CacheRead?: number }
+}
+
+export interface ModelProbeRun {
+  id: string
+  target_id: string
+  source: string
+  state: string
+  verdict: string
+  reason: string
+  mode: string
+  rule_version: string
+  decision_id?: string
+  created_at: number
+  updated_at: number
+  next_at: number
+  deadline: number
+  attempts: number
+  confirmed_rounds: number
+  samples: ModelProbeSample[]
+}
+
+export interface ModelProbeSummary {
+  settings: ModelProbeSettings
+  runs: ModelProbeRun[]
+  used_requests: number
+  remaining_requests: number
+  paused_until: number
+  next_due: Record<string, number>
+  active: number
+  rule_version: string
 }
 
 /** 套餐领取状态（后端 model.ClaimState）。 */
