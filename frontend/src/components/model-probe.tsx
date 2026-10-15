@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
+import { NetworkHealth } from '@/components/network-health'
 import { Empty, PanelCard } from '@/components/panel'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -108,8 +109,12 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
     finally { setTriggering('') }
   }
 
-  return <PanelCard title="模型可用性" subtitle="5.3f 最小请求与账号／线路对照，独立于网络连通性" badge={<Button variant="outline" size="sm" onClick={() => setOpen(!open)} aria-expanded={open}><Settings2 />配置模型巡检</Button>}>
-    {error ? <p role="alert" className="text-sm text-destructive">读取模型巡检失败：{errMsg(error)}</p> : !data?.settings ? <p role="status" className="text-sm text-muted-foreground">正在读取模型巡检配置…</p> : <>
+  return <PanelCard title="代理健康巡检" subtitle="统一调度：先检查网络，再按账号资格检查 5.3f；两层共用处置模式" badge={<Button variant="outline" size="sm" onClick={() => setOpen(!open)} aria-expanded={open}><Settings2 />配置健康巡检</Button>}>
+    {error ? <p role="alert" className="text-sm text-destructive">读取巡检失败：{errMsg(error)}</p> : !data?.settings ? <p role="status" className="text-sm text-muted-foreground">正在读取巡检配置…</p> : <>
+      {data.settings.migration_notice && <p role="status" className="rounded-lg border p-3 text-sm">{data.settings.migration_notice}</p>}
+      <div className="text-xs font-medium">统一动作：{data.settings.mode === 'observe' ? '仅观察，两层均不自动移除' : '自动处置，网络须复核、模型须严格对照'}</div>
+      <NetworkHealth profiles={profiles} enabled={data.settings.network_enabled ?? false} />
+      <h3 className="border-t pt-4 text-sm font-semibold">模型可用性</h3>
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border bg-muted/30 px-3 py-2 text-xs">
         <span className="flex items-center gap-1.5 font-medium"><Activity className="size-3.5" />{data.settings.enabled ? data.settings.mode === 'auto_retire' ? '自动严格处置' : '仅观察，不删除' : '未启用，不发送探测请求'}</span>
         <span>每 {data.settings.interval_minutes} 分钟 · 错峰执行</span>
@@ -130,6 +135,11 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
       {historyTarget && <section aria-label="模型对照记录" className="rounded-lg border p-3"><div className="mb-3 text-sm font-medium">{names.get(historyTarget) ?? historyTarget} · 最近 20 次诊断</div>{historyError ? <p role="alert">读取记录失败：{errMsg(historyError)}</p> : !history ? <p role="status">正在读取记录…</p> : history.runs.length === 0 ? <p className="text-xs text-muted-foreground">还没有模型检查记录。</p> : history.runs.map((run) => <div key={run.id} className="border-b py-3 last:border-0"><div className="flex flex-wrap gap-3 text-xs"><strong>{describe(run)}</strong><span>{time(run.created_at)}</span><span>{run.attempts}/8 次出站 · {run.confirmed_rounds}/2 轮对照</span></div><div className="my-2 flex flex-wrap items-center gap-2">{run.samples.map((s, i) => <div key={s.request_id || i} className="flex items-center gap-2">{i > 0 && <ArrowRight className="size-3 text-muted-foreground" />}<span className={'rounded-md border px-2 py-1 text-xs ' + (s.stale ? 'text-muted-foreground' : s.complete ? 'border-emerald-200 text-emerald-800' : s.status === 405 ? 'border-amber-200 text-amber-800' : '')} title={(labels[s.kind] ?? s.kind) + ' · 账号引用 ' + s.account_ref}>{s.role === 'screen' ? '筛查' : (s.role === 'reference' ? '参考' : '目标') + s.round} · {s.status || '未取得响应'}{s.business_code && '/' + s.business_code}{s.stale && ' · 旧结果'}</span></div>)}</div><p className="mb-1 text-xs text-muted-foreground">{confirmedUsage(run)}</p><p className="text-xs text-muted-foreground">{labels[run.reason] ?? run.reason} · {run.rule_version}{run.decision_id && ' · ' + run.decision_id}</p></div>)}</section>}
     </>}
     {open && <form aria-label="模型巡检配置" className="space-y-4 border-t pt-4" onSubmit={(e) => { e.preventDefault(); confirmSave() }}>
+      <fieldset className="space-y-3 rounded-lg border p-3"><legend className="px-1 text-sm font-medium">基础网络巡检</legend>
+        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={value.network_enabled ?? false} onChange={(e) => draft.edit({ network_enabled: e.target.checked })} />启用基础网络巡检（不需要账号）</label>
+        <div className="grid gap-4 sm:grid-cols-2"><div className="space-y-1.5"><Label htmlFor="network-interval">网络巡检间隔（分钟）</Label><Input id="network-interval" type="number" min={1} max={1440} required value={value.network_interval_minutes ?? 30} onChange={(e) => draft.edit({ network_interval_minutes: Number(e.target.value) })} /></div><div className="space-y-1.5"><Label htmlFor="network-confirm">网络复核等待（秒）</Label><Input id="network-confirm" type="number" min={1} max={300} required value={value.network_confirm_seconds ?? 10} onChange={(e) => draft.edit({ network_confirm_seconds: Number(e.target.value) })} /></div></div>
+        <p className="text-xs text-muted-foreground">首次异常不删除；再次异常且参考正常才按统一模式处置。网络复核的直连不带任何账号凭据，和下面的模型直连许可不同。</p>
+      </fieldset>
       <label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" checked={value.enabled} onChange={(e) => draft.edit({ enabled: e.target.checked })} />启用模型巡检</label>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3"><div className="space-y-1.5"><Label htmlFor="model-probe-mode">处置模式</Label><select id="model-probe-mode" className={selectClass} value={value.mode} onChange={(e) => draft.edit({ mode: e.target.value as ModelProbeSettings['mode'] })}><option value="observe">仅观察，不改变业务路由</option><option value="auto_retire">证据达标后严格退役</option></select></div>{numberFields.map((field) => <div key={field.key} className="space-y-1.5"><Label htmlFor={'probe-' + field.key}>{field.label}</Label><Input id={'probe-' + field.key} type="number" min={field.min} max={field.max} required value={value[field.key]} onChange={(e) => draft.edit({ [field.key]: Number(e.target.value) })} /></div>)}</div>
       <p className="text-xs text-muted-foreground">保存后后续轮次使用新间隔，无需重启。冷却、十分钟证据窗口和请求预算仍独立生效；参考与失败请求同样计入预算。</p>

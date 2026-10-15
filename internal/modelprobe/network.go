@@ -189,6 +189,14 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 		}
 		manual := m.netPending
 		m.netPending = map[string]bool{}
+		// 三个入口各六秒，48 条的两次检查及参考复核可在五分钟批次预算内完成。
+		// 大池拆分后立即处理剩余批次，不因重新起轮一直只检查列表开头。
+		if len(selected) > 48 {
+			for _, v := range selected[48:] {
+				m.netPending[v.ID] = true
+			}
+			selected = selected[:48]
+		}
 		m.netNext = now.Add(time.Duration(p.NetworkIntervalMinutes) * time.Minute)
 		if len(selected) == 0 {
 			return false, nil

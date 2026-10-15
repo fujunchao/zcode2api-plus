@@ -51,6 +51,14 @@ func (s *Store) NetworkHealth() ([]NetworkHealthRecord, error) {
 		if err := json.Unmarshal([]byte(raw), &r); err != nil {
 			return nil, err
 		}
+		if r.PolicyRevision != s.modelProbe.Policy.Revision && r.State == "waiting" {
+			r.State = "interrupted"
+			r.RecheckAt = 0
+		}
+		if p, ok := s.probeProfileLocked(r.ProfileID); ok && p.Generation != r.Generation {
+			r.State = "changed"
+			r.RecheckAt = 0
+		}
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].At > out[j].At })
@@ -69,6 +77,10 @@ func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHe
 	}
 	defer tx.Rollback()
 	for _, r := range records {
+		if p, ok := s.probeProfileLocked(r.ProfileID); ok && p.Generation != r.Generation {
+			r.State = "changed"
+			r.RecheckAt = 0
+		}
 		raw, err := json.Marshal(r)
 		if err != nil {
 			return err
@@ -76,6 +88,9 @@ func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHe
 		if _, err = tx.Exec("INSERT OR REPLACE INTO proxy_network_health(profile_id,data) VALUES (?,?)", r.ProfileID, string(raw)); err != nil {
 			return err
 		}
+	}
+	if _, err = tx.Exec("DELETE FROM proxy_network_health WHERE rowid NOT IN (SELECT rowid FROM proxy_network_health ORDER BY rowid DESC LIMIT 10000)"); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

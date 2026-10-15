@@ -40,7 +40,7 @@ function mount(data = summary()) {
 test('巡检时间可自行设置，后台刷新不覆盖未保存的输入', async () => {
   const data = summary()
   const client = mount(data)
-  fireEvent.click(await screen.findByRole('button', { name: '配置模型巡检' }))
+  fireEvent.click(await screen.findByRole('button', { name: '配置健康巡检' }))
   const interval = await screen.findByLabelText('模型巡检间隔（分钟）')
   expect((interval as HTMLInputElement).value).toBe('30')
   fireEvent.change(interval, { target: { value: '17' } })

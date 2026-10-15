@@ -71,6 +71,11 @@ export interface Account {
 
 /** 独立的模型业务巡检；不能以连通性探测的 ok 代替这里的完整结果。 */
 export interface ModelProbeSettings {
+  health_version?: number
+  network_enabled?: boolean
+  network_interval_minutes?: number
+  network_confirm_seconds?: number
+  migration_notice?: string
   enabled: boolean
   mode: 'observe' | 'auto_retire'
   model: string
@@ -85,6 +90,20 @@ export interface ModelProbeSettings {
   egress_groups: Record<string, string>
   allow_direct_control: boolean
   revision: number
+}
+
+export interface NetworkHealthRecord {
+  profile_id: string
+  generation: number
+  state: string
+  at: number
+  recheck_at?: number
+  round_id: string
+  first: UpstreamProbe
+  second?: UpstreamProbe
+  control?: UpstreamProbe
+  control_id?: string
+  removed: boolean
 }
 
 export interface ModelProbeSample {

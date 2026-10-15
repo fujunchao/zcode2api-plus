@@ -61,19 +61,6 @@ export function SettingsPage() {
   const setClaimCaptchaCooldown = (value: string) => claimDraft.edit({ claimCaptchaCooldown: value })
   const setClaimRetryCooldown = (value: string) => claimDraft.edit({ claimRetryCooldown: value })
   const setClaimPreviewCooldown = (value: string) => claimDraft.edit({ claimPreviewCooldown: value })
-  const proxyDraft = useDraftGroup(
-    data ? {
-      proxyHealth: data.proxy_health_enabled ?? true,
-      proxyHealthInterval: String(data.proxy_health_interval ?? '30'),
-    } : undefined,
-    {
-      proxyHealth: true,
-      proxyHealthInterval: '30',
-    },
-  )
-  const { proxyHealth, proxyHealthInterval } = proxyDraft.value
-  const setProxyHealth = (value: boolean) => proxyDraft.edit({ proxyHealth: value })
-  const setProxyHealthInterval = (value: string) => proxyDraft.edit({ proxyHealthInterval: value })
   const riskDraft = useDraftGroup(
     data ? {
       riskCoolingSteps: String(data.risk_cooling_steps ?? '300,900,3600'),
@@ -120,7 +107,6 @@ export function SettingsPage() {
   const [showKeys, setShowKeys] = useState(false)
   const [saving, setSaving] = useState(false)
   const [savingClaim, setSavingClaim] = useState(false)
-  const [savingProxyHealth, setSavingProxyHealth] = useState(false)
   const [savingRiskCooling, setSavingRiskCooling] = useState(false)
   const [saving503Steps, setSaving503Steps] = useState(false)
   const [savingAsyncForceDirect, setSavingAsyncForceDirect] = useState(false)
@@ -199,28 +185,6 @@ export function SettingsPage() {
       toast.error('儲存失敗：' + errMsg(err))
     } finally {
       setSavingClaim(false)
-    }
-  }
-
-  /* 線路自動巡檢：独立表单，只提交巡检相关字段 */
-  async function saveProxyHealth(e: FormEvent) {
-    e.preventDefault()
-    const interval = parseInt(proxyHealthInterval, 10)
-    if (isNaN(interval) || interval < 1) {
-      toast.error('巡檢間隔必須是 ≥1 的整數（分鐘）')
-      return
-    }
-    setSavingProxyHealth(true)
-    try {
-      await persistGroup(proxyDraft, {
-        proxy_health_enabled: proxyHealth,
-        proxy_health_interval: interval,
-      })
-      toast.success('已儲存')
-    } catch (err) {
-      toast.error('儲存失敗：' + errMsg(err))
-    } finally {
-      setSavingProxyHealth(false)
     }
   }
 
@@ -462,49 +426,7 @@ export function SettingsPage() {
         </CardContent>
       </Card>
 
-      {/* 線路自動巡檢 */}
-      <Card>
-        <CardContent className="flex flex-col gap-5">
-          <div className="text-sm font-semibold">線路自動巡檢</div>
-          <form className="flex flex-col gap-5" onSubmit={saveProxyHealth}>
-            <label className="flex cursor-pointer items-start gap-2 text-sm">
-              <Checkbox checked={proxyHealth} onCheckedChange={(v) => setProxyHealth(v === true)} />
-              <span>
-                自動巡檢代理線路
-                <span className="block text-xs text-muted-foreground">
-                  每隔一段時間對全部已啟用線路做 z.ai 可達性檢測（與手動「全部測試」同口徑）。
-                  檢測不通過的線路會被<strong>自動移除</strong>，其綁定帳號按「空閒線路優先 →
-                  綁定數最少 → 直連兜底」自動改派。關閉後線路只由人工管理。
-                </span>
-              </span>
-            </label>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="set-proxy-health-interval">巡檢間隔（分鐘）</Label>
-              <div className="text-xs text-muted-foreground">
-                最小 1 分鐘。若某一輪全部線路失敗且直連也不可达，會判定為本機網路故障而跳過移除，
-                不會清空線路池；停用線路不參與巡檢。
-              </div>
-              <Input
-                id="set-proxy-health-interval"
-                type="number"
-                min={1}
-                className="w-40"
-                value={proxyHealthInterval}
-                onChange={(e) => setProxyHealthInterval(e.target.value)}
-              />
-            </div>
-            <p className="text-xs text-muted-foreground">
-              改動即時生效（間隔從下一輪起按新值計）；每輪的移除與改派都會寫入日誌（前綴 proxy-health）。
-            </p>
-            <div className="flex justify-end">
-              <Button type="submit" disabled={savingProxyHealth}>
-                {savingProxyHealth ? <Loader2 className="animate-spin" /> : null}
-                儲存
-              </Button>
-            </div>
-          </form>
-        </CardContent>
-      </Card>
+<Card><CardContent className="space-y-2"><div className="text-sm font-semibold">代理健康巡检已统一</div><p className="text-xs text-muted-foreground">网络复核、模型对照和处置模式在代理页面统一配置，此处不再运行独立自动清理器。</p><a className="text-sm underline" href="/admin/proxies">前往代理健康巡检</a></CardContent></Card>
 
       {/* 風控冷卻 */}
       <Card>
