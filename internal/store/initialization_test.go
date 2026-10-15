@@ -1,11 +1,178 @@
 package store
 
 import (
+	"errors"
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	"zcode2api/internal/model"
 )
+
+func TestNewAccountInitializationLateResultsCannotOverrideChanges(t *testing.T) {
+	for _, change := range []string{"pause", "disable", "batch-disable", "archive", "manual", "credential-aba", "proxy-aba"} {
+		t.Run(change, func(t *testing.T) {
+			s, a, trial, fixed := initializationStoreFixture(t)
+			attempt, err := s.BeginInitialization(a.ID, time.Now())
+			if err != nil || attempt == nil {
+				t.Fatal(err)
+			}
+			defer s.ReleaseInitialization(attempt)
+			switch change {
+			case "pause":
+				err = s.ChangeInitialization(a.ID, s.Initialization(a.ID).Revision, "pause")
+			case "disable":
+				_, err = s.SetEnabled(a.Provider, a.ID, false)
+			case "batch-disable":
+				_, err = s.BatchSetEnabled([]string{a.ID}, false, false)
+			case "archive":
+				_, err = s.SetArchived(a.Provider, a.ID, true)
+			case "manual":
+				_, err = s.AssignProxyProfile(a.ID, fixed.ID)
+			case "credential-aba":
+				_, err = s.RenewJWT(a.Provider, a.ID, jwtFor("other"))
+				if err == nil {
+					_, err = s.RenewJWT(a.Provider, a.ID, a.Secret())
+				}
+			case "proxy-aba":
+				_, err = s.UpdateProxyProfile(trial.ID, trial.Name, "http://127.0.0.1:18082", true)
+				if err == nil {
+					_, err = s.UpdateProxyProfile(trial.ID, trial.Name, trial.URL, true)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := s.FindAny(a.ID)
+			task := s.Initialization(a.ID)
+			if err := s.ObserveInitialization(attempt, model.InitialQuotaObservation{Kind: "available", Snapshot: attempt.Account, CheckedAt: float64(time.Now().Unix())}); !errors.Is(err, ErrInitializationConflict) {
+				t.Fatalf("迟到响应未被拒绝：%v", err)
+			}
+			if !reflect.DeepEqual(before, s.FindAny(a.ID)) || !reflect.DeepEqual(task, s.Initialization(a.ID)) {
+				t.Fatal("迟到结果修改了人工操作后的状态")
+			}
+		})
+	}
+}
+
+func TestNewAccountInitializationCreateAndBindAreAtomic(t *testing.T) {
+	for _, stage := range []string{"create", "bind"} {
+		t.Run(stage, func(t *testing.T) {
+			s, a, _, _ := initializationStoreFixture(t)
+			if stage == "create" {
+				if _, err := s.db.Exec(`CREATE TRIGGER reject_initialization BEFORE INSERT ON account_initializations BEGIN SELECT RAISE(ABORT,'injected'); END`); err != nil {
+					t.Fatal(err)
+				}
+				before := s.ListAccounts("")
+				if _, _, err := s.AddAccountWithIdentity(model.ProviderZai, "第二个", jwtFor("second"), "", AccountCreationOptions{InitializeProxy: true}); err == nil {
+					t.Fatal("登记任务失败时不能创建可调度账号")
+				}
+				if !reflect.DeepEqual(before, s.ListAccounts("")) {
+					t.Fatal("创建失败提前发布了账号")
+				}
+			} else {
+				attempt, err := s.BeginInitialization(a.ID, time.Now())
+				if err != nil || attempt == nil {
+					t.Fatal(err)
+				}
+				defer s.ReleaseInitialization(attempt)
+				if err := s.ObserveInitialization(attempt, model.InitialQuotaObservation{Kind: "available", Snapshot: attempt.Account, CheckedAt: float64(time.Now().Unix())}); err != nil {
+					t.Fatal(err)
+				}
+				before, task := s.FindAny(a.ID), s.Initialization(a.ID)
+				if _, err := s.db.Exec(fmt.Sprintf("CREATE TRIGGER reject_bind BEFORE INSERT ON accounts WHEN NEW.id='%s' BEGIN SELECT RAISE(ABORT,'injected'); END", a.ID)); err != nil {
+					t.Fatal(err)
+				}
+				if ok, err := s.BindInitialization(a.ID, task.Revision, false); err == nil || ok {
+					t.Fatal("绑定落盘失败不得报告完成")
+				}
+				if !reflect.DeepEqual(before, s.FindAny(a.ID)) || !reflect.DeepEqual(task, s.Initialization(a.ID)) {
+					t.Fatal("绑定失败发布了部分状态")
+				}
+			}
+			reopened, err := New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if len(reopened.ListAccounts("")) != 1 || reopened.FindAny(a.ID).IsSelectable(time.Now()) {
+				t.Fatal("重启后不能放行未完成账号")
+			}
+		})
+	}
+}
+
+func TestNewAccountInitializationRestartPreservesUncertainClaim(t *testing.T) {
+	s, a, _, _ := initializationStoreFixture(t)
+	attempt, err := s.BeginInitialization(a.ID, time.Now())
+	if err != nil || attempt == nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordInitializationClaim(attempt, "trial"); err != nil {
+		t.Fatal(err)
+	}
+	s.ReleaseInitialization(attempt)
+	reopened, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	resumed, err := reopened.BeginInitialization(a.ID, time.Now())
+	if err != nil || resumed == nil {
+		t.Fatal(err)
+	}
+	defer reopened.ReleaseInitialization(resumed)
+	if resumed.Task.State != "verifying" || !resumed.Task.Uncertain || resumed.Task.Attempts != 1 || len(resumed.Task.PlanIDs) != 1 {
+		t.Fatalf("恢复必须核验原请求，不能重开取额：%+v", resumed.Task)
+	}
+	if resumed.Task.Deadline != attempt.Task.Deadline {
+		t.Fatal("重启清零了轮次预算")
+	}
+}
+
+func TestNewAccountInitializationDispatchAndReplenishment(t *testing.T) {
+	s, a, _, fixed := initializationStoreFixture(t)
+	for _, mode := range []string{"direct", "forced_direct", "custom_client"} {
+		egress := s.DirectEgress(a, mode)
+		if mode == "custom_client" {
+			egress.Mode = mode
+		}
+		if release, err := s.AcquireModelDispatch(a, egress); err == nil {
+			release()
+			t.Fatalf("初始化账号通过 %s 提前出站", mode)
+		}
+	}
+	completeInitializationFixture(t, s, a)
+	if _, _, err := s.DeleteProxyProfile(fixed.ID); err != nil {
+		t.Fatal(err)
+	}
+	addSelectionProxy(t, s, "新增补线", 18089, true)
+	if got := s.FindAny(a.ID); got.ProxyID != nil || got.IsSelectable(time.Now()) {
+		t.Fatal("自动补线覆盖固定出口等待")
+	}
+	if err := s.ChangeInitialization(a.ID, s.Initialization(a.ID).Revision, "retry"); err == nil {
+		t.Fatal("已到账账号不能被重新安排领取")
+	}
+}
+
+func TestNewAccountInitializationPolicyRevisionAndUnavailableDisable(t *testing.T) {
+	s, _, _, fixed := initializationStoreFixture(t)
+	policy, err := s.NewAccountProxyPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SaveNewAccountProxyPolicy(DefaultNewAccountProxyPolicy()); !errors.Is(err, ErrInitializationConflict) {
+		t.Fatalf("旧配置覆盖了当前版本：%v", err)
+	}
+	if _, _, err := s.DeleteProxyProfile(fixed.ID); err != nil {
+		t.Fatal(err)
+	}
+	policy.Enabled = false
+	if _, err := s.SaveNewAccountProxyPolicy(policy); err != nil {
+		t.Fatalf("节点失效后仍必须能关闭策略：%v", err)
+	}
+}
 
 func initializationStoreFixture(t *testing.T) (*Store, *model.Account, ProxyProfile, ProxyProfile) {
 	t.Helper()

@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -9,7 +10,80 @@ import (
 	"time"
 
 	"zcode2api/internal/model"
+	"zcode2api/internal/store"
 )
+
+func TestNewAccountInitializationQuotaEvidence(t *testing.T) {
+	for _, tc := range []struct{ name, body, kind string }{
+		{"空额度", newAccountEmptyBalance, "missing"},
+		{"可用额度", newAccountAllocatedBalance, "available"},
+		{"缺业务码", `{"data":{"plans":[],"balances":[]}}`, "unknown"},
+		{"缺余额", `{"code":0,"data":{"plans":[]}}`, "unknown"},
+		{"空对象", `{"code":0,"data":{}}`, "unknown"},
+		{"可用量优先", `{"code":0,"data":{"plans":[{"plan_id":"old"}],"balances":[{"model":"m","total_units":150,"available_units":0,"remaining_units":150}]}}`, "allocated"},
+		{"无模型名", `{"code":0,"data":{"plans":[],"balances":[{"available_units":150}]}}`, "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAccountQuotaFixture(t, tc.body, tc.body)
+			policy := store.DefaultNewAccountProxyPolicy()
+			policy.Enabled = true
+			policy.DefaultProxyID = f.good.ID
+			if _, err := f.h.Store.SaveNewAccountProxyPolicy(policy); err != nil {
+				t.Fatal(err)
+			}
+			a, _, err := f.h.Store.AddAccountWithIdentity(model.ProviderZai, "证据", jwtTokenFor("evidence"), "", store.AccountCreationOptions{InitializeProxy: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempt, err := f.h.Store.BeginInitialization(a.ID, time.Now())
+			if err != nil || attempt == nil {
+				t.Fatal(err)
+			}
+			defer f.h.Store.ReleaseInitialization(attempt)
+			before := f.h.Store.FindAny(a.ID)
+			got := f.h.Quota.ObserveInitialization(context.Background(), attempt)
+			if got.Kind != tc.kind {
+				t.Fatalf("证据分类错误：got=%s want=%s", got.Kind, tc.kind)
+			}
+			if !reflect.DeepEqual(before, f.h.Store.FindAny(a.ID)) || len(f.h.Store.ListProxyProfiles()) != 2 {
+				t.Fatal("观测提前写入账号或删除代理")
+			}
+		})
+	}
+}
+
+func TestNewAccountInitializationPolicyDoesNotAdoptExistingAccounts(t *testing.T) {
+	f := newAccountQuotaFixture(t, newAccountEmptyBalance, newAccountEmptyBalance)
+	old, _, err := f.h.Store.SaveOAuthAccount("旧号", jwtTokenFor("old-policy"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.Store.AssignProxyProfile(old.ID, f.bad.ID); err != nil {
+		t.Fatal(err)
+	}
+	policy := store.DefaultNewAccountProxyPolicy()
+	policy.Enabled = true
+	policy.DefaultProxyID = f.good.ID
+	if _, err := f.h.Store.SaveNewAccountProxyPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	f.h.Register(mux)
+	if status, _ := do(t, mux, f.h.Store, http.MethodPost, "/admin/api/accounts", map[string]any{"tokens": []string{old.Secret()}, "proxy_id": "__auto__"}); status != http.StatusOK {
+		t.Fatal(status)
+	}
+	if f.h.Store.Initialization(old.ID) != nil || *f.h.Store.FindAny(old.ID).ProxyID != f.bad.ID {
+		t.Fatal("重复添加接管了旧号")
+	}
+	if status, _ := do(t, mux, f.h.Store, http.MethodPost, "/admin/api/import", map[string]any{"providers": map[string]any{"zai": []map[string]string{{"name": "备份", "secret": jwtTokenFor("backup-policy")}}}}); status != http.StatusOK {
+		t.Fatal(status)
+	}
+	for _, a := range f.h.Store.ListAccounts("") {
+		if f.h.Store.Initialization(a.ID) != nil {
+			t.Fatal("备份导入登记了新号任务")
+		}
+	}
+}
 
 // 通过新增端点验证共享线路保护；上游和凭据均来自隔离夹具。
 func TestNewAccountEmptyQuotaNeverDeletesSharedProxy(t *testing.T) {
