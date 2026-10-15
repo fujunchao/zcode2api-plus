@@ -84,11 +84,23 @@ func (m *Manager) send(parent context.Context, l *store.ModelProbeLease) (o stor
 		limit = errorLimit
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
+	isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	u := gateway.NewUsageCollector(isSSE)
+	u.Feed(raw)
+	u.Finish()
+	if u.UsageComplete() {
+		usage = u.AsDict()
+	}
 	if readErr != nil || len(raw) > limit {
 		kind = "incomplete_response"
 		if ctx.Err() != nil {
 			kind = "timeout"
 		}
+		return
+	}
+	if ctx.Err() != nil {
+		kind = "canceled"
+		o.InvalidRequest = true
 		return
 	}
 	o.BusinessCode = gateway.UpstreamBusinessCode(string(raw))
@@ -113,11 +125,6 @@ func (m *Manager) send(parent context.Context, l *store.ModelProbeLease) (o stor
 		kind = "redirect_or_invalid_status"
 		return
 	}
-	isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
-	u := gateway.NewUsageCollector(isSSE)
-	u.Feed(raw)
-	u.Finish()
-	usage = u.AsDict()
 	valid := u.ResponseComplete()
 	if isSSE {
 		valid = valid && validSSEMessage(raw)
@@ -137,6 +144,20 @@ func validSSEMessage(raw []byte) bool {
 	started, stopped, bad := false, false, false
 	observe := func(frame *sse.Event) {
 		if frame == nil {
+			return
+		}
+		data := strings.TrimSpace(frame.Data)
+		if data == "" {
+			return
+		}
+		if data == "[DONE]" {
+			if !started || !stopped {
+				bad = true
+			}
+			return
+		}
+		if stopped {
+			bad = true
 			return
 		}
 		var p map[string]any

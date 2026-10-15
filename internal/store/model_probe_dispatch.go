@@ -73,7 +73,7 @@ func (s *Store) QueueModelProbe(target, source string, now time.Time) (ModelProb
 
 func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (ModelProbeRun, error) {
 	p := s.modelProbe.Policy
-	if s.strictClosed || !p.Enabled || !slices.Contains(p.TargetProxyIDs, target) {
+	if s.strictClosed || s.modelProbe.storageError || !p.Enabled || !slices.Contains(p.TargetProxyIDs, target) {
 		return ModelProbeRun{}, ErrModelProbeUnavailable
 	}
 	profile, ok := s.probeProfileLocked(target)
@@ -93,7 +93,7 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 		return ModelProbeRun{}, errors.New("模型巡检等待队列已满")
 	}
 	r := &ModelProbeRun{ID: "probe-" + randomHex(12), TargetID: target, Source: source, State: "queued", Verdict: "unknown", Reason: "queued", Mode: p.Mode,
-		RuleVersion: ModelProbeRuleVersion, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli(), NextAt: now.UnixMilli(), Deadline: now.Add(20 * time.Minute).UnixMilli(), Samples: []ModelProbeSample{}, policy: p.clone(), target: profile, phase: "screen",
+		RuleVersion: ModelProbeRuleVersion, TemplateVersion: ModelProbeTemplateVersion, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli(), NextAt: now.UnixMilli(), Deadline: now.Add(20 * time.Minute).UnixMilli(), Samples: []ModelProbeSample{}, policy: p.clone(), target: profile, phase: "screen",
 		credentials: map[string]string{}, bindings: map[string]uint64{}, targetURL: config.UpstreamZai}
 	for _, id := range p.AccountIDs {
 		if s.probeAccountReadyLocked(id, now) {
@@ -109,8 +109,9 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 		r.State, r.Reason = "skipped", "no_eligible_account"
 	}
 	if source != "manual" {
-		if good, ok := s.modelProbe.business[target]; ok && good.At.After(now.Add(-30*time.Minute)) && !s.modelProbe.hints[target].After(good.At) {
+		if good, ok := s.recentProbeBusinessLocked(profile, now, 30*time.Minute); ok && !s.modelProbe.hints[target].After(good.At) {
 			r.State, r.Verdict, r.Reason = "skipped", "healthy_recent", "skipped_recent_success"
+			r.ObservedAt = good.At.UnixMilli()
 		}
 	}
 	if s.modelProbe.PausedUntil > now.UnixMilli() {
@@ -173,7 +174,7 @@ func (s *Store) ScheduleModelProbes(now time.Time) error {
 func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.strictClosed || !s.modelProbe.Policy.Enabled || len(s.modelProbe.leases) >= s.modelProbe.Policy.Concurrency {
+	if s.strictClosed || s.modelProbe.storageError || !s.modelProbe.Policy.Enabled || len(s.modelProbe.leases) >= s.modelProbe.Policy.Concurrency {
 		return nil, nil
 	}
 	var runs []*ModelProbeRun
@@ -233,6 +234,11 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 			}
 			continue
 		}
+		if r.phase == "target" && !s.freshModelProbeReferenceLocked(r, id, now) {
+			copy := *r
+			copy.phase, copy.Reason = "reference", "reference_expired"
+			r = &copy
+		}
 		routeID, role := r.TargetID, r.phase
 		if r.phase == "reference" {
 			routeID = r.referenceID
@@ -275,7 +281,7 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 }
 
 func (s *Store) probeLeaseCurrentLocked(l *ModelProbeLease, now time.Time) bool {
-	if l == nil || s.strictClosed || s.modelProbe.leases[l.id] != l || !s.modelProbe.Policy.Enabled || s.modelProbe.Policy.Revision != l.revision || !s.probeAccountReadyLocked(l.account.ID, now) {
+	if l == nil || s.strictClosed || s.modelProbe.storageError || s.modelProbe.leases[l.id] != l || !s.modelProbe.Policy.Enabled || s.modelProbe.Policy.Revision != l.revision || !s.probeAccountReadyLocked(l.account.ID, now) {
 		return false
 	}
 	a := s.findAnyLocked(l.account.ID)
@@ -405,9 +411,12 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 			}
 		}
 	}
-	copy.Samples = append(copy.Samples, ModelProbeSample{RequestID: l.requestID, AccountRef: strictDigest(l.account.ID)[:12], RouteID: l.routeID, Role: l.role, Round: l.round, At: now.UnixMilli(), Status: o.Status, BusinessCode: o.BusinessCode, Kind: kind, Complete: o.Complete, Usage: usage, Stale: !current})
+	copy.Samples = append(copy.Samples, ModelProbeSample{Source: "model_probe", RequestID: l.requestID, AccountRef: strictDigest(l.account.ID)[:12], RouteID: l.routeID, Role: l.role, Round: l.round, At: now.UnixMilli(), Status: o.Status, BusinessCode: safeProbeCode(o.BusinessCode), Kind: kind, Complete: o.Complete, Usage: usage, Stale: !current})
+	if l.started {
+		copy.ObservedAt = now.UnixMilli()
+	}
 	o.At = now
-	if current && l.started && !o.InvalidRequest && o.RequestID == l.requestID && validProbeObservation(l, o) {
+	if current && l.started && (kind == "success" || kind == "risk_control") && !o.InvalidRequest && o.RequestID == l.requestID && validProbeObservation(l, o) {
 		if (o.Complete && o.Status >= 200 && o.Status < 300 && o.BusinessCode == "") || (o.Status == 405 && o.BusinessCode == "3012") {
 			copy.proofs = append(copy.proofs, modelProbeEvidence{ProxyObservation: o, account: l.account.ID, route: l.routeID, role: l.role, credential: l.credential, identity: l.identity, generation: l.profile.Generation, round: l.round})
 		}
@@ -419,13 +428,34 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 		s.advanceModelProbeLocked(&copy, l, o, kind, account, now)
 	}
 	if err := s.commitProbeResultLocked(&copy, account); err != nil {
-		return err
-	}
-	if err := s.persistProbeStateLocked(); err != nil {
+		s.modelProbe.storageError = true
+		copy.State, copy.Verdict, copy.Reason = "interrupted", "inconclusive", "storage_error"
+		s.modelProbe.runs[copy.ID] = &copy
 		return err
 	}
 	if copy.Verdict == "route_correlated" {
 		return s.retireModelProbeLocked(&copy, now)
 	}
 	return nil
+}
+
+// 业务码只展示有限数字或已知类型，不能让上游把任意正文／凭据塞进日志字段。
+func safeProbeCode(code string) string {
+	if code == "" {
+		return ""
+	}
+	numeric := len(code) <= 6
+	for _, c := range code {
+		if c < '0' || c > '9' {
+			numeric = false
+		}
+	}
+	if numeric {
+		return code
+	}
+	switch code {
+	case "F001", "invalid_request_error", "rate_limit_error", "authentication_error", "overloaded_error", "api_error":
+		return code
+	}
+	return "unrecognized"
 }

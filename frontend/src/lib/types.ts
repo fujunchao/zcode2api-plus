@@ -88,6 +88,7 @@ export interface ModelProbeSettings {
 }
 
 export interface ModelProbeSample {
+  source?: string
   request_id: string
   account_ref: string
   route_id: string
@@ -103,6 +104,8 @@ export interface ModelProbeSample {
 }
 
 export interface ModelProbeRun {
+  template_version?: string
+  observed_at?: number
   id: string
   target_id: string
   source: string
@@ -122,6 +125,9 @@ export interface ModelProbeRun {
 }
 
 export interface ModelProbeSummary {
+  observed_targets?: number
+  total_targets?: number
+  storage_error?: boolean
   settings: ModelProbeSettings
   runs: ModelProbeRun[]
   used_requests: number

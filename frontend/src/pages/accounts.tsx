@@ -988,6 +988,7 @@ export function AccountsPage() {
                       <Badge className={STATUS_BADGE[a.initialization?.blocked || a.local_scheduling_reason === 'risk_isolation' ? 'cooling' : a.status]}>
                         {a.initialization?.blocked ? (a.initialization.granted_at ? '待固定代理' : '初始化中') : a.local_scheduling_reason === 'risk_isolation' ? '本地隔离' : STATUS_LABEL[a.status] || a.status}
                       </Badge>
+                      {a.model_probe_only && <div className="mt-1"><Badge variant="outline" title="不参与普通业务选号；在模型巡检配置中解除专用角色">探测专用</Badge></div>}
                       {a.local_recheck_at != null && (
                         <div className="mt-1 text-[10px] text-muted-foreground" title="本地时间门槛到期后重新评估状态和额度，不保证上游接受">
                           重新评估：{fmtDate(a.local_recheck_at)}

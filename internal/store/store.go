@@ -1732,6 +1732,7 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 	var base []*model.Account
 	for _, a := range s.accounts[provider] {
 		a.Initialization = s.initializationViewLocked(a)
+		a.ModelProbeOnly = s.isModelProbeAccountLocked(a.ID)
 		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (forceDirect || s.proxyBindingAvailableLocked(a)) {
 			base = append(base, a)
 		}

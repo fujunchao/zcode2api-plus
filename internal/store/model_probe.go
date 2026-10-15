@@ -10,11 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 )
 
 const ModelProbeModel = "glm-5.3-flash"
 const ModelProbeRuleVersion = "proxy-model-probe-3012-v1"
+const ModelProbeTemplateVersion = "minimal-ok-v1"
 const modelProbeStateKey = "model_probe_v1"
 const ModelProbeDirect = "direct"
 
@@ -67,13 +69,21 @@ type modelProbePersistent struct {
 
 type modelProbeState struct {
 	modelProbePersistent
-	runs     map[string]*ModelProbeRun
-	leases   map[string]*ModelProbeLease
-	business map[string]ProxyObservation
-	hints    map[string]time.Time
+	runs         map[string]*ModelProbeRun
+	leases       map[string]*ModelProbeLease
+	business     map[string]modelProbeBusiness
+	hints        map[string]time.Time
+	storageError bool
+}
+
+type modelProbeBusiness struct {
+	ProxyObservation
+	identity, credential, account string
+	generation                    uint64
 }
 
 type ModelProbeSample struct {
+	Source       string      `json:"source"`
 	RequestID    string      `json:"request_id"`
 	AccountRef   string      `json:"account_ref"`
 	RouteID      string      `json:"route_id"`
@@ -97,9 +107,11 @@ type ModelProbeRun struct {
 	Reason          string             `json:"reason"`
 	Mode            string             `json:"mode"`
 	RuleVersion     string             `json:"rule_version"`
+	TemplateVersion string             `json:"template_version"`
 	DecisionID      string             `json:"decision_id,omitempty"`
 	CreatedAt       int64              `json:"created_at"`
 	UpdatedAt       int64              `json:"updated_at"`
+	ObservedAt      int64              `json:"observed_at"`
 	NextAt          int64              `json:"next_at"`
 	Deadline        int64              `json:"deadline"`
 	Attempts        int                `json:"attempts"`
@@ -133,7 +145,7 @@ func probeRunOpen(r *ModelProbeRun) bool {
 
 func (s *Store) loadModelProbe() error {
 	s.modelProbe = modelProbeState{modelProbePersistent: modelProbePersistent{Version: 1, Policy: DefaultModelProbeSettings(), NextDue: map[string]int64{}, LastDiagnosis: map[string]int64{}},
-		runs: map[string]*ModelProbeRun{}, leases: map[string]*ModelProbeLease{}, business: map[string]ProxyObservation{}, hints: map[string]time.Time{}}
+		runs: map[string]*ModelProbeRun{}, leases: map[string]*ModelProbeLease{}, business: map[string]modelProbeBusiness{}, hints: map[string]time.Time{}}
 	if raw := s.settings[modelProbeStateKey]; raw != "" {
 		if err := json.Unmarshal([]byte(raw), &s.modelProbe.modelProbePersistent); err != nil {
 			return fmt.Errorf("读取模型巡检状态失败: %w", err)
@@ -222,6 +234,9 @@ func (s *Store) SaveModelProbeSettings(p ModelProbeSettings, now time.Time) (Mod
 		return old.clone(), errors.New("模型巡检选择数量超过上限")
 	}
 	for _, id := range p.AccountIDs {
+		if !p.Enabled && slices.Contains(old.AccountIDs, id) {
+			continue
+		}
 		a := s.findAnyLocked(id)
 		if a == nil || a.Mode != "jwt" || s.initializationManagedLocked(id) {
 			return old.clone(), errors.New("探测账号必须是存在且未受初始化或固定出口托管的 JWT")
@@ -272,10 +287,39 @@ func (s *Store) SaveModelProbeSettings(p ModelProbeSettings, now time.Time) (Mod
 	if err != nil {
 		return old.clone(), err
 	}
-	if err := s.setMeta(modelProbeStateKey, string(raw)); err != nil {
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return old.clone(), err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", modelProbeStateKey, string(raw)); err != nil {
+		return old.clone(), err
+	}
+	changed := map[string]*ModelProbeRun{}
+	for id, r := range s.modelProbe.runs {
+		if !probeRunOpen(r) {
+			continue
+		}
+		copy := *r
+		copy.State, copy.Verdict, copy.Reason = "interrupted", "inconclusive", "policy_changed"
+		copy.UpdatedAt = now.UnixMilli()
+		data, err := json.Marshal(&copy)
+		if err != nil {
+			return old.clone(), err
+		}
+		if _, err = tx.Exec("UPDATE model_probe_runs SET data=? WHERE id=?", string(data), id); err != nil {
+			return old.clone(), err
+		}
+		changed[id] = &copy
+	}
+	if err = tx.Commit(); err != nil {
 		return old.clone(), err
 	}
 	s.modelProbe.modelProbePersistent = next
+	s.modelProbe.storageError = false
+	for id, r := range changed {
+		s.modelProbe.runs[id] = r
+	}
 	s.publishModelProbeRolesLocked()
 	return p.clone(), nil
 }
@@ -338,6 +382,9 @@ func (s *Store) modelProbeHistoryLocked(target string, offset, limit int) []Mode
 }
 
 type ModelProbeSummary struct {
+	ObservedTargets   int                `json:"observed_targets"`
+	TotalTargets      int                `json:"total_targets"`
+	StorageError      bool               `json:"storage_error"`
 	Settings          ModelProbeSettings `json:"settings"`
 	Runs              []ModelProbeRun    `json:"runs"`
 	UsedRequests      int                `json:"used_requests"`
@@ -359,7 +406,26 @@ func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 	for k, v := range s.modelProbe.NextDue {
 		due[k] = v
 	}
-	return ModelProbeSummary{Settings: s.modelProbe.Policy.clone(), Runs: s.modelProbeHistoryLocked("", 0, 50), UsedRequests: used, RemainingRequests: max(0, s.modelProbe.Policy.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion}, nil
+	latest := map[string]*ModelProbeRun{}
+	for _, r := range s.modelProbe.runs {
+		old := latest[r.TargetID]
+		if old == nil || r.CreatedAt > old.CreatedAt || (r.CreatedAt == old.CreatedAt && r.ID > old.ID) {
+			latest[r.TargetID] = r
+		}
+	}
+	views := []ModelProbeRun{}
+	observed := 0
+	for _, id := range s.modelProbe.Policy.TargetProxyIDs {
+		if r := latest[id]; r != nil {
+			v := r.view()
+			v.Samples = []ModelProbeSample{}
+			views = append(views, v)
+			if r.ObservedAt > now.Add(-30*time.Minute).UnixMilli() {
+				observed++
+			}
+		}
+	}
+	return ModelProbeSummary{ObservedTargets: observed, TotalTargets: len(s.modelProbe.Policy.TargetProxyIDs), StorageError: s.modelProbe.storageError, Settings: s.modelProbe.Policy.clone(), Runs: views, UsedRequests: used, RemainingRequests: max(0, s.modelProbe.Policy.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion}, nil
 }
 
 // 清理展示历史不影响仍在滚动预算窗口内的尝试登记。
@@ -427,11 +493,27 @@ func (s *Store) observeModelProbeBusinessLocked(acc *model.Account, egress Proxy
 		return
 	}
 	if o.Complete && o.Status >= 200 && o.Status < 300 {
-		s.modelProbe.business[egress.ID] = o
+		s.modelProbe.business[egress.ID] = modelProbeBusiness{ProxyObservation: o, identity: egress.identity, generation: egress.Generation, credential: s.strictCredentialRefLocked(acc), account: acc.ID}
 	}
 	if o.Status == 405 && o.BusinessCode == "3012" {
 		s.modelProbe.hints[egress.ID] = o.At
 	}
+}
+
+func (s *Store) recentProbeBusinessLocked(profile ProxyProfile, now time.Time, window time.Duration) (ProxyObservation, bool) {
+	e, ok := s.modelProbe.business[profile.ID]
+	if !ok || e.generation != profile.Generation || e.identity != strictProxyIdentity(profile.URL) || e.At.Before(now.Add(-window)) || e.At.After(now) {
+		return ProxyObservation{}, false
+	}
+	a := s.findAnyLocked(e.account)
+	if a == nil || s.strictCredentialRefLocked(a) != e.credential {
+		return ProxyObservation{}, false
+	}
+	// 同模型名的 API Key 备用端点不能替 JWT 目标作可用性证明。
+	if !probeTargetMatches(config.UpstreamZai, e.ProxyObservation) {
+		return ProxyObservation{}, false
+	}
+	return e.ProxyObservation, true
 }
 
 // 独立 SQL 事务同时保存探测结果和账号实际消耗，失败时不提前发布账号快照。
@@ -451,6 +533,13 @@ func (s *Store) commitProbeResultLocked(r *ModelProbeRun, a *model.Account) erro
 		}
 	}
 	if _, err = tx.Exec("INSERT OR REPLACE INTO model_probe_runs(id,created_at,data) VALUES (?,?,?)", r.ID, r.CreatedAt, string(raw)); err != nil {
+		return err
+	}
+	state, err := json.Marshal(s.modelProbe.modelProbePersistent)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", modelProbeStateKey, string(state)); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {

@@ -31,7 +31,7 @@ func IsRiskControlBody(text string) bool {
 
 // ApplyRiskControl 只在持有账号写锁时调用：共享阶梯算法，不包含代理换线或落库。
 func ApplyRiskControl(acc *Account, detail string, now time.Time, steps []int) (secs, streak int, invalid bool) {
-	acc.RiskControlStreak++
+	acc.RiskControlStreak = max(0, acc.RiskControlStreak) + 1
 	streak = acc.RiskControlStreak
 	ts := float64(now.UnixNano()) / 1e9
 	acc.LastRiskControlAt = &ts

@@ -13,7 +13,11 @@ import (
 )
 
 func validProbeObservation(l *ModelProbeLease, o ProxyObservation) bool {
-	u, err := url.Parse(l.targetURL)
+	return probeTargetMatches(l.targetURL, o) && o.ContentRef != "" && o.ProfileRef != "" && o.DeviceRef != "" && o.SessionRef != "" && o.EntryRef == l.EntryID()
+}
+
+func probeTargetMatches(target string, o ProxyObservation) bool {
+	u, err := url.Parse(target)
 	if err != nil {
 		return false
 	}
@@ -21,7 +25,24 @@ func validProbeObservation(l *ModelProbeLease, o ProxyObservation) bool {
 	if path == "" {
 		path = "/"
 	}
-	return strings.EqualFold(o.TargetOrigin, u.Scheme+"://"+u.Host) && o.TargetPath == path && o.Method == "POST" && o.Model == ModelProbeModel && o.ContentRef != "" && o.ProfileRef != "" && o.DeviceRef != "" && o.SessionRef != "" && o.EntryRef == l.EntryID()
+	return strings.EqualFold(o.TargetOrigin, u.Scheme+"://"+u.Host) && o.TargetPath == path && o.Method == "POST" && o.Model == ModelProbeModel
+}
+
+func (s *Store) freshModelProbeReferenceLocked(r *ModelProbeRun, account string, now time.Time) bool {
+	for i := len(r.proofs) - 1; i >= 0; i-- {
+		e := r.proofs[i]
+		if e.role == "reference" && e.round == r.round && e.account == account && probeSuccess(e.ProxyObservation) && s.probeEvidenceCurrentLocked(e, now) && !e.At.Before(now.Add(-2*time.Minute)) {
+			for _, other := range s.modelProbe.runs {
+				for _, bad := range other.proofs {
+					if bad.route == e.route && probeRisk(bad.ProxyObservation) && probeComparable(e.ProxyObservation, bad.ProxyObservation) && s.probeEvidenceCurrentLocked(bad, now) && bad.At.After(e.At) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func probeRisk(o ProxyObservation) bool {
@@ -158,7 +179,7 @@ func (s *Store) probeConfirmedRoundsLocked(r *ModelProbeRun, now time.Time) (int
 			}
 		}
 	}
-	if good, ok := s.modelProbe.business[r.TargetID]; ok && good.At.After(now.Add(-10*time.Minute)) && probeComparable(seed.ProxyObservation, good) {
+	if good, ok := s.recentProbeBusinessLocked(r.target, now, 10*time.Minute); ok && probeComparable(seed.ProxyObservation, good) {
 		return 0, nil
 	}
 	seen := map[string]bool{}

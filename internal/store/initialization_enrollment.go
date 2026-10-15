@@ -12,6 +12,9 @@ import (
 
 // initializationEnrollmentReason 只决定能否人工接管，不据本地空快照断言上游有领取资格。
 func initializationEnrollmentReason(a *model.Account, now time.Time) string {
+	if a != nil && a.ModelProbeOnly {
+		return "探测专用账号须先解除专用角色，不能同时接管初始化"
+	}
 	if !initializationHealthy(a, now) || a.JWTToken == nil || *a.JWTToken == "" {
 		return "仅支持启用、未归档且不处于失效或冷却状态的 JWT 账号"
 	}
