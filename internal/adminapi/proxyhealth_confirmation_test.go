@@ -23,7 +23,7 @@ func TestProxyHealthRecoveryBeforeConfirmationKeepsLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	NewProxyHealthScheduler(st).runOnce(nil)
+	runUnifiedNetworkRound(t, st)
 	profiles := st.ListProxyProfiles()
 	if len(profiles) != 1 || profiles[0].ID != p.ID {
 		t.Fatal("未复核同一线路就删除了已经恢复的代理")

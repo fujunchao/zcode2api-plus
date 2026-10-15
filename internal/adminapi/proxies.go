@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/networkprobe"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
 )
@@ -320,38 +321,16 @@ func probeUpstream(client *http.Client) map[string]any {
 }
 
 func probeUpstreamContext(ctx context.Context, client *http.Client) map[string]any {
-	report := map[string]any{"ok": false, "blocked": false, "error": "", "ms": 0}
-	entries := make([]any, 0, len(upstreamProbeTargets))
-	reachable, blocked := false, false
-	firstErr := ""
-	for _, target := range upstreamProbeTargets {
-		if ctx.Err() != nil {
-			report["error"] = ctx.Err().Error()
-			return report
-		}
-		entry := probeUpstreamTargetContext(ctx, client, target)
-		entries = append(entries, entry)
-		switch {
-		case entry["ok"] == true && entry["blocked"] != true:
-			if !reachable {
-				report["ms"] = entry["ms"]
-			}
-			reachable = true
-		case entry["blocked"] == true:
-			blocked = true
-		default:
-			if firstErr == "" {
-				firstErr, _ = entry["error"].(string)
-			}
-		}
+	r := networkprobe.Check(ctx, client, upstreamProbeTargets)
+	entries := []any{}
+	for _, e := range r.Targets {
+		entries = append(entries, map[string]any{"url": e.URL, "host": e.Host, "ok": e.OK, "blocked": e.Blocked, "status": e.Status, "ms": e.MS, "error": e.Error})
 	}
-	report["targets"] = entries
-	report["ok"] = reachable
-	report["blocked"] = !reachable && blocked
-	if !reachable && firstErr != "" {
-		report["error"] = firstErr
+	reason := r.Error
+	if r.Blocked {
+		reason = ""
 	}
-	return report
+	return map[string]any{"ok": r.OK, "blocked": r.Blocked, "error": reason, "ms": r.MS, "targets": entries}
 }
 
 // probeUpstreamTarget 探测单个上游目标：拿到任何 HTTP 响应即 ok=true。

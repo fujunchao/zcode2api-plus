@@ -58,6 +58,7 @@ func TestModelProbeHTTP405DoesNotReportModelSuccess(t *testing.T) {
 		t.Fatalf("模型巡检应默认关闭且有独立设置入口：status=%d body=%v", status, settings)
 	}
 	settings["enabled"], settings["interval_minutes"] = true, 17
+	settings["mode"], settings["network_enabled"] = "observe", false // 模型 HTTP 专项；网络层由独立真实 HTTP 回归覆盖。
 	settings["account_ids"], settings["target_proxy_ids"] = []string{a.ID}, []string{p.ID}
 	status, saved := do(t, mux, st, http.MethodPut, "/admin/api/proxies/model-probe/settings", settings)
 	if status != http.StatusOK || saved["interval_minutes"] != float64(17) {

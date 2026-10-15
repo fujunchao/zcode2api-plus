@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,24 +27,29 @@ var ErrModelProbeBudget = errors.New("模型巡检请求预算已用完")
 
 // ModelProbeSettings 的账号列表同时声明专用角色，关闭 Enabled 不自动释放角色。
 type ModelProbeSettings struct {
-	Enabled            bool              `json:"enabled"`
-	Mode               string            `json:"mode"`
-	Model              string            `json:"model"`
-	IntervalMinutes    int               `json:"interval_minutes"`
-	Concurrency        int               `json:"concurrency"`
-	TimeoutSeconds     int               `json:"timeout_seconds"`
-	GlobalDailyLimit   int               `json:"global_daily_limit"`
-	AccountDailyLimit  int               `json:"account_daily_limit"`
-	AccountIDs         []string          `json:"account_ids"`
-	TargetProxyIDs     []string          `json:"target_proxy_ids"`
-	ReferenceProxyIDs  []string          `json:"reference_proxy_ids"`
-	EgressGroups       map[string]string `json:"egress_groups"`
-	AllowDirectControl bool              `json:"allow_direct_control"`
-	Revision           uint64            `json:"revision"`
+	HealthVersion          int               `json:"health_version"`
+	NetworkEnabled         bool              `json:"network_enabled"`
+	NetworkIntervalMinutes int               `json:"network_interval_minutes"`
+	NetworkConfirmSeconds  int               `json:"network_confirm_seconds"`
+	MigrationNotice        string            `json:"migration_notice,omitempty"`
+	Enabled                bool              `json:"enabled"`
+	Mode                   string            `json:"mode"`
+	Model                  string            `json:"model"`
+	IntervalMinutes        int               `json:"interval_minutes"`
+	Concurrency            int               `json:"concurrency"`
+	TimeoutSeconds         int               `json:"timeout_seconds"`
+	GlobalDailyLimit       int               `json:"global_daily_limit"`
+	AccountDailyLimit      int               `json:"account_daily_limit"`
+	AccountIDs             []string          `json:"account_ids"`
+	TargetProxyIDs         []string          `json:"target_proxy_ids"`
+	ReferenceProxyIDs      []string          `json:"reference_proxy_ids"`
+	EgressGroups           map[string]string `json:"egress_groups"`
+	AllowDirectControl     bool              `json:"allow_direct_control"`
+	Revision               uint64            `json:"revision"`
 }
 
 func DefaultModelProbeSettings() ModelProbeSettings {
-	return ModelProbeSettings{Mode: "observe", Model: ModelProbeModel, IntervalMinutes: 30, Concurrency: 1, TimeoutSeconds: 30,
+	return ModelProbeSettings{NetworkIntervalMinutes: 30, NetworkConfirmSeconds: 10, Mode: "observe", Model: ModelProbeModel, IntervalMinutes: 30, Concurrency: 1, TimeoutSeconds: 30,
 		GlobalDailyLimit: 200, AccountDailyLimit: 100, AccountIDs: []string{}, TargetProxyIDs: []string{}, ReferenceProxyIDs: []string{}, EgressGroups: map[string]string{}}
 }
 
@@ -163,6 +169,13 @@ func (s *Store) loadModelProbe() error {
 	}
 	delete(s.settings, modelProbeStateKey)
 	s.publishSettings()
+	s.migrateNetworkHealthPolicy()
+	if err := s.initNetworkHealth(); err != nil {
+		return err
+	}
+	if err := s.ClearInterruptedNetworkHealth(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS model_probe_runs (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, data TEXT NOT NULL);
 	CREATE TABLE IF NOT EXISTS model_probe_attempts (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, started_at INTEGER NOT NULL);
 	CREATE INDEX IF NOT EXISTS idx_model_probe_attempts_at ON model_probe_attempts(started_at);`); err != nil {
@@ -233,6 +246,11 @@ func (s *Store) SaveModelProbeSettings(p ModelProbeSettings, now time.Time) (Mod
 	if p.Revision != old.Revision {
 		return old.clone(), ErrModelProbeConflict
 	}
+	if p.NetworkIntervalMinutes < 1 || p.NetworkIntervalMinutes > 1440 || p.NetworkConfirmSeconds < 1 || p.NetworkConfirmSeconds > 300 {
+		return old.clone(), errors.New("网络巡检间隔或复核等待无效")
+	}
+	p.HealthVersion = 1
+	p.MigrationNotice = ""
 	if p.Model != ModelProbeModel || (p.Mode != "observe" && p.Mode != "auto_retire") || p.IntervalMinutes < 1 || p.IntervalMinutes > 1440 || p.Concurrency < 1 || p.Concurrency > 2 || p.TimeoutSeconds < 5 || p.TimeoutSeconds > 60 || p.GlobalDailyLimit < 1 || p.GlobalDailyLimit > 10000 || p.AccountDailyLimit < 1 || p.AccountDailyLimit > 10000 {
 		return old.clone(), errors.New("模型巡检模式、间隔或请求预算无效")
 	}
@@ -302,6 +320,12 @@ func (s *Store) SaveModelProbeSettings(p ModelProbeSettings, now time.Time) (Mod
 	if _, err = tx.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", modelProbeStateKey, string(raw)); err != nil {
 		return old.clone(), err
 	}
+	aliases := map[string]string{"proxy_health_enabled": strconv.FormatBool(p.NetworkEnabled), "proxy_health_interval": strconv.Itoa(p.NetworkIntervalMinutes)}
+	for key, value := range aliases {
+		if _, err = tx.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", key, value); err != nil {
+			return old.clone(), err
+		}
+	}
 	changed := map[string]*ModelProbeRun{}
 	for id, r := range s.modelProbe.runs {
 		if !probeRunOpen(r) {
@@ -323,6 +347,10 @@ func (s *Store) SaveModelProbeSettings(p ModelProbeSettings, now time.Time) (Mod
 		return old.clone(), err
 	}
 	s.modelProbe.modelProbePersistent = next
+	for key, value := range aliases {
+		s.settings[key] = value
+	}
+	s.publishSettings()
 	s.modelProbe.storageError = false
 	for id, r := range changed {
 		s.modelProbe.runs[id] = r

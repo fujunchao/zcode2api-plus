@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"zcode2api/internal/model"
+	"zcode2api/internal/networkprobe"
 	"zcode2api/internal/store"
 	"zcode2api/internal/web"
 )
@@ -19,6 +21,12 @@ type Manager struct {
 	started, closed bool
 	wake            chan struct{}
 	wg              sync.WaitGroup
+	netMu           sync.Mutex
+	netRound        *networkRound
+	netPending      map[string]bool
+	netNext         time.Time
+	netRevision     uint64
+	networkTargets  func() []string
 }
 
 // now 是测试使用的时钟接入；生产调用不传，所有冷却和预算仍由 Store 校验。
@@ -28,7 +36,7 @@ func New(parent context.Context, st *store.Store, clock ...func() time.Time) *Ma
 	if len(clock) > 0 && clock[0] != nil {
 		now = clock[0]
 	}
-	return &Manager{store: st, ctx: ctx, cancel: cancel, now: now, wake: make(chan struct{}, 2)}
+	return &Manager{store: st, ctx: ctx, cancel: cancel, now: now, wake: make(chan struct{}, 2), networkTargets: networkprobe.Targets, netPending: map[string]bool{}}
 }
 
 func (m *Manager) Start() {
@@ -38,7 +46,22 @@ func (m *Manager) Start() {
 		return
 	}
 	m.started = true
-	m.wg.Add(3)
+	m.wg.Add(4)
+	go func() {
+		defer m.wg.Done()
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-tick.C:
+				if _, err := m.RunNetworkDue(m.ctx); err != nil && m.ctx.Err() == nil {
+					web.Warn("proxy-health", "统一网络巡检未完成，未报告删除成功")
+				}
+			}
+		}
+	}()
 	go func() {
 		defer m.wg.Done()
 		tick := time.NewTicker(5 * time.Second)
@@ -111,7 +134,15 @@ func (m *Manager) RunDue(ctx context.Context) (bool, error) {
 	if err != nil || l == nil {
 		return false, err
 	}
+	if !m.networkPreflight(ctx, l) {
+		return true, m.store.CompleteModelProbe(l, store.ProxyObservation{}, "network_unavailable", model.Usage{}, m.now())
+	}
 	o, kind, usage := m.send(ctx, l)
+	if kind == "connection_failed" || kind == "timeout" || kind == "incomplete_response" {
+		if p := l.Profile(); p.ID != "" {
+			_ = m.QueueNetwork(p.ID)
+		}
+	}
 	return true, m.store.CompleteModelProbe(l, o, kind, usage, m.now())
 }
 

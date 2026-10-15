@@ -3,12 +3,38 @@
 package adminapi
 
 import (
+	"context"
 	"net/http"
+	"slices"
 	"testing"
+	"time"
 
 	"zcode2api/internal/model"
+	"zcode2api/internal/modelprobe"
 	"zcode2api/internal/store"
 )
+
+// 同一真实 HTTP 状态机推进两轮，只推进测试时钟，不缩短生产复核间隔。
+func runUnifiedNetworkRound(t *testing.T, st *store.Store) {
+	t.Helper()
+	now := time.Now()
+	m := modelprobe.NewWithNetworkTargets(context.Background(), st, func() []string { return slices.Clone(upstreamProbeTargets) }, func() time.Time { return now })
+	defer m.Close()
+	before := len(st.ListProxyProfiles())
+	if err := m.QueueNetwork(""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RunNetworkDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.ListProxyProfiles()) != before {
+		t.Fatal("首轮不能删除任何代理")
+	}
+	now = now.Add(time.Duration(st.ModelProbeSettings().NetworkConfirmSeconds+1) * time.Second)
+	if _, err := m.RunNetworkDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // bindAccount 建号并绑到指定线路（直接走 store，避开 HTTP 入池派生的后台领取）。
 func bindAccount(t *testing.T, st *store.Store, name, uid, profileID string) string {
@@ -39,7 +65,7 @@ func TestProxyHealthRoundPurgesFailedLine(t *testing.T) {
 	}
 	accID := bindAccount(t, st, "acc-1", "u-health-1", lineDead.ID)
 
-	NewProxyHealthScheduler(st).runOnce(nil)
+	runUnifiedNetworkRound(t, st)
 
 	profiles := st.ListProxyProfiles()
 	if len(profiles) != 1 || profiles[0].ID != lineOK.ID {
@@ -64,7 +90,7 @@ func TestProxyHealthRoundSkipsWhenAllFailAndDirectDead(t *testing.T) {
 	}
 	accID := bindAccount(t, st, "acc-1", "u-health-2", lineDead.ID)
 
-	NewProxyHealthScheduler(st).runOnce(nil)
+	runUnifiedNetworkRound(t, st)
 
 	if profiles := st.ListProxyProfiles(); len(profiles) != 1 {
 		t.Fatalf("疑为网络故障时不应移除线路: %+v", profiles)
@@ -91,7 +117,7 @@ func TestProxyHealthRoundPurgesAllWhenDirectWorks(t *testing.T) {
 	}
 	accID := bindAccount(t, st, "acc-1", "u-health-3", lineDead1.ID)
 
-	NewProxyHealthScheduler(st).runOnce(nil)
+	runUnifiedNetworkRound(t, st)
 
 	if profiles := st.ListProxyProfiles(); len(profiles) != 0 {
 		t.Fatalf("直连可用时应移除全部失效线路: %+v", profiles)
@@ -117,7 +143,7 @@ func TestProxyHealthRoundKeepsHealthyLines(t *testing.T) {
 	}
 	accID := bindAccount(t, st, "acc-1", "u-health-4", lineA.ID)
 
-	NewProxyHealthScheduler(st).runOnce(nil)
+	runUnifiedNetworkRound(t, st)
 
 	if profiles := st.ListProxyProfiles(); len(profiles) != 2 {
 		t.Fatalf("健康线路不应被移除: %+v", profiles)
@@ -139,7 +165,7 @@ func TestProxyHealthRoundSkipsDisabledLines(t *testing.T) {
 		t.Fatalf("建线路失败: %v", err)
 	}
 
-	NewProxyHealthScheduler(st).runOnce(nil)
+	runUnifiedNetworkRound(t, st)
 
 	if profiles := st.ListProxyProfiles(); len(profiles) != 1 {
 		t.Fatalf("停用线路不应被自动移除: %+v", profiles)

@@ -16,7 +16,7 @@ func (h *Handler) handleModelProbeSettings(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusOK, h.Store.ModelProbeSettings())
 		return
 	}
-	p := store.DefaultModelProbeSettings()
+	p := h.Store.ModelProbeSettings()
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&p); err != nil {
@@ -49,6 +49,32 @@ func (h *Handler) handleModelProbeSummary(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleHealthSummary(w http.ResponseWriter, r *http.Request) {
+	model, err := h.Store.ModelProbeSummary(time.Now())
+	if err != nil {
+		writeError500(w, err)
+		return
+	}
+	network, err := h.Store.NetworkHealth()
+	if err != nil {
+		writeError500(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model": model, "network": network})
+}
+
+func (h *Handler) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	if h.ModelProbe == nil {
+		writeAPIError(w, errBadRequest("巡检管理器未就绪"))
+		return
+	}
+	if err := h.ModelProbe.RequestHealth(r.PathValue("profile_id")); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"profile_id": r.PathValue("profile_id"), "state": "queued"})
 }
 
 func (h *Handler) handleStartModelProbe(w http.ResponseWriter, r *http.Request) {

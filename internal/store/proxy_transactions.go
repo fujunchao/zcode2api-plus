@@ -63,6 +63,10 @@ func (s *Store) removeProxiesLocked(ids map[string]bool, excludedURL string, rea
 func (s *Store) PurgeProxyProfilesIfCurrent(expected []ProxyProfile) ([]string, ProxyReassign, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.purgeProxyProfilesIfCurrentLocked(expected)
+}
+
+func (s *Store) purgeProxyProfilesIfCurrentLocked(expected []ProxyProfile) ([]string, ProxyReassign, error) {
 	wanted := map[string]bool{}
 	for _, p := range s.listProxyProfilesLocked() {
 		for _, snapshot := range expected {

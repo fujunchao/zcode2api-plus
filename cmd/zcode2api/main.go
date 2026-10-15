@@ -153,10 +153,7 @@ func serve() int {
 	sched := adminapi.NewClaimScheduler(admin)
 	sched.Start()
 
-	// 代理线路自动巡检：周期检测可用性，自动移除不可用线路并改派绑定账号
-	//（全部线路不可用且直连也不可达时跳过该轮，防本机网络故障清空线路池）
-	proxyHealth := adminapi.NewProxyHealthScheduler(st, ctx)
-	proxyHealth.Start()
+	// 网络复核与模型检查统一由 admin.ModelProbe 管理，不再运行第二套自动清理器。
 	admin.Subscription.Start()
 
 	printBanner(st)
@@ -165,7 +162,7 @@ func serve() int {
 	// 收到信号时共享 ctx 立即取消后台网络；HTTP 完成后在同一剩余预算内收尾。
 	cleanup := func() {
 		stop()
-		stops := []func(){mon.Stop, sched.Stop, proxyHealth.Stop, admin.Close, qs.Close}
+		stops := []func(){mon.Stop, sched.Stop, admin.Close, qs.Close}
 		if pool != nil {
 			stops = append(stops, pool.Close)
 		}

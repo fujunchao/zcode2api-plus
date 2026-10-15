@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -18,12 +19,13 @@ func (s *Store) SetSettings(values map[string]string) error {
 	defer s.mu.Unlock()
 	keys := make([]string, 0, len(values))
 	for key := range values {
-		if key == strictProxyStateKey || key == "proxy_profiles" || key == initializationPolicyKey {
+		if key == strictProxyStateKey || key == "proxy_profiles" || key == initializationPolicyKey || key == modelProbeStateKey {
 			return errors.New("代理内部状态不可通过普通设置修改，请使用受控线路入口")
 		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	networkNext, networkChanged := s.networkPolicyFromLegacy(values)
 	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		logPersistFailure("settings", "batch", err)
@@ -36,6 +38,15 @@ func (s *Store) SetSettings(values map[string]string) error {
 			return err
 		}
 	}
+	if networkChanged {
+		raw, err := json.Marshal(networkNext)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", modelProbeStateKey, string(raw)); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		logPersistFailure("settings", "commit", err)
 		return err
@@ -44,5 +55,8 @@ func (s *Store) SetSettings(values map[string]string) error {
 		s.settings[key] = values[key]
 	}
 	s.publishSettings()
+	if networkChanged {
+		s.modelProbe.modelProbePersistent = networkNext
+	}
 	return nil
 }

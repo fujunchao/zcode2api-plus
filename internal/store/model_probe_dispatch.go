@@ -36,6 +36,7 @@ type ModelProbeLease struct {
 
 func (l *ModelProbeLease) Account() *model.Account { return l.account.Clone() }
 func (l *ModelProbeLease) ProxyURL() string        { return l.profile.URL }
+func (l *ModelProbeLease) Profile() ProxyProfile   { return l.profile }
 func (l *ModelProbeLease) TargetURL() string       { return l.targetURL }
 func (l *ModelProbeLease) RunID() string           { return l.runID }
 func (l *ModelProbeLease) SessionID() string {
