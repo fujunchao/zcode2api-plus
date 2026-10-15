@@ -527,6 +527,29 @@ export function AccountsPage() {
     })
   }
 
+  function batchInitialize() {
+    const targets = [...selectedInFilter]
+    if (!targets.length) return
+    confirm({
+      title: '补入初始化',
+      confirmText: '确认补入',
+      description: <>
+        将接管选中的 <b>{targets.length}</b> 个账号的代理路由，先核验额度，再按新号策略取额和固定绑定。
+        仅无使用、成功领取或已分配额度记录的 JWT 可补入；已有初始化任务不会重置，未选择账号不会被扫描。
+      </>,
+      onConfirm: async () => {
+        setBatchBusy(true)
+        try {
+          const result = await api<BatchResult>('POST', '/accounts/batch/initialize', { ids: targets.map((a) => a.id), confirm_proxy_takeover: true })
+          batchResultToast('补入初始化', result)
+          setSelected(new Set())
+          invalidate()
+        } catch (e) { toast.error('补入初始化失败：' + errMsg(e)) }
+        finally { setBatchBusy(false) }
+      },
+    })
+  }
+
   /* ── 歸檔 ┐─ 歸檔＝停止調用，帳號移入歸檔區僅保留記錄 */
   function doArchive(a: Account) {
     const label = a.email || a.name || a.id
@@ -728,8 +751,9 @@ export function AccountsPage() {
     if (!file) return
     try {
       const payload: unknown = JSON.parse(await file.text())
-      const d = await api<{ count: number }>('POST', '/import', payload)
-      toast.success(`匯入 ${d.count} 個帳號`)
+      const d = await api<{ count: number; created?: number; duplicated?: number; initializing?: number }>('POST', '/import', payload)
+      const details = [d.created != null ? `新建 ${d.created}` : '', d.duplicated ? `已存在 ${d.duplicated}` : '', d.initializing ? `${d.initializing} 个已进入初始化` : ''].filter(Boolean)
+      toast.success(`匯入 ${d.count} 個帳號${details.length ? `（${details.join(' · ')}）` : ''}`)
       invalidate()
     } catch (e) {
       toast.error('匯入失敗：' + errMsg(e))
@@ -777,7 +801,7 @@ export function AccountsPage() {
           </Button>
         </div>
       </div>
-      <input ref={fileRef} type="file" accept=".json" hidden onChange={(e) => void onImportFile(e)} />
+      <input ref={fileRef} type="file" accept=".json" aria-label="导入账号文件" hidden onChange={(e) => void onImportFile(e)} />
 
       {/* 帳號概覽 */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -877,6 +901,9 @@ export function AccountsPage() {
           </Button>
           <Button variant="outline" size="sm" disabled={batchBusy} onClick={batchRecover}>
             {batchBusy ? <Loader2 className="animate-spin" /> : <HeartPulse />} 批量恢復
+          </Button>
+          <Button variant="outline" size="sm" disabled={batchBusy} onClick={batchInitialize}>
+            {batchBusy ? <Loader2 className="animate-spin" /> : <Gift />} 补入初始化
           </Button>
           <Button
             variant="destructive"

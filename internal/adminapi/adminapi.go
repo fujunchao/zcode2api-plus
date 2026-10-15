@@ -112,6 +112,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/batch/enable", guard(h.handleBatchEnable))
 	mux.HandleFunc("POST /admin/api/accounts/batch/disable", guard(h.handleBatchDisable))
 	mux.HandleFunc("POST /admin/api/accounts/batch/recover", guard(h.handleBatchRecover))
+	mux.HandleFunc("POST /admin/api/accounts/batch/initialize", guard(h.handleBatchInitialize))
 	mux.HandleFunc("GET /admin/api/status", guard(h.handleStatus))
 	mux.HandleFunc("GET /admin/api/proxies/subscription", guard(h.handleSubscription))
 	mux.HandleFunc("PUT /admin/api/proxies/subscription", guard(h.handleSaveSubscription))

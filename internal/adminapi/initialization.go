@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"zcode2api/internal/store"
 )
@@ -73,6 +74,30 @@ func (h *Handler) handleInitializationAction(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "initialization": h.Store.FindAny(id).Initialization})
 	if h.Initialization != nil {
+		h.Initialization.Wake()
+	}
+}
+
+func (h *Handler) handleBatchInitialize(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		IDs       []string `json:"ids"`
+		Confirmed bool     `json:"confirm_proxy_takeover"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeAPIError(w, errBadRequest("补入初始化请求格式无效"))
+		return
+	}
+	started := time.Now()
+	result, err := h.Store.BatchEnrollInitializations(payload.IDs, payload.Confirmed)
+	h.logBatchOutcome("补入初始化", result, err, started)
+	if err != nil {
+		writeJSON(w, batchErrorStatus(err), batchBody(result, map[string]any{"detail": err.Error()}))
+		return
+	}
+	writeJSON(w, http.StatusOK, batchBody(result, nil))
+	if result.Succeeded > 0 && h.Initialization != nil {
 		h.Initialization.Wake()
 	}
 }
