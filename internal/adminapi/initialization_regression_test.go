@@ -20,6 +20,8 @@ func TestNewAccountInitializationQuotaEvidence(t *testing.T) {
 		{"缺业务码", `{"data":{"plans":[],"balances":[]}}`, "unknown"},
 		{"缺余额", `{"code":0,"data":{"plans":[]}}`, "unknown"},
 		{"空对象", `{"code":0,"data":{}}`, "unknown"},
+		{"只有套餐", `{"code":0,"data":{"plans":[{"plan_id":"pending"}],"balances":[]}}`, "unknown"},
+		{"未知剩余额度", `{"code":0,"data":{"plans":[],"balances":[{"model":"m","total_units":150}]}}`, "unknown"},
 		{"可用量优先", `{"code":0,"data":{"plans":[{"plan_id":"old"}],"balances":[{"model":"m","total_units":150,"available_units":0,"remaining_units":150}]}}`, "allocated"},
 		{"无模型名", `{"code":0,"data":{"plans":[],"balances":[{"available_units":150}]}}`, "unknown"},
 	} {
