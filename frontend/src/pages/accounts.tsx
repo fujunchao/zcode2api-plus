@@ -23,6 +23,7 @@ import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
 import { PlanRows, QuotaRows, allPlansExpired } from '@/components/quota-rows'
 import { ModelQuotaCards } from '@/components/model-quota-cards'
+import { InitializationProgress } from '@/components/initialization-progress'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -88,7 +89,7 @@ const STATUS_BADGE: Record<AccountStatus, string> = {
   disabled: 'bg-muted text-muted-foreground',
 }
 
-type FilterKey = 'all' | AccountStatus
+type FilterKey = 'all' | 'initializing' | AccountStatus
 
 /* 錯誤類型篩選：'fault' 是按「是否歸因於帳號自身」聚合，其餘是具體類型。
    聚合項讓「一鍵找出有問題的號」成立，而不必在下拉裡逐個類型點一遍。 */
@@ -206,7 +207,8 @@ export function AccountsPage() {
   const errCounts: Record<string, number> = {}
   let faultCount = 0
   liveAccounts.forEach((a) => {
-    counts[a.status] = (counts[a.status] || 0) + 1
+    const status = a.initialization?.blocked ? 'initializing' : a.status
+    counts[status] = (counts[status] || 0) + 1
     const kind = a.last_error_kind
     if (!kind) return
     errCounts[kind] = (errCounts[kind] || 0) + 1
@@ -216,7 +218,7 @@ export function AccountsPage() {
      'fault' 用歸因布林值過濾，因此 client_canceled（用戶端取消，不計為帳號故障）
      不會混進「帳號故障」視圖——但它仍可從下拉單獨選出。 */
   const filtered = liveAccounts
-    .filter((a) => filter === 'all' || a.status === filter)
+    .filter((a) => filter === 'all' || (a.initialization?.blocked ? 'initializing' : a.status) === filter)
     .filter((a) => {
       if (errFilter === 'all') return true
       const kind = a.last_error_kind
@@ -313,13 +315,13 @@ export function AccountsPage() {
     setLoginStatus('正在驗證並匯入帳號…')
     setLoginErr(false)
     try {
-      const d = await api<{ status: string; message?: string }>(
+      const d = await api<{ status: string; message?: string; account?: Account }>(
         'POST',
         '/login/complete/' + encodeURIComponent(flow.flowId),
         { callback_url: url },
       )
       if (d.status !== 'ready') throw new Error(d.message || '授權結果無效')
-      toast.success('登入成功，已匯入帳號池')
+      toast.success(d.account?.initialization?.blocked ? '登录成功，正在初始化；进度可在账号列表查看' : '登入成功，已匯入帳號池')
       setAddOpen(false)
       invalidate()
     } catch (e) {
@@ -813,6 +815,7 @@ export function AccountsPage() {
         {(
           [
             ['all', '全部'],
+            ['initializing', '初始化'],
             ['exhausted', '用完'],
             ['disabled', '停用'],
           ] as [FilterKey, string][]
@@ -955,8 +958,8 @@ export function AccountsPage() {
                       </div>
                     </TableCell>
                     <TableCell className="text-center">
-                      <Badge className={STATUS_BADGE[a.local_scheduling_reason === 'risk_isolation' ? 'cooling' : a.status]}>
-                        {a.local_scheduling_reason === 'risk_isolation' ? '本地隔离' : STATUS_LABEL[a.status] || a.status}
+                      <Badge className={STATUS_BADGE[a.initialization?.blocked || a.local_scheduling_reason === 'risk_isolation' ? 'cooling' : a.status]}>
+                        {a.initialization?.blocked ? (a.initialization.granted_at ? '待固定代理' : '初始化中') : a.local_scheduling_reason === 'risk_isolation' ? '本地隔离' : STATUS_LABEL[a.status] || a.status}
                       </Badge>
                       {a.local_recheck_at != null && (
                         <div className="mt-1 text-[10px] text-muted-foreground" title="本地时间门槛到期后重新评估状态和额度，不保证上游接受">
@@ -968,7 +971,7 @@ export function AccountsPage() {
                       {!a.proxy_url ? (
                         <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                           <span className="size-1.5 rounded-full bg-muted-foreground/40" />
-                          直連
+                          {a.initialization?.blocked ? '等待代理' : '直連'}
                         </span>
                       ) : (
                         <span className="flex items-center gap-1.5 text-xs">
@@ -994,6 +997,7 @@ export function AccountsPage() {
                           <ClaimHint account={a} />
                         </>
                       )}
+                      <InitializationProgress account={a} proxies={proxies} />
                     </TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.use_count || 0}</TableCell>
                     <TableCell className="text-center tabular-nums text-muted-foreground">{a.fail_count || 0}</TableCell>
@@ -1007,7 +1011,7 @@ export function AccountsPage() {
                     <TableCell>
                       <div className="flex justify-end gap-0">
                         {a.mode === 'jwt' && (
-                          <Button variant="ghost" size="icon-sm" title="重新整理額度" onClick={() => void refreshOne(a)}>
+                          <Button variant="ghost" size="icon-sm" disabled={a.initialization?.blocked} title="重新整理額度" onClick={() => void refreshOne(a)}>
                             {refreshing.has(a.id) ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                           </Button>
                         )}
@@ -1015,6 +1019,7 @@ export function AccountsPage() {
                           <Button
                             variant="ghost"
                             size="icon-sm"
+                            disabled={a.initialization?.blocked}
                             title={claimCooling(a) ? `${claimStateText(a)}；點擊仍可強制領取` : '領取活動套餐'}
                             onClick={() => void claimOne(a)}
                           >
@@ -1222,7 +1227,7 @@ export function AccountsPage() {
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>編輯帳號</DialogTitle>
-            <DialogDescription>修改名稱、憑證、出口線路或停用特定模型。</DialogDescription>
+            <DialogDescription>修改名称、凭据、出口线路或停用特定模型。手动修改出口线路将解除新号固定代理托管。</DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-4">
             <div className="flex flex-col gap-2">

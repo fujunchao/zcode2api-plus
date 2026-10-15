@@ -450,7 +450,7 @@ export function SettingsPage() {
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              冷卻與開關只約束自動路徑；帳號頁的手動「領取套餐」按鈕永遠可用。
+              冷却与开关约束自动路径；普通账号可手动领取，正在初始化的账号由初始化任务独占处理。
             </p>
             <div className="flex justify-end">
               <Button type="submit" disabled={savingClaim}>

@@ -24,6 +24,7 @@ export interface TotalTokens {
 export type AccountStatus = 'active' | 'exhausted' | 'cooling' | 'invalid' | 'disabled'
 
 export interface Account {
+  initialization?: InitializationState
   id: string
   name: string
   email: string | null
@@ -75,7 +76,35 @@ export interface ClaimState {
   last_error: string | null
 }
 
+export interface InitializationState {
+  state: string
+  reason: string
+  revision: number
+  managed: boolean
+  blocked: boolean
+  paused: boolean
+  default_proxy_id: string
+  current_proxy_id: string
+  attempts: number
+  max_attempts: number
+  granted_at?: number
+  next_at?: number
+  last_error?: string
+}
+
+export interface NewAccountProxyPolicy {
+  enabled: boolean
+  default_proxy_id: string
+  pool_mode: 'all_enabled' | 'selected'
+  proxy_ids: string[]
+  max_attempts: number
+  attempt_timeout_seconds: number
+  round_budget_seconds: number
+  revision: number
+}
+
 export interface Stats {
+  initializing?: number
   total: number
   active: number
   exhausted: number

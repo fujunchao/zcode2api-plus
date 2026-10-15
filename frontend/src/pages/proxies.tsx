@@ -6,6 +6,7 @@ import { toast } from 'sonner'
 import { useConfirm } from '@/components/confirm'
 import { Empty, PanelCard } from '@/components/panel'
 import { ProxySubscription } from '@/components/proxy-subscription'
+import { NewAccountPolicy } from '@/components/new-account-policy'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -144,16 +145,16 @@ export function ProxiesPage() {
       description: (
         <>
           确认删除 <code className="rounded bg-muted px-1 py-0.5">{p.name}</code>？使用此线路的账号会优先改派到其他空闲代理；
-          没有空闲代理时，分配到绑定账号最少的启用代理。只有没有可用代理时才改为直连。
+          没有空闲代理时，分配到绑定账号最少的启用代理。普通账号无可用代理时才直连；初始化或固定出口托管账号只会等待，不会自动换出口。
         </>
       ),
       onConfirm: async () => {
         try {
-          const d = await api<{ ok: boolean; reassigned: number; direct_fallback: number }>(
+          const d = await api<{ ok: boolean; reassigned: number; direct_fallback: number; waiting_initialization?: number }>(
             'DELETE',
             '/proxies/' + encodeURIComponent(p.id),
           )
-          toast.success(deletedMessage(d.reassigned || 0, d.direct_fallback || 0))
+          toast.success(deletedMessage(d.reassigned || 0, d.direct_fallback || 0) + (d.waiting_initialization ? `；${d.waiting_initialization} 个托管账号等待专用代理` : ''))
           invalidate()
         } catch (e) {
           toast.error('刪除失敗：' + errMsg(e))
@@ -293,6 +294,7 @@ export function ProxiesPage() {
       </div>
 
       <ProxySubscription />
+      <NewAccountPolicy profiles={profiles} />
 
       {/* 伺服器目前出口 */}
       <div
