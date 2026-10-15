@@ -65,6 +65,7 @@ type Store struct {
 	closeOnce             sync.Once
 	closeErr              error
 	accounts              map[string][]*model.Account
+	initializations       map[string]*InitializationTask
 	settings              map[string]string
 	rotation              map[string]int
 	riskProxyHistory      riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
@@ -112,6 +113,7 @@ func New() (*Store, error) {
 		db:                db,
 		accounts:          map[string][]*model.Account{model.ProviderZai: {}},
 		settings:          map[string]string{},
+		initializations:   map[string]*InitializationTask{},
 		rotation:          map[string]int{},
 		lineTruncStrikes:  map[string]int{},
 		lineTruncTotals:   map[string]int{},
@@ -183,6 +185,7 @@ func (s *Store) init() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_acc_provider ON %s (provider);
 		CREATE INDEX IF NOT EXISTS idx_acc_status   ON %s (status);
+		CREATE TABLE IF NOT EXISTS account_initializations (account_id TEXT PRIMARY KEY, data TEXT NOT NULL);
 	`, metaTable, accountsTable, accountsTable, accountsTable)); err != nil {
 		return err
 	}
@@ -292,6 +295,9 @@ func (s *Store) load() error {
 	}
 	s.settings = settings
 	s.publishSettings()
+	if _, err := s.initializationPolicyLocked(); err != nil {
+		return err
+	}
 
 	accounts := map[string][]*model.Account{model.ProviderZai: {}}
 	rows, err = s.db.Query(fmt.Sprintf(
@@ -315,6 +321,10 @@ func (s *Store) load() error {
 	}
 	s.accounts = accounts
 	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	if err := s.loadInitializations(); err != nil {
 		return err
 	}
 	if err := s.migrateAccountIdentity(); err != nil {
@@ -408,6 +418,7 @@ func (s *Store) deleteAccountLocked(id string) error {
 	}
 	s.strictProxy = next
 	delete(s.strictStartPlanProofs, id)
+	delete(s.initializations, id)
 	return nil
 }
 
@@ -1076,6 +1087,9 @@ func (s *Store) AutoAssignProxies(accountIDs []string) (assigned map[string]stri
 	var pending []*model.Account
 	next := s.cloneStrictProxyLocked()
 	for _, id := range dedupeIDs(accountIDs) {
+		if s.initializationManagedLocked(id) {
+			continue
+		}
 		acc := s.findAnyLocked(id).Clone()
 		if acc == nil || derefStr(acc.ProxyID) != "" || derefStr(acc.ProxyURL) != "" {
 			continue
@@ -1120,14 +1134,14 @@ func (s *Store) ListAccounts(provider string) []*model.Account {
 		src := s.accounts[provider]
 		out := make([]*model.Account, len(src))
 		for i, a := range src {
-			out[i] = a.Clone()
+			out[i] = s.snapshotLocked(a)
 		}
 		return out
 	}
 	var out []*model.Account
 	for _, p := range Providers {
 		for _, a := range s.accounts[p] {
-			out = append(out, a.Clone())
+			out = append(out, s.snapshotLocked(a))
 		}
 	}
 	return out
@@ -1137,14 +1151,14 @@ func (s *Store) ListAccounts(provider string) []*model.Account {
 func (s *Store) Find(provider, idOrName string) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.findLocked(provider, idOrName).Clone()
+	return s.snapshotLocked(s.findLocked(provider, idOrName))
 }
 
 // FindAny 按 id 在全部提供商中查找账号；找不到返回 nil。返回副本（见 ListAccounts）。
 func (s *Store) FindAny(idOrName string) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.findAnyLocked(idOrName).Clone()
+	return s.snapshotLocked(s.findAnyLocked(idOrName))
 }
 
 // SnapshotAccount 返回账号的独立副本（找不到返回 nil）。
@@ -1164,7 +1178,7 @@ func (s *Store) SnapshotAccount(provider, idOrName string) *model.Account {
 	if acc == nil {
 		return nil
 	}
-	return acc.Clone()
+	return s.snapshotLocked(acc)
 }
 
 func (s *Store) findLocked(provider, idOrName string) *model.Account {
@@ -1217,7 +1231,7 @@ func (s *Store) AddAccount(provider, name, secret string) (*model.Account, error
 // AutoAssignProxies 改的就是同一个对象，读 account.ProxyURL 立刻能看到新线路」。
 // 因此调用方**不得把它交给长活后台任务**，也不要长期持有——需要副本请用
 // SnapshotAccount。读 API（Find/FindAny/ListAccounts/Select）返回的才是副本。
-func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*model.Account, bool, error) {
+func (s *Store) AddAccountWithIdentity(provider, name, secret, email string, options ...AccountCreationOptions) (*model.Account, bool, error) {
 	if _, ok := s.providersSet()[provider]; !ok {
 		return nil, false, fmt.Errorf("不支持的 provider: %s", provider)
 	}
@@ -1232,7 +1246,7 @@ func (s *Store) AddAccountWithIdentity(provider, name, secret, email string) (*m
 	acc.VirtualDeviceMid = &mid
 	// 先落库再改内存：落库失败时内存不能留下一个不存在的账号。反过来会让账号在本次
 	// 进程里可用、重启后消失，而调用方收到错误以为没建成。
-	if err := s.persistAccountLocked(acc); err != nil {
+	if err := s.persistCreatedAccountLocked(acc, options); err != nil {
 		logPersistFailure("add", provider+"/"+acc.ID, err)
 		return nil, false, err
 	}
@@ -1693,6 +1707,7 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 	window := config.RiskSilentWindow()
 	var base []*model.Account
 	for _, a := range s.accounts[provider] {
+		a.Initialization = s.initializationViewLocked(a)
 		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (forceDirect || s.proxyBindingAvailableLocked(a)) {
 			base = append(base, a)
 		}
@@ -1802,12 +1817,13 @@ func orStar(modelName string) string {
 // 整号耗尽 / 冷却中（未到期）/ 风控静默期 / 其余计入 Active。Active 桶再按
 // ModelAvailability(modelName) 细分，直接回答「健康账号里有多少被模型层排除、为什么」。
 type PoolStat struct {
-	Total     int
-	Archived  int
-	Disabled  int // Enabled=false 或 Status=disabled
-	Invalid   int
-	Exhausted int // 整号 exhausted（全部已知模型耗尽）
-	Cooling   int // Status=cooling 且冷却未到期
+	Initializing int
+	Total        int
+	Archived     int
+	Disabled     int // Enabled=false 或 Status=disabled
+	Invalid      int
+	Exhausted    int // 整号 exhausted（全部已知模型耗尽）
+	Cooling      int // Status=cooling 且冷却未到期
 	// RiskSilent 处于风控静默期的账号数：状态层已放行（冷却到期或本就 active），
 	// 但被选号硬闸门拦下。冷却未到期的账号先记 Cooling，冷却已到期但静默期未过
 	// 的记本桶——每个账号只进一个桶，「为什么不可选」唯一。
@@ -1831,6 +1847,11 @@ func (s *Store) PoolStats(provider, modelName string) PoolStat {
 	stat := PoolStat{CoolingByKind: map[string]int{}}
 	for _, a := range s.accounts[provider] {
 		stat.Total++
+		a.Initialization = s.initializationViewLocked(a)
+		if a.InitializationBlocked() {
+			stat.Initializing++
+			continue
+		}
 		if a.ArchivedAt != nil {
 			stat.Archived++
 			continue

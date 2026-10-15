@@ -99,6 +99,9 @@ func persistAccountOnTx(tx *sql.Tx, acc *model.Account) error {
 }
 
 func deleteAccountOnTx(tx *sql.Tx, id string) error {
+	if _, err := tx.Exec("DELETE FROM account_initializations WHERE account_id = ?", id); err != nil {
+		return err
+	}
 	_, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", accountsTable), id)
 	return err
 }
@@ -156,7 +159,7 @@ func markBatchRollback(res *BatchResult, cause error) {
 //
 // 返回的 IDs 只含本次真正新建的账号（重复项不进 IDs），可直接交给
 // AutoAssignProxies / 额度刷新链路使用。
-func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchResult, error) {
+func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem, options ...AccountCreationOptions) (BatchResult, error) {
 	res := BatchResult{Total: len(items)}
 	if len(items) == 0 {
 		return res, errors.New("批量新增列表为空")
@@ -221,8 +224,19 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 		return res, nil // 全部重复：无需写库，幂等达成
 	}
 	next := s.cloneStrictProxyLocked()
+	jobs := map[string]*InitializationTask{}
 	for _, a := range fresh {
+		job, err := s.newInitializationLocked(a, options)
+		if err != nil {
+			markBatchRollback(&res, err)
+			return res, err
+		}
 		trackStrictAccountVersions(&next, a)
+		if job != nil {
+			job.CredentialGeneration = next.Credentials[a.ID].Generation
+			setStrictIntent(&next, a, initializationIntent)
+			jobs[a.ID] = job
+		}
 	}
 	strictRaw, err := marshalJSON(next)
 	if err != nil {
@@ -243,6 +257,11 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 			_ = tx.Rollback()
 			return res, err
 		}
+		if err := persistInitializationOnTx(tx, jobs[acc.ID]); err != nil {
+			markBatchRollback(&res, err)
+			_ = tx.Rollback()
+			return res, err
+		}
 	}
 	if _, err := tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", strictProxyStateKey, string(strictRaw)); err != nil {
 		markBatchRollback(&res, err)
@@ -255,8 +274,12 @@ func (s *Store) BatchAddAccounts(provider string, items []BatchAddItem) (BatchRe
 		return res, err
 	}
 	s.strictProxy = next
+	for id, job := range jobs {
+		s.initializations[id] = job
+	}
 	for _, a := range fresh {
 		a.CredentialGeneration = next.Credentials[a.ID].Generation
+		a.Initialization = s.initializationViewLocked(a)
 	}
 	s.accounts[provider] = append(s.accounts[provider], fresh...)
 	return res, nil
@@ -346,6 +369,7 @@ func (s *Store) BatchRemoveAccounts(ids []string, missingOK bool) (BatchResult, 
 	for _, acc := range targets {
 		removed[acc.ID] = true
 		delete(s.strictStartPlanProofs, acc.ID)
+		delete(s.initializations, acc.ID)
 	}
 	for p, list := range s.accounts {
 		remaining := list[:0:0]
@@ -638,7 +662,7 @@ func (s *Store) QueryAccounts(q AccountQuery) ([]*model.Account, int) {
 
 	out := make([]*model.Account, len(filtered))
 	for i, acc := range filtered {
-		out[i] = acc.Clone()
+		out[i] = s.snapshotLocked(acc)
 	}
 	return out, total
 }

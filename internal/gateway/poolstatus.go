@@ -35,6 +35,9 @@ var coolingKindLabels = map[string]string{
 // 而账号名常为邮箱，属于不该外泄的信息；只给计数与成因。
 func PoolStatusText(stat store.PoolStat) string {
 	var parts []string
+	if stat.Initializing > 0 {
+		parts = append(parts, fmt.Sprintf("%d 账号正在初始化或等待固定代理", stat.Initializing))
+	}
 	if stat.Cooling > 0 {
 		type kv struct {
 			kind string
@@ -119,6 +122,9 @@ func PoolStatusDetails(stat store.PoolStat, modelName string) map[string]any {
 		"invalid":        stat.Invalid,
 		"disabled":       stat.Disabled,
 		"archived":       stat.Archived,
+	}
+	if stat.Initializing > 0 {
+		details["initializing"] = stat.Initializing
 	}
 	if stat.CoolingEarliest != nil {
 		details["cooling_earliest"] = *stat.CoolingEarliest

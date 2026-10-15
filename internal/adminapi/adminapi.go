@@ -107,6 +107,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/proxies/subscription/blocks", guard(h.handleSubscriptionBlocks))
 	mux.HandleFunc("DELETE /admin/api/proxies/subscription/blocks/{fingerprint}", guard(h.handleUnblockSubscription))
 	mux.HandleFunc("GET /admin/api/proxies", guard(h.handleListProxies))
+	mux.HandleFunc("GET /admin/api/proxies/new-account-policy", guard(h.handleGetNewAccountPolicy))
+	mux.HandleFunc("PUT /admin/api/proxies/new-account-policy", guard(h.handleSaveNewAccountPolicy))
 	mux.HandleFunc("GET /admin/api/proxies/strict", guard(h.handleStrictProxyStatus))
 	mux.HandleFunc("POST /admin/api/proxies/strict/recover", guard(h.handleRecoverStrictProxy))
 	mux.HandleFunc("POST /admin/api/proxies/strict/blocks/{identity}/unblock", guard(h.handleUnblockStrictProxy))

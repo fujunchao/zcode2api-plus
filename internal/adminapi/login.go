@@ -253,7 +253,13 @@ func (h *Handler) saveOAuthAccountContext(ctx context.Context, result *oauth.Exc
 	}
 	// 邮箱必须在入池时就传入：每次登录的 token 都不同，只比凭据字节会把同一个号
 	// 建成两条记录（见 store.AddAccountWithIdentity 的三级判重）。
-	account, isNew, err := h.Store.SaveOAuthAccount(name, result.Token, email)
+	options := store.AccountCreationOptions{InitializeProxy: session == nil || session.auto, Source: "oauth"}
+	if session != nil && session.auto && session.proxyID != "" {
+		if profile, ok := h.loginProxyProfile(session.proxyID, session.proxyURL); ok {
+			options.LoginProxy = &profile
+		}
+	}
+	account, isNew, err := h.Store.SaveOAuthAccount(name, result.Token, email, options)
 	if err != nil {
 		return nil, errUpstream(fmt.Sprintf("凭证入池失败: %v", err))
 	}
@@ -267,7 +273,7 @@ func (h *Handler) saveOAuthAccountContext(ctx context.Context, result *oauth.Exc
 	// 线路必须在兑换与刷新之前落到账号上：这三步都要出站。
 	// 「自動」挑出的线路命中既有账号时不覆盖原指派——重登不该换掉老号的线路；
 	// 此时 account.ProxyURL 保持老号原值，后续出站仍走它。
-	if !(session != nil && session.auto && !isNew) {
+	if !account.IsInitializing() && !(session != nil && session.auto && !isNew) {
 		if apiErr := h.applyLoginProxy(account, session); apiErr != nil {
 			return nil, apiErr
 		}
@@ -286,7 +292,7 @@ func (h *Handler) saveOAuthAccountContext(ctx context.Context, result *oauth.Exc
 	if account.ProxyURL != nil {
 		accountProxy = *account.ProxyURL
 	}
-	if result.AccessToken != "" {
+	if result.AccessToken != "" && (!account.IsInitializing() || accountProxy != "") {
 		route := h.Store.ProxyEgress(account)
 		keyCtx := oauth.WithDispatchGuard(ctx, func() (func(), error) {
 			return h.Store.AcquireProxyDispatch(account, route)
@@ -298,7 +304,7 @@ func (h *Handler) saveOAuthAccountContext(ctx context.Context, result *oauth.Exc
 			web.Warn("adminapi", fmt.Sprintf("兑换 API Key 失败: %v", err))
 		}
 	}
-	if account.Mode == "jwt" {
+	if account.Mode == "jwt" && !account.IsInitializing() {
 		if isNew {
 			_, observations := h.Quota.RefreshAccountsObserved([]*model.Account{account})
 			h.scheduleNewAccountClaim(account, observations[account.ID])

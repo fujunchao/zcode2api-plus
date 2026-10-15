@@ -160,7 +160,7 @@ func (h *Handler) handleAddAccounts(w http.ResponseWriter, r *http.Request) {
 		if name == "" {
 			name = fmt.Sprintf("%s-%d", provider, len(h.Store.ListAccounts(provider))+1)
 		}
-		acc, isNew, err := h.Store.AddAccountWithIdentity(provider, name, tok, "")
+		acc, isNew, err := h.Store.AddAccountWithIdentity(provider, name, tok, "", store.AccountCreationOptions{InitializeProxy: autoAssign, Source: "admin_add"})
 		if err != nil {
 			writeError500(w, err)
 			return
@@ -216,7 +216,7 @@ func (h *Handler) postAddAccounts(provider string, added []string, autoAssign bo
 	}
 	fresh := []*model.Account{}
 	for _, a := range h.Store.ListAccounts(provider) {
-		if addedSet[a.ID] && a.Mode == "jwt" {
+		if addedSet[a.ID] && a.Mode == "jwt" && !a.IsInitializing() {
 			fresh = append(fresh, a)
 		}
 	}

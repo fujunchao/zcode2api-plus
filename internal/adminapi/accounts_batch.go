@@ -115,7 +115,7 @@ func (h *Handler) handleBatchAddAccounts(w http.ResponseWriter, r *http.Request)
 	}
 
 	start := time.Now()
-	res, err := h.Store.BatchAddAccounts(provider, items)
+	res, err := h.Store.BatchAddAccounts(provider, items, store.AccountCreationOptions{InitializeProxy: autoAssign, Source: "admin_batch"})
 	if err != nil {
 		h.logBatchOutcome("新增", res, err, start)
 		writeJSON(w, batchErrorStatus(err), batchBody(res, map[string]any{"detail": err.Error()}))

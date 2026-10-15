@@ -14,6 +14,9 @@ func (a *Account) LocalSchedulingBarrier(now time.Time, extraRiskWindow time.Dur
 	if !a.Enabled || a.Status == StatusDisabled {
 		return "disabled", nil
 	}
+	if a.InitializationBlocked() {
+		return "initialization_" + a.Initialization.Reason, nil
+	}
 	if a.Status == StatusInvalid || a.Status == StatusExhausted {
 		return a.Status, nil
 	}

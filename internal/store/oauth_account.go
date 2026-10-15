@@ -8,7 +8,7 @@ import (
 )
 
 // SaveOAuthAccount 统一 CLI/后台的授权入库；普通添加仍保留“重复项不修改”语义。
-func (s *Store) SaveOAuthAccount(name, token, email string) (*model.Account, bool, error) {
+func (s *Store) SaveOAuthAccount(name, token, email string, options ...AccountCreationOptions) (*model.Account, bool, error) {
 	token = strings.TrimSpace(token)
 	candidate := accountWithIdentity(model.ProviderZai, name, token, email)
 	if candidate.Name == "oauth-login" && candidate.Email != nil {
@@ -23,7 +23,7 @@ func (s *Store) SaveOAuthAccount(name, token, email string) (*model.Account, boo
 	if live == nil {
 		mid := config.NewDeviceMid()
 		candidate.VirtualDeviceMid = &mid
-		if err := s.persistAccountLocked(candidate); err != nil {
+		if err := s.persistCreatedAccountLocked(candidate, options); err != nil {
 			return nil, false, err
 		}
 		s.accounts[model.ProviderZai] = append(s.accounts[model.ProviderZai], candidate)

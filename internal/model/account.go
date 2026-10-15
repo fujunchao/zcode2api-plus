@@ -118,7 +118,8 @@ type Account struct {
 	// 读写必须走 SetClaimState/ClaimView，序列化由 MarshalJSON 在锁内完成
 	// （claimMu 保护）：领取在后台 goroutine 写、后台快照与序列化在读，
 	// CI 的 -race 实测抓到过竞态。
-	Claim *ClaimState `json:"claim"`
+	Claim          *ClaimState         `json:"claim"`
+	Initialization *InitializationView `json:"-"`
 
 	// claimMu 保护 Claim 指针的替换与读取。Account 一律按指针使用、从不按值复制，
 	// 故可内嵌锁；已发布的 ClaimState 视为不可变（改动一律生成新快照整体替换）。
@@ -362,6 +363,7 @@ func (a *Account) Clone() *Account {
 		UserID:           a.UserID,
 		VirtualDeviceMid: a.VirtualDeviceMid,
 		Claim:            a.ClaimView(),
+		Initialization:   a.Initialization.Clone(),
 
 		RateLimitStreak:      a.RateLimitStreak,
 		RiskControlStreak:    a.RiskControlStreak,
@@ -497,12 +499,12 @@ func jwtPayload(token string) string {
 // 停用必须看 Enabled 而不只是 Status==disabled——失效账号被停用后状态仍保持
 // invalid（见 store.applyEnabled），只比状态会让停用号继续被轮询。
 func (a *Account) IsQuotaRefreshTarget() bool {
-	return a.Mode == "jwt" && a.ArchivedAt == nil && a.Enabled && a.Status != StatusDisabled
+	return !a.InitializationBlocked() && a.Mode == "jwt" && a.ArchivedAt == nil && a.Enabled && a.Status != StatusDisabled
 }
 
 // IsAutoClaimTarget 检查自动领取资格；额度耗尽仍允许领新套餐。
 func (a *Account) IsAutoClaimTarget(now time.Time) bool {
-	if a.Mode != "jwt" || a.JWTToken == nil || *a.JWTToken == "" ||
+	if a.InitializationBlocked() || a.Mode != "jwt" || a.JWTToken == nil || *a.JWTToken == "" ||
 		a.ArchivedAt != nil || !a.Enabled || !IsManageable(a.Status) {
 		return false
 	}
@@ -513,6 +515,9 @@ func (a *Account) IsAutoClaimTarget(now time.Time) bool {
 // IsSelectable 是否可被轮询选中（对齐 Account.is_selectable）。
 // 已归档账号一律不可选（归档即停止调用）。
 func (a *Account) IsSelectable(now time.Time) bool {
+	if a.InitializationBlocked() {
+		return false
+	}
 	if a.ArchivedAt != nil {
 		return false
 	}
@@ -748,7 +753,7 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 	if len(a.Plans) > 0 {
 		planSource = a.Plans
 	}
-	return map[string]any{
+	view := map[string]any{
 		"id":                a.ID,
 		"name":              a.Name,
 		"email":             a.Email,
@@ -792,6 +797,10 @@ func (a *Account) PublicView(now time.Time) map[string]any {
 		// 暴露设备指纹便于后台核对账号间是否已相互隔离（管理员接口，非公开）。
 		"virtual_device_mid": a.VirtualDeviceMid,
 	}
+	if a.Initialization != nil {
+		view["initialization"] = a.Initialization.Clone()
+	}
+	return view
 }
 
 // ── 内部工具 ────────────────────────────────────────────────────────────────
