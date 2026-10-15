@@ -2,6 +2,7 @@ package modelprobe_test
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -13,6 +14,54 @@ import (
 	"zcode2api/internal/modelprobe"
 	"zcode2api/internal/store"
 )
+
+func TestUnifiedNetworkMigrationKeepsObservationConsent(t *testing.T) {
+	f := newNetworkFixture(t)
+	db, err := sql.Open("sqlite", "file:"+config.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	old := `{"version":1,"policy":{"enabled":true,"mode":"observe","model":"glm-5.3-flash","interval_minutes":30,"concurrency":1,"timeout_seconds":30,"global_daily_limit":200,"account_daily_limit":100,"account_ids":[],"target_proxy_ids":[],"reference_proxy_ids":[],"egress_groups":{},"revision":3},"next_due":{},"last_diagnosis":{}}`
+	if _, err := db.Exec("UPDATE meta SET value=? WHERE key='model_probe_v1'", old); err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	p := other.ModelProbeSettings()
+	if !p.Enabled || !p.NetworkEnabled || p.Mode != "observe" || p.HealthVersion != 1 || p.MigrationNotice == "" {
+		t.Fatalf("迁移扩大了自动处置权限或遗失旧网络功能：%+v", p)
+	}
+	_ = f
+}
+
+func TestUnifiedNetworkLargePoolCompletesAcrossBatches(t *testing.T) {
+	f := newNetworkFixture(t)
+	f.blocked.Store(false)
+	for i := 0; i < 55; i++ {
+		if _, err := f.st.AddProxyProfile("分批目标", f.good.URL, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.m.QueueNetwork(""); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := f.m.RunNetworkDue(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := f.st.NetworkHealth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r) != 57 {
+		t.Fatalf("大池未覆盖完整目标集合：%d", len(r))
+	}
+}
 
 func TestUnifiedNetworkModelConnectionFailureDoesNotReplayModel(t *testing.T) {
 	f := newFixture(t)

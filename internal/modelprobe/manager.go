@@ -13,20 +13,21 @@ import (
 )
 
 type Manager struct {
-	store           *store.Store
-	ctx             context.Context
-	cancel          context.CancelFunc
-	now             func() time.Time
-	mu              sync.Mutex
-	started, closed bool
-	wake            chan struct{}
-	wg              sync.WaitGroup
-	netMu           sync.Mutex
-	netRound        *networkRound
-	netPending      map[string]bool
-	netNext         time.Time
-	netRevision     uint64
-	networkTargets  func() []string
+	store              *store.Store
+	ctx                context.Context
+	cancel             context.CancelFunc
+	now                func() time.Time
+	mu                 sync.Mutex
+	started, closed    bool
+	wake               chan struct{}
+	wg                 sync.WaitGroup
+	netMu              sync.Mutex
+	netRound           *networkRound
+	netPending         map[string]bool
+	netNext            time.Time
+	netRevision        uint64
+	netPendingRevision uint64
+	networkTargets     func() []string
 }
 
 // now 是测试使用的时钟接入；生产调用不传，所有冷却和预算仍由 Store 校验。
@@ -36,7 +37,8 @@ func New(parent context.Context, st *store.Store, clock ...func() time.Time) *Ma
 	if len(clock) > 0 && clock[0] != nil {
 		now = clock[0]
 	}
-	return &Manager{store: st, ctx: ctx, cancel: cancel, now: now, wake: make(chan struct{}, 2), networkTargets: networkprobe.Targets, netPending: map[string]bool{}}
+	p := st.ModelProbeSettings()
+	return &Manager{store: st, ctx: ctx, cancel: cancel, now: now, wake: make(chan struct{}, 2), networkTargets: networkprobe.Targets, netPending: map[string]bool{}, netRevision: p.Revision, netPendingRevision: p.Revision, netNext: now().Add(time.Duration(p.NetworkIntervalMinutes) * time.Minute)}
 }
 
 func (m *Manager) Start() {

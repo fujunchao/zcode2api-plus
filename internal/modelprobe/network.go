@@ -12,6 +12,7 @@ import (
 	"zcode2api/internal/networkprobe"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
+	"zcode2api/internal/web"
 )
 
 type networkRound struct {
@@ -32,6 +33,10 @@ func NewWithNetworkTargets(ctx context.Context, st *store.Store, targets func() 
 }
 
 func (m *Manager) QueueNetwork(id string) error {
+	return m.queueNetwork(id, false)
+}
+
+func (m *Manager) queueNetwork(id string, manual bool) error {
 	if m.ctx.Err() != nil {
 		return m.ctx.Err()
 	}
@@ -53,22 +58,24 @@ func (m *Manager) QueueNetwork(id string) error {
 	}
 	m.netMu.Lock()
 	defer m.netMu.Unlock()
-	if m.netPending == nil {
+	if m.netPending == nil || m.netPendingRevision != p.Revision {
 		m.netPending = map[string]bool{}
 	}
+	m.netPendingRevision = p.Revision
 	if m.netRound != nil {
 		for _, v := range m.netRound.profiles {
 			if v.ID == id {
+				m.netRound.manual[id] = m.netRound.manual[id] || manual
 				return nil
 			}
 		}
 	}
-	m.netPending[id] = true
+	m.netPending[id] = m.netPending[id] || manual
 	return nil
 }
 
 func (m *Manager) RequestHealth(id string) error {
-	if err := m.QueueNetwork(id); err != nil {
+	if err := m.queueNetwork(id, true); err != nil {
 		return err
 	}
 	m.Start()
@@ -163,6 +170,9 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 		m.netRound = nil
 		m.netRevision = p.Revision
 		m.netNext = now.Add(time.Duration(p.NetworkIntervalMinutes) * time.Minute)
+		if m.netPendingRevision != p.Revision {
+			m.netPending = map[string]bool{}
+		}
 	}
 	if m.netRound != nil && (m.netRound.policy.Revision != p.Revision || m.netRound.key != key || !now.Before(m.netRound.deadline)) {
 		m.netRound = nil
@@ -178,11 +188,13 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 		}
 		all := []store.ProxyProfile{}
 		selected := []store.ProxyProfile{}
-		whole := !now.Before(m.netNext) || m.netPending[""]
+		_, allPending := m.netPending[""]
+		whole := !now.Before(m.netNext) || allPending
 		for _, v := range m.store.ListProxyProfiles() {
 			if v.Enabled {
 				all = append(all, v)
-				if whole || m.netPending[v.ID] {
+				_, pending := m.netPending[v.ID]
+				if whole || pending {
 					selected = append(selected, v)
 				}
 			}
@@ -193,7 +205,7 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 		// 大池拆分后立即处理剩余批次，不因重新起轮一直只检查列表开头。
 		if len(selected) > 48 {
 			for _, v := range selected[48:] {
-				m.netPending[v.ID] = true
+				m.netPending[v.ID] = manual[v.ID]
 			}
 			selected = selected[:48]
 		}
@@ -201,7 +213,7 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 		if len(selected) == 0 {
 			return false, nil
 		}
-		r := &networkRound{id: fmt.Sprintf("network-%d", now.UnixNano()), key: key, policy: p, profiles: selected, all: all, targets: targets, manual: manual, deadline: now.Add(5 * time.Minute)}
+		r := &networkRound{id: fmt.Sprintf("network-%d", now.UnixNano()), key: key, policy: p, profiles: selected, all: all, targets: targets, manual: manual, deadline: now.Add(5*time.Minute + time.Duration(p.NetworkConfirmSeconds)*time.Second)}
 		r.first = m.networkBatch(ctx, selected, p, targets)
 		if ctx.Err() != nil {
 			return true, ctx.Err()
@@ -328,6 +340,7 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 	if err := m.store.SaveNetworkHealth(p, records); err != nil {
 		return true, err
 	}
+	web.Warn("proxy-health", fmt.Sprintf("round=%s stage=confirmed checked=%d candidates=%d removed=%d mode=%s", r.id, len(r.profiles), len(remove), len(removed), p.Mode))
 	m.enqueueNetworkModels(r, records)
 	return true, nil
 }
