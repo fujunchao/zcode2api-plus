@@ -15,9 +15,9 @@ import (
 
 type modelProbeEvidence struct {
 	ProxyObservation
-	account, route, role, credential string
-	generation                       uint64
-	round                            int
+	account, route, role, credential, identity string
+	generation                                 uint64
+	round                                      int
 }
 
 // ModelProbeLease 只能由 Store 签发；账号的临时路由不发布到持久绑定。
@@ -31,6 +31,7 @@ type ModelProbeLease struct {
 	started                                                   bool
 	requestID                                                 string
 	startedAt                                                 time.Time
+	bindingGeneration                                         uint64
 }
 
 func (l *ModelProbeLease) Account() *model.Account { return l.account.Clone() }
@@ -92,10 +93,13 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 		return ModelProbeRun{}, errors.New("模型巡检等待队列已满")
 	}
 	r := &ModelProbeRun{ID: "probe-" + randomHex(12), TargetID: target, Source: source, State: "queued", Verdict: "unknown", Reason: "queued", Mode: p.Mode,
-		RuleVersion: ModelProbeRuleVersion, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli(), NextAt: now.UnixMilli(), Deadline: now.Add(20 * time.Minute).UnixMilli(), Samples: []ModelProbeSample{}, policy: p.clone(), target: profile, phase: "screen"}
+		RuleVersion: ModelProbeRuleVersion, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli(), NextAt: now.UnixMilli(), Deadline: now.Add(20 * time.Minute).UnixMilli(), Samples: []ModelProbeSample{}, policy: p.clone(), target: profile, phase: "screen",
+		credentials: map[string]string{}, bindings: map[string]uint64{}, targetURL: config.UpstreamZai}
 	for _, id := range p.AccountIDs {
 		if s.probeAccountReadyLocked(id, now) {
 			r.accounts = append(r.accounts, id)
+			r.credentials[id] = s.strictCredentialRefLocked(s.findAnyLocked(id))
+			r.bindings[id] = s.strictProxy.RouteVersions[id].Generation
 			if len(r.accounts) == 2 {
 				break
 			}
@@ -111,6 +115,13 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 	}
 	if s.modelProbe.PausedUntil > now.UnixMilli() {
 		r.State, r.Verdict, r.Reason = "skipped", "inconclusive", "reference_unavailable"
+	} else if s.modelProbe.PausedUntil > 0 {
+		r.referenceID = s.probeReferenceLocked(p, profile)
+		if r.referenceID != "" {
+			r.phase, r.round = "reference", 1
+		} else {
+			r.State, r.Reason = "skipped", "reference_unavailable"
+		}
 	}
 	if err := s.pruneModelProbeLocked(now); err != nil {
 		return ModelProbeRun{}, err
@@ -130,6 +141,7 @@ func (s *Store) ScheduleModelProbes(now time.Time) error {
 	if !p.Enabled || s.strictClosed {
 		return nil
 	}
+	changed := false
 	for _, id := range p.TargetProxyIDs {
 		due := s.modelProbe.NextDue[id]
 		hint := s.modelProbe.hints[id]
@@ -138,6 +150,7 @@ func (s *Store) ScheduleModelProbes(now time.Time) error {
 		}
 		if due == 0 {
 			s.modelProbe.NextDue[id] = now.Add(time.Duration(p.IntervalMinutes) * time.Minute).UnixMilli()
+			changed = true
 			continue
 		}
 		if _, err := s.queueModelProbeLocked(id, "scheduled", now); err != nil && !errors.Is(err, ErrModelProbeUnavailable) {
@@ -148,8 +161,12 @@ func (s *Store) ScheduleModelProbes(now time.Time) error {
 		factor := 80 + int(seed[0])%41
 		s.modelProbe.NextDue[id] = now.Add(time.Duration(p.IntervalMinutes) * time.Minute * time.Duration(factor) / 100).UnixMilli()
 		delete(s.modelProbe.hints, id)
+		changed = true
 	}
-	return s.persistProbeStateLocked()
+	if changed {
+		return s.persistProbeStateLocked()
+	}
+	return nil
 }
 
 // TakeModelProbe 只预留一个可运行阶段，真实出站前仍由 GuardModelProbeClient 复核。
@@ -203,6 +220,13 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 			continue
 		}
 		id := r.accounts[r.accountIndex]
+		aCurrent := s.findAnyLocked(id)
+		if aCurrent == nil || s.strictCredentialRefLocked(aCurrent) != r.credentials[id] || s.strictProxy.RouteVersions[id].Generation != r.bindings[id] || r.targetURL != config.UpstreamZai {
+			if err := finish("account_or_target_changed"); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if !s.probeAccountReadyLocked(id, now) {
 			if err := finish("account_not_ready"); err != nil {
 				return nil, err
@@ -237,7 +261,7 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 		}
 		a := s.snapshotLocked(s.findAnyLocked(id))
 		l := &ModelProbeLease{store: s, id: "attempt-" + randomHex(12), runID: r.ID, role: role, routeID: routeID, profile: profile, identity: strictProxyIdentity(profile.URL), account: a,
-			credential: s.strictCredentialRefLocked(a), targetURL: config.UpstreamZai, round: r.round, revision: r.policy.Revision}
+			credential: s.strictCredentialRefLocked(a), targetURL: r.targetURL, round: r.round, revision: r.policy.Revision, bindingGeneration: r.bindings[id]}
 		copy := *r
 		copy.State = "running"
 		if err := s.persistModelProbeRunLocked(&copy); err != nil {
@@ -255,7 +279,7 @@ func (s *Store) probeLeaseCurrentLocked(l *ModelProbeLease, now time.Time) bool 
 		return false
 	}
 	a := s.findAnyLocked(l.account.ID)
-	if a == nil || s.strictCredentialRefLocked(a) != l.credential || config.UpstreamZai != l.targetURL {
+	if a == nil || s.strictCredentialRefLocked(a) != l.credential || config.UpstreamZai != l.targetURL || s.strictProxy.RouteVersions[a.ID].Generation != l.bindingGeneration {
 		return false
 	}
 	if l.routeID == ModelProbeDirect {
@@ -382,13 +406,26 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 		}
 	}
 	copy.Samples = append(copy.Samples, ModelProbeSample{RequestID: l.requestID, AccountRef: strictDigest(l.account.ID)[:12], RouteID: l.routeID, Role: l.role, Round: l.round, At: now.UnixMilli(), Status: o.Status, BusinessCode: o.BusinessCode, Kind: kind, Complete: o.Complete, Usage: usage, Stale: !current})
+	o.At = now
+	if current && l.started && !o.InvalidRequest && o.RequestID == l.requestID && validProbeObservation(l, o) {
+		if (o.Complete && o.Status >= 200 && o.Status < 300 && o.BusinessCode == "") || (o.Status == 405 && o.BusinessCode == "3012") {
+			copy.proofs = append(copy.proofs, modelProbeEvidence{ProxyObservation: o, account: l.account.ID, route: l.routeID, role: l.role, credential: l.credential, identity: l.identity, generation: l.profile.Generation, round: l.round})
+		}
+	}
 	copy.State, copy.Verdict, copy.Reason = "completed", "inconclusive", kind
 	if !current {
 		copy.Reason = "stale_snapshot"
-	} else if kind == "success" && o.Complete {
-		copy.Verdict = "healthy_recent"
-	} else if kind == "risk_control" {
-		copy.Verdict = "suspect"
+	} else {
+		s.advanceModelProbeLocked(&copy, l, o, kind, account, now)
 	}
-	return s.commitProbeResultLocked(&copy, account)
+	if err := s.commitProbeResultLocked(&copy, account); err != nil {
+		return err
+	}
+	if err := s.persistProbeStateLocked(); err != nil {
+		return err
+	}
+	if copy.Verdict == "route_correlated" {
+		return s.retireModelProbeLocked(&copy, now)
+	}
+	return nil
 }

@@ -113,12 +113,17 @@ type ModelProbeRun struct {
 	round           int
 	referenceID     string
 	proofs          []modelProbeEvidence
+	credentials     map[string]string
+	bindings        map[string]uint64
+	targetURL       string
 }
 
 func (r *ModelProbeRun) view() ModelProbeRun {
 	v := *r
 	v.Samples = append([]ModelProbeSample{}, r.Samples...)
 	v.proofs, v.accounts = nil, nil
+	v.credentials, v.bindings = nil, nil
+	v.target, v.policy = ProxyProfile{}, ModelProbeSettings{}
 	return v
 }
 

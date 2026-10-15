@@ -476,39 +476,7 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 		if reason == "" {
 			continue
 		}
-		b := strictProxyBlock{Identity: identity, DecisionID: "decision-" + randomHex(12), State: "retiring", Reason: reason, TargetOrigin: target, CreatedAt: o.At.UnixMilli(), Evidence: refs, RuleVersion: StrictProxyRuleVersion}
-		// 无认证订阅端点直接使用同一身份键；即使只有裸 URL 也不能靠首次启用订阅回流。
-		for _, p := range s.listProxyProfilesLocked() {
-			if strictProxyIdentity(p.URL) == identity {
-				if canonical, err := proxy.CanonicalRoute(p.URL); err == nil {
-					if _, err := proxysub.Canonical(canonical); err == nil {
-						b.SubscriptionKey = identity
-					}
-				}
-				break
-			}
-		}
-		if b.SubscriptionKey == "" && identity == egress.identity {
-			if canonical, err := proxy.CanonicalRoute(derefStr(acc.ProxyURL)); err == nil {
-				if _, err := proxysub.Canonical(canonical); err == nil {
-					b.SubscriptionKey = identity
-				}
-			}
-		}
-		s.strictProxy.Blocks[identity] = b // 与新许可同锁线性化，即使持久化失败也不准入。
-		if len(s.strictProxy.Blocks) >= proxysub.MaxBlocks {
-			s.strictProxy.ImportPaused = true
-		}
-		if err := s.writeStrictJournalLocked(s.strictProxy.Blocks); err != nil {
-			s.strictProxy.Paused = true
-			result.Reason = "persist_failed"
-			// 文件系统恢复日志失败时再尝试 SQL 意图；任一路径成功即可跨重启闭锁。
-			next := s.cloneStrictProxyLocked()
-			dbErr := s.commitProxyBundleStrictLocked(context.Background(), nil, nil, nil, nil, &next)
-			s.scheduleStrictProxyRecoveryLocked()
-			return result, fmt.Errorf("持久化严格删除日志失败，代理准入已暂停: %w", errors.Join(err, dbErr))
-		}
-		d, err := s.retireStrictIdentityLocked(identity)
+		d, err := s.startStrictRetirementLocked(identity, derefStr(acc.ProxyURL), reason, target, StrictProxyRuleVersion, refs, o.At)
 		result.Removed = append(result.Removed, d.Removed...)
 		result.Reason = d.Reason
 		result.DecisionID = d.DecisionID

@@ -144,7 +144,7 @@ func (s *Store) commitProxyIntentLocked(pending []*model.Account, intent string)
 // retiring 意图已先落恢复日志，失败时原绑定/配置不发布，但新派发仍被拒绝。
 func (s *Store) retireStrictIdentityLocked(identity string) (ProxyDecision, error) {
 	b := s.strictProxy.Blocks[identity]
-	result := ProxyDecision{Reason: b.Reason, DecisionID: b.DecisionID, RuleVersion: StrictProxyRuleVersion}
+	result := ProxyDecision{Reason: b.Reason, DecisionID: b.DecisionID, RuleVersion: b.RuleVersion}
 	if b.State == "removed" {
 		result.Reason = "already_retired"
 		return result, nil
@@ -206,7 +206,7 @@ func (s *Store) retireStrictIdentityLocked(identity string) (ProxyDecision, erro
 		err = s.commitProxyBundleStrictLocked(context.Background(), remaining, pending, nil, sub, &next)
 	}
 	if err != nil {
-		return ProxyDecision{Reason: "persist_failed", DecisionID: b.DecisionID, RuleVersion: StrictProxyRuleVersion}, err
+		return ProxyDecision{Reason: "persist_failed", DecisionID: b.DecisionID, RuleVersion: b.RuleVersion}, err
 	}
 	for _, id := range result.Removed {
 		s.clearLineTruncateLocked(id)
