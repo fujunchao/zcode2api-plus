@@ -402,6 +402,25 @@ func (s *Store) persistProbeStateLocked() error {
 	return s.setMeta(modelProbeStateKey, string(raw))
 }
 
+// StopModelProbes 终止未完成诊断，保留已发生的请求预算和展示历史。
+func (s *Store) StopModelProbes(now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.modelProbe.runs {
+		if !probeRunOpen(r) {
+			continue
+		}
+		copy := *r
+		copy.State, copy.Verdict, copy.Reason = "interrupted", "inconclusive", "process_stopped"
+		copy.UpdatedAt = now.UnixMilli()
+		if err := s.persistModelProbeRunLocked(&copy); err != nil {
+			return err
+		}
+		s.modelProbe.runs[r.ID] = &copy
+	}
+	return nil
+}
+
 // 仅保存去敏观测，不读取日志或正文。业务证据与主动探测证据不互相凑数。
 func (s *Store) observeModelProbeBusinessLocked(acc *model.Account, egress ProxyEgress, o ProxyObservation) {
 	if egress.ID == "" || !s.modelProbe.Policy.Enabled || o.Model != ModelProbeModel {

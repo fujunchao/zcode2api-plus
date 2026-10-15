@@ -101,6 +101,9 @@ func (m *Manager) Request(target string) (store.ModelProbeRun, error) {
 
 // RunDue 与生产工作者共用同一发送路径，返回是否取得一个阶段；不会等待未来的冷却时间。
 func (m *Manager) RunDue(ctx context.Context) (bool, error) {
+	if m.ctx.Err() != nil {
+		return false, m.ctx.Err()
+	}
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
@@ -118,4 +121,7 @@ func (m *Manager) Close() {
 	m.cancel()
 	m.mu.Unlock()
 	m.wg.Wait()
+	if err := m.store.StopModelProbes(m.now()); err != nil {
+		web.Warn("model-probe", "关停巡检状态保存失败，重启后将终止旧任务")
+	}
 }
