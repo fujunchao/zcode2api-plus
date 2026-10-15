@@ -371,7 +371,7 @@ func (s *Store) EndInitialization(a *InitializationAttempt, reason, message stri
 	return s.commitInitializationLocked(t, nil, next)
 }
 
-func (s *Store) BindInitialization(id string, revision uint64, currentDefault bool) (bool, error) {
+func (s *Store) BindInitialization(id string, revision uint64, currentDefault bool, explicit ...bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old := s.initializations[id]
@@ -381,6 +381,10 @@ func (s *Store) BindInitialization(id string, revision uint64, currentDefault bo
 	if old.GrantedAt == 0 {
 		return false, errors.New("尚未确认额度到账，不能绑定业务代理")
 	}
+	manual := len(explicit) > 0 && explicit[0]
+	if old.Paused && !manual {
+		return false, ErrInitializationUnavailable
+	}
 	if old.State == "completed" && !currentDefault {
 		return true, nil
 	}
@@ -388,7 +392,7 @@ func (s *Store) BindInitialization(id string, revision uint64, currentDefault bo
 	if policyErr != nil {
 		return false, policyErr
 	}
-	if !policy.Enabled || !s.ClaimAutoEnabled() {
+	if !manual && (!policy.Enabled || !s.ClaimAutoEnabled()) {
 		return false, ErrInitializationUnavailable
 	}
 	live := s.findAnyLocked(id)

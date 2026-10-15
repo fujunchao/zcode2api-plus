@@ -210,6 +210,9 @@ func TestNewAccountInitializationPauseAfterQuotaPreventsAutomaticBind(t *testing
 	if !s.FindAny(a.ID).InitializationBlocked() {
 		t.Fatal("暂停被当成了业务就绪")
 	}
+	if ok, err := s.BindInitialization(a.ID, s.Initialization(a.ID).Revision, false, true); err != nil || !ok {
+		t.Fatalf("管理员明确重试绑定应可以恢复：%v", err)
+	}
 }
 
 func initializationStoreFixture(t *testing.T) (*Store, *model.Account, ProxyProfile, ProxyProfile) {

@@ -59,7 +59,7 @@ func (h *Handler) handleInitializationAction(w http.ResponseWriter, r *http.Requ
 	action := r.PathValue("action")
 	var err error
 	if action == "bind-default" {
-		_, err = h.Store.BindInitialization(id, payload.Revision, payload.UseCurrentDefault)
+		_, err = h.Store.BindInitialization(id, payload.Revision, payload.UseCurrentDefault, true)
 	} else {
 		err = h.Store.ChangeInitialization(id, payload.Revision, action)
 	}
