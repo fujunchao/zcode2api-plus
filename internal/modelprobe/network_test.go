@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func TestUnifiedNetworkLargePoolCompletesAcrossBatches(t *testing.T) {
 	f := newNetworkFixture(t)
 	f.blocked.Store(false)
 	for i := 0; i < 55; i++ {
-		if _, err := f.st.AddProxyProfile("分批目标", f.good.URL, true); err != nil {
+		if _, err := f.st.AddProxyProfile("分批目标-"+strconv.Itoa(i), f.good.URL, true); err != nil {
 			t.Fatal(err)
 		}
 	}
