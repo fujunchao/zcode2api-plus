@@ -174,6 +174,10 @@ func (s *Store) loadModelProbe() error {
 		runs: map[string]*ModelProbeRun{}, leases: map[string]*ModelProbeLease{}, business: map[string]modelProbeBusiness{}, hints: map[string]time.Time{}}
 	existing := s.settings[modelProbeStateKey] != ""
 	if raw := s.settings[modelProbeStateKey]; raw != "" {
+		// 从零值反序列化：JSON 里缺失的字段必须落回零值，而不是继承新版本默认值。
+		// 否则旧状态会带着 target_mode/account_mode 的「自动」默认伪装成已迁移，
+		// 升级部署会被静默扩大成自动全覆盖。
+		s.modelProbe.modelProbePersistent = modelProbePersistent{}
 		if err := json.Unmarshal([]byte(raw), &s.modelProbe.modelProbePersistent); err != nil {
 			return fmt.Errorf("读取模型巡检状态失败: %w", err)
 		}
