@@ -40,3 +40,4 @@
 ## 执行记录
 
 - 已核对工作区、origin／upstream 和 `v2.10.13-go`；仅向 origin 推送。用户原有 `.gitignore` 修改和未跟踪分析文档不纳入本次提交。
+- 回归提交 `9f3cf187106d01dac5ee1432b83b46db1a160481` 的 [CI 38914628542](https://github.com/fujunchao/zcode2api-plus/actions/runs/38914628542) 已通过真实本地 HTTP 代理在 Ubuntu 复现：一次响应头超时后返回 `proxy_removed`、`proxy_reassigned:2`，新增保护断言失败。未在开发机运行自动化测试。

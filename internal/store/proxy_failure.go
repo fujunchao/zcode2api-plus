@@ -2,7 +2,8 @@ package store
 
 import "zcode2api/internal/model"
 
-// PurgeFailedAccountProxy 处理已经确认的代理端点故障，与新号空额度规则无关。
+// PurgeFailedAccountProxy 供已达到阈值的断流等故障处置使用，仍受统一模式和节点保护约束。
+// 计费单次失败不得调用本方法，只能报告 ObserveProxyEndpointFailure。
 // expected 必须是失败请求实际使用的不可变快照；旧凭据/旧绑定的迟到失败不能误删新线路。
 func (s *Store) PurgeFailedAccountProxy(expected *model.Account, route ...ProxyEgress) (bool, ProxyReassign, error) {
 	empty := ProxyReassign{Assigned: map[string]string{}}

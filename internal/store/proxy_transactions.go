@@ -82,11 +82,19 @@ func (s *Store) purgeProxyProfilesIfCurrentLocked(expected []ProxyProfile) ([]st
 
 func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[string]bool, reasons ...string) ([]string, ProxyReassign, error) {
 	result := ProxyReassign{Assigned: map[string]string{}}
+	manual := len(reasons) > 0 && reasons[0] == "manual"
+	if !manual && s.modelProbe.Policy.Mode != "auto_retire" {
+		return nil, result, nil
+	}
+	protected := s.proxyAutoDeleteProtectionsLocked()
+	// 只处理真正允许删除的 ID；后面的账号解绑不能继续使用未过滤的原集合。
+	allowed := map[string]bool{}
 	remaining := []ProxyProfile{}
 	var removed []string
 	for _, p := range s.listProxyProfilesLocked() {
-		if ids[p.ID] {
+		if ids[p.ID] && (manual || protected[strictProxyIdentity(p.URL)] == "") {
 			removed = append(removed, p.ID)
+			allowed[p.ID] = true
 		} else {
 			remaining = append(remaining, p)
 		}
@@ -99,7 +107,7 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 	var pending []*model.Account
 	next := s.cloneStrictProxyLocked()
 	for _, a := range s.allAccountsLocked() {
-		if a.ProxyID != nil && ids[*a.ProxyID] {
+		if a.ProxyID != nil && allowed[*a.ProxyID] {
 			copy := a.Clone()
 			copy.ProxyID, copy.ProxyURL = nil, nil
 			pending = append(pending, copy)

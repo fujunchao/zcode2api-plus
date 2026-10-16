@@ -82,6 +82,7 @@ type Store struct {
 	strictStartPlanProofs map[string][]startPlanProxyProof
 	strictNow             func() time.Time // 仅替换严格证据的时钟，供确定性窗口回归。
 	modelProbe            modelProbeState
+	proxyFailureRechecks  map[string]proxyFailureRecheck // 运行期异常通知，不是删除证据；重启不续用。
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -770,11 +771,12 @@ func (s *Store) ProxyHealthIntervalMinutes() int {
 
 // ProxyProfile 命名代理出口（設定以 JSON 儲存在 meta 表中）。
 type ProxyProfile struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	URL        string `json:"url"`
-	Enabled    bool   `json:"enabled"`
-	Generation uint64 `json:"-"` // 进程读快照附带持久代次，不允许 API 提交覆盖。
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	URL                 string `json:"url"`
+	Enabled             bool   `json:"enabled"`
+	AutoDeleteProtected bool   `json:"auto_delete_protected,omitempty"`
+	Generation          uint64 `json:"-"` // 进程读快照附带持久代次，不允许 API 提交覆盖。
 }
 
 // ListProxyProfiles 列出全部代理线路。
@@ -844,7 +846,7 @@ func (s *Store) saveProxyProfilesLocked(profiles []ProxyProfile) error {
 }
 
 // AddProxyProfile 新增命名代理出口。
-func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, error) {
+func (s *Store) AddProxyProfile(name, url string, enabled bool, protection ...bool) (ProxyProfile, error) {
 	normalized, err := proxy.NormalizeProxyURL(url)
 	if err != nil {
 		return ProxyProfile{}, err
@@ -871,6 +873,9 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, e
 		}
 	}
 	profile := ProxyProfile{ID: "proxy-" + randomHex(4), Name: name, URL: *normalized, Enabled: enabled}
+	if len(protection) > 0 {
+		profile.AutoDeleteProtected = protection[0]
+	}
 	profiles = append(profiles, profile)
 	if err := s.saveProxyProfilesLocked(profiles); err != nil {
 		return ProxyProfile{}, err
@@ -880,7 +885,7 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool) (ProxyProfile, e
 }
 
 // UpdateProxyProfile 更新代理线路；同步指派了该线路的账号。
-func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (ProxyProfile, error) {
+func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool, protection ...bool) (ProxyProfile, error) {
 	normalized, err := proxy.NormalizeProxyURL(url)
 	if err != nil {
 		return ProxyProfile{}, err
@@ -916,6 +921,10 @@ func (s *Store) UpdateProxyProfile(profileID, name, url string, enabled bool) (P
 	profiles[target].Name = name
 	profiles[target].URL = *normalized
 	profiles[target].Enabled = enabled
+	// 旧客户端不认识保护字段，省略时必须保留，不能在改名或修改启停时悄悄解除。
+	if len(protection) > 0 {
+		profiles[target].AutoDeleteProtected = protection[0]
+	}
 	var pending []*model.Account
 	for _, acc := range s.allAccountsLocked() {
 		if acc.ProxyID != nil && *acc.ProxyID == profileID {

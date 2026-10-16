@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { api, errMsg } from '@/lib/api'
 import type { NetworkHealthRecord, ProxyProfile, UpstreamProbe } from '@/lib/types'
 
-const states: Record<string, string> = { healthy: '网络可达', waiting: '等待复核', recovered: '复核已恢复', unconfirmed: '缺少健康参考，保留', confirmed_failure: '网络异常已确认', removed: '已按策略移除', interrupted: '旧轮次已终止', changed: '线路已变化，待重新检测' }
+const states: Record<string, string> = { healthy: '网络可达', waiting: '等待复核', recovered: '复核已恢复', unconfirmed: '缺少健康参考，保留', confirmed_failure: '网络异常已确认', protected_failure: '网络异常，受保护未删除', removed: '已按策略移除', interrupted: '旧轮次已终止', changed: '线路已变化，待重新检测' }
 const stamp = (at?: number) => at ? new Date(at).toLocaleString('zh-CN', { hour12: false }) : '—'
 function detail(r?: UpstreamProbe) { return r ? (r.targets ?? []).map((t) => `${t.host} ${t.status ?? '无响应'}${t.blocked ? ' 防护拦截' : ''} ${t.ms ?? 0}ms`).join('；') || r.error || '未取得结果' : '未执行' }
 

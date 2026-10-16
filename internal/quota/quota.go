@@ -252,7 +252,7 @@ func (s *Service) quotaRequestFailure(ctx context.Context, acc *model.Account, c
 		if s.observationOnly != nil {
 			out["proxy_failure"] = proxy.FailureEndpointUnreachable
 		} else {
-			maps.Copy(out, proxyguard.Purge(ctx, s.Store, acc, proxy.FailureEndpointUnreachable, route...))
+			maps.Copy(out, proxyguard.Observe(ctx, s.Store, acc, proxy.FailureEndpointUnreachable, route...))
 		}
 	}
 	return out

@@ -15,6 +15,7 @@ export const labels: Record<string, string> = {
   budget_exhausted: '请求预算已用完', diagnosis_budget: '已到诊断次数或时间上限',
   evidence_incomplete_or_contradicted: '证据不足、过期或存在反证', qualified_observe: '已达标，观察模式未执行删除',
   retired: '已严格退役', decision_disabled: '自动决定门禁关闭', evidence_incomplete: '证据不完整，暂停删除',
+  protected_proxy: '节点受保护，未自动删除', observe_only: '仅观察，未自动删除',
   stale_snapshot: '账号、线路或策略已变化，旧结果未处置', account_or_target_changed: '账号或目标版本变化',
   policy_changed: '策略已变更', process_restarted: '重启终止旧诊断', process_stopped: '进程关停', persist_failed: '处置保存失败，请检查严格恢复状态',
   risk_control: '405 风控响应', authentication_failed: '账号鉴权失败', quota_exhausted: '额度不足', rate_limited: '上游限流',

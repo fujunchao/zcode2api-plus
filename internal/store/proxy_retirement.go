@@ -19,6 +19,10 @@ func (s *Store) startStrictRetirementLocked(identity, rawURL, reason, target, ru
 	if b, ok := s.strictProxy.Blocks[identity]; ok {
 		return ProxyDecision{RuleVersion: b.RuleVersion, Reason: "already_retired", DecisionID: b.DecisionID}, nil
 	}
+	if reason := s.automaticProxyRemovalReasonLocked(identity); reason != "" {
+		result.Reason = reason
+		return result, nil
+	}
 	b := strictProxyBlock{Identity: identity, DecisionID: "decision-" + randomHex(12), State: "retiring", Reason: reason, TargetOrigin: target, CreatedAt: at.UnixMilli(), Evidence: refs, RuleVersion: rule}
 	for _, p := range s.listProxyProfilesLocked() {
 		if strictProxyIdentity(p.URL) == identity {

@@ -70,6 +70,7 @@ type ClaimOutcome = {
   ok: boolean
   message?: string
   proxy_removed?: string
+  proxy_failure_action?: string
   proxy_reassigned?: number
   proxy_direct_fallback?: number
 }
@@ -77,6 +78,8 @@ type ClaimResponse = { outcomes: ClaimOutcome[]; summary: { ok: number; fail: nu
 
 function claimFailureMessage(outcome: ClaimOutcome): string {
   const message = outcome.message ?? '未知原因'
+  if (outcome.proxy_failure_action === 'recheck_pending') return `${message}；已保留代理与账号绑定，等待独立网络复核；保留领取冷却`
+  if (outcome.proxy_failure_action === 'observed' || outcome.proxy_failure_action === 'rate_limited') return `${message}；仅记录计费异常，已保留代理与账号绑定；保留领取冷却`
   if (!outcome.proxy_removed) return message
   return `${message}；已移除问题代理，${outcome.proxy_reassigned ?? 0} 个账号已改派，${outcome.proxy_direct_fallback ?? 0} 个无可用代理改为直连；保留领取冷却`
 }

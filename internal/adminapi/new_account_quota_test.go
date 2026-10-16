@@ -221,12 +221,12 @@ func TestNewAccountFirstQuotaProtectsProxy(t *testing.T) {
 	}
 }
 
-func TestExistingAccountEmptyQuotaClaimRiskPurgesProxy(t *testing.T) {
+func TestExistingAccountEmptyQuotaClaimRiskKeepsProxy(t *testing.T) {
 	f := newClaimGuardFixture(t, http.StatusOK, `{"code":0,"data":{"plans":[],"balances":[]}}`)
 	f.h.Quota.FetchQuota(f.a)
 	w := f.manual()
-	if w.Code != http.StatusOK || len(f.h.Store.ListProxyProfiles()) != 1 || !strings.Contains(w.Body.String(), "proxy_removed") {
-		t.Fatalf("新规则下老账号也按明确领取风控淘汰，而不是按空额度淘汰：%s", w.Body.String())
+	if w.Code != http.StatusOK || len(f.h.Store.ListProxyProfiles()) != 2 || strings.Contains(w.Body.String(), "proxy_removed") || !strings.Contains(w.Body.String(), "recheck_pending") {
+		t.Fatalf("空额度与单次领取风控都不能直接淘汰共享代理：%s", w.Body.String())
 	}
 }
 

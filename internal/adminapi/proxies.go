@@ -29,9 +29,14 @@ func (h *Handler) handleListProxies(w http.ResponseWriter, r *http.Request) {
 	stats := h.Store.LineTruncateStats()
 	origins := h.Store.SubscriptionOrigins()
 	profiles := h.Store.ListProxyProfiles()
+	protections := h.Store.ProxyAutoDeleteProtections()
 	out := make([]map[string]any, 0, len(profiles))
 	for _, p := range profiles {
 		entry := map[string]any{"id": p.ID, "name": p.Name, "url": p.URL, "enabled": p.Enabled}
+		entry["auto_delete_protected"] = p.AutoDeleteProtected
+		if reason := protections[p.ID]; reason != "" {
+			entry["auto_delete_protection"] = reason
+		}
 		if origin, ok := origins[p.ID]; ok {
 			entry["subscription"] = origin
 		}
@@ -50,10 +55,16 @@ func (h *Handler) handleAddProxy(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, apiErr)
 		return
 	}
+	protection, err := proxyProtectionPayload(payload)
+	if err != nil {
+		writeAPIError(w, errBadRequest(err.Error()))
+		return
+	}
 	profile, err := h.Store.AddProxyProfile(
 		strOf(firstTruthy(payload["name"])),
 		strOf(firstTruthy(payload["url"])),
 		payloadEnabled(payload),
+		protection...,
 	)
 	if err != nil {
 		writeAPIError(w, errBadRequest(err.Error()))
@@ -68,11 +79,17 @@ func (h *Handler) handleUpdateProxy(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, apiErr)
 		return
 	}
+	protection, err := proxyProtectionPayload(payload)
+	if err != nil {
+		writeAPIError(w, errBadRequest(err.Error()))
+		return
+	}
 	profile, err := h.Store.UpdateProxyProfile(
 		r.PathValue("profile_id"),
 		strOf(firstTruthy(payload["name"])),
 		strOf(firstTruthy(payload["url"])),
 		payloadEnabled(payload),
+		protection...,
 	)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -83,6 +100,18 @@ func (h *Handler) handleUpdateProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, profile)
+}
+
+func proxyProtectionPayload(payload map[string]any) ([]bool, error) {
+	value, supplied := payload["auto_delete_protected"]
+	if !supplied {
+		return nil, nil
+	}
+	protected, ok := value.(bool)
+	if !ok {
+		return nil, errors.New("auto_delete_protected 必须是布尔值")
+	}
+	return []bool{protected}, nil
 }
 
 // handleDeleteProxy 删除线路。原绑定账号按空闲优先、最少绑定改派到其他启用线路，

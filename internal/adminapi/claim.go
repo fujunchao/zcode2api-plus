@@ -158,7 +158,7 @@ func (h *Handler) applyClaimOutcome(acc *model.Account, outcomes []map[string]an
 		web.Warn("claim", "领取状态落库失败: "+err.Error())
 		return
 	}
-	// 单次空额度仍不能淘汰老号代理；实际连接故障/可疑请求则适用于新老账号。
+	// 单次计费失败只观测并通知网络复核，不能直接删除新老账号的共享业务出口。
 	proxyguard.ApplyClaimFailures(h.backgroundContext(), h.Store, acc, outcomes, route...)
 }
 

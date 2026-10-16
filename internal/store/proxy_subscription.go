@@ -300,7 +300,7 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 			if p.Enabled && (!ok || !previous.Enabled || strictProxyIdentity(previous.URL) != strictProxyIdentity(p.URL)) {
 				newEligible = true
 			}
-			if !ok || strictProxyIdentity(previous.URL) != strictProxyIdentity(p.URL) || previous.Enabled != p.Enabled {
+			if !ok || strictProxyIdentity(previous.URL) != strictProxyIdentity(p.URL) || previous.Enabled != p.Enabled || previous.AutoDeleteProtected != p.AutoDeleteProtected {
 				strict.Generations[p.ID]++
 			}
 		}

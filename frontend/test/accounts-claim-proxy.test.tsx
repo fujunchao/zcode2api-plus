@@ -28,3 +28,27 @@ test.each([true, false])('领取失败提示准确说明是否移除了代理：
     expect(message).not.toContain('已移除')
   }
 })
+
+test.each(['recheck_pending', 'observed', 'rate_limited'])('计费观测提示保留节点，不将 %s 误报为删除或已恢复', async (action) => {
+  mock.warning.mockClear()
+  mock.api.mockImplementation(async (method: string) => method === 'GET' ? {
+    accounts: [{ id: 'a1', name: 'test', mode: 'jwt', status: 'active', enabled: true, quota: {}, plans: [], disabled_models: [], exhausted_models: [], archived_at: null }],
+    stats: {}, models: [], proxies: [], ts: 1,
+  } : {
+    outcomes: [{ ok: false, message: '等待响应头超时', proxy_failure_action: action }],
+    summary: { ok: 0, fail: 1 },
+  })
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+  render(<QueryClientProvider client={client}><AccountsPage /></QueryClientProvider>)
+  fireEvent.click(await screen.findByTitle('領取活動套餐'))
+  await waitFor(() => expect(mock.warning).toHaveBeenCalled())
+  const message = mock.warning.mock.calls[0][0]
+  expect(message).toContain('等待响应头超时')
+  expect(message).toContain('已保留代理与账号绑定')
+  expect(message).toContain('保留领取冷却')
+  expect(message).not.toContain('已移除')
+  expect(message).not.toContain('已恢复')
+  if (action === 'recheck_pending') expect(message).toContain('等待独立网络复核')
+  else expect(message).toContain('仅记录计费异常')
+  client.clear()
+})

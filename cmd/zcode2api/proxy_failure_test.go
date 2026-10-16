@@ -14,7 +14,7 @@ import (
 	"zcode2api/internal/store"
 )
 
-func TestCLIProxyEndpointClaimFailureReassignsAccount(t *testing.T) {
+func TestCLIProxyEndpointClaimFailureKeepsAccountRoute(t *testing.T) {
 	oldDB, oldData, oldBase := config.DBPath, config.DataDir, config.ZcodeBillingBase
 	config.DataDir = t.TempDir()
 	config.DBPath = filepath.Join(config.DataDir, "accounts.db")
@@ -35,7 +35,7 @@ func TestCLIProxyEndpointClaimFailureReassignsAccount(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	bad, _ := st.AddProxyProfile("bad", up.URL, true)
-	good, _ := st.AddProxyProfile("good", "http://127.0.0.1:18081", true)
+	_, _ = st.AddProxyProfile("good", "http://127.0.0.1:18081", true)
 	a, _ := st.AddAccount(model.ProviderZai, "cli", "header.payload.sig") // 无 user_id，不触发外部遥测。
 	_, _ = st.AssignProxyProfile(a.ID, bad.ID)
 	cm := captcha.NewManager()
@@ -45,11 +45,11 @@ func TestCLIProxyEndpointClaimFailureReassignsAccount(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cm.Close() })
 	outcomes := claimCLIAccount(st, st.FindAny(a.ID), cm)
-	if len(outcomes) != 1 || outcomes[0]["proxy_removed"] != bad.ID || len(st.ListProxyProfiles()) != 1 {
-		t.Fatalf("CLI 真实领取边界必须执行共同的代理故障收尾：%v", outcomes)
+	if len(outcomes) != 1 || outcomes[0]["proxy_removed"] != nil || outcomes[0]["proxy_failure_action"] != "recheck_pending" || len(st.ListProxyProfiles()) != 2 {
+		t.Fatalf("CLI 真实领取边界必须仅记录异常和复核通知：%v", outcomes)
 	}
 	got := st.FindAny(a.ID)
-	if got.ProxyID == nil || *got.ProxyID != good.ID {
-		t.Fatal("CLI 失败后应改派到可用线路")
+	if got.ProxyID == nil || *got.ProxyID != bad.ID {
+		t.Fatal("CLI 计费失败后应保留原业务线路")
 	}
 }

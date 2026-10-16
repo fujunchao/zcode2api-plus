@@ -76,16 +76,16 @@ func (f *claimGuardFixture) manual() *httptest.ResponseRecorder {
 	return w
 }
 
-// v2.9.7 的明确领取风控适用于新老账号，不再依赖初始额度证据。
-func TestExistingAccountClaimRiskPurgesProxy(t *testing.T) {
+// 领取风控不直接归因到共享代理，保留冷却与绑定，交由独立网络复核。
+func TestExistingAccountClaimRiskKeepsProxy(t *testing.T) {
 	for _, mode := range []string{"manual", "auto"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newClaimGuardFixture(t, 200, `{"code":0,"data":{"plans":[],"balances":[]}}`)
 			f.h.Quota.FetchQuota(f.a)
 			if mode == "manual" {
 				w := f.manual()
-				if w.Code != 200 || !strings.Contains(w.Body.String(), "unusual activity") || !strings.Contains(w.Body.String(), "proxy_removed") {
-					t.Fatalf("应报告风控和代理删除: %d %s", w.Code, w.Body.String())
+				if w.Code != 200 || !strings.Contains(w.Body.String(), "unusual activity") || strings.Contains(w.Body.String(), "proxy_removed") || !strings.Contains(w.Body.String(), "recheck_pending") {
+					t.Fatalf("应报告风控及待复核，但不删除代理: %d %s", w.Code, w.Body.String())
 				}
 			} else {
 				if !claimSlot.acquire() {
@@ -95,15 +95,15 @@ func TestExistingAccountClaimRiskPurgesProxy(t *testing.T) {
 					t.Fatal("风控不得报告领取成功")
 				}
 			}
-			if len(f.h.Store.ListProxyProfiles()) != 1 {
-				t.Fatal("领取明确返回可疑请求时也应淘汰老账号使用的代理")
+			if len(f.h.Store.ListProxyProfiles()) != 2 {
+				t.Fatal("单次领取可疑请求不能删除老账号使用的共享代理")
 			}
 			got := f.h.Store.FindAny(f.a.ID)
-			if got.ProxyID == nil || *got.ProxyID != f.good.ID || got.ProxyURL == nil || *got.ProxyURL != f.good.URL {
-				t.Fatal("老账号应按现有策略改派")
+			if got.ProxyID == nil || *got.ProxyID != f.bad.ID || got.ProxyURL == nil || *got.ProxyURL != f.bad.URL {
+				t.Fatal("必须保留老账号已有代理绑定")
 			}
 			if got.Claim == nil || got.Claim.NextAt == nil || *got.Claim.NextAt <= float64(time.Now().Unix()) {
-				t.Fatal("换线应保留领取冷却")
+				t.Fatal("异常观测应保留领取冷却")
 			}
 			if f.oldClaims.Load() != 1 || f.newClaims.Load() != 0 {
 				t.Fatal("本次不得在新线路立即重领")
@@ -112,7 +112,7 @@ func TestExistingAccountClaimRiskPurgesProxy(t *testing.T) {
 	}
 }
 
-func TestClaimRiskWithoutInitialQuotaEvidencePurgesProxy(t *testing.T) {
+func TestClaimRiskWithoutInitialQuotaEvidenceKeepsProxy(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -130,14 +130,14 @@ func TestClaimRiskWithoutInitialQuotaEvidencePurgesProxy(t *testing.T) {
 				f.h.Quota.FetchQuota(f.a)
 			}
 			w := f.manual()
-			if w.Code != 200 || !strings.Contains(w.Body.String(), "proxy_removed") || len(f.h.Store.ListProxyProfiles()) != 1 {
-				t.Fatalf("明确领取风控不应受额度查询结果限制: %s", w.Body.String())
+			if w.Code != 200 || strings.Contains(w.Body.String(), "proxy_removed") || !strings.Contains(w.Body.String(), "recheck_pending") || len(f.h.Store.ListProxyProfiles()) != 2 {
+				t.Fatalf("领取风控观测不应依赖初始额度，且不能删除节点: %s", w.Body.String())
 			}
 		})
 	}
 }
 
-func TestExistingBatchClaimUsesReassignedProxy(t *testing.T) {
+func TestExistingBatchClaimKeepsSharedProxy(t *testing.T) {
 	f := newClaimGuardFixture(t, 200, `{"code":0,"data":{"plans":[],"balances":[]}}`)
 	peer, _ := f.h.Store.AddAccount(model.ProviderZai, "peer", "header.payload.other")
 	_, _ = f.h.Store.AssignProxyProfile(peer.ID, f.bad.ID)
@@ -145,10 +145,10 @@ func TestExistingBatchClaimUsesReassignedProxy(t *testing.T) {
 		f.h.Quota.FetchQuota(a)
 	}
 	w := f.manual()
-	if w.Code != 200 || f.oldClaims.Load() != 1 || f.newClaims.Load() != 1 {
-		t.Fatalf("批量后续账号必须使用故障改派后的代理: old=%d new=%d response=%s", f.oldClaims.Load(), f.newClaims.Load(), w.Body.String())
+	if w.Code != 200 || f.oldClaims.Load() != 2 || f.newClaims.Load() != 0 {
+		t.Fatalf("批量领取不得悄悄改派共享账号的业务出口: old=%d new=%d response=%s", f.oldClaims.Load(), f.newClaims.Load(), w.Body.String())
 	}
-	if len(f.h.Store.ListProxyProfiles()) != 1 {
-		t.Fatal("不能继续用旧请求证据删除有效的新代理")
+	if len(f.h.Store.ListProxyProfiles()) != 2 {
+		t.Fatal("批量异常通知不能变成删除证据")
 	}
 }

@@ -102,7 +102,7 @@ func (s *Store) networkHealthSummaryLocked(now time.Time) (NetworkHealthSummary,
 		switch r.State {
 		case "healthy", "recovered":
 			out.Checked++
-		case "waiting", "unconfirmed", "confirmed_failure":
+		case "waiting", "unconfirmed", "confirmed_failure", "protected_failure":
 			out.Checked++
 			out.Failed++
 		}

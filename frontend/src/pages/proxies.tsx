@@ -50,6 +50,16 @@ function maskUrl(url: string): string {
   return String(url || '').replace(/\/\/([^@/]+)@/, '//***@')
 }
 
+function protectionText(p?: ProxyProfile): string {
+  switch (p?.auto_delete_protection) {
+    case 'default_proxy': return '默认业务出口，自动保护'
+    case 'managed_default': return '托管账号默认出口，自动保护'
+    case 'policy_unavailable': return '默认出口策略待修复，保守保护'
+    case 'manual': return p.auto_delete_protected ? '已开启手工保护' : '同路由节点已开启保护'
+    default: return p?.auto_delete_protected ? '已开启手工保护' : ''
+  }
+}
+
 /* z.ai 側可達性的主文案：可達 / 被邊緣攔截 / 不可達 三態。 */
 function formatUpstream(u?: UpstreamProbe): string {
   if (!u) return ''
@@ -104,7 +114,12 @@ export function ProxiesPage() {
   const [editingId, setEditingId] = useState('')
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
+  const [enabled, setEnabled] = useState(true)
+  const [protectedFlag, setProtectedFlag] = useState(true)
   const [saving, setSaving] = useState(false)
+  const editingProfile = profiles.find((p) => p.id === editingId)
+  const inheritedProtection = !!editingProfile?.auto_delete_protection &&
+    (editingProfile.auto_delete_protection !== 'manual' || !editingProfile.auto_delete_protected)
 
   function invalidate() {
     void qc.invalidateQueries({ queryKey: ['proxies'] })
@@ -114,6 +129,8 @@ export function ProxiesPage() {
     setEditingId(p?.id ?? '')
     setName(p?.name ?? '')
     setUrl(p?.url ?? '')
+    setEnabled(p?.enabled ?? true)
+    setProtectedFlag(p?.auto_delete_protected ?? !p)
     setModalOpen(true)
   }
 
@@ -127,7 +144,8 @@ export function ProxiesPage() {
       await api(editingId ? 'PUT' : 'POST', editingId ? '/proxies/' + encodeURIComponent(editingId) : '/proxies', {
         name: name.trim(),
         url: url.trim(),
-        enabled: true,
+        enabled,
+        auto_delete_protected: protectedFlag,
       })
       setModalOpen(false)
       toast.success(editingId ? '代理已更新' : '代理已建立')
@@ -360,6 +378,7 @@ export function ProxiesPage() {
                     </span>
                     <div className="min-w-0 flex-1 leading-tight">
                       <strong className="block truncate text-sm">{p.name}</strong>
+                      {protectionText(p) && <small className="block text-xs text-amber-700">禁止自动删除 · {protectionText(p)}</small>}
                       {p.subscription && <small className="block text-xs text-muted-foreground" title={'导入：' + new Date(p.subscription.imported_at).toLocaleString()}>
                         订阅来源 · 最近复检 {new Date(p.subscription.probed_at).toLocaleString()}
                       </small>}
@@ -398,7 +417,7 @@ export function ProxiesPage() {
                     </div>
                     {(p.truncate_total ?? 0) > 0 && (
                       <span
-                        title="線路斷流計數（連續／累計；記憶體態，重啟歸零）。連續達到熔斷閾值會自動移除線路並改派帳號。"
+                        title="线路断流计数（连续／累计；内存态，重启归零）。达到阈值后仍须遵守统一自动处置模式与节点保护；受保护线路不会自动删除。"
                         className="flex items-center gap-1 rounded-full bg-red-100 px-2.5 py-1 text-xs font-medium text-red-700"
                       >
                         斷流 {p.truncate_streak ?? 0}/{p.truncate_total}
@@ -492,6 +511,13 @@ export function ProxiesPage() {
               />
             </div>
             <p className="text-xs text-muted-foreground">僅接受 HTTP、HTTPS、SOCKS4、SOCKS5 代理地址，可包含 user:pass 認證。</p>
+            <div className="space-y-2 rounded-lg border p-3">
+              <Label htmlFor="proxy-protected" className="flex items-center gap-2">
+                <input id="proxy-protected" type="checkbox" className="size-4 accent-primary" checked={protectedFlag || inheritedProtection} disabled={inheritedProtection} onChange={(e) => setProtectedFlag(e.target.checked)} />
+                禁止自动删除
+              </Label>
+              <p className="text-xs text-muted-foreground">{inheritedProtection ? `${protectionText(editingProfile)}，需先调整对应默认出口或同路由保护设置。` : '适用于家庭服务器等手工维护节点。异常仍会显示，但不会自动删除或因删除改派账号；手动删除不受此保护限制。'}</p>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setModalOpen(false)}>取消</Button>

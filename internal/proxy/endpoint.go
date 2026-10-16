@@ -21,6 +21,7 @@ var ErrEndpointUnreachable = errors.New("代理无法连接目标端点")
 
 // IsEndpointUnreachable 只识别传输层失败，不把普通 HTTP/业务错误归因给代理。
 // 调用方的取消/截止时间不算故障；http.Client 自身超时而父上下文仍有效时则算不可达。
+// 返回 true 只说明该请求未完成，不能据此确认代理永久失效或直接删除共享节点。
 func IsEndpointUnreachable(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false

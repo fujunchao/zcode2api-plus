@@ -100,7 +100,7 @@ func TestProxyEndpointBrokenResponses(t *testing.T) {
 				}
 				accounts := existingProxyFailureAccounts(t, f)
 				callProxyEndpoint(t, f, accounts[0], endpoint)
-				assertFaultProxyReassigned(t, f, accounts)
+				assertBillingFailureKeepsProxy(t, f, accounts)
 			})
 		}
 	}
@@ -151,7 +151,7 @@ func TestProxyEndpointOldEmptyQuotaKeepsProxy(t *testing.T) {
 	}
 }
 
-func TestProxyEndpointSuspiciousAfterPartialSuccessStillPurges(t *testing.T) {
+func TestProxyEndpointSuspiciousAfterPartialSuccessKeepsProxy(t *testing.T) {
 	f := newAccountQuotaFixture(t, newAccountAllocatedBalance, newAccountAllocatedBalance)
 	accounts := existingProxyFailureAccounts(t, f)
 	f.mu.Lock()
@@ -169,13 +169,13 @@ func TestProxyEndpointSuspiciousAfterPartialSuccessStillPurges(t *testing.T) {
 	if !f.h.claimUnderGateContext(context.Background(), accounts[0]) {
 		t.Fatal("本轮第一个套餐应已成功领取")
 	}
-	assertFaultProxyReassigned(t, f, accounts)
+	assertBillingFailureKeepsProxy(t, f, accounts)
 	if state := f.h.Store.FindAny(accounts[0].ID).ClaimView(); state == nil || state.ClaimedAt == nil || state.NextAt == nil {
-		t.Fatal("淘汰不能丢失已成功领取的记录")
+		t.Fatal("异常观测不能丢失已成功领取的记录")
 	}
 }
 
-func TestProxyEndpointBatchPreviewUsesReassignedProxy(t *testing.T) {
+func TestProxyEndpointBatchPreviewKeepsSharedProxy(t *testing.T) {
 	f := newAccountQuotaFixture(t, newAccountAllocatedBalance, newAccountAllocatedBalance)
 	accounts := existingProxyFailureAccounts(t, f)
 	f.mu.Lock()
@@ -194,10 +194,10 @@ func TestProxyEndpointBatchPreviewUsesReassignedProxy(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatal("预览失败")
 	}
-	assertFaultProxyReassigned(t, f, accounts)
+	assertBillingFailureKeepsProxy(t, f, accounts)
 	for _, request := range f.accountRequests(accounts[1].Secret()) {
-		if request.line != "good" {
-			t.Fatal("后续账号必须立即使用改派后的代理，不能沿用批量旧快照")
+		if request.line != "bad" {
+			t.Fatal("计费观测不得为后续共享账号悄悄更换业务出口")
 		}
 	}
 }
@@ -312,15 +312,15 @@ func TestProxyEndpointLateFailureKeepsChangedProxy(t *testing.T) {
 	}
 }
 
-func assertFaultProxyReassigned(t *testing.T, f *newAccountFixture, accounts []*model.Account) {
+func assertBillingFailureKeepsProxy(t *testing.T, f *newAccountFixture, accounts []*model.Account) {
 	t.Helper()
-	if len(f.h.Store.ListProxyProfiles()) != 1 {
-		t.Fatal("已确认无法访问端点或领取可疑请求的代理，应立即从池中删除")
+	if len(f.h.Store.ListProxyProfiles()) != 2 {
+		t.Fatal("计费传输失败或领取可疑请求只能观测，不能删除共享代理")
 	}
 	for _, a := range accounts {
 		got := f.h.Store.FindAny(a.ID)
-		if got.ProxyID == nil || *got.ProxyID != f.good.ID || got.ProxyURL == nil || *got.ProxyURL != f.good.URL || got.UseCount != 8 {
-			t.Fatal("故障代理的全部关联账号应按现有策略改派，保留使用记录")
+		if got.ProxyID == nil || *got.ProxyID != f.bad.ID || got.ProxyURL == nil || *got.ProxyURL != f.bad.URL || got.UseCount != 8 {
+			t.Fatal("计费失败必须保留全部共享账号绑定和使用记录")
 		}
 	}
 }
@@ -341,7 +341,7 @@ func disconnectProxy(t *testing.T, f *newAccountFixture) {
 	f.bad = p
 }
 
-func TestProxyEndpointQuotaFailureReassignsAllBindings(t *testing.T) {
+func TestProxyEndpointQuotaFailureKeepsAllBindings(t *testing.T) {
 	f := newAccountQuotaFixture(t, newAccountAllocatedBalance, newAccountAllocatedBalance)
 	disconnectProxy(t, f)
 	accounts := existingProxyFailureAccounts(t, f)
@@ -349,13 +349,13 @@ func TestProxyEndpointQuotaFailureReassignsAllBindings(t *testing.T) {
 	if result["error"] == nil {
 		t.Fatal("断连必须返回查询失败")
 	}
-	assertFaultProxyReassigned(t, f, accounts)
-	if result["proxy_removed"] != f.bad.ID {
-		t.Fatal("额度结果应明确回报原代理已被删除")
+	assertBillingFailureKeepsProxy(t, f, accounts)
+	if result["proxy_removed"] != nil || result["proxy_failure_action"] != "recheck_pending" {
+		t.Fatalf("额度结果应明确回报仅等待复核：%v", result)
 	}
 }
 
-func TestProxyEndpointClaimFailureReassignsAllBindings(t *testing.T) {
+func TestProxyEndpointClaimFailureKeepsAllBindings(t *testing.T) {
 	f := newAccountQuotaFixture(t, newAccountAllocatedBalance, newAccountAllocatedBalance)
 	disconnectProxy(t, f)
 	accounts := existingProxyFailureAccounts(t, f)
@@ -367,14 +367,14 @@ func TestProxyEndpointClaimFailureReassignsAllBindings(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("领取请求应保留逐账号结果：%d %v", code, body)
 	}
-	assertFaultProxyReassigned(t, f, accounts)
+	assertBillingFailureKeepsProxy(t, f, accounts)
 	data, _ := json.Marshal(body)
-	if !strings.Contains(string(data), "proxy_removed") {
-		t.Fatal("领取结果应带上代理删除信息")
+	if strings.Contains(string(data), "proxy_removed") || !strings.Contains(string(data), "recheck_pending") {
+		t.Fatal("领取结果应报告待复核，不得报告删除")
 	}
 }
 
-func TestProxyEndpointSuspiciousClaimReassignsExistingAccounts(t *testing.T) {
+func TestProxyEndpointSuspiciousClaimKeepsExistingAccounts(t *testing.T) {
 	for _, mode := range []string{"manual", "auto", "preview"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newAccountQuotaFixture(t, newAccountAllocatedBalance, newAccountAllocatedBalance)
@@ -406,7 +406,7 @@ func TestProxyEndpointSuspiciousClaimReassignsExistingAccounts(t *testing.T) {
 					t.Fatal("领取接口应保留逐账号结果")
 				}
 			}
-			assertFaultProxyReassigned(t, f, accounts)
+			assertBillingFailureKeepsProxy(t, f, accounts)
 		})
 	}
 }

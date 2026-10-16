@@ -181,6 +181,12 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 	defer stop()
 	defer cancel()
 	if m.netRound == nil {
+		// 计费异常仅触发新的无凭据网络检查；不把它当成已失败的首轮，也不续跑模型。
+		for _, profile := range m.store.TakeProxyNetworkRechecks(p, now) {
+			if _, pending := m.netPending[profile.ID]; !pending {
+				m.netPending[profile.ID] = false
+			}
+		}
 		if len(m.netPending) == 0 && now.Before(m.netNext) {
 			return false, nil
 		}
@@ -329,10 +335,13 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 	if err != nil {
 		return true, err
 	}
+	protections := m.store.ProxyAutoDeleteProtections()
 	for i := range records {
 		if slices.Contains(removed, records[i].ProfileID) {
 			records[i].Removed = true
 			records[i].State = "removed"
+		} else if records[i].State == "confirmed_failure" && protections[records[i].ProfileID] != "" {
+			records[i].State = "protected_failure"
 		}
 	}
 	if err := m.store.SaveNetworkHealth(p, records); err != nil {

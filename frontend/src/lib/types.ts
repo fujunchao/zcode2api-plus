@@ -258,6 +258,9 @@ export interface ProxyProfile {
   name: string
   url: string
   enabled: boolean
+  /** 显式保护标记；默认／托管出口还可能具有不可由此开关解除的有效保护。 */
+  auto_delete_protected?: boolean
+  auto_delete_protection?: 'manual' | 'default_proxy' | 'managed_default' | 'policy_unavailable'
   subscription?: { source: string; fingerprint: string; imported_at: number; last_ok: number; probed_at: number; ip?: string }
   /** 線路級斷流計數（後端記憶體態，有斷流記錄時才有值）：連續 / 累計。 */
   truncate_streak?: number

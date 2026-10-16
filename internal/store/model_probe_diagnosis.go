@@ -279,6 +279,10 @@ func (s *Store) retireModelProbeLocked(r *ModelProbeRun, now time.Time) error {
 		_ = s.persistModelProbeRunLocked(r)
 		return err
 	}
+	if d.DecisionID == "" {
+		r.Reason = d.Reason
+		return s.persistModelProbeRunLocked(r)
+	}
 	r.DecisionID, r.Reason = d.DecisionID, "retired"
 	if err := s.persistModelProbeRunLocked(r); err != nil {
 		return err
