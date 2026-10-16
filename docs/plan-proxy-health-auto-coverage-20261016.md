@@ -2,7 +2,9 @@
 
 日期：2026-10-16（Asia/Shanghai）。基线：`origin/go-rewrite` 的 `7ef13b3`（v2.10.9-go 统一巡检）。
 
-**状态：已在本分支实施**（`codex/proxy-health-auto-coverage`）。先提交会变红的端到端回归（`1aa36d9`、`3549868`），再实现；自动化验证全部由 GitHub Actions Ubuntu 执行。
+**状态：已在本分支实施**（`codex/proxy-health-auto-coverage`）。先提交会变红的端到端回归（`1aa36d9`、`3549868`），再实现（`4c5f0e8`）；自动化验证全部由 GitHub Actions Ubuntu 执行，当前 SHA 的完整 CI 通过。
+
+> 实施中发现并修正三处：① `DefaultModelProbeSettings` 携带 `HealthVersion=2` 会让全新安装跳过 `migrateNetworkHealthPolicy`，网络巡检不再继承环境默认值；② 新回归最初用默认设置构造保存请求，缺少当前 revision，实际失败于乐观锁而非目标缺口，改为从当前设置派生后才覆盖到目标行为；③ 旧状态 `json.Unmarshal` 到已带默认值的结构时，缺失字段会保留新默认值（`target_mode=auto`），升级部署被误判为「已迁移」——改为从零值反序列化，缺失字段落回零值后再走迁移。
 
 ## 1. 背景与已确认决策
 
