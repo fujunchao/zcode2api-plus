@@ -14,12 +14,16 @@ import (
 	"zcode2api/internal/store"
 )
 
-// enableAuto 把 fixture 切换为自动覆盖 + 自动择优：不选择目标与账号，专用角色随之释放。
+// enableAuto 把 fixture 切换为自动覆盖 + 自动择优：清空手工选择，专用角色随之释放。
+// 必须从当前设置派生（保留 revision），否则会撞上乐观锁而不是走到目标行为。
 func (f *fixture) enableAuto(t *testing.T, mode string) {
 	t.Helper()
-	p := store.DefaultModelProbeSettings()
+	p := f.st.ModelProbeSettings()
 	p.Enabled, p.Mode = true, mode
 	p.TargetMode, p.AccountMode = "auto", "auto"
+	p.AccountIDs, p.TargetProxyIDs, p.ReferenceProxyIDs = nil, nil, nil
+	p.EgressGroups = map[string]string{}
+	p.ExcludeProxyIDs = nil
 	if _, err := f.st.SaveModelProbeSettings(p, f.now); err != nil {
 		t.Fatal(err)
 	}
