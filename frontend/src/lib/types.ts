@@ -171,6 +171,7 @@ export interface ModelProbeRun {
 }
 
 export interface ModelProbeSummary {
+  sampled_at?: number
   evidence_incomplete_until?: number
   observed_targets?: number
   total_targets?: number

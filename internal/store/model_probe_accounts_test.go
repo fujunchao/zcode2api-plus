@@ -88,7 +88,7 @@ func TestModelProbeAccountColdPickAndBusinessOccupancy(t *testing.T) {
 	}
 	release := s.TrackModelAccountUse(a.ID)
 	view, err := s.ModelProbeSummary(now)
-	if err != nil || len(view.Accounts) != 1 || view.Accounts[0].Reason != "business_busy" {
+	if err != nil || view.SampledAt != now.UnixMilli() || len(view.Accounts) != 1 || view.Accounts[0].Reason != "business_busy" {
 		t.Fatalf("巡检应避让正在处理业务的账号：%+v %v", view, err)
 	}
 	release()

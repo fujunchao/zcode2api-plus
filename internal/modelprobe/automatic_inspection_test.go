@@ -246,3 +246,16 @@ func TestModelProbeAutomaticInspectionBudgetWaitSurvivesRestart(t *testing.T) {
 		t.Fatal("预算窗口释放后应续检，不能被入队时的20分钟期限丢弃")
 	}
 }
+
+func TestModelProbeDedicatedQueueKeepsOriginalDeadline(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.st.QueueModelProbe(f.target.ID, "manual", f.now); err != nil {
+		t.Fatal(err)
+	}
+	f.now = f.now.Add(21 * time.Minute)
+	f.drainImmediate(t)
+	runs := f.st.ModelProbeHistory(f.target.ID, 0, 100)
+	if len(runs) != 1 || runs[0].Reason != "diagnosis_budget" || runs[0].Attempts != 0 || len(f.requests) != 0 {
+		t.Fatalf("自动资源等待不能改变旧专用模式的入队期限：%+v", runs)
+	}
+}

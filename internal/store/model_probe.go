@@ -65,7 +65,7 @@ type ModelProbeSettings struct {
 
 func DefaultModelProbeSettings() ModelProbeSettings {
 	// HealthVersion 保持 0：全新安装仍需经过 migrateNetworkHealthPolicy 继承网络巡检的
-	// 环境默认值，再由 migrateAutoHealthPolicy 落到 v2（自动覆盖 + 自动择优）。
+	// 环境默认值，再由 migrateAutoHealthPolicy 落到 v3（全节点主动巡检 + 自动择优）。
 	return ModelProbeSettings{TargetMode: "auto", AccountMode: "auto", NetworkIntervalMinutes: 30, NetworkConfirmSeconds: 10, Mode: "observe", Model: ModelProbeModel, IntervalMinutes: 30, Concurrency: 1, TimeoutSeconds: 30,
 		GlobalDailyLimit: 200, AccountDailyLimit: 100, ExcludeProxyIDs: []string{}, AccountIDs: []string{}, TargetProxyIDs: []string{}, ReferenceProxyIDs: []string{}, EgressGroups: map[string]string{}}
 }
@@ -547,6 +547,7 @@ type ModelProbeAccountView struct {
 }
 
 type ModelProbeSummary struct {
+	SampledAt                int64                   `json:"sampled_at"`
 	EvidenceIncompleteUntil  int64                   `json:"evidence_incomplete_until"`
 	ObservedTargets          int                     `json:"observed_targets"`
 	TotalTargets             int                     `json:"total_targets"`
@@ -664,7 +665,7 @@ func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 			}
 		}
 	}
-	return ModelProbeSummary{EvidenceIncompleteUntil: s.modelProbe.EvidenceIncompleteUntil, ObservedTargets: observed, TotalTargets: len(targets), ExcludedTargets: excluded,
+	return ModelProbeSummary{SampledAt: now.UnixMilli(), EvidenceIncompleteUntil: s.modelProbe.EvidenceIncompleteUntil, ObservedTargets: observed, TotalTargets: len(targets), ExcludedTargets: excluded,
 		EffectiveIntervalMinutes: int(effective / time.Minute), StorageError: s.modelProbe.storageError, Settings: p.clone(), Runs: views, Accounts: accounts,
 		UsedRequests: used, RemainingRequests: max(0, p.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion,
 		CheckedTargets: checked, FreshHealthyTargets: freshHealthy, BusinessObservedTargets: businessObserved, FailedTargets: failed, EligibleAccounts: eligible, WaitingAccounts: waitAccounts, WaitingBudget: waitBudget, Queued: queued, NextBudgetAt: budget.NextAt, LastChecks: checks, Network: network}, nil

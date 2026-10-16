@@ -32,10 +32,10 @@ export function HealthSummaryCard({ data, error, loading, onDetail, onSettings }
     </section>
   }
 
-  const status = healthStatus(data)
+  const status = healthStatus(data, data.sampled_at)
   const enabled = data.settings.enabled || (data.settings.network_enabled ?? false)
   // 下次巡检时刻取所有目标里最早的一个；无目标时留空。
-  const nextAt = Object.values(data.next_due ?? {}).filter((v) => v > Date.now()).sort((a, b) => a - b)[0]
+  const nextAt = Object.values(data.next_due ?? {}).filter((v) => v > (data.sampled_at ?? 0)).sort((a, b) => a - b)[0]
   return <section aria-label="代理健康巡检" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card p-4">
     <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
       <span className="flex items-center gap-2 text-sm font-semibold">

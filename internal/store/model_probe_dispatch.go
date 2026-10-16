@@ -233,7 +233,7 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 			}
 			continue
 		}
-		if (r.Attempts > 0 && now.UnixMilli() >= r.Deadline) || r.Attempts >= 8 {
+		if ((r.policy.AccountMode != "auto" || r.Attempts > 0) && now.UnixMilli() >= r.Deadline) || r.Attempts >= 8 {
 			if err := finish("diagnosis_budget"); err != nil {
 				return nil, err
 			}
