@@ -841,6 +841,7 @@ export function AccountsPage() {
             ['all', '全部'],
             ['initializing', '初始化'],
             ['exhausted', '用完'],
+            ['invalid', '异常'],
             ['disabled', '停用'],
           ] as [FilterKey, string][]
         ).map(([k, l]) => (
@@ -848,6 +849,7 @@ export function AccountsPage() {
             key={k}
             size="sm"
             variant={filter === k ? 'default' : 'outline'}
+            aria-pressed={filter === k}
             className="h-8 rounded-full"
             onClick={() => changeFilter(k)}
           >
@@ -961,7 +963,7 @@ export function AccountsPage() {
               {!filtered.length ? (
                 <TableRow>
                   <TableCell colSpan={11} className="py-10 text-center text-sm text-muted-foreground">
-                    尚無帳號，請點擊右上角「新增」
+                    {filter === 'invalid' ? '暂无符合筛选条件的异常账号' : '尚無帳號，請點擊右上角「新增」'}
                   </TableCell>
                 </TableRow>
               ) : (
