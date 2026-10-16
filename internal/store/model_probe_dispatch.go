@@ -47,14 +47,13 @@ func (l *ModelProbeLease) EntryID() string {
 }
 func stringID(i int) string { raw, _ := json.Marshal(i); return string(raw) }
 
+// probeAccountReadyLocked 复核探测账号资格：手工模式仍限定专用集合，自动模式使用全部合格账号。
 func (s *Store) probeAccountReadyLocked(id string, now time.Time) bool {
-	a := s.snapshotLocked(s.findAnyLocked(id))
-	if a == nil || !s.isModelProbeAccountLocked(id) || s.initializationManagedLocked(id) || a.Mode != "jwt" || a.Secret() == "" {
+	if s.modelProbe.Policy.AccountMode != "auto" && !s.isModelProbeAccountLocked(id) {
 		return false
 	}
-	a.ModelProbeOnly = false
-	available, known := a.UsableQuotaForModel(ModelProbeModel)
-	return a.IsModelSelectable(ModelProbeModel, now) && !a.InRiskControlSilentWindow(now, config.RiskSilentWindow()) && known && available > 0
+	_, ok := s.probeAccountEligibilityLocked(id, now)
+	return ok
 }
 
 func (s *Store) probeProfileLocked(id string) (ProxyProfile, bool) {
@@ -74,7 +73,7 @@ func (s *Store) QueueModelProbe(target, source string, now time.Time) (ModelProb
 
 func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (ModelProbeRun, error) {
 	p := s.modelProbe.Policy
-	if s.strictClosed || s.modelProbe.storageError || !p.Enabled || !slices.Contains(p.TargetProxyIDs, target) {
+	if s.strictClosed || s.modelProbe.storageError || !p.Enabled || !s.modelProbeTargetAllowedLocked(p, target) {
 		return ModelProbeRun{}, ErrModelProbeUnavailable
 	}
 	profile, ok := s.probeProfileLocked(target)
@@ -96,17 +95,21 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 	r := &ModelProbeRun{ID: "probe-" + randomHex(12), TargetID: target, Source: source, State: "queued", Verdict: "unknown", Reason: "queued", Mode: p.Mode,
 		RuleVersion: ModelProbeRuleVersion, TemplateVersion: ModelProbeTemplateVersion, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli(), NextAt: now.UnixMilli(), Deadline: now.Add(20 * time.Minute).UnixMilli(), Samples: []ModelProbeSample{}, policy: p.clone(), target: profile, phase: "screen",
 		credentials: map[string]string{}, bindings: map[string]uint64{}, targetURL: config.UpstreamZai}
-	for _, id := range p.AccountIDs {
-		if s.probeAccountReadyLocked(id, now) {
-			r.accounts = append(r.accounts, id)
-			r.credentials[id] = s.strictCredentialRefLocked(s.findAnyLocked(id))
-			r.bindings[id] = s.strictProxy.RouteVersions[id].Generation
-			if len(r.accounts) == 2 {
-				break
-			}
+	for _, id := range s.probeAccountCandidatesLocked(p, now) {
+		if len(r.accounts) == 2 {
+			break
 		}
+		if !s.probeAccountReadyLocked(id, now) {
+			continue
+		}
+		r.accounts = append(r.accounts, id)
+		r.credentials[id] = s.strictCredentialRefLocked(s.findAnyLocked(id))
+		r.bindings[id] = s.strictProxy.RouteVersions[id].Generation
 	}
-	if len(r.accounts) == 0 {
+	if len(r.accounts) > 0 {
+		// 只把主账号计入「最近被选中」，让并列账号在后续轮次里轮转。
+		s.touchProbeAccountPickLocked(r.accounts[0], now)
+	} else {
 		r.State, r.Reason = "skipped", "no_eligible_account"
 	}
 	if source != "manual" {
@@ -118,7 +121,7 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 	if s.modelProbe.PausedUntil > now.UnixMilli() {
 		r.State, r.Verdict, r.Reason = "skipped", "inconclusive", "reference_unavailable"
 	} else if s.modelProbe.PausedUntil > 0 {
-		r.referenceID = s.probeReferenceLocked(p, profile)
+		r.referenceID = s.probeReferenceLocked(p, profile, now)
 		if r.referenceID != "" {
 			r.phase, r.round = "reference", 1
 		} else {
@@ -136,6 +139,7 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 }
 
 // ScheduleModelProbes 在同一时钟下处理到期目标；间隔修改不需要重启。
+// 手工模式逐目标推进；自动模式按轮转窗口分配预算（见 scheduleAutoRotationLocked）。
 func (s *Store) ScheduleModelProbes(now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,8 +147,13 @@ func (s *Store) ScheduleModelProbes(now time.Time) error {
 	if !p.Enabled || s.strictClosed {
 		return nil
 	}
+	targets := s.effectiveProbeTargetsLocked(p)
+	if p.TargetMode == "auto" {
+		return s.scheduleAutoRotationLocked(p, targets, now)
+	}
 	changed := false
-	for _, id := range p.TargetProxyIDs {
+	for _, t := range targets {
+		id := t.ID
 		due := s.modelProbe.NextDue[id]
 		hint := s.modelProbe.hints[id]
 		if due > now.UnixMilli() && (hint.IsZero() || now.UnixMilli() < s.modelProbe.LastDiagnosis[id]+int64(time.Hour/time.Millisecond)) {
@@ -417,6 +426,10 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 		copy.ObservedAt = now.UnixMilli()
 	}
 	o.At = now
+	// 探测结果也进入账号滚动窗口（真实出站才算），供后续自动择优排序。
+	if l.started {
+		s.recordProbeAccountOutcomeLocked(l.account.ID, now, probeSuccess(o), probeRisk(o))
+	}
 	if current && l.started && (kind == "success" || kind == "risk_control") && !o.InvalidRequest && o.RequestID == l.requestID && validProbeObservation(l, o) {
 		if (o.Complete && o.Status >= 200 && o.Status < 300 && o.BusinessCode == "") || (o.Status == 405 && o.BusinessCode == "3012") {
 			copy.proofs = append(copy.proofs, modelProbeEvidence{ProxyObservation: o, account: l.account.ID, route: l.routeID, role: l.role, credential: l.credential, identity: l.identity, generation: l.profile.Generation, round: l.round})

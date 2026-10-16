@@ -84,12 +84,32 @@ export interface ModelProbeSettings {
   timeout_seconds: number
   global_daily_limit: number
   account_daily_limit: number
+  /** 目标来源：auto 动态覆盖全部启用线路（可用排除名单），manual 只用 target_proxy_ids。 */
+  target_mode: 'auto' | 'manual'
+  exclude_proxy_ids: string[]
+  /** 账号来源：auto 从全部合格账号按近期成功率自动择优，dedicated 只用 account_ids（退出业务选号）。 */
+  account_mode: 'auto' | 'dedicated'
   account_ids: string[]
   target_proxy_ids: string[]
   reference_proxy_ids: string[]
   egress_groups: Record<string, string>
   allow_direct_control: boolean
   revision: number
+}
+
+/** 自动择优账号的可解释视图（后端 ModelProbeAccountView）。 */
+export interface ModelProbeAccountView {
+  id: string
+  name: string
+  eligible: boolean
+  /** 不合格原因（eligible=false 时）。 */
+  reason?: string
+  /** 合格账号的评分名次（1 起）。 */
+  rank?: number
+  recent_success: number
+  recent_total: number
+  last_success_at?: number
+  last_pick_at?: number
 }
 
 export interface NetworkHealthRecord {
@@ -147,9 +167,15 @@ export interface ModelProbeSummary {
   evidence_incomplete_until?: number
   observed_targets?: number
   total_targets?: number
+  /** 自动覆盖模式下的排除线路数。 */
+  excluded_targets?: number
+  /** 自动覆盖模式下单条线路的预计检测周期（分钟）。 */
+  effective_interval_minutes?: number
   storage_error?: boolean
   settings: ModelProbeSettings
   runs: ModelProbeRun[]
+  /** 自动择优账号视图（仅 account_mode=auto 时返回）。 */
+  accounts?: ModelProbeAccountView[]
   used_requests: number
   remaining_requests: number
   paused_until: number

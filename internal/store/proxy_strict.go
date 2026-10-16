@@ -422,6 +422,9 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 		}
 	}
 	s.observeModelProbeBusinessLocked(acc, egress, o)
+	if o.Model == ModelProbeModel {
+		s.recordProbeAccountOutcomeLocked(acc.ID, o.At, probeSuccess(o), probeRisk(o))
+	}
 	identity := egress.identity
 	if isDirect {
 		identity = "direct"

@@ -350,7 +350,8 @@ func (m *Manager) enqueueNetworkModels(r *networkRound, records []store.NetworkH
 		return
 	}
 	for _, v := range records {
-		if r.manual[v.ProfileID] && (v.State == "healthy" || v.State == "recovered") && slices.Contains(r.policy.TargetProxyIDs, v.ProfileID) {
+		// 目标资格（自动覆盖 / 手工选择 / 排除名单）由 Store 在入队时统一判定。
+		if r.manual[v.ProfileID] && (v.State == "healthy" || v.State == "recovered") {
 			_, _ = m.store.QueueModelProbe(v.ProfileID, "manual", m.now())
 		}
 	}

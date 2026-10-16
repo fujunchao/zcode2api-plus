@@ -12,7 +12,7 @@ import { useDraftGroup } from '@/hooks/use-draft-group'
 import { api, errMsg } from '@/lib/api'
 import type { Account, ModelProbeRun, ModelProbeSettings, ModelProbeSummary, ProxyProfile } from '@/lib/types'
 
-const defaults: ModelProbeSettings = { enabled: false, mode: 'observe', model: 'glm-5.3-flash', interval_minutes: 30, concurrency: 1, timeout_seconds: 30, global_daily_limit: 200, account_daily_limit: 100, account_ids: [], target_proxy_ids: [], reference_proxy_ids: [], egress_groups: {}, allow_direct_control: false, revision: 0 }
+const defaults: ModelProbeSettings = { enabled: false, mode: 'observe', model: 'glm-5.3-flash', interval_minutes: 30, concurrency: 1, timeout_seconds: 30, global_daily_limit: 200, account_daily_limit: 100, target_mode: 'auto', exclude_proxy_ids: [], account_mode: 'auto', account_ids: [], target_proxy_ids: [], reference_proxy_ids: [], egress_groups: {}, allow_direct_control: false, revision: 0 }
 const labels: Record<string, string> = {
   unknown: '尚未检测', healthy_recent: '最近模型成功', suspect: '待核查', route_correlated: '线路相关证据成立',
   account_correlated: '更偏账号／身份相关', mixed: '有成功也有失败', inconclusive: '无法确认',
@@ -30,6 +30,12 @@ const labels: Record<string, string> = {
   captcha_required: '上游要求验证', incomplete_response: '响应未完整收到', invalid_response: '不是完整模型消息',
   connection_failed: '连接失败', timeout: '请求超时', canceled: '请求取消', invalid_request: '请求构造不满足契约',
   upstream_error: '其他上游错误', redirect_or_invalid_status: '重定向或异常状态', skipped_recent_success: '近期业务已成功，本轮免测', success: '完整模型成功',
+  insufficient_probe_accounts: '可用探测账号不足两个，未执行删除',
+}
+/** 自动择优账号不可用的原因（后端 probeAccountEligibilityLocked）。 */
+const accountReasons: Record<string, string> = {
+  missing: '账号已不存在', initialization_managed: '初始化／固定出口托管，不可借用', not_jwt: '不是 JWT 账号',
+  not_selectable: '停用、归档、冷却或额度耗尽', risk_isolation: '风控静默隔离中', quota_unknown: '额度未知', quota_empty: '5.3f 额度已用完',
 }
 const numberFields = [
   { key: 'interval_minutes', label: '模型巡检间隔（分钟）', min: 1, max: 1440 },
@@ -69,9 +75,19 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
   const { data: accounts, error: accountError } = useQuery({ queryKey: ['model-probe-accounts', search], enabled: open, queryFn: () => api<{ accounts: Account[] }>('GET', '/accounts?limit=200&mode=jwt&keyword=' + encodeURIComponent(search)) })
   const { data: history, error: historyError } = useQuery({ queryKey: ['model-probe-history', historyTarget], enabled: !!historyTarget, queryFn: () => api<{ runs: ModelProbeRun[] }>('GET', '/proxies/' + encodeURIComponent(historyTarget) + '/model-probe/history?limit=20'), refetchInterval: historyTarget ? 10_000 : false })
   const names = new Map(profiles.map((p) => [p.id, p.name]))
+  const targetMode = value.target_mode ?? 'auto'
+  const accountMode = value.account_mode ?? 'auto'
+  const excludedIDs = value.exclude_proxy_ids ?? []
+  // 目标表格反映已保存的策略：自动模式列出全部启用且未排除的线路，手工模式列出所选。
+  const savedMode = data?.settings.target_mode ?? 'manual'
+  const tableIDs = savedMode === 'auto'
+    ? profiles.filter((p) => p.enabled && !(data?.settings.exclude_proxy_ids ?? []).includes(p.id)).map((p) => p.id)
+    : data?.settings.target_proxy_ids ?? []
+  // 出口组声明覆盖当前草稿的目标集合；自动模式下即全部启用且未排除的线路。
+  const groupTargetIDs = targetMode === 'auto' ? profiles.filter((p) => p.enabled && !excludedIDs.includes(p.id)).map((p) => p.id) : value.target_proxy_ids
   const visibleIDs = [...new Set([...profiles.map((p) => p.id), ...value.target_proxy_ids, ...value.reference_proxy_ids])]
   const visibleAccounts = [...new Set([...(accounts?.accounts ?? []).filter((a) => a.mode === 'jwt').map((a) => a.id), ...value.account_ids])]
-  const groupIDs = [...new Set([...value.target_proxy_ids, ...value.reference_proxy_ids, ...(value.allow_direct_control ? ['direct'] : [])])]
+  const groupIDs = [...new Set([...groupTargetIDs, ...value.reference_proxy_ids, ...(value.allow_direct_control ? ['direct'] : [])])]
 
   async function save() {
     if (!data?.settings) return
@@ -92,10 +108,14 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
 
   function confirmSave() {
     if (!data?.settings) return
-    const rolesChanged = !sameIDs(value.account_ids, data.settings.account_ids)
+    const rolesChanged = accountMode === 'dedicated' && !sameIDs(value.account_ids, data.settings.account_ids)
+    const releasesRoles = (data.settings.account_mode ?? 'dedicated') !== 'auto' && accountMode === 'auto'
     const destructive = (value.enabled || value.network_enabled) && value.mode === 'auto_retire' && ((!data.settings.enabled && !data.settings.network_enabled) || data.settings.mode !== 'auto_retire')
-    if (rolesChanged || destructive || (value.allow_direct_control && !data.settings.allow_direct_control)) {
-      confirm({ title: '确认健康巡检策略', description: '选中的探测专用账号将退出普通业务选号。自动模式会处理经过二次复核的网络故障，或严格对照达标的模型 405；固定出口账号仍等待，不擅自换线。仅观察同时约束网络和模型巡检。', confirmText: '确认并保存', danger: !!destructive, onConfirm: save })
+    if (rolesChanged || releasesRoles || destructive || (value.allow_direct_control && !data.settings.allow_direct_control)) {
+      const description = releasesRoles
+        ? '切换为自动择优会解除现有探测专用角色，原专用账号回到普通业务选号；之后每次诊断按近期成功率从合格账号中自动挑选。自动模式会处理经过二次复核的网络故障，或严格对照达标的模型 405；固定出口账号仍等待，不擅自换线。'
+        : '选中的探测专用账号将退出普通业务选号。自动模式会处理经过二次复核的网络故障，或严格对照达标的模型 405；固定出口账号仍等待，不擅自换线。仅观察同时约束网络和模型巡检。'
+      confirm({ title: '确认健康巡检策略', description, confirmText: '确认并保存', danger: !!destructive, onConfirm: save })
     } else void save()
   }
 
@@ -119,15 +139,16 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border bg-muted/30 px-3 py-2 text-xs">
         <span className="flex items-center gap-1.5 font-medium"><Activity className="size-3.5" />{data.settings.enabled ? data.settings.mode === 'auto_retire' ? '自动严格处置' : '仅观察，不删除' : '未启用，不发送探测请求'}</span>
         <span>每 {data.settings.interval_minutes} 分钟 · 错峰执行</span>
+        <span>单线检测周期约 {data.effective_interval_minutes ?? data.settings.interval_minutes} 分钟</span>
         <span className="font-mono tabular-nums">24h {data.used_requests}/{data.settings.global_daily_limit} 次</span>
         <span>剩余 {data.remaining_requests} 次 · 在途 {data.active}</span>
-        <span>近 30 分钟已观测 {data.observed_targets ?? 0}/{data.total_targets ?? data.settings.target_proxy_ids.length} 条</span>
+        <span>近 30 分钟已观测 {data.observed_targets ?? 0}/{data.total_targets ?? data.settings.target_proxy_ids.length} 条{(data.excluded_targets ?? 0) > 0 ? ` · 排除 ${data.excluded_targets} 条` : ''}</span>
       </div>
       {data.storage_error && <p role="alert" className="text-sm text-destructive">巡检结果保存失败，已暂停新探测。修复存储后重新保存配置或重启；旧请求不会自动重放。</p>}
       {(data.evidence_incomplete_until ?? 0) > Date.now() && <p role="status" className="text-xs text-muted-foreground">短窗口证据因重启或容量裁剪不完整，新的严格删除暂停至 {time(data.evidence_incomplete_until)}；已有禁止记录不受影响。</p>}
       {data.paused_until > Date.now() && <p role="status" className="text-sm text-amber-700">参考组不可用，主动对照暂停至 {time(data.paused_until)}；不会因此清空代理池。</p>}
-      {data.settings.target_proxy_ids.length === 0 ? <Empty>尚未选择目标。先配置少量探测账号、目标与独立参考线路。</Empty> : <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead><tr className="border-b text-muted-foreground"><th className="pb-2 font-medium">目标线路</th><th className="pb-2 font-medium">模型结论</th><th className="pb-2 font-medium">最近记录／下一次</th><th className="pb-2 text-right font-medium">操作</th></tr></thead><tbody>
-        {data.settings.target_proxy_ids.map((id) => {
+      {tableIDs.length === 0 ? <Empty>{savedMode === 'auto' ? '没有可巡检的启用线路：全部停用或在排除名单中。' : '尚未选择目标。可切换为自动覆盖全部启用线路。'}</Empty> : <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead><tr className="border-b text-muted-foreground"><th className="pb-2 font-medium">目标线路</th><th className="pb-2 font-medium">模型结论</th><th className="pb-2 font-medium">最近记录／下一次</th><th className="pb-2 text-right font-medium">操作</th></tr></thead><tbody>
+        {tableIDs.map((id) => {
           const run = data.runs.find((r) => r.target_id === id)
           const busy = !!run && ['queued', 'running', 'waiting'].includes(run.state)
           return <tr key={id} className="border-b last:border-0"><td className="py-3 pr-3 font-medium">{names.get(id) ?? '已删除线路 ' + id}</td><td className="py-3 pr-3"><div>{describe(run)}</div><div className="mt-1 max-w-72 text-muted-foreground">{run ? labels[run.reason] ?? run.reason : '网络连通不等于模型成功'}</div></td><td className="py-3 pr-3 tabular-nums"><div>{time(run?.updated_at)}</div><div className="mt-1 text-muted-foreground">{time(busy ? run?.next_at : data.next_due[id])}</div></td><td className="py-3 text-right"><div className="flex justify-end gap-2"><Button size="sm" variant="outline" disabled={!data.settings.enabled || busy || !!triggering || !profiles.find((p) => p.id === id)?.enabled} onClick={() => void check(id)} aria-label={'立即模型检查：' + (names.get(id) ?? id)}>{triggering === id && <Loader2 className="animate-spin motion-reduce:animate-none" />}立即模型检查</Button><Button size="sm" variant="ghost" onClick={() => setHistoryTarget(historyTarget === id ? '' : id)}>记录</Button></div></td></tr>
@@ -144,11 +165,29 @@ export function ModelProbePanel({ profiles }: { profiles: ProxyProfile[] }) {
       <label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" checked={value.enabled} onChange={(e) => draft.edit({ enabled: e.target.checked })} />启用模型巡检</label>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3"><div className="space-y-1.5"><Label htmlFor="model-probe-mode">处置模式</Label><select id="model-probe-mode" className={selectClass} value={value.mode} onChange={(e) => draft.edit({ mode: e.target.value as ModelProbeSettings['mode'] })}><option value="observe">仅观察，不改变业务路由</option><option value="auto_retire">证据达标后严格退役</option></select></div>{numberFields.map((field) => <div key={field.key} className="space-y-1.5"><Label htmlFor={'probe-' + field.key}>{field.label}</Label><Input id={'probe-' + field.key} type="number" min={field.min} max={field.max} required value={value[field.key]} onChange={(e) => draft.edit({ [field.key]: Number(e.target.value) })} /></div>)}</div>
       <p className="text-xs text-muted-foreground">保存后后续轮次使用新间隔，无需重启。冷却、十分钟证据窗口和请求预算仍独立生效；参考与失败请求同样计入预算。</p>
-      <fieldset className="space-y-2 rounded-lg border p-3"><legend className="px-1 text-sm font-medium">探测专用账号</legend><p className="text-xs text-muted-foreground">选择后退出普通业务选号；初始化／固定出口托管账号不能加入。至少两个账号才能完整交叉对照，关闭巡检不解除专用角色。</p><Label htmlFor="model-probe-search">搜索探测账号</Label><Input id="model-probe-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="按账号名称搜索，每页最多 200 条" />{accountError && <p role="alert" className="text-xs text-destructive">读取账号失败：{errMsg(accountError)}</p>}<div className="grid max-h-48 gap-2 overflow-auto sm:grid-cols-2">{visibleAccounts.map((id) => { const a = accounts?.accounts.find((v) => v.id === id); const selected = value.account_ids.includes(id); return <label key={id} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={selected} disabled={!selected && (!a?.enabled || !!a.initialization?.managed || a.status === 'invalid' || !!a.archived_at)} onChange={(e) => draft.edit({ account_ids: toggle(value.account_ids, id, e.target.checked) })} />{a?.name ?? id}{a?.initialization?.managed && '（固定／初始化托管，不可用）'}</label> })}</div>{!visibleAccounts.length && <p className="text-xs text-muted-foreground">没有可选账号，请先准备未托管的已获额度 JWT。</p>}</fieldset>
-      <div className="grid gap-4 md:grid-cols-2">{(['target_proxy_ids', 'reference_proxy_ids'] as const).map((key) => <fieldset key={key} className="rounded-lg border p-3"><legend className="px-1 text-sm font-medium">{key === 'target_proxy_ids' ? '目标线路' : '参考线路'}</legend><div className="mb-2 flex gap-3"><button type="button" className="text-xs underline" onClick={() => draft.edit({ [key]: profiles.filter((p) => p.enabled).map((p) => p.id) })}>选择全部启用线路</button><button type="button" className="text-xs underline" onClick={() => draft.edit({ [key]: [] })}>清空选择</button></div><div className="grid max-h-48 gap-2 overflow-auto">{visibleIDs.map((id) => <label key={id} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={value[key].includes(id)} disabled={!value[key].includes(id) && !profiles.find((p) => p.id === id)?.enabled} onChange={(e) => draft.edit({ [key]: toggle(value[key], id, e.target.checked) })} />{key === 'target_proxy_ids' ? '目标：' : '参考：'}{names.get(id) ?? '已删除 ' + id}</label>)}</div></fieldset>)}</div>
-      <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={value.allow_direct_control} onChange={(e) => draft.edit({ allow_direct_control: e.target.checked })} />允许探测专用账号使用直连作为参考</label>
+      <fieldset className="space-y-2 rounded-lg border p-3"><legend className="px-1 text-sm font-medium">探测账号</legend><div className="space-y-1.5"><Label htmlFor="model-probe-account-mode">账号来源</Label><select id="model-probe-account-mode" className={selectClass} value={accountMode} onChange={(e) => draft.edit({ account_mode: e.target.value as ModelProbeSettings['account_mode'] })}><option value="auto">自动择优（按近期成功率，账号留在业务池）</option><option value="dedicated">手工指定专用账号（退出业务选号）</option></select></div>{accountMode === 'auto' ? <>
+        <p className="text-xs text-muted-foreground">每次诊断按近期成功率从全部合格 JWT 账号中自动挑选，账号留在业务池、持久绑定不被改写；初始化／固定出口托管账号不可借用。探测会消耗所选账号的少量额度，收到 405 仍按现有规则冷却该账号。</p>
+        <div className="grid max-h-48 gap-2 overflow-auto sm:grid-cols-2">{(data?.accounts ?? []).map((a) => <div key={a.id} className="flex items-center gap-2 text-xs"><span className={'shrink-0 rounded-md border px-1.5 py-0.5 tabular-nums ' + (a.eligible ? 'border-emerald-200 text-emerald-800' : 'text-muted-foreground')}>{a.eligible ? `#${a.rank ?? '-'}` : '不可用'}</span><span className="truncate">{a.name}</span><span className="truncate text-muted-foreground">{a.eligible ? `近期成功 ${a.recent_success}/${a.recent_total}` : accountReasons[a.reason ?? ''] ?? a.reason ?? '不可用'}</span></div>)}</div>
+        {!(data?.accounts ?? []).length && <p className="text-xs text-muted-foreground">暂无合格账号：需要未托管的 JWT 账号，且 5.3f 额度已知且可用。</p>}
+      </> : <>
+        <p className="text-xs text-muted-foreground">选择后退出普通业务选号；初始化／固定出口托管账号不能加入。至少两个账号才能完整交叉对照，关闭巡检不解除专用角色。</p>
+        <Label htmlFor="model-probe-search">搜索探测账号</Label><Input id="model-probe-search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="按账号名称搜索，每页最多 200 条" />
+        {accountError && <p role="alert" className="text-xs text-destructive">读取账号失败：{errMsg(accountError)}</p>}
+        <div className="grid max-h-48 gap-2 overflow-auto sm:grid-cols-2">{visibleAccounts.map((id) => { const a = accounts?.accounts.find((v) => v.id === id); const selected = value.account_ids.includes(id); return <label key={id} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={selected} disabled={!selected && (!a?.enabled || !!a.initialization?.managed || a.status === 'invalid' || !!a.archived_at)} onChange={(e) => draft.edit({ account_ids: toggle(value.account_ids, id, e.target.checked) })} />{a?.name ?? id}{a?.initialization?.managed && '（固定／初始化托管，不可用）'}</label> })}</div>
+        {!visibleAccounts.length && <p className="text-xs text-muted-foreground">没有可选账号，请先准备未托管的已获额度 JWT。</p>}
+      </>}</fieldset>
+      <fieldset className="rounded-lg border p-3"><legend className="px-1 text-sm font-medium">目标线路</legend><div className="mb-2 space-y-1.5"><Label htmlFor="model-probe-target-mode">覆盖范围</Label><select id="model-probe-target-mode" className={selectClass} value={targetMode} onChange={(e) => draft.edit({ target_mode: e.target.value as ModelProbeSettings['target_mode'] })}><option value="auto">自动覆盖全部启用线路</option><option value="manual">手工指定目标线路</option></select></div>{targetMode === 'auto' ? <>
+        <p className="mb-2 text-xs text-muted-foreground">动态覆盖全部启用线路，新增／订阅补充的线路自动纳入；每轮按预算挑最久未检测的线路，周期内全部覆盖。近 30 分钟有同模型业务成功的线路自动免测。</p>
+        <div className="mb-2 text-xs font-medium">排除名单（勾选后不参与巡检）</div>
+        <div className="grid max-h-48 gap-2 overflow-auto">{profiles.map((p) => <label key={p.id} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={excludedIDs.includes(p.id)} disabled={!p.enabled} onChange={(e) => draft.edit({ exclude_proxy_ids: toggle(excludedIDs, p.id, e.target.checked) })} />排除：{p.name}{!p.enabled && '（已停用）'}</label>)}</div>
+      </> : <>
+        <div className="mb-2 flex gap-3"><button type="button" className="text-xs underline" onClick={() => draft.edit({ target_proxy_ids: profiles.filter((p) => p.enabled).map((p) => p.id) })}>选择全部启用线路</button><button type="button" className="text-xs underline" onClick={() => draft.edit({ target_proxy_ids: [] })}>清空选择</button></div>
+        <div className="grid max-h-48 gap-2 overflow-auto">{visibleIDs.map((id) => <label key={id} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={value.target_proxy_ids.includes(id)} disabled={!value.target_proxy_ids.includes(id) && !profiles.find((p) => p.id === id)?.enabled} onChange={(e) => draft.edit({ target_proxy_ids: toggle(value.target_proxy_ids, id, e.target.checked) })} />目标：{names.get(id) ?? '已删除 ' + id}</label>)}</div>
+      </>}</fieldset>
+      <fieldset className="rounded-lg border p-3"><legend className="px-1 text-sm font-medium">参考线路</legend><p className="mb-2 text-xs text-muted-foreground">留空时自动从其余启用线路中挑选独立参考（别名与已声明同出口组不互证）；手工指定后只用所选线路。自动退役仍要求目标与参考都有声明且属不同出口组，否则该目标只观察。</p><div className="mb-2 flex gap-3"><button type="button" className="text-xs underline" onClick={() => draft.edit({ reference_proxy_ids: profiles.filter((p) => p.enabled).map((p) => p.id) })}>选择全部启用线路</button><button type="button" className="text-xs underline" onClick={() => draft.edit({ reference_proxy_ids: [] })}>清空选择</button></div><div className="grid max-h-48 gap-2 overflow-auto">{visibleIDs.map((id) => <label key={id} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={value.reference_proxy_ids.includes(id)} disabled={!value.reference_proxy_ids.includes(id) && !profiles.find((p) => p.id === id)?.enabled} onChange={(e) => draft.edit({ reference_proxy_ids: toggle(value.reference_proxy_ids, id, e.target.checked) })} />参考：{names.get(id) ?? '已删除 ' + id}</label>)}</div></fieldset>
+      <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={value.allow_direct_control} onChange={(e) => draft.edit({ allow_direct_control: e.target.checked })} />允许探测账号使用直连作为参考</label>
       <fieldset className="rounded-lg border p-3"><legend className="px-1 text-sm font-medium">出口组声明</legend><p className="mb-3 text-xs text-muted-foreground">同一个家庭公网出口的不同端口填同一个组。自动退役必须有明确不同组的参考；这是你的配置声明，不是服务器自动确认的出口 IP。</p><div className="grid gap-3 sm:grid-cols-2">{groupIDs.map((id) => <div key={id} className="space-y-1.5"><Label htmlFor={'probe-group-' + id}>出口组：{id === 'direct' ? '直连' : names.get(id) ?? id}</Label><Input id={'probe-group-' + id} maxLength={64} value={value.egress_groups[id] ?? ''} onChange={(e) => draft.edit({ egress_groups: { ...value.egress_groups, [id]: e.target.value } })} placeholder="例如：家庭宽带 A" /></div>)}</div></fieldset>
-      <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-3"><p className="max-w-xl text-xs text-muted-foreground">模型固定为 glm-5.3-flash，最小回复上限 16 token。正常业务绑定不被探测改写，固定节点失效仍等待，不退回取额池。</p><Button type="submit" disabled={saving || !data?.settings}>{saving && <Loader2 className="animate-spin motion-reduce:animate-none" />}保存模型巡检配置</Button></div>
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-3"><p className="max-w-xl text-xs text-muted-foreground">模型固定为 glm-5.3-flash，最小回复上限 16 token。正常业务绑定不被探测改写，固定节点失效仍等待，不退回取额池；自动择优账号的额度消耗与 405 冷却按现有账号规则生效。</p><Button type="submit" disabled={saving || !data?.settings}>{saving && <Loader2 className="animate-spin motion-reduce:animate-none" />}保存模型巡检配置</Button></div>
     </form>}
     {element}
   </PanelCard>

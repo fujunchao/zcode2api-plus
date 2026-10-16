@@ -98,7 +98,7 @@ func (s *Store) advanceModelProbeLocked(r *ModelProbeRun, l *ModelProbeLease, o 
 			r.Reason = "diagnosis_rate_limit"
 			return
 		}
-		r.referenceID = s.probeReferenceLocked(r.policy, r.target)
+		r.referenceID = s.probeReferenceLocked(r.policy, r.target, now)
 		if r.referenceID == "" {
 			r.Reason = "no_reference"
 			return
@@ -245,6 +245,11 @@ func (s *Store) probeAccountCorrelatedLocked(r *ModelProbeRun, goodAccount strin
 func (s *Store) retireModelProbeLocked(r *ModelProbeRun, now time.Time) error {
 	if r.policy.Mode != "auto_retire" {
 		r.Reason = "qualified_observe"
+		return s.persistModelProbeRunLocked(r)
+	}
+	// 自动择优沿用「自动处置至少两个合格账号」的门槛：入队时冻结不足两个即不删除。
+	if r.policy.AccountMode == "auto" && len(r.accounts) < 2 {
+		r.Reason = "insufficient_probe_accounts"
 		return s.persistModelProbeRunLocked(r)
 	}
 	if !s.StrictProxyEnabled() || s.modelProbe.PausedUntil > now.UnixMilli() {
