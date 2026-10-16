@@ -7,7 +7,7 @@ import { useConfirm } from '@/components/confirm'
 import { Empty, PanelCard } from '@/components/panel'
 import { ProxySubscription } from '@/components/proxy-subscription'
 import { NewAccountPolicy } from '@/components/new-account-policy'
-import { ModelProbePanel } from '@/components/model-probe'
+import { HealthPanel } from '@/components/health/panel'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -296,7 +296,7 @@ export function ProxiesPage() {
 
       <ProxySubscription />
       <NewAccountPolicy profiles={profiles} />
-      <ModelProbePanel profiles={profiles} />
+      <HealthPanel profiles={profiles} />
 
       {/* 伺服器目前出口 */}
       <div

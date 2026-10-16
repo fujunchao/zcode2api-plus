@@ -9,7 +9,8 @@ const states: Record<string, string> = { healthy: '网络可达', waiting: '等�
 const stamp = (at?: number) => at ? new Date(at).toLocaleString('zh-CN', { hour12: false }) : '—'
 function detail(r?: UpstreamProbe) { return r ? (r.targets ?? []).map((t) => `${t.host} ${t.status ?? '无响应'}${t.blocked ? ' 防护拦截' : ''} ${t.ms ?? 0}ms`).join('；') || r.error || '未取得结果' : '未执行' }
 
-export function NetworkHealth({ profiles, enabled }: { profiles: ProxyProfile[]; enabled: boolean }) {
+/** 网络可用性表：动态覆盖全部启用线路，不需要账号凭据。 */
+export function NetworkTable({ profiles, enabled }: { profiles: ProxyProfile[]; enabled: boolean }) {
   const qc = useQueryClient()
   const [busy, setBusy] = useState('')
   const [expanded, setExpanded] = useState('')
@@ -22,7 +23,6 @@ export function NetworkHealth({ profiles, enabled }: { profiles: ProxyProfile[];
     finally { setBusy('') }
   }
   return <section aria-label="基础网络巡检" className="space-y-3">
-    <div className="text-sm font-semibold">网络可用性（无需账号）</div>
     <p className="text-xs text-muted-foreground">动态覆盖全部启用代理，后续新增也会自动纳入。首轮失败 → 独立复核 → 健康参考／无凭据直连核查；模型账号不足不影响此层。</p>
     {error && <p role="alert" className="text-sm text-destructive">读取网络结果失败：{errMsg(error)}</p>}
     <div className="max-h-96 overflow-auto rounded-lg border"><table className="w-full text-left text-xs"><thead><tr className="border-b bg-muted/30"><th className="p-2">代理</th><th className="p-2">网络状态</th><th className="p-2">最近检查／复核时间</th><th className="p-2">操作</th></tr></thead><tbody>
