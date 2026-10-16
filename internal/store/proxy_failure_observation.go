@@ -55,15 +55,11 @@ func (s *Store) ObserveProxyEndpointFailure(ctx context.Context, expected *model
 		return "rate_limited"
 	}
 	if !exists && len(s.proxyFailureRechecks) >= proxyFailureRecheckLimit {
-		// 丢弃通知只会少做一次探测，不能被解释为成功或补成删除证据。
-		oldestID := ""
-		var oldest time.Time
-		for key, hint := range s.proxyFailureRechecks {
-			if oldestID == "" || hint.At.Before(oldest) {
-				oldestID, oldest = key, hint.At
-			}
-		}
-		delete(s.proxyFailureRechecks, oldestID)
+		// 满载时仅记录新异常，不驱逐已有节点的冷却；否则大池轮换会打散限频。
+		return "capacity_limited"
+	}
+	if exists && at.Before(previous.At) {
+		at = previous.At // 并发请求进入锁的顺序不一定等于产生通知时间的顺序。
 	}
 	s.proxyFailureRechecks[id] = proxyFailureRecheck{AccountID: expected.ID, Provider: expected.Provider, Route: route[0], PolicyRevision: p.Revision, At: at, Pending: true}
 	return "recheck_pending"
@@ -71,7 +67,8 @@ func (s *Store) ObserveProxyEndpointFailure(ctx context.Context, expected *model
 
 func (s *Store) pruneProxyFailureRechecksLocked(now time.Time) {
 	for id, hint := range s.proxyFailureRechecks {
-		if hint.PolicyRevision != s.modelProbe.Policy.Revision || hint.At.After(now) || !now.Before(hint.At.Add(proxyFailureRecheckTTL)) {
+		// 管理器可能刚取完 now 就收到新通知，不能将几微秒后的合法通知当成过期。
+		if hint.PolicyRevision != s.modelProbe.Policy.Revision || !now.Before(hint.At.Add(proxyFailureRecheckTTL)) {
 			delete(s.proxyFailureRechecks, id)
 		}
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -130,5 +131,52 @@ func TestProxyEndpointObservationCancellationAndExpiry(t *testing.T) {
 	defer reopened.Close()
 	if len(reopened.TakeProxyNetworkRechecks(reopened.ModelProbeSettings(), now)) != 0 {
 		t.Fatal("重启不得重建旧计费失败通知")
+	}
+}
+
+func TestProxyEndpointObservationOutOfOrderClockKeepsNotificationAndCooldown(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "共享出口", 18080, true)
+	a := addSelectionAccount(t, s, "账号", p.ID)
+	route, now := s.ProxyEgress(a), time.Now()
+	// 管理器先读取时钟，计费通知随后到达：不能丢掉略晚的合法通知。
+	s.ObserveProxyEndpointFailure(context.Background(), a, proxy.FailureEndpointUnreachable, now.Add(time.Millisecond), route)
+	if pending := s.TakeProxyNetworkRechecks(s.ModelProbeSettings(), now); len(pending) != 1 {
+		t.Fatal("管理器时钟快照早于通知几毫秒不代表通知无效")
+	}
+	// 另一并发请求较早取得时钟，但较晚进入锁：不能驱逐刚建立的冷却。
+	if got := s.ObserveProxyEndpointFailure(context.Background(), a, proxy.FailureEndpointUnreachable, now, route); got != "rate_limited" {
+		t.Fatalf("乱序到达的通知不能绕过同节点复核间隔：%s", got)
+	}
+	if len(s.TakeProxyNetworkRechecks(s.ModelProbeSettings(), now.Add(time.Second))) != 0 {
+		t.Fatal("一次并发乱序不应变成第二轮探测")
+	}
+}
+
+func TestProxyEndpointObservationCapacityDoesNotEvictCooldown(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "已有通知", 18080, true)
+	other := addSelectionProxy(t, s, "新通知", 18081, true)
+	a := addSelectionAccount(t, s, "已有账号", p.ID)
+	peer := addSelectionAccount(t, s, "新账号", other.ID)
+	now, policy := time.Now(), s.ModelProbeSettings()
+	s.ObserveProxyEndpointFailure(context.Background(), a, proxy.FailureEndpointUnreachable, now, s.ProxyEgress(a))
+	s.TakeProxyNetworkRechecks(policy, now)
+	// 构造刚被删除的节点仍占据通知窗口的合法运行期状态；不创建上千份数据库。
+	for i := 1; i < proxyFailureRecheckLimit; i++ {
+		s.proxyFailureRechecks[fmt.Sprintf("recently-removed-%d", i)] = proxyFailureRecheck{At: now.Add(time.Second), PolicyRevision: policy.Revision, NextAt: now.Add(5 * time.Minute)}
+	}
+	if got := s.ObserveProxyEndpointFailure(context.Background(), peer, proxy.FailureEndpointUnreachable, now.Add(time.Minute), s.ProxyEgress(peer)); got != "capacity_limited" {
+		t.Fatalf("满载新异常只能记录，不能谎称已入队：%s", got)
+	}
+	if got := s.ObserveProxyEndpointFailure(context.Background(), a, proxy.FailureEndpointUnreachable, now.Add(time.Minute), s.ProxyEgress(a)); got != "rate_limited" {
+		t.Fatalf("满载不能驱逐最早消费节点的冷却：%s", got)
+	}
+	if len(s.TakeProxyNetworkRechecks(policy, now.Add(time.Minute))) != 0 || len(s.ListProxyProfiles()) != 2 {
+		t.Fatal("满载不等于探测成功或允许删除")
+	}
+	later := now.Add(11 * time.Minute)
+	if got := s.ObserveProxyEndpointFailure(context.Background(), peer, proxy.FailureEndpointUnreachable, later, s.ProxyEgress(peer)); got != "recheck_pending" {
+		t.Fatalf("过期通知应释放容量，不能永久阻止新复核：%s", got)
 	}
 }

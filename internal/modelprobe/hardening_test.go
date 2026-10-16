@@ -258,7 +258,7 @@ func TestModelProbeInvalidAccountsProduceNoHTTP(t *testing.T) {
 	}
 }
 
-func TestModelProbeFixedAccountsWaitAfterRetirement(t *testing.T) {
+func TestModelProbeFixedAccountsProtectedUntilManualRemoval(t *testing.T) {
 	f := newFixture(t)
 	p := store.DefaultNewAccountProxyPolicy()
 	p.Enabled = true
@@ -288,12 +288,19 @@ func TestModelProbeFixedAccountsWaitAfterRetirement(t *testing.T) {
 		return 200, completeMessage
 	}
 	r := f.drive(t)
-	if r.DecisionID == "" {
-		t.Fatalf("未形成严格淘汰：%+v", r)
+	if r.DecisionID != "" || r.Verdict != "route_correlated" || r.Reason != "protected_proxy" || len(f.st.ListProxyProfiles()) != 2 {
+		t.Fatalf("完整模型对照可以确认异常，但默认业务节点仍须保留：%+v", r)
 	}
 	live := f.st.FindAny(a.ID)
+	if live.InitializationBlocked() || live.ProxyID == nil || *live.ProxyID != f.target.ID {
+		t.Fatal("受保护默认出口不得被自动解绑或改派")
+	}
+	if removed, _, err := f.st.DeleteProxyProfile(f.target.ID); err != nil || !removed {
+		t.Fatalf("默认节点仍允许管理员明确删除：%v %v", removed, err)
+	}
+	live = f.st.FindAny(a.ID)
 	if !live.InitializationBlocked() || f.st.Initialization(a.ID).State != "awaiting_default" {
-		t.Fatal("固定节点失效必须等待")
+		t.Fatal("管理员删除固定节点后仍必须等待，不能丢失原来的托管隔离")
 	}
 	if release, err := f.st.AcquireModelDispatch(live, f.st.DirectEgress(live, "forced_direct")); err == nil {
 		release()

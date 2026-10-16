@@ -27,7 +27,7 @@ func Observe(ctx context.Context, st *store.Store, acc *model.Account, reason st
 	if reason == proxy.FailureClaimSuspicious {
 		label = "领取返回可疑请求"
 	}
-	web.Warn("proxy-observation", fmt.Sprintf("账号 %s %s，保留线路 %s 与全部绑定；网络复核 action=%s",
+	web.Warn("proxy-observation", fmt.Sprintf("账号 %s %s；本次不删除线路 %s、不改派账号；网络复核 action=%s",
 		acc.ID, label, *acc.ProxyID, action))
 	return out
 }

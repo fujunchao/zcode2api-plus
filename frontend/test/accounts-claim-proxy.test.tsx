@@ -29,7 +29,7 @@ test.each([true, false])('领取失败提示准确说明是否移除了代理：
   }
 })
 
-test.each(['recheck_pending', 'observed', 'rate_limited'])('计费观测提示保留节点，不将 %s 误报为删除或已恢复', async (action) => {
+test.each(['recheck_pending', 'observed', 'rate_limited', 'capacity_limited'])('计费观测提示保留节点，不将 %s 误报为删除或已恢复', async (action) => {
   mock.warning.mockClear()
   mock.api.mockImplementation(async (method: string) => method === 'GET' ? {
     accounts: [{ id: 'a1', name: 'test', mode: 'jwt', status: 'active', enabled: true, quota: {}, plans: [], disabled_models: [], exhausted_models: [], archived_at: null }],

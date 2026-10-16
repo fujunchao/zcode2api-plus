@@ -21,7 +21,7 @@
 - 只有普通节点解除手工保护后才可能自动删除；默认／托管默认出口须先调整对应策略或解除托管。修改手工保护会废弃旧线路代次证据。
 - 观察模式和保护只阻止新自动删除决定；已持久化的严格退役恢复事务继续完成，不复活历史删除、不解除账号冷却。历史上已被删除的家庭节点仍需管理员重新添加并配置默认出口。
 
-计费结果中的 `proxy_failure_action` 区分 `recheck_pending`（等待复核）、`observed`（仅记录）、`rate_limited`（等待最短重查间隔）、`stale_snapshot`（旧身份不采用）、`initializing` 和 `ignored`。服务中的统一管理器消费运行期通知；独立 CLI 不自行启动后台巡检，也不承诺退出后续跑。
+计费结果中的 `proxy_failure_action` 区分 `recheck_pending`（等待复核）、`observed`（仅记录）、`rate_limited`（等待最短重查间隔）、`capacity_limited`（通知满载，仅记录）、`stale_snapshot`（旧身份不采用）、`initializing` 和 `ignored`。满载不驱逐已有节点的冷却，避免大量节点轮换绕过限频。服务中的统一管理器消费运行期通知；独立 CLI 不自行启动后台巡检，也不承诺退出后续跑。
 
 ## 全节点主动巡检与账号自动择优（v2.10.12-go）
 
