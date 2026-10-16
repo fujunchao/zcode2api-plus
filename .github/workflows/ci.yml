@@ -156,7 +156,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       - name: Repeat model probe contracts
-        run: go test ./internal/modelprobe ./internal/adminapi -run '^TestModelProbe' -count=10 -timeout=240s
+        run: go test ./internal/modelprobe ./internal/adminapi ./internal/store ./internal/gateway ./internal/asyncpool -run '^TestModelProbe' -count=10 -timeout=240s
 
       - name: Repeat unified proxy health contracts
         run: go test ./internal/modelprobe ./internal/adminapi -run 'TestUnified|TestProxyHealth' -count=10 -timeout=240s

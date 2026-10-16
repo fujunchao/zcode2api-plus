@@ -190,6 +190,7 @@ export interface ModelProbeSummary {
   active: number
   rule_version: string
   checked_targets?: number
+  fresh_healthy_targets?: number
   business_observed_targets?: number
   failed_targets?: number
   eligible_accounts?: number

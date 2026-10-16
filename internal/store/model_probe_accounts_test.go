@@ -8,6 +8,7 @@ import (
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/networkprobe"
 )
 
 func automaticAccountStore(t *testing.T) (*Store, *model.Account, time.Time) {
@@ -101,9 +102,12 @@ func TestModelProbeAccountColdPickAndBusinessOccupancy(t *testing.T) {
 func TestModelProbeAccountWindowRejectsOldCredentialAndPersists(t *testing.T) {
 	s, a, now := automaticAccountStore(t)
 	s.ObserveModelAccountOutcome(a, accountOutcome("old", 200, now), "success")
-	fresh, err := s.AddAccount(a.Provider, a.Name, jwtFor("auto-window")+"-refreshed")
-	if err != nil {
+	if _, err := s.RenewJWT(a.Provider, a.ID, jwtFor("auto-window")+"-refreshed"); err != nil {
 		t.Fatal(err)
+	}
+	fresh := s.FindAny(a.ID)
+	if fresh.SameCredential(a) || fresh.CredentialGeneration <= a.CredentialGeneration {
+		t.Fatal("夹具必须通过真实续期入口变更凭据代次，不能只调用去重入库")
 	}
 	s.ObserveModelAccountOutcome(a, accountOutcome("late-old", 200, now), "success")
 	view, err := s.ModelProbeSummary(now)
@@ -155,5 +159,57 @@ func TestModelProbeAutomaticMigrationPreservesConsentAndBudgets(t *testing.T) {
 	view, err := again.ModelProbeSummary(now)
 	if err != nil || view.UsedRequests != 1 || again.FindAny(a.ID).ModelProbeOnly {
 		t.Fatalf("迁移应保留已用预算并释放旧专用角色：%+v %v", view, err)
+	}
+}
+
+func TestModelProbeNetworkSummaryRejectsOldTargetsAndVersions(t *testing.T) {
+	s, _, now := automaticAccountStore(t)
+	profile, err := s.AddProxyProfile("合成网络节点", "http://127.0.0.1:18888", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := s.ModelProbeSettings()
+	p.NetworkEnabled = true
+	p, err = s.SaveModelProbeSettings(p, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := NetworkHealthRecord{ProfileID: profile.ID, Generation: profile.Generation, PolicyRevision: p.Revision, State: "healthy", At: now.UnixMilli(), TargetsKey: networkprobe.TargetsKey(networkprobe.Targets()), First: networkprobe.Report{OK: true}}
+	if err := s.SaveNetworkHealth(p, []NetworkHealthRecord{record}); err != nil {
+		t.Fatal(err)
+	}
+	view, err := s.ModelProbeSummary(now)
+	if err != nil || view.Network.Checked != 1 || view.Network.Failed != 0 {
+		t.Fatalf("当前网络成功未汇总：%+v %v", view.Network, err)
+	}
+	config.UpstreamZai = "http://replacement.invalid/v1/messages"
+	view, err = s.ModelProbeSummary(now)
+	if err != nil || view.Network.Checked != 0 {
+		t.Fatal("模型目标站点变化后，旧网络成功不能继续算覆盖")
+	}
+	config.UpstreamZai = "http://model.invalid/v1/messages"
+	if _, err := s.UpdateProxyProfile(profile.ID, profile.Name, "http://127.0.0.1:18889", true); err != nil {
+		t.Fatal(err)
+	}
+	view, err = s.ModelProbeSummary(now)
+	if err != nil || view.Network.Checked != 0 {
+		t.Fatal("节点代次变化后，旧网络成功不能继续算覆盖")
+	}
+}
+
+func TestModelProbeAccountWindowScopesEndpointAndPrunesDeletedTopology(t *testing.T) {
+	s, a, now := automaticAccountStore(t)
+	s.ObserveModelAccountOutcome(a, accountOutcome("old-endpoint", 200, now), "success")
+	config.UpstreamZai = "http://new-model.invalid/v1/messages"
+	view, err := s.ModelProbeSummary(now)
+	if err != nil || view.Accounts[0].RecentTotal != 0 {
+		t.Fatalf("其他模型端点的旧成功不能用于当前选号：%+v %v", view, err)
+	}
+	p := s.ModelProbeSettings()
+	p.Enabled, p.Mode = true, "observe"
+	p.EgressGroups["deleted-node"] = "old-group"
+	saved, err := s.SaveModelProbeSettings(p, now)
+	if err != nil || saved.EgressGroups["deleted-node"] != "" {
+		t.Fatalf("自动巡检不应要求手工清理已删除节点的拓扑声明：%+v %v", saved, err)
 	}
 }

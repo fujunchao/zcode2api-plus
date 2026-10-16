@@ -41,3 +41,12 @@ test('网络异常不能被模型成功掩盖，网络单独启用不声称模�
   data.network.failed = 0
   expect(healthStatus(data).text).toBe('网络正常（模型未启用）')
 })
+
+test('主动覆盖完整但成功记录过期，不能继续报告正常', () => {
+  const data = summary()
+  data.checked_targets = 2
+  data.eligible_accounts = 1
+  data.fresh_healthy_targets = 0
+  expect(healthStatus(data).level).not.toBe('ok')
+  expect(healthStatus(data).text).toContain('过期')
+})

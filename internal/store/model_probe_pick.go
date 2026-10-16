@@ -3,7 +3,7 @@ package store
 import "time"
 
 // 仅在尚未开始真实请求时允许重选；成对对照开始后仍冻结主体与代次。
-func (s *Store) prepareAutomaticProbeLocked(r *ModelProbeRun, b probeBudget, now time.Time) string {
+func (s *Store) prepareAutomaticProbeLocked(r *ModelProbeRun, b probeBudget, candidates []probeAccountRow, now time.Time) string {
 	if s.modelProbe.PausedUntil > now.UnixMilli() {
 		return "reference_unavailable"
 	}
@@ -13,7 +13,7 @@ func (s *Store) prepareAutomaticProbeLocked(r *ModelProbeRun, b probeBudget, now
 	r.accounts, r.accountIndex = nil, 0
 	r.credentials, r.bindings = map[string]string{}, map[string]uint64{}
 	reason := "no_eligible_account"
-	for _, row := range s.probeAccountRowsLocked(r.policy, now, b) {
+	for _, row := range candidates {
 		if !row.view.Eligible {
 			switch row.view.Reason {
 			case "account_budget_exhausted":

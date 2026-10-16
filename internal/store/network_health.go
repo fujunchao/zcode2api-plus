@@ -86,6 +86,7 @@ func (s *Store) networkHealthSummaryLocked(now time.Time) (NetworkHealthSummary,
 		return out, err
 	}
 	latest := map[string]NetworkHealthRecord{}
+	targetsKey := networkprobe.TargetsKey(networkprobe.Targets())
 	for _, r := range records {
 		latest[r.ProfileID] = r
 	}
@@ -95,7 +96,7 @@ func (s *Store) networkHealthSummaryLocked(now time.Time) (NetworkHealthSummary,
 		}
 		out.Total++
 		r, ok := latest[profile.ID]
-		if !ok || r.Generation != profile.Generation || r.PolicyRevision != p.Revision || r.At < now.Add(-time.Duration(p.NetworkIntervalMinutes)*time.Minute).UnixMilli() || r.At > now.UnixMilli() {
+		if !ok || r.Generation != profile.Generation || r.PolicyRevision != p.Revision || r.TargetsKey != targetsKey || r.At < now.Add(-time.Duration(p.NetworkIntervalMinutes)*time.Minute).UnixMilli() || r.At > now.UnixMilli() {
 			continue
 		}
 		switch r.State {

@@ -2,10 +2,8 @@ package modelprobe
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -83,7 +81,7 @@ func (m *Manager) RequestHealth(id string) error {
 }
 
 func networkTargetsKey(targets []string) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(targets, "\n"))))
+	return networkprobe.TargetsKey(targets)
 }
 
 func (m *Manager) checkNetwork(ctx context.Context, p store.ProxyProfile, policy store.ModelProbeSettings, targets []string) networkprobe.Report {

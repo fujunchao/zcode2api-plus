@@ -3,6 +3,8 @@ package networkprobe
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/url"
@@ -14,6 +16,12 @@ import (
 )
 
 const Timeout = 6 * time.Second
+
+// TargetsKey 绑定探测站点集合，配置变更后旧站点的成功不能冒充新配置健康。
+func TargetsKey(targets []string) string {
+	sum := sha256.Sum256([]byte(strings.Join(targets, "\n")))
+	return hex.EncodeToString(sum[:])
+}
 
 type Target struct {
 	URL     string `json:"url"`

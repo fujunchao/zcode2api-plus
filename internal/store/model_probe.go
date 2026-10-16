@@ -352,6 +352,10 @@ func (s *Store) SaveModelProbeSettings(p ModelProbeSettings, now time.Time) (Mod
 		}
 	}
 	for k, v := range p.EgressGroups {
+		if p.TargetMode == "auto" && k != ModelProbeDirect && profiles[k].ID == "" {
+			delete(p.EgressGroups, k)
+			continue
+		}
 		v = strings.TrimSpace(v)
 		if len(v) > 64 || strings.ContainsAny(v, "\r\n\t") || (k != ModelProbeDirect && profiles[k].ID == "" && p.Enabled) {
 			return old.clone(), errors.New("出口组标识无效")
@@ -559,6 +563,7 @@ type ModelProbeSummary struct {
 	Active                   int                     `json:"active"`
 	RuleVersion              string                  `json:"rule_version"`
 	CheckedTargets           int                     `json:"checked_targets"`
+	FreshHealthyTargets      int                     `json:"fresh_healthy_targets"`
 	BusinessObservedTargets  int                     `json:"business_observed_targets"`
 	FailedTargets            int                     `json:"failed_targets"`
 	EligibleAccounts         int                     `json:"eligible_accounts"`
@@ -628,11 +633,13 @@ func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 			accounts = append(accounts, row.view)
 		}
 	}
-	checked, businessObserved, failed, queued, waitAccounts, waitBudget := 0, 0, 0, 0, 0, 0
+	checked, businessObserved, failed, queued, waitAccounts, waitBudget, freshHealthy := 0, 0, 0, 0, 0, 0, 0
 	checks := map[string]int64{}
 	for _, t := range targets {
+		fresh := false
 		if c, ok := s.modelProbe.Checks[t.ID]; ok && c.Generation == t.Generation && c.Identity == strictProxyIdentity(t.URL) && c.Target == strictDigest(config.UpstreamZai) {
 			checks[t.ID] = c.At
+			fresh = c.Kind == "success" && c.At >= now.Add(-30*time.Minute).UnixMilli() && c.At <= now.UnixMilli()
 			if c.At >= now.Add(-effective).UnixMilli() && c.At <= now.UnixMilli() {
 				checked++
 				if c.Kind != "success" {
@@ -642,6 +649,10 @@ func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 		}
 		if _, ok := s.recentProbeBusinessLocked(t, now, 30*time.Minute); ok {
 			businessObserved++
+			fresh = true
+		}
+		if fresh {
+			freshHealthy++
 		}
 		if r := latest[t.ID]; r != nil && probeRunOpen(r) {
 			queued++
@@ -656,7 +667,7 @@ func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 	return ModelProbeSummary{EvidenceIncompleteUntil: s.modelProbe.EvidenceIncompleteUntil, ObservedTargets: observed, TotalTargets: len(targets), ExcludedTargets: excluded,
 		EffectiveIntervalMinutes: int(effective / time.Minute), StorageError: s.modelProbe.storageError, Settings: p.clone(), Runs: views, Accounts: accounts,
 		UsedRequests: used, RemainingRequests: max(0, p.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion,
-		CheckedTargets: checked, BusinessObservedTargets: businessObserved, FailedTargets: failed, EligibleAccounts: eligible, WaitingAccounts: waitAccounts, WaitingBudget: waitBudget, Queued: queued, NextBudgetAt: budget.NextAt, LastChecks: checks, Network: network}, nil
+		CheckedTargets: checked, FreshHealthyTargets: freshHealthy, BusinessObservedTargets: businessObserved, FailedTargets: failed, EligibleAccounts: eligible, WaitingAccounts: waitAccounts, WaitingBudget: waitBudget, Queued: queued, NextBudgetAt: budget.NextAt, LastChecks: checks, Network: network}, nil
 }
 
 // 清理展示历史不影响仍在滚动预算窗口内的尝试登记。

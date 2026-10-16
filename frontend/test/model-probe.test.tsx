@@ -154,6 +154,7 @@ test('高级选项默认折叠，展开后仍不要求目标和账号选择', as
   const targetGroup = screen.getByRole('group', { name: '模型目标排除（可选）' })
   expect(within(targetGroup).queryByText('选择全部启用线路')).toBeNull()
   expect(screen.getByRole('region', { name: '账号自动择优依据' })).toBeTruthy()
+  expect(mock.api.mock.calls.some(([, path]) => String(path).startsWith('/accounts?limit=200'))).toBe(false)
   client.clear()
 })
 

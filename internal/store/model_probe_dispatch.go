@@ -147,6 +147,9 @@ func (s *Store) ScheduleModelProbes(now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.modelProbe.Policy
+	if s.strictClosed {
+		return nil
+	}
 	// 业务统计最多每五秒批量落盘，避免每次业务请求重写整个近期窗口。
 	if s.modelProbe.accountsDirty && now.Sub(s.modelProbe.accountsFlushedAt) >= 5*time.Second {
 		if err := s.persistProbeStateLocked(); err != nil {
@@ -202,6 +205,10 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 	if err != nil {
 		return nil, err
 	}
+	var candidates []probeAccountRow
+	if s.modelProbe.Policy.AccountMode == "auto" {
+		candidates = s.probeAccountRowsLocked(s.modelProbe.Policy, now, budget)
+	}
 	var runs []*ModelProbeRun
 	for _, r := range s.modelProbe.runs {
 		if probeRunOpen(r) && r.State != "running" && r.NextAt <= now.UnixMilli() {
@@ -241,7 +248,7 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 		}
 		if r.policy.AccountMode == "auto" && r.Attempts == 0 {
 			copy := *r
-			reason := s.prepareAutomaticProbeLocked(&copy, budget, now)
+			reason := s.prepareAutomaticProbeLocked(&copy, budget, candidates, now)
 			if reason != "" {
 				copy.State, copy.Reason = "waiting", reason
 				copy.NextAt, copy.UpdatedAt = now.Add(5*time.Second).UnixMilli(), now.UnixMilli()

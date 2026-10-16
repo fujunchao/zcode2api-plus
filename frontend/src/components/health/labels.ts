@@ -90,6 +90,7 @@ export function healthStatus(data: ModelProbeSummary, now = Date.now()): { level
   const total = targetCount(data)
   if (total === 0 || (data.checked_targets ?? 0) < total) return { level: 'warning', text: `主动覆盖不足 ${data.checked_targets ?? 0}/${total}` }
   if (data.settings.network_enabled && (!data.network || data.network.checked < data.network.total || data.network.total === 0)) return { level: 'warning', text: '网络覆盖不足' }
+  if (data.fresh_healthy_targets !== undefined && data.fresh_healthy_targets < total) return { level: 'warning', text: '部分模型记录已过期，等待刷新' }
   return { level: 'ok', text: '正常' }
 }
 

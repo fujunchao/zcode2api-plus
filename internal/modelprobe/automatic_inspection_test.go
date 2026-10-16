@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"zcode2api/internal/model"
+	"zcode2api/internal/modelprobe"
 	"zcode2api/internal/store"
 )
 
@@ -202,5 +203,46 @@ func TestModelProbeAutomaticInspectionResumesAfterAccountReturns(t *testing.T) {
 	f.drainImmediate(t)
 	if len(f.requests) != 2 {
 		t.Fatalf("账号恢复后应接续两个待检节点，不等下一完整周期：%d", len(f.requests))
+	}
+}
+
+func TestModelProbeAutomaticInspectionBudgetWaitSurvivesRestart(t *testing.T) {
+	f := newFixture(t)
+	f.enableAuto(t, "observe")
+	p := f.st.ModelProbeSettings()
+	p.GlobalDailyLimit = 1
+	if _, err := f.st.SaveModelProbeSettings(p, f.now); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.drive(t); r.Attempts != 1 {
+		t.Fatalf("应先完成一个真实请求：%+v", r)
+	}
+	f.m.Close()
+	if err := f.st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := store.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = again.Close() })
+	m := modelprobe.New(context.Background(), again, func() time.Time { return f.now })
+	t.Cleanup(m.Close)
+	if _, err := again.QueueModelProbe(f.reference.ID, "manual", f.now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	view, err := again.ModelProbeSummary(f.now)
+	if err != nil || view.UsedRequests != 1 || view.WaitingBudget != 1 || len(f.requests) != 1 {
+		t.Fatalf("重启不得重置预算，未发送任务应保留等待：%+v %v", view, err)
+	}
+	f.now = f.now.Add(24*time.Hour + time.Second)
+	if _, err := m.RunDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.requests) != 2 {
+		t.Fatal("预算窗口释放后应续检，不能被入队时的20分钟期限丢弃")
 	}
 }

@@ -23,6 +23,7 @@ type probeAccountOutcome struct {
 type probeAccountWindow struct {
 	Entries    []probeAccountOutcome `json:"entries,omitempty"`
 	Credential string                `json:"credential,omitempty"`
+	Target     string                `json:"target,omitempty"`
 	LastPickAt int64                 `json:"last_pick,omitempty"`
 	LastAt     int64                 `json:"last_at,omitempty"`
 }
@@ -62,7 +63,7 @@ func (w *probeAccountWindow) score(now time.Time) probeAccountScore {
 				out.ProbeSuccess++
 			}
 			// 对未知线路的风控、传输及平台错误不推定为账号问题。
-			if e.Success || (!e.Risk && !accountOutcomeNeutral(e.Kind)) {
+			if e.Success || (!e.Risk && e.Kind != "risk_control" && !accountOutcomeNeutral(e.Kind)) {
 				probes = append(probes, e)
 			}
 		} else {
@@ -120,8 +121,9 @@ func (s *Store) probeAccountWindowLocked(id string) *probeAccountWindow {
 		return nil
 	}
 	credential := s.strictCredentialRefLocked(a)
-	if w == nil || w.Credential != credential {
-		w = &probeAccountWindow{Credential: credential}
+	target := strictDigest(config.UpstreamZai)
+	if w == nil || w.Credential != credential || w.Target != target {
+		w = &probeAccountWindow{Credential: credential, Target: target}
 		s.modelProbe.AccountWindows[id] = w
 	}
 	return w
@@ -289,7 +291,7 @@ func (s *Store) probeAccountRowsLocked(p ModelProbeSettings, now time.Time, b pr
 			continue
 		}
 		w := s.modelProbe.AccountWindows[id]
-		if w != nil && w.Credential != s.strictCredentialRefLocked(a) {
+		if w != nil && (w.Credential != s.strictCredentialRefLocked(a) || w.Target != strictDigest(config.UpstreamZai)) {
 			w = nil
 		}
 		score := w.score(now)
