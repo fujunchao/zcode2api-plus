@@ -27,33 +27,41 @@ var ErrModelProbeBudget = errors.New("模型巡检请求预算已用完")
 
 // ModelProbeSettings 的账号列表同时声明专用角色，关闭 Enabled 不自动释放角色。
 type ModelProbeSettings struct {
-	HealthVersion          int               `json:"health_version"`
-	NetworkEnabled         bool              `json:"network_enabled"`
-	NetworkIntervalMinutes int               `json:"network_interval_minutes"`
-	NetworkConfirmSeconds  int               `json:"network_confirm_seconds"`
-	MigrationNotice        string            `json:"migration_notice,omitempty"`
-	Enabled                bool              `json:"enabled"`
-	Mode                   string            `json:"mode"`
-	Model                  string            `json:"model"`
-	IntervalMinutes        int               `json:"interval_minutes"`
-	Concurrency            int               `json:"concurrency"`
-	TimeoutSeconds         int               `json:"timeout_seconds"`
-	GlobalDailyLimit       int               `json:"global_daily_limit"`
-	AccountDailyLimit      int               `json:"account_daily_limit"`
-	AccountIDs             []string          `json:"account_ids"`
-	TargetProxyIDs         []string          `json:"target_proxy_ids"`
-	ReferenceProxyIDs      []string          `json:"reference_proxy_ids"`
-	EgressGroups           map[string]string `json:"egress_groups"`
-	AllowDirectControl     bool              `json:"allow_direct_control"`
-	Revision               uint64            `json:"revision"`
+	HealthVersion          int    `json:"health_version"`
+	NetworkEnabled         bool   `json:"network_enabled"`
+	NetworkIntervalMinutes int    `json:"network_interval_minutes"`
+	NetworkConfirmSeconds  int    `json:"network_confirm_seconds"`
+	MigrationNotice        string `json:"migration_notice,omitempty"`
+	Enabled                bool   `json:"enabled"`
+	Mode                   string `json:"mode"`
+	Model                  string `json:"model"`
+	IntervalMinutes        int    `json:"interval_minutes"`
+	Concurrency            int    `json:"concurrency"`
+	TimeoutSeconds         int    `json:"timeout_seconds"`
+	GlobalDailyLimit       int    `json:"global_daily_limit"`
+	AccountDailyLimit      int    `json:"account_daily_limit"`
+	// TargetMode 决定模型巡检覆盖哪些线路：auto 动态覆盖全部启用线路（可配排除名单），
+	// manual 只巡检显式选择的 TargetProxyIDs。
+	TargetMode      string   `json:"target_mode"`
+	ExcludeProxyIDs []string `json:"exclude_proxy_ids"`
+	// AccountMode 决定探测账号来源：auto 从全部合格账号按近期成功率自动择优，
+	// dedicated 只使用显式选择的 AccountIDs（这些账号退出普通业务选号）。
+	AccountMode        string            `json:"account_mode"`
+	AccountIDs         []string          `json:"account_ids"`
+	TargetProxyIDs     []string          `json:"target_proxy_ids"`
+	ReferenceProxyIDs  []string          `json:"reference_proxy_ids"`
+	EgressGroups       map[string]string `json:"egress_groups"`
+	AllowDirectControl bool              `json:"allow_direct_control"`
+	Revision           uint64            `json:"revision"`
 }
 
 func DefaultModelProbeSettings() ModelProbeSettings {
-	return ModelProbeSettings{NetworkIntervalMinutes: 30, NetworkConfirmSeconds: 10, Mode: "observe", Model: ModelProbeModel, IntervalMinutes: 30, Concurrency: 1, TimeoutSeconds: 30,
-		GlobalDailyLimit: 200, AccountDailyLimit: 100, AccountIDs: []string{}, TargetProxyIDs: []string{}, ReferenceProxyIDs: []string{}, EgressGroups: map[string]string{}}
+	return ModelProbeSettings{HealthVersion: 2, TargetMode: "auto", AccountMode: "auto", NetworkIntervalMinutes: 30, NetworkConfirmSeconds: 10, Mode: "observe", Model: ModelProbeModel, IntervalMinutes: 30, Concurrency: 1, TimeoutSeconds: 30,
+		GlobalDailyLimit: 200, AccountDailyLimit: 100, ExcludeProxyIDs: []string{}, AccountIDs: []string{}, TargetProxyIDs: []string{}, ReferenceProxyIDs: []string{}, EgressGroups: map[string]string{}}
 }
 
 func (p ModelProbeSettings) clone() ModelProbeSettings {
+	p.ExcludeProxyIDs = append([]string{}, p.ExcludeProxyIDs...)
 	p.AccountIDs = append([]string{}, p.AccountIDs...)
 	p.TargetProxyIDs = append([]string{}, p.TargetProxyIDs...)
 	p.ReferenceProxyIDs = append([]string{}, p.ReferenceProxyIDs...)

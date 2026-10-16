@@ -90,6 +90,7 @@ func newFixture(t *testing.T) *fixture {
 	p := store.DefaultModelProbeSettings()
 	p.Enabled = true
 	p.Mode = "auto_retire"
+	p.TargetMode, p.AccountMode = "manual", "dedicated"
 	p.AccountIDs = []string{f.accounts[0].ID, f.accounts[1].ID}
 	p.TargetProxyIDs = []string{f.target.ID}
 	p.ReferenceProxyIDs = []string{f.reference.ID}
