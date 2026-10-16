@@ -95,32 +95,35 @@ func (s *Store) queueModelProbeLocked(target, source string, now time.Time) (Mod
 	r := &ModelProbeRun{ID: "probe-" + randomHex(12), TargetID: target, Source: source, State: "queued", Verdict: "unknown", Reason: "queued", Mode: p.Mode,
 		RuleVersion: ModelProbeRuleVersion, TemplateVersion: ModelProbeTemplateVersion, CreatedAt: now.UnixMilli(), UpdatedAt: now.UnixMilli(), NextAt: now.UnixMilli(), Deadline: now.Add(20 * time.Minute).UnixMilli(), Samples: []ModelProbeSample{}, policy: p.clone(), target: profile, phase: "screen",
 		credentials: map[string]string{}, bindings: map[string]uint64{}, targetURL: config.UpstreamZai}
-	for _, id := range s.probeAccountCandidatesLocked(p, now) {
-		if len(r.accounts) == 2 {
-			break
+	// 旧专用模式保留入队冻结；自动模式直到取得执行槽才选择当前可用账号。
+	if p.AccountMode != "auto" {
+		for _, id := range p.AccountIDs {
+			if len(r.accounts) == 2 {
+				break
+			}
+			if !s.probeAccountReadyLocked(id, now) {
+				continue
+			}
+			r.accounts = append(r.accounts, id)
+			r.credentials[id] = s.strictCredentialRefLocked(s.findAnyLocked(id))
+			r.bindings[id] = s.strictProxy.RouteVersions[id].Generation
 		}
-		if !s.probeAccountReadyLocked(id, now) {
-			continue
+		if len(r.accounts) > 0 {
+			// 只把主账号计入「最近被选中」，让并列账号在后续轮次里轮转。
+			s.touchProbeAccountPickLocked(r.accounts[0], now)
+		} else {
+			r.State, r.Reason = "skipped", "no_eligible_account"
 		}
-		r.accounts = append(r.accounts, id)
-		r.credentials[id] = s.strictCredentialRefLocked(s.findAnyLocked(id))
-		r.bindings[id] = s.strictProxy.RouteVersions[id].Generation
 	}
-	if len(r.accounts) > 0 {
-		// 只把主账号计入「最近被选中」，让并列账号在后续轮次里轮转。
-		s.touchProbeAccountPickLocked(r.accounts[0], now)
-	} else {
-		r.State, r.Reason = "skipped", "no_eligible_account"
-	}
-	if source != "manual" {
+	if source != "manual" && p.TargetMode != "auto" {
 		if good, ok := s.recentProbeBusinessLocked(profile, now, 30*time.Minute); ok && !s.modelProbe.hints[target].After(good.At) {
 			r.State, r.Verdict, r.Reason = "skipped", "healthy_recent", "skipped_recent_success"
 			r.ObservedAt = good.At.UnixMilli()
 		}
 	}
-	if s.modelProbe.PausedUntil > now.UnixMilli() {
+	if p.AccountMode != "auto" && s.modelProbe.PausedUntil > now.UnixMilli() {
 		r.State, r.Verdict, r.Reason = "skipped", "inconclusive", "reference_unavailable"
-	} else if s.modelProbe.PausedUntil > 0 {
+	} else if p.AccountMode != "auto" && s.modelProbe.PausedUntil > 0 {
 		r.referenceID = s.probeReferenceLocked(p, profile, now)
 		if r.referenceID != "" {
 			r.phase, r.round = "reference", 1
@@ -144,6 +147,14 @@ func (s *Store) ScheduleModelProbes(now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.modelProbe.Policy
+	// 业务统计最多每五秒批量落盘，避免每次业务请求重写整个近期窗口。
+	if s.modelProbe.accountsDirty && now.Sub(s.modelProbe.accountsFlushedAt) >= 5*time.Second {
+		if err := s.persistProbeStateLocked(); err != nil {
+			return err
+		}
+		s.modelProbe.accountsDirty = false
+		s.modelProbe.accountsFlushedAt = now
+	}
 	if !p.Enabled || s.strictClosed {
 		return nil
 	}
@@ -187,6 +198,10 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 	if s.strictClosed || s.modelProbe.storageError || !s.modelProbe.Policy.Enabled || len(s.modelProbe.leases) >= s.modelProbe.Policy.Concurrency {
 		return nil, nil
 	}
+	budget, err := s.probeBudgetLocked(now)
+	if err != nil {
+		return nil, err
+	}
 	var runs []*ModelProbeRun
 	for _, r := range s.modelProbe.runs {
 		if probeRunOpen(r) && r.State != "running" && r.NextAt <= now.UnixMilli() {
@@ -211,7 +226,7 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 			}
 			continue
 		}
-		if now.UnixMilli() >= r.Deadline || r.Attempts >= 8 {
+		if (r.Attempts > 0 && now.UnixMilli() >= r.Deadline) || r.Attempts >= 8 {
 			if err := finish("diagnosis_budget"); err != nil {
 				return nil, err
 			}
@@ -223,6 +238,20 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 				return nil, err
 			}
 			continue
+		}
+		if r.policy.AccountMode == "auto" && r.Attempts == 0 {
+			copy := *r
+			reason := s.prepareAutomaticProbeLocked(&copy, budget, now)
+			if reason != "" {
+				copy.State, copy.Reason = "waiting", reason
+				copy.NextAt, copy.UpdatedAt = now.Add(5*time.Second).UnixMilli(), now.UnixMilli()
+				if err := s.persistModelProbeRunLocked(&copy); err != nil {
+					return nil, err
+				}
+				s.modelProbe.runs[copy.ID] = &copy
+				continue
+			}
+			r = &copy
 		}
 		if r.accountIndex >= len(r.accounts) {
 			if err := finish("no_eligible_account"); err != nil {
@@ -285,6 +314,9 @@ func (s *Store) TakeModelProbe(now time.Time) (*ModelProbeLease, error) {
 		}
 		s.modelProbe.runs[r.ID] = &copy
 		s.modelProbe.leases[l.id] = l
+		if r.Attempts == 0 && r.policy.AccountMode == "auto" {
+			s.touchProbeAccountPickLocked(id, now)
+		}
 		return l, nil
 	}
 	return nil, nil
@@ -427,8 +459,18 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 	}
 	o.At = now
 	// 探测结果也进入账号滚动窗口（真实出站才算），供后续自动择优排序。
-	if l.started {
-		s.recordProbeAccountOutcomeLocked(l.account.ID, now, probeSuccess(o), probeRisk(o))
+	if l.started && current && !o.InvalidRequest {
+		s.recordProbeAccountOutcomeLocked(l.account.ID, o, "probe", kind)
+		if l.routeID == r.TargetID && kind != "canceled" {
+			if s.modelProbe.Checks == nil {
+				s.modelProbe.Checks = map[string]modelProbeCheck{}
+			}
+			s.modelProbe.Checks[r.TargetID] = modelProbeCheck{At: now.UnixMilli(), Generation: r.target.Generation, Identity: strictProxyIdentity(r.target.URL), Target: strictDigest(r.targetURL), Kind: kind}
+			if r.policy.TargetMode == "auto" {
+				_, interval := s.probeRotationLocked(r.policy, len(s.effectiveProbeTargetsLocked(r.policy)))
+				s.modelProbe.NextDue[r.TargetID] = now.Add(interval).UnixMilli()
+			}
+		}
 	}
 	if current && l.started && (kind == "success" || kind == "risk_control") && !o.InvalidRequest && o.RequestID == l.requestID && validProbeObservation(l, o) {
 		if (o.Complete && o.Status >= 200 && o.Status < 300 && o.BusinessCode == "") || (o.Status == 405 && o.BusinessCode == "3012") {
@@ -440,6 +482,9 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 		copy.Reason = "stale_snapshot"
 	} else {
 		s.advanceModelProbeLocked(&copy, l, o, kind, account, now)
+	}
+	if current && !l.started && r.Attempts == 0 && r.policy.AccountMode == "auto" && (kind == "budget_exhausted" || kind == "network_unavailable" || kind == "dispatch_changed") {
+		copy.State, copy.Reason, copy.NextAt = "waiting", kind, now.Add(5*time.Second).UnixMilli()
 	}
 	if err := s.commitProbeResultLocked(&copy, account); err != nil {
 		s.modelProbe.storageError = true

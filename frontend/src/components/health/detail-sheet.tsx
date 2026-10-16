@@ -21,7 +21,7 @@ export function HealthDetailSheet({ open, onOpenChange, data, profiles, triggeri
 }) {
   const [expanded, setExpanded] = useState('')
   const suspects = data.runs.filter((r) => r.verdict === 'suspect').length
-  const observed = data.observed_targets ?? 0
+  const observed = data.checked_targets ?? 0
   const total = targetCount(data)
   return <Sheet open={open} onOpenChange={onOpenChange}>
     <SheetContent className="w-full overflow-y-auto sm:max-w-2xl">
@@ -38,9 +38,12 @@ export function HealthDetailSheet({ open, onOpenChange, data, profiles, triggeri
           <span>单线检测周期约 {effectiveInterval(data)} 分钟</span>
           <span className="font-mono tabular-nums">24h {data.used_requests}/{data.settings.global_daily_limit} 次</span>
           <span>剩余 {data.remaining_requests} 次 · 在途 {data.active}</span>
-          <span>近 30 分钟已观测 {observed}/{total} 条{(data.excluded_targets ?? 0) > 0 ? ` · 排除 ${data.excluded_targets} 条` : ''}</span>
+          <span>主动覆盖 {observed}/{total} 条{(data.excluded_targets ?? 0) > 0 ? ` · 排除 ${data.excluded_targets} 条` : ''}</span>
+          <span>近 30 分钟业务成功旁证 {data.business_observed_targets ?? 0} 条（不代替主动检查）</span>
+          <span>等待账号 {data.waiting_accounts ?? 0} · 等待预算 {data.waiting_budget ?? 0}</span>
           {suspects > 0 && <span className="text-amber-700">{suspects} 条线路待核查</span>}
         </div>
+        <p className="text-xs text-muted-foreground">主动覆盖按参考轮转周期内的实际目标请求统计，不代表全部健康；预算、账号等待和异常复核会延后完成时间。排队与业务旁证不计为主动完成。</p>
         <Tabs defaultValue="model">
           <TabsList>
             <TabsTrigger value="network">网络可用性</TabsTrigger>

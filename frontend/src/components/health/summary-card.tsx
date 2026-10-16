@@ -47,8 +47,10 @@ export function HealthSummaryCard({ data, error, loading, onDetail, onSettings }
         {status.text}
       </span>
       {enabled && <>
-        <span className="text-xs text-muted-foreground">{targetCount(data)} 条线路 · 周期 {effectiveInterval(data)} 分钟</span>
-        <span className="font-mono text-xs tabular-nums text-muted-foreground">预算 {data.used_requests}/{data.settings.global_daily_limit}</span>
+        {data.settings.enabled ? <>
+          <span className="text-xs text-muted-foreground">主动覆盖 {data.checked_targets ?? 0}/{targetCount(data)} · 参考轮转 {effectiveInterval(data)} 分钟</span>
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">预算 {data.used_requests}/{data.settings.global_daily_limit}</span>
+        </> : <span className="text-xs text-muted-foreground">网络覆盖 {data.network?.checked ?? 0}/{data.network?.total ?? 0}</span>}
         {nextAt ? <span className="text-xs text-muted-foreground">下次 {time(nextAt)}</span> : null}
       </>}
     </div>

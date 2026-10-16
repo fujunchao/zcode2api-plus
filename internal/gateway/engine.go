@@ -416,6 +416,7 @@ func (e *Engine) tryAccount(
 		resp, err := client.Do(httpReq)
 		finishAttempt(resp, err)
 		if err != nil {
+			ObserveModelAttemptError(attemptCtx, err, e.now())
 			release()
 			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
@@ -750,6 +751,7 @@ func (e *Engine) handleUpstreamJSON(
 	contentType := resp.Header.Get("Content-Type")
 	text := string(buffered)
 	code := UpstreamBusinessCode(text)
+	ObserveModelAttemptJSONError(ctx, code, e.now())
 	if stream || (code != "" && code != "0") {
 		diag.ObserveResponseBody(resp, buffered, nil, false, "json_body")
 	}

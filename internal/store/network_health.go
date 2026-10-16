@@ -36,6 +36,10 @@ func (s *Store) initNetworkHealth() error {
 func (s *Store) NetworkHealth() ([]NetworkHealthRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.networkHealthLocked()
+}
+
+func (s *Store) networkHealthLocked() ([]NetworkHealthRecord, error) {
 	rows, err := s.db.Query("SELECT data FROM proxy_network_health")
 	if err != nil {
 		return nil, err
@@ -63,6 +67,46 @@ func (s *Store) NetworkHealth() ([]NetworkHealthRecord, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].At > out[j].At })
 	return out, rows.Err()
+}
+
+type NetworkHealthSummary struct {
+	Total   int `json:"total"`
+	Checked int `json:"checked"`
+	Failed  int `json:"failed"`
+}
+
+func (s *Store) networkHealthSummaryLocked(now time.Time) (NetworkHealthSummary, error) {
+	out := NetworkHealthSummary{}
+	p := s.modelProbe.Policy
+	if !p.NetworkEnabled {
+		return out, nil
+	}
+	records, err := s.networkHealthLocked()
+	if err != nil {
+		return out, err
+	}
+	latest := map[string]NetworkHealthRecord{}
+	for _, r := range records {
+		latest[r.ProfileID] = r
+	}
+	for _, profile := range s.listProxyProfilesLocked() {
+		if !profile.Enabled {
+			continue
+		}
+		out.Total++
+		r, ok := latest[profile.ID]
+		if !ok || r.Generation != profile.Generation || r.PolicyRevision != p.Revision || r.At < now.Add(-time.Duration(p.NetworkIntervalMinutes)*time.Minute).UnixMilli() || r.At > now.UnixMilli() {
+			continue
+		}
+		switch r.State {
+		case "healthy", "recovered":
+			out.Checked++
+		case "waiting", "unconfirmed", "confirmed_failure":
+			out.Checked++
+			out.Failed++
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHealthRecord) error {
@@ -210,7 +254,8 @@ func (s *Store) networkPolicyFromLegacy(values map[string]string) (modelProbePer
 		next.Policy.NetworkIntervalMinutes = v
 	}
 	next.Policy.Revision++
-	next.Policy.HealthVersion = 1
+	// 兼容字段更新不得把策略版本降回v1，否则重启会重复迁移和清空近期统计。
+	next.Policy.HealthVersion = max(3, next.Policy.HealthVersion)
 	return next, true
 }
 

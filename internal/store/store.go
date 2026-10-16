@@ -134,6 +134,9 @@ func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.strictClosed = true
+		if s.modelProbe.accountsDirty {
+			s.closeErr = s.persistProbeStateLocked()
+		}
 		if s.strictRetryCancel != nil {
 			s.strictRetryCancel()
 		}
@@ -142,7 +145,7 @@ func (s *Store) Close() error {
 		if done != nil {
 			<-done
 		}
-		s.closeErr = s.db.Close()
+		s.closeErr = errors.Join(s.closeErr, s.db.Close())
 		if s.processLock != nil {
 			s.closeErr = errors.Join(s.closeErr, s.processLock.Close())
 		}

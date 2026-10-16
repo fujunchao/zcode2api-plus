@@ -91,15 +91,27 @@ type modelProbePersistent struct {
 	PausedUntil             int64                          `json:"paused_until"`
 	EvidenceIncompleteUntil int64                          `json:"evidence_incomplete_until"`
 	AccountWindows          map[string]*probeAccountWindow `json:"account_windows,omitempty"`
+	Checks                  map[string]modelProbeCheck     `json:"checks,omitempty"`
+}
+
+type modelProbeCheck struct {
+	At         int64  `json:"at"`
+	Generation uint64 `json:"generation"`
+	Identity   string `json:"identity"`
+	Target     string `json:"target"`
+	Kind       string `json:"kind"`
 }
 
 type modelProbeState struct {
 	modelProbePersistent
-	runs         map[string]*ModelProbeRun
-	leases       map[string]*ModelProbeLease
-	business     map[string]modelProbeBusiness
-	hints        map[string]time.Time
-	storageError bool
+	runs              map[string]*ModelProbeRun
+	leases            map[string]*ModelProbeLease
+	business          map[string]modelProbeBusiness
+	hints             map[string]time.Time
+	storageError      bool
+	accountsDirty     bool
+	accountsFlushedAt time.Time
+	businessActive    map[string]int
 }
 
 type modelProbeBusiness struct {
@@ -280,7 +292,7 @@ func (s *Store) SaveModelProbeSettings(p ModelProbeSettings, now time.Time) (Mod
 	if (p.TargetMode != "auto" && p.TargetMode != "manual") || (p.AccountMode != "auto" && p.AccountMode != "dedicated") {
 		return old.clone(), errors.New("模型巡检目标或账号模式无效")
 	}
-	p.HealthVersion = 2
+	p.HealthVersion = 3
 	p.MigrationNotice = ""
 	if p.Model != ModelProbeModel || (p.Mode != "observe" && p.Mode != "auto_retire") || p.IntervalMinutes < 1 || p.IntervalMinutes > 1440 || p.Concurrency < 1 || p.Concurrency > 2 || p.TimeoutSeconds < 5 || p.TimeoutSeconds > 60 || p.GlobalDailyLimit < 1 || p.GlobalDailyLimit > 10000 || p.AccountDailyLimit < 1 || p.AccountDailyLimit > 10000 {
 		return old.clone(), errors.New("模型巡检模式、间隔或请求预算无效")
@@ -512,15 +524,22 @@ func (s *Store) modelProbeHistoryLocked(target string, offset, limit int) []Mode
 
 // ModelProbeAccountView 是自动择优账号的可解释视图（只读，供管理端展示选择依据）。
 type ModelProbeAccountView struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Eligible      bool   `json:"eligible"`
-	Reason        string `json:"reason,omitempty"`
-	Rank          int    `json:"rank,omitempty"`
-	RecentSuccess int    `json:"recent_success"`
-	RecentTotal   int    `json:"recent_total"`
-	LastSuccessAt int64  `json:"last_success_at,omitempty"`
-	LastPickAt    int64  `json:"last_pick_at,omitempty"`
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	Eligible          bool    `json:"eligible"`
+	Reason            string  `json:"reason,omitempty"`
+	Rank              int     `json:"rank,omitempty"`
+	RecentSuccess     int     `json:"recent_success"`
+	RecentTotal       int     `json:"recent_total"`
+	LastSuccessAt     int64   `json:"last_success_at,omitempty"`
+	LastPickAt        int64   `json:"last_pick_at,omitempty"`
+	ProbeSuccess      int     `json:"probe_success"`
+	ProbeTotal        int     `json:"probe_total"`
+	NeutralFailures   int     `json:"neutral_failures"`
+	Canceled          int     `json:"canceled"`
+	Score             float64 `json:"score"`
+	RemainingRequests int     `json:"remaining_requests"`
+	ActiveRequests    int     `json:"active_requests"`
 }
 
 type ModelProbeSummary struct {
@@ -539,13 +558,28 @@ type ModelProbeSummary struct {
 	NextDue                  map[string]int64        `json:"next_due"`
 	Active                   int                     `json:"active"`
 	RuleVersion              string                  `json:"rule_version"`
+	CheckedTargets           int                     `json:"checked_targets"`
+	BusinessObservedTargets  int                     `json:"business_observed_targets"`
+	FailedTargets            int                     `json:"failed_targets"`
+	EligibleAccounts         int                     `json:"eligible_accounts"`
+	WaitingAccounts          int                     `json:"waiting_accounts"`
+	WaitingBudget            int                     `json:"waiting_budget"`
+	Queued                   int                     `json:"queued"`
+	NextBudgetAt             int64                   `json:"next_budget_at"`
+	LastChecks               map[string]int64        `json:"last_checks"`
+	Network                  NetworkHealthSummary    `json:"network"`
 }
 
 func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var used int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM model_probe_attempts WHERE started_at>?", now.Add(-24*time.Hour).UnixMilli()).Scan(&used); err != nil {
+	budget, err := s.probeBudgetLocked(now)
+	if err != nil {
+		return ModelProbeSummary{}, err
+	}
+	used := budget.Total
+	network, err := s.networkHealthSummaryLocked(now)
+	if err != nil {
 		return ModelProbeSummary{}, err
 	}
 	p := s.modelProbe.Policy
@@ -584,9 +618,45 @@ func (s *Store) ModelProbeSummary(now time.Time) (ModelProbeSummary, error) {
 		}
 	}
 	_, effective := s.probeRotationLocked(p, len(targets))
+	accounts := []ModelProbeAccountView{}
+	eligible := 0
+	for _, row := range s.probeAccountRowsLocked(p, now, budget) {
+		if row.view.Eligible {
+			eligible++
+		}
+		if len(accounts) < probeAccountViewLimit {
+			accounts = append(accounts, row.view)
+		}
+	}
+	checked, businessObserved, failed, queued, waitAccounts, waitBudget := 0, 0, 0, 0, 0, 0
+	checks := map[string]int64{}
+	for _, t := range targets {
+		if c, ok := s.modelProbe.Checks[t.ID]; ok && c.Generation == t.Generation && c.Identity == strictProxyIdentity(t.URL) && c.Target == strictDigest(config.UpstreamZai) {
+			checks[t.ID] = c.At
+			if c.At >= now.Add(-effective).UnixMilli() && c.At <= now.UnixMilli() {
+				checked++
+				if c.Kind != "success" {
+					failed++
+				}
+			}
+		}
+		if _, ok := s.recentProbeBusinessLocked(t, now, 30*time.Minute); ok {
+			businessObserved++
+		}
+		if r := latest[t.ID]; r != nil && probeRunOpen(r) {
+			queued++
+			switch r.Reason {
+			case "no_eligible_account", "accounts_busy":
+				waitAccounts++
+			case "budget_exhausted", "account_budget_exhausted":
+				waitBudget++
+			}
+		}
+	}
 	return ModelProbeSummary{EvidenceIncompleteUntil: s.modelProbe.EvidenceIncompleteUntil, ObservedTargets: observed, TotalTargets: len(targets), ExcludedTargets: excluded,
-		EffectiveIntervalMinutes: int(effective / time.Minute), StorageError: s.modelProbe.storageError, Settings: p.clone(), Runs: views, Accounts: s.probeAccountViewsLocked(now),
-		UsedRequests: used, RemainingRequests: max(0, p.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion}, nil
+		EffectiveIntervalMinutes: int(effective / time.Minute), StorageError: s.modelProbe.storageError, Settings: p.clone(), Runs: views, Accounts: accounts,
+		UsedRequests: used, RemainingRequests: max(0, p.GlobalDailyLimit-used), PausedUntil: s.modelProbe.PausedUntil, NextDue: due, Active: len(s.modelProbe.leases), RuleVersion: ModelProbeRuleVersion,
+		CheckedTargets: checked, BusinessObservedTargets: businessObserved, FailedTargets: failed, EligibleAccounts: eligible, WaitingAccounts: waitAccounts, WaitingBudget: waitBudget, Queued: queued, NextBudgetAt: budget.NextAt, LastChecks: checks, Network: network}, nil
 }
 
 // 清理展示历史不影响仍在滚动预算窗口内的尝试登记。
@@ -616,27 +686,7 @@ func (s *Store) pruneModelProbeLocked(now time.Time) error {
 			s.modelProbe.EvidenceIncompleteUntil = max(s.modelProbe.EvidenceIncompleteUntil, e.At.Add(10*time.Minute+time.Millisecond).UnixMilli())
 		}
 	}
-	// 账号滚动窗口：24 小时过期 + 账号数上限，保持状态有界（只作排序启发，不参与证据）。
-	windowCutoff := now.Add(-probeAccountWindowTTL).UnixMilli()
-	for id, w := range s.modelProbe.AccountWindows {
-		if w == nil || w.LastAt < windowCutoff {
-			delete(s.modelProbe.AccountWindows, id)
-		}
-	}
-	if len(s.modelProbe.AccountWindows) > probeAccountWindowLimit {
-		type aged struct {
-			id string
-			at int64
-		}
-		all := make([]aged, 0, len(s.modelProbe.AccountWindows))
-		for id, w := range s.modelProbe.AccountWindows {
-			all = append(all, aged{id: id, at: w.LastAt})
-		}
-		sort.Slice(all, func(i, j int) bool { return all[i].at < all[j].at })
-		for _, v := range all[:len(all)-probeAccountWindowLimit] {
-			delete(s.modelProbe.AccountWindows, v.id)
-		}
-	}
+	s.pruneProbeAccountWindowsLocked(now)
 	// 禁止窗口先落盘，即使随后清理失败也不能从缺失的缓存产生决定。
 	if err := s.persistProbeStateLocked(); err != nil {
 		return err
@@ -687,7 +737,7 @@ func (s *Store) StopModelProbes(now time.Time) error {
 		}
 		s.modelProbe.runs[r.ID] = &copy
 	}
-	return nil
+	return s.persistProbeStateLocked()
 }
 
 // 仅保存去敏观测，不读取日志或正文。业务证据与主动探测证据不互相凑数。

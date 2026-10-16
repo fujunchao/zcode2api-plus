@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -33,6 +34,7 @@ func ModelAttemptClient(client *http.Client) *http.Client {
 
 type proxyAttemptObservation struct {
 	once             sync.Once
+	healthOnce       sync.Once
 	store            *store.Store
 	account          *model.Account
 	egress           store.ProxyEgress
@@ -70,7 +72,84 @@ func BeginProxyAttempt(ctx context.Context, st *store.Store, acc *model.Account,
 	}
 	acc = acc.Clone()
 	value := ModelRequestObservation(acc, request, body, entry)
-	return context.WithValue(ctx, proxyObservationKey{}, &proxyAttemptObservation{store: st, account: acc, egress: egress, value: value, targetRef: observationRef(request.URL.String())}), release, nil
+	p := &proxyAttemptObservation{store: st, account: acc, egress: egress, value: value, targetRef: observationRef(request.URL.String())}
+	attemptCtx := context.WithValue(ctx, proxyObservationKey{}, p)
+	idle := st.TrackModelAccountUse(acc.ID)
+	var once sync.Once
+	finish := func() {
+		once.Do(func() {
+			// 没有走完整模型交付的路径也有终态；不把响应头或usage当成成功。
+			kind := "incomplete_response"
+			if p.responseStatus == 0 {
+				kind = "connection_failed"
+			} else if !p.responseVerified {
+				kind = "invalid_target"
+			} else if p.responseStatus >= 300 && p.responseStatus < 400 {
+				kind = "redirect_or_invalid_status"
+			}
+			observeModelAttemptHealth(attemptCtx, "", false, kind, time.Now())
+			idle()
+			release()
+		})
+	}
+	return attemptCtx, finish, nil
+}
+
+func modelAccountOutcomeKind(status int, code string, complete bool) string {
+	switch {
+	case complete && status >= 200 && status < 300 && code == "":
+		return "success"
+	case status == 405 && code == "3012":
+		return "risk_control"
+	case code == "3007" || code == "F001":
+		return "captcha_required"
+	case status == 401 || status == 403:
+		return "authentication_failed"
+	case status == 402 || code == "1005":
+		return "quota_exhausted"
+	case status == 429 || code == "3008" || code == "3009" || code == "3010":
+		return "rate_limited"
+	case status >= 500 || code != "":
+		return "upstream_error"
+	default:
+		return "invalid_response"
+	}
+}
+
+func observeModelAttemptHealth(ctx context.Context, code string, complete bool, kind string, now time.Time) {
+	p, _ := ctx.Value(proxyObservationKey{}).(*proxyAttemptObservation)
+	if p == nil {
+		return
+	}
+	p.healthOnce.Do(func() {
+		o := p.value
+		o.Status, o.BusinessCode, o.Complete, o.At = p.responseStatus, code, complete, now
+		if ctx.Err() != nil {
+			kind, o.Complete = "canceled", false
+		}
+		if kind == "invalid_target" || kind == "dispatch_changed" {
+			return
+		}
+		p.store.ObserveModelAccountOutcome(p.account, o, kind)
+	})
+}
+
+// ObserveModelAttemptError 区分真实连接失败与未派发；严格退役仍不接收这些错误。
+func ObserveModelAttemptError(ctx context.Context, err error, now time.Time) {
+	kind := "connection_failed"
+	if errors.Is(err, store.ErrProxyRetired) || errors.Is(err, store.ErrInvalidProxyRoute) || errors.Is(err, store.ErrStrictProxyPaused) || errors.Is(err, store.ErrInitializationUnavailable) {
+		kind = "dispatch_changed"
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		kind = "timeout"
+	}
+	observeModelAttemptHealth(ctx, "", false, kind, now)
+}
+
+// ObserveModelAttemptJSONError 记录HTTP 200内的业务错误，不混入完整成功或退役证据。
+func ObserveModelAttemptJSONError(ctx context.Context, code string, now time.Time) {
+	if code != "" && code != "0" {
+		observeModelAttemptHealth(ctx, code, false, modelAccountOutcomeKind(200, code, false), now)
+	}
 }
 
 // ModelRequestObservation 共用真实模型请求的去敏校验；不获取许可，也不产生调度副作用。
@@ -149,6 +228,7 @@ func ObserveProxyAttempt(ctx context.Context, status int, code string, complete 
 	}
 	// 交付层可能统一写 200；严格证据必须使用实际上游状态，不把 3xx 或异常响应算成功。
 	status = p.responseStatus
+	observeModelAttemptHealth(ctx, code, complete, modelAccountOutcomeKind(status, code, complete), now)
 	if !((status == 405 && code == "3012") || (complete && status >= 200 && status < 300)) {
 		return
 	}

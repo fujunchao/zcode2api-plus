@@ -29,3 +29,15 @@ test('有合格账号但没有完成巡检时应显示覆盖不足', () => {
   expect(healthStatus(data).level).not.toBe('ok')
   expect(healthStatus(data).text).toContain('覆盖')
 })
+
+test('网络异常不能被模型成功掩盖，网络单独启用不声称模型健康', () => {
+  const data = summary()
+  data.settings.network_enabled = true
+  data.checked_targets = 2
+  data.eligible_accounts = 1
+  data.network = { total: 2, checked: 2, failed: 1 }
+  expect(healthStatus(data).text).toContain('网络异常')
+  data.settings.enabled = false
+  data.network.failed = 0
+  expect(healthStatus(data).text).toBe('网络正常（模型未启用）')
+})

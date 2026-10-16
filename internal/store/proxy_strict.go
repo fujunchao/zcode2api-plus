@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/proxysub"
@@ -422,8 +423,12 @@ func (s *Store) ObserveProxyOutcome(acc *model.Account, egress ProxyEgress, o Pr
 		}
 	}
 	s.observeModelProbeBusinessLocked(acc, egress, o)
-	if o.Model == ModelProbeModel {
-		s.recordProbeAccountOutcomeLocked(acc.ID, o.At, probeSuccess(o), probeRisk(o))
+	if acc.Mode == "jwt" && probeTargetMatches(config.UpstreamZai, o) {
+		kind := "success"
+		if probeRisk(o) {
+			kind = "risk_control"
+		}
+		s.recordProbeAccountOutcomeLocked(acc.ID, o, "business", kind)
 	}
 	identity := egress.identity
 	if isDirect {

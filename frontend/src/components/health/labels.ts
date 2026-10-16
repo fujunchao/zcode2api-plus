@@ -22,12 +22,15 @@ export const labels: Record<string, string> = {
   connection_failed: '连接失败', timeout: '请求超时', canceled: '请求取消', invalid_request: '请求构造不满足契约',
   upstream_error: '其他上游错误', redirect_or_invalid_status: '重定向或异常状态', skipped_recent_success: '近期业务已成功，本轮免测', success: '完整模型成功',
   insufficient_probe_accounts: '可用探测账号不足两个，未执行删除',
+  account_budget_exhausted: '等待账号巡检预算恢复', accounts_busy: '等待空闲探测账号',
+  network_unavailable: '网络尚未通过检查，等待网络恢复',
 }
 
 /** 自动择优账号不可用的原因（后端 probeAccountEligibilityLocked）。 */
 export const accountReasons: Record<string, string> = {
   missing: '账号已不存在', initialization_managed: '初始化／固定出口托管，不可借用', not_jwt: '不是 JWT 账号',
   not_selectable: '停用、归档、冷却或额度耗尽', risk_isolation: '风控静默隔离中', quota_unknown: '额度未知', quota_empty: '5.3f 额度已用完',
+  account_budget_exhausted: '账号巡检预算已用完', business_busy: '正在处理业务，巡检暂避', probe_busy: '正在执行其他巡检',
 }
 
 export const numberFields = [
@@ -70,9 +73,23 @@ export function healthStatus(data: ModelProbeSummary, now = Date.now()): { level
   if (data.paused_until > now) return { level: 'warning', text: '对照已暂停（参考组不可用）' }
   if ((data.evidence_incomplete_until ?? 0) > now) return { level: 'warning', text: '严格删除暂停（证据不完整）' }
   if (!data.settings.enabled && !(data.settings.network_enabled ?? false)) return { level: 'off', text: '未启用' }
+  if (data.settings.network_enabled && (data.network?.failed ?? 0) > 0) return { level: 'warning', text: `${data.network!.failed} 条线路网络异常` }
   if (data.active > 0) return { level: 'active', text: `正在检查 ${data.active} 条线路` }
-  const suspects = data.runs.filter((r) => r.verdict === 'suspect').length
+  const suspects = Math.max(data.failed_targets ?? 0, data.runs.filter((r) => r.verdict === 'suspect').length)
   if (suspects > 0) return { level: 'warning', text: `${suspects} 条线路待核查` }
+  if (!data.settings.enabled) {
+    const network = data.network
+    return network && network.total > 0 && network.checked === network.total
+      ? { level: 'ok', text: '网络正常（模型未启用）' }
+      : { level: 'warning', text: '网络覆盖不足（模型未启用）' }
+  }
+  if (data.remaining_requests <= 0 || (data.waiting_budget ?? 0) > 0) return { level: 'warning', text: '等待巡检预算恢复' }
+  const eligible = data.eligible_accounts ?? (data.accounts ?? []).filter((a) => a.eligible).length
+  if (eligible === 0 || (data.waiting_accounts ?? 0) > 0) return { level: 'warning', text: '等待合格的空闲账号' }
+  if ((data.queued ?? 0) > 0) return { level: 'active', text: `${data.queued} 条线路等待检查` }
+  const total = targetCount(data)
+  if (total === 0 || (data.checked_targets ?? 0) < total) return { level: 'warning', text: `主动覆盖不足 ${data.checked_targets ?? 0}/${total}` }
+  if (data.settings.network_enabled && (!data.network || data.network.checked < data.network.total || data.network.total === 0)) return { level: 'warning', text: '网络覆盖不足' }
   return { level: 'ok', text: '正常' }
 }
 

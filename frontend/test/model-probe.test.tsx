@@ -11,9 +11,9 @@ function summary() {
   return {
     settings: { enabled: false, mode: 'observe', model: 'glm-5.3-flash', interval_minutes: 30,
       concurrency: 1, timeout_seconds: 30, global_daily_limit: 200, account_daily_limit: 100,
-      target_mode: 'manual' as 'auto' | 'manual', exclude_proxy_ids: [] as string[],
-      account_mode: 'dedicated' as 'auto' | 'dedicated',
-      account_ids: ['a'], target_proxy_ids: ['t'], reference_proxy_ids: ['r'],
+      target_mode: 'auto' as 'auto' | 'manual', exclude_proxy_ids: [] as string[],
+      account_mode: 'auto' as 'auto' | 'dedicated',
+      account_ids: [] as string[], target_proxy_ids: [] as string[], reference_proxy_ids: [] as string[],
       egress_groups: { t: '家庭出口', r: '参考出口' }, allow_direct_control: false, revision: 1 },
     runs: [] as Record<string, unknown>[], accounts: [] as Record<string, unknown>[],
     used_requests: 0, remaining_requests: 200, paused_until: 0,
@@ -125,20 +125,22 @@ test('自动覆盖无需手工选择：表格列出全部启用线路并展示�
   client.clear()
 })
 
-test('切换为自动择优需确认并提示解除专用角色', async () => {
+test('保存旧手工策略即可自动迁移，不再要求选账号但提示解除专用角色', async () => {
   const data = summary()
+  data.settings = { ...data.settings, target_mode: 'manual', account_mode: 'dedicated', account_ids: ['a'], target_proxy_ids: ['t'], reference_proxy_ids: ['r'] }
   const client = mount(data)
   await openSettings()
-  fireEvent.change(await screen.findByLabelText('账号来源'), { target: { value: 'auto' } })
+  expect(screen.queryByLabelText('账号来源')).toBeNull()
+  expect(screen.queryByLabelText('覆盖范围')).toBeNull()
   fireEvent.submit(screen.getByRole('form', { name: '模型巡检配置' }))
   const dialog = await screen.findByRole('alertdialog')
   expect(dialog.textContent).toContain('解除现有探测专用角色')
   fireEvent.click(within(dialog).getByRole('button', { name: '确认并保存' }))
-  await waitFor(() => expect(mock.api).toHaveBeenCalledWith('PUT', '/proxies/model-probe/settings', expect.objectContaining({ account_mode: 'auto' })))
+  await waitFor(() => expect(mock.api).toHaveBeenCalledWith('PUT', '/proxies/model-probe/settings', expect.objectContaining({ account_mode: 'auto', target_mode: 'auto', account_ids: [], target_proxy_ids: [], reference_proxy_ids: [] })))
   client.clear()
 })
 
-test('高级选项默认折叠：自动覆盖模式下不渲染线路与账号列表', async () => {
+test('高级选项默认折叠，展开后仍不要求目标和账号选择', async () => {
   const data = summary()
   data.settings = { ...data.settings, enabled: true, target_mode: 'auto', account_mode: 'auto', account_ids: [], target_proxy_ids: [], reference_proxy_ids: [] }
   const client = mount(data)
@@ -147,20 +149,22 @@ test('高级选项默认折叠：自动覆盖模式下不渲染线路与账号�
   expect(screen.queryByLabelText('覆盖范围')).toBeNull()
   expect(screen.queryByLabelText('账号来源')).toBeNull()
   fireEvent.click(await screen.findByRole('button', { name: /高级选项/ }))
-  expect(await screen.findByLabelText('覆盖范围')).toBeTruthy()
-  // 自动模式：只显示排除名单，不渲染手工目标勾选列表（参考线路区另有同名按钮，须限定作用域）。
-  const targetGroup = screen.getByLabelText('覆盖范围').closest('fieldset') as HTMLElement
+  expect(screen.queryByLabelText('覆盖范围')).toBeNull()
+  expect(screen.queryByLabelText('账号来源')).toBeNull()
+  const targetGroup = screen.getByRole('group', { name: '模型目标排除（可选）' })
   expect(within(targetGroup).queryByText('选择全部启用线路')).toBeNull()
+  expect(screen.getByRole('region', { name: '账号自动择优依据' })).toBeTruthy()
   client.clear()
 })
 
 test('摘要行在正常时只显示一行，异常时给出可读结论', async () => {
   const data = summary()
   data.settings = { ...data.settings, enabled: true, target_mode: 'auto', account_mode: 'auto' }
-  const client = mount(data)
+  const ready = { ...data, checked_targets: 2, total_targets: 2, eligible_accounts: 1 }
+  const client = mount(ready)
   expect(await screen.findByText('正常')).toBeTruthy()
   // 存储失败优先于其他状态，且不显示为「正常」。
-  client.setQueryData(['model-probe'], { ...data, storage_error: true })
+  client.setQueryData(['model-probe'], { ...ready, storage_error: true })
   expect(await screen.findByText('巡检已暂停：结果保存失败')).toBeTruthy()
   expect(screen.queryByText('正常')).toBeNull()
   client.clear()

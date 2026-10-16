@@ -33,9 +33,8 @@ func TestUnifiedNetworkMigrationKeepsObservationConsent(t *testing.T) {
 	}
 	defer other.Close()
 	p := other.ModelProbeSettings()
-	// v2.10.10 起迁移落到 HealthVersion=2：既有部署保留手工选择（manual/dedicated），
-	// 不得因升级自动获得全量覆盖或自动择优。
-	if !p.Enabled || !p.NetworkEnabled || p.Mode != "observe" || p.HealthVersion != 2 || p.MigrationNotice == "" || p.TargetMode != "manual" || p.AccountMode != "dedicated" {
+	// v3只取消人工目标／账号选择，仍保留网络功能和原来的观察处置授权。
+	if !p.Enabled || !p.NetworkEnabled || p.Mode != "observe" || p.HealthVersion != 3 || p.MigrationNotice == "" || p.TargetMode != "auto" || p.AccountMode != "auto" {
 		t.Fatalf("迁移扩大了自动处置权限或遗失旧网络功能：%+v", p)
 	}
 	_ = f

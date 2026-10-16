@@ -110,6 +110,13 @@ export interface ModelProbeAccountView {
   recent_total: number
   last_success_at?: number
   last_pick_at?: number
+  probe_success?: number
+  probe_total?: number
+  neutral_failures?: number
+  canceled?: number
+  score?: number
+  remaining_requests?: number
+  active_requests?: number
 }
 
 export interface NetworkHealthRecord {
@@ -182,6 +189,16 @@ export interface ModelProbeSummary {
   next_due: Record<string, number>
   active: number
   rule_version: string
+  checked_targets?: number
+  business_observed_targets?: number
+  failed_targets?: number
+  eligible_accounts?: number
+  waiting_accounts?: number
+  waiting_budget?: number
+  queued?: number
+  next_budget_at?: number
+  last_checks?: Record<string, number>
+  network?: { total: number; checked: number; failed: number }
 }
 
 /** 套餐领取状态（后端 model.ClaimState）。 */

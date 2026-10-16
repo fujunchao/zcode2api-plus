@@ -777,6 +777,7 @@ func (p *Pool) attemptUpstreamOnce(
 	resp, err := client.Do(httpReq)
 	finishAttempt(resp, err)
 	if err != nil {
+		gateway.ObserveModelAttemptError(ctx, err, time.Now())
 		return false, err
 	}
 	gateway.ConfirmProxyAttemptResponse(ctx, resp)
@@ -952,6 +953,7 @@ func (p *Pool) handleUpstreamJSON(
 		return false, errNetwork{err.Error()}
 	}
 	text := string(raw)
+	gateway.ObserveModelAttemptJSONError(ctx, gateway.UpstreamBusinessCode(text), time.Now())
 	switch code := gateway.UpstreamBusinessCode(text); {
 	case code == "1005":
 		// 每日额度耗尽：标该模型耗尽后换号（与 sync 同）。
