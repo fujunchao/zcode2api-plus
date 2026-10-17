@@ -56,6 +56,11 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 默认客户端版本已同步至 `3.15.3`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。版本特定的内部状态与回滚要求见下方发布说明。
 
+`v2.10.23-go` 新增 **单线绑定容量口径**：`ZCODE_PROXY_MAX_BINDINGS_PER_LINE`（默认 8）。
+选线仍是「绑定最少优先」，因此它不改变分配结果；真实价值是当选中的最空闲线路都已
+超限时记 `line-cap capacity_short=1`（说明线路数不足、该扩池），并在批量改派后记
+`top_targets=p1:6,p2:4` 让落点可核对。详见 [发布说明](docs/releases/v2.10.23-go.md)。
+
 `v2.10.22-go` 把 **405 脏线清理** 接上定向模型巡检：线路被隔离后自动入队一次带凭据的
 模型请求（同线路 30 分钟一次、全局每小时 12 次预算），健康结论提前解封并清零档位，
 失败结论保持隔离、删除仍只由既有退休链完成；`stage=confirmed` 日志补 `removed_ids`
