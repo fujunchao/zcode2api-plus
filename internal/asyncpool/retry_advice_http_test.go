@@ -36,6 +36,12 @@ func asyncErrorFromSSE(t *testing.T, raw string) map[string]any {
 }
 
 func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.T) {
+	// 阈值置 1：本用例只验证「票据终态 + 等待建议」，需要首个 405 就落进请求级
+	// 分支；默认阈值 3 时同一条线路上的账号会继续换号，不会登记重放防护。
+	oldThreshold := gateway.RiskControlRequestLevelThreshold
+	gateway.RiskControlRequestLevelThreshold = 1
+	t.Cleanup(func() { gateway.RiskControlRequestLevelThreshold = oldThreshold })
+
 	p, st, cm, _ := newTestPool(t)
 	oldEnabled := config.AsyncEnabled
 	config.AsyncEnabled, config.AsyncMaxRetries = true, 3
@@ -133,7 +139,7 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		} else if errorObject["type"] != "risk_control_cooldown" {
 			t.Fatal("后续命中应明确为本地保护终态")
 		}
-		if header.Get("Retry-After") != "" || calls.Load() != 2 {
+		if header.Get("Retry-After") != "" || calls.Load() != 1 {
 			t.Fatal("已发送响应头的票据不能回改状态/头，也不能为重投继续消耗账号")
 		}
 		if len(details) != 2 {
@@ -141,7 +147,7 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		}
 	}
 	_, raw := post("另一个正常请求")
-	if !strings.Contains(raw, "event: done") || strings.Contains(raw, "wait_same_gateway") || calls.Load() != 4 {
+	if !strings.Contains(raw, "event: done") || strings.Contains(raw, "wait_same_gateway") || calls.Load() != 2 {
 		t.Fatal("局部风控保护不能全局关闭其他请求的 3009 原地重试")
 	}
 	captureMu.Lock()

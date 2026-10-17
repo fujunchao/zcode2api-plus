@@ -45,7 +45,8 @@ func TestRetryAdviceCoversRiskExhaustionAndReplay(t *testing.T) {
 			t.Fatalf("需要明确等待建议: Retry-After=%q policy=%q", resp.Header.Get("Retry-After"), resp.Header.Get("X-Zcode2api-Retry-Policy"))
 		}
 	}
-	if f.callCount() != 2 {
+	// 阈值 1 时首个账号即触发请求级：整轮只出站一次，第二次入站零出站。
+	if f.callCount() != 1 {
 		t.Fatalf("第二次入站必须零出站，实际总数=%d", f.callCount())
 	}
 }
