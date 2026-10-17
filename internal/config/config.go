@@ -282,6 +282,14 @@ var (
 	// 选号与恢复共用本值，RiskSilentWindow 是唯一换算点；不自动复活失效账号。
 	RiskSilentHours = envInt("ZCODE_RISK_SILENT_HOURS", 0)
 
+	// SelectExpireFirstDays 选号「到期门槛」窗口（天）：持有 N 天内到期、且不会自动
+	// 刷新的额度列（one_time / 周月套餐）的账号优先。0 = 关闭。
+	//
+	// 解决的是「快过期额度还没用就作废」：原第 4 层只按剩余多少排序，与到期方向相反。
+	// 门槛只收窄候选，不改变并列组内的轮询——同规格账号整体并列时行为与旧版一致。
+	// 日额度（跨度 ≈24h）不算，避免把「每天刷新」误当损耗。
+	SelectExpireFirstDays = max(0, envInt("ZCODE_SELECT_EXPIRE_FIRST_DAYS", 3))
+
 	// 官方客户端版本号：随请求头 / URL 参数上行，用于伪装成官方客户端。
 	// 2026-09-17 由 3.7.7 升至 3.11.2，与 zcode-switch 的 CLIENT_APP_VERSION 对齐；
 	// 2026-09-23 由 3.11.2 升至 3.14.3（本机实装客户端版本，激活失效排查项之一，

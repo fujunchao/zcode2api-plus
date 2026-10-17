@@ -1818,6 +1818,24 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 	if len(pool) == 0 {
 		return nil
 	}
+	// 到期门槛：持有「窗口内到期、且不会自动刷新」额度列的账号优先。
+	//
+	// 为什么插在 promo 之前：promo 层只认 one_time，但 one_time 也可能 20 天后才到期；
+	// 而「套餐 2 天后结束」的额度更急。两者都急时按各自层次走，不互相吞掉。
+	// 为什么是门槛而不是排序：按到期排序再取前 N 个会把流量压到少数账号（zcode-pool
+	// 的 take(4) 就是热点来源）；这里只收窄候选，组内仍然轮询。
+	if days := config.SelectExpireFirstDays; days > 0 && modelName != "" {
+		window := time.Duration(days) * 24 * time.Hour
+		var expiring []*model.Account
+		for _, a := range pool {
+			if _, ok := a.SoonestNonRefreshingExpiry(modelName, now, window); ok {
+				expiring = append(expiring, a)
+			}
+		}
+		if len(expiring) > 0 {
+			pool = expiring
+		}
+	}
 	// 持有未耗尽一次性优惠（period 含 one_time 且 remaining>0）的账号优先：
 	// 优惠额度不用会过期，每日体验额度次日刷新；优惠组耗尽后自然回落全池轮询。
 	var promo, regular []*model.Account
@@ -1901,6 +1919,10 @@ type PoolStat struct {
 	// 的记本桶——每个账号只进一个桶，「为什么不可选」唯一。
 	RiskSilent int
 	Active     int // 通过健康门槛（Select 第一层，含静默期闸门）的账号数
+	// ExpiringSoon Active 账号中持有「窗口内到期且不会自动刷新」额度的数量
+	// （config.SelectExpireFirstDays，0=关闭时恒为 0）。用于解释到期门槛为何收窄候选；
+	// 门控本身不改变这些账号的可选性。
+	ExpiringSoon int
 	// CoolingEarliest 冷却账号中最早的到期时间（unix 秒）；无冷却账号为 nil。
 	CoolingEarliest *float64
 	// CoolingByKind 冷却账号按 last_error_kind 细分（upstream_unavailable /
@@ -1967,6 +1989,11 @@ func (s *Store) PoolStats(provider, modelName string) PoolStat {
 				stat.ModelStat = map[string]int{}
 			}
 			stat.ModelStat[a.ModelAvailability(modelName)]++
+			if days := config.SelectExpireFirstDays; days > 0 {
+				if _, ok := a.SoonestNonRefreshingExpiry(modelName, now, time.Duration(days)*24*time.Hour); ok {
+					stat.ExpiringSoon++
+				}
+			}
 		}
 	}
 	return stat

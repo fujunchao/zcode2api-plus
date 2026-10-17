@@ -603,6 +603,108 @@ func (a *Account) ModelAvailability(model any) string {
 	return "unknown"
 }
 
+// SoonestNonRefreshingExpiry 返回该模型「会作废且将在 window 内到期」的最早到期时刻
+// （Unix 秒，含小数）。第二个返回值为 false 表示没有这类额度列。
+//
+// 用途：选号的到期门槛。只认**不会自动刷新**的额度列：
+//   - period 含 one_time（活动/一次性额度）；
+//   - 或 period_start 与 period_end 都是数值且跨度 > 36h（周/月/套餐周期）。
+//
+// 日额度（跨度 ≈24h）刻意不算：它次日刷新，没用完不等于浪费，提前抢只会打乱轮询。
+//
+// 到期时刻优先取 expires_at（更像套餐/活动结束），缺失时回落到 period_end；单位按
+// 量级归一（秒/毫秒/微秒/纳秒）。无法识别的一律跳过——宁可少提一个账号，也不能把
+// 长期池误判成即将作废。
+func (a *Account) SoonestNonRefreshingExpiry(model any, now time.Time, window time.Duration) (float64, bool) {
+	if a == nil || window <= 0 {
+		return 0, false
+	}
+	target := NormalizeModelName(model)
+	if target == "" {
+		return 0, false
+	}
+	limit := float64(now.Add(window).UnixNano()) / 1e9
+	nowSec := float64(now.UnixNano()) / 1e9
+	best, found := 0.0, false
+	for _, quota := range a.QuotaEntriesForModel(target) {
+		if !quotaHasBalance(quota) || !quotaNonRefreshing(quota) {
+			continue
+		}
+		expire, ok := quotaExpiryUnix(quota)
+		// 已经过期但快照仍显示有余额：额度其实已作废，提上去只会白打一次上游。
+		if !ok || expire > limit || expire <= nowSec {
+			continue
+		}
+		if !found || expire < best {
+			best, found = expire, true
+		}
+	}
+	return best, found
+}
+
+// quotaHasBalance 该额度列是否仍有余额。available 优先于 remaining（与
+// UsableQuotaForModel 同口径：available 是「现在还能用多少」）。
+func quotaHasBalance(quota map[string]any) bool {
+	for _, key := range []string{"available", "remaining"} {
+		if v, ok := quotaNumber(quota, key); ok {
+			return v > 0
+		}
+	}
+	return false
+}
+
+// quotaExpiryUnix 取额度列的到期时刻（Unix 秒），expires_at 优先、period_end 兜底。
+func quotaExpiryUnix(quota map[string]any) (float64, bool) {
+	for _, key := range []string{"expires_at", "period_end"} {
+		v, ok := quotaNumber(quota, key)
+		if !ok {
+			continue
+		}
+		if sec, ok := normalizeUnixSeconds(v); ok {
+			return sec, true
+		}
+	}
+	return 0, false
+}
+
+// quotaNonRefreshing 该额度列是否「用不完就作废」而不是按日刷新。
+func quotaNonRefreshing(quota map[string]any) bool {
+	if period, _ := quota["period"].(string); strings.Contains(period, "one_time") {
+		return true
+	}
+	start, okStart := quotaNumber(quota, "period_start")
+	end, okEnd := quotaNumber(quota, "period_end")
+	if !okStart || !okEnd {
+		return false
+	}
+	startSec, okS := normalizeUnixSeconds(start)
+	endSec, okE := normalizeUnixSeconds(end)
+	if !okS || !okE {
+		return false
+	}
+	return endSec-startSec > 36*3600
+}
+
+// normalizeUnixSeconds 把秒/毫秒/微秒/纳秒时间戳统一成秒。
+// 阈值按当前量级划线（秒 ~1e9、毫秒 ~1e12、微秒 ~1e15、纳秒 ~1e18），
+// 超出识别范围的值返回 false，由调用方跳过该列。
+func normalizeUnixSeconds(v float64) (float64, bool) {
+	switch {
+	case v < 1e9:
+		// 2001 年之前的「绝对时间戳」不可能来自上游套餐字段；更可能是
+		// 相对秒数（如 TTL=3600）。无法确定语义时跳过，别把它当成 1970 年。
+		return 0, false
+	case v >= 1e17:
+		return v / 1e9, true
+	case v >= 1e14:
+		return v / 1e6, true
+	case v >= 1e11:
+		return v / 1e3, true
+	default:
+		return v, true
+	}
+}
+
 // IsModelSelectable 账号全局可用且指定模型未耗尽时才允许调度。
 func (a *Account) IsModelSelectable(model any, now time.Time) bool {
 	if !a.IsSelectable(now) {

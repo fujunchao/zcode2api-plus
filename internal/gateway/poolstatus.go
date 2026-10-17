@@ -129,6 +129,11 @@ func PoolStatusDetails(stat store.PoolStat, modelName string) map[string]any {
 	if stat.CoolingEarliest != nil {
 		details["cooling_earliest"] = *stat.CoolingEarliest
 	}
+	// 到期门槛的观测口径：多少可用账号持有窗口内会作废的额度。
+	// 只在开启且确实存在时输出，避免给老部署增加无意义字段。
+	if stat.ExpiringSoon > 0 {
+		details["expiring_soon"] = stat.ExpiringSoon
+	}
 	if len(stat.CoolingByKind) > 0 {
 		details["cooling_by_kind"] = stat.CoolingByKind
 	}
