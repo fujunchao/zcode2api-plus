@@ -79,7 +79,7 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		captureMu.Unlock()
 		// 「另一个正常请求」单独走 3009 → 原地重试 → 成功的路径：它不该被前一个
 		// 内容的局部风控保护波及（阈值置 1 时任何 405 都会登记保护，故这里不返回 405）。
-		if firstContent(body) == "另一个正常请求" {
+		if strings.Contains(firstContent(body), "另一个正常请求") {
 			if otherCalls.Add(1) == 1 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -184,12 +184,23 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 }
 
 // firstContent 取出首条用户消息文本，供合成上游按内容分流。
+// 上游收到的是归一化后的 body：content 可能是字符串，也可能是 text block 数组。
 func firstContent(body map[string]any) string {
 	msgs, ok := body["messages"].([]any)
 	if !ok || len(msgs) == 0 {
 		return ""
 	}
 	m, _ := msgs[0].(map[string]any)
-	s, _ := m["content"].(string)
-	return s
+	switch v := m["content"].(type) {
+	case string:
+		return v
+	case []any:
+		for _, block := range v {
+			bm, _ := block.(map[string]any)
+			if s, ok := bm["text"].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
