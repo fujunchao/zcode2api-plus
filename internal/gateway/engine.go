@@ -187,6 +187,14 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		// 直接调用引擎也冻结一次入口身份，换号/重试不能冒充独立内容输入。
 		diag.GatewayRequestID = config.NewUUIDv4()
 	}
+	// 请求级墙钟预算（0=关闭）：只回答「还能不能再发起一次尝试」，**不派生 ctx**。
+	// 已经开始的流式交付必须能跑完——掐断长回答比慢更糟。判定点有两处：
+	//   - 每轮选号之前（本循环）；
+	//   - tryAccount 内每次出站之前（捕获验证码等待等耗时）。
+	var deadlineAt time.Time
+	if config.RequestDeadline > 0 {
+		deadlineAt = e.now().Add(config.RequestDeadline)
+	}
 	// 重放防护（P1-3）：同一份内容刚刚被判定请求级风控 ⇒ TTL 内直接快速失败。
 	// 上游 405 是两段式（内容触发 + 账号标记），请求级判定成立时每个被尝试的账号都
 	// 已被服务端标记；窗口期内继续接同内容请求只会把下一个健康账号再标记一个
@@ -234,6 +242,13 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	timeoutRetries := 0
 	probeTried := false
 	for range MaxAccountAttempts {
+		if !deadlineAt.IsZero() && !e.now().Before(deadlineAt) {
+			// 预算已在上一轮尝试里用尽：不再选号，也不惩罚任何账号。
+			diag.DeadlineHit = true
+			web.ReqErr(reqID, fmt.Sprintf("请求总耗时超过 %s，已停止换号（已尝试 %d 个账号）",
+				config.RequestDeadline, diag.Attempts))
+			return requestDeadlineResult(diag.Attempts)
+		}
 		acc := e.Store.SelectAvoiding(model.ProviderZai, tried, modelName, avoid)
 		var probe *store.QuotaProbe
 		if acc == nil && !probeTried && ctx.Err() == nil {
@@ -261,7 +276,7 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 					}
 				}()
 			}
-			return e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, attr, deliver, diag, scope, timeoutRetries)
+			return e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, attr, deliver, diag, scope, timeoutRetries, deadlineAt)
 		}()
 		if res.retrySame {
 			continue
@@ -324,6 +339,7 @@ func (e *Engine) tryAccount(
 	diag *ReqDiag,
 	scope *RiskScope,
 	timeoutRetries int,
+	deadlineAt time.Time,
 ) attemptResult {
 	// JWT 决定鉴权、system 和错误分类；是否取验证码由模型专用入口独立判断。
 	isJWT := acc.Mode == "jwt"
@@ -341,6 +357,18 @@ func (e *Engine) tryAccount(
 	budget := 1 + MaxCaptchaRetries + len(e.BusyRetryDelays) + MaxRateLimitRetries + len(e.OverloadRetryDelays)
 
 	for range budget {
+		// 验证码求解、3010 等待等都可能吃掉时间：每次真正出站前再判一次总预算。
+		// 这里只结束请求，不标记账号——等待太久不是账号的错。
+		if !deadlineAt.IsZero() && !e.now().Before(deadlineAt) {
+			if diag != nil {
+				diag.DeadlineHit = true
+			}
+			attempts := 0
+			if diag != nil {
+				attempts = diag.Attempts
+			}
+			return attemptResult{final: requestDeadlineResult(attempts)}
+		}
 		// x-request-id 按**上游 HTTP 尝试**换新：官方同一轮次（queryId 不变）内每次
 		// attempt 都换新 requestId（CLI 日志实证）。本循环内的验证码重试等多次出站
 		// 同样如此；session/trace/query 保持（轮次与会话连续）。
@@ -427,7 +455,28 @@ func (e *Engine) tryAccount(
 		defer release()
 		// 首字节预算：覆盖建连 + 上传 + 收到响应头。收到响应头即停表（Headers），
 		// 长流不受影响；Stop 在本次尝试结束时释放。
-		watchdog := newFirstByteWatchdog(attemptCtx, config.UpstreamFirstByteTimeout, egress.Identity())
+		//
+		// 剩余总预算不足时按剩余收紧：否则最后一次尝试会再白等满 90s，最坏时叠加成
+		// 450s。只用 config 值（>0）时才收紧——关掉首字节预算的部署不应被总预算
+		// 悄悄打开看门狗。
+		firstByteBudget := config.UpstreamFirstByteTimeout
+		if firstByteBudget > 0 && !deadlineAt.IsZero() {
+			remaining := deadlineAt.Sub(e.now())
+			if remaining <= 0 {
+				if diag != nil {
+					diag.DeadlineHit = true
+				}
+				attempts := 0
+				if diag != nil {
+					attempts = diag.Attempts
+				}
+				return attemptResult{final: requestDeadlineResult(attempts)}
+			}
+			if remaining < firstByteBudget {
+				firstByteBudget = remaining
+			}
+		}
+		watchdog := newFirstByteWatchdog(attemptCtx, firstByteBudget, egress.Identity())
 		defer watchdog.Stop()
 		httpReq = httpReq.WithContext(watchdog.Context())
 		if diag != nil {
@@ -1224,6 +1273,19 @@ func errResultWithDetails(status int, errType, msg string, details map[string]an
 			"details": details,
 		}},
 	}
+}
+
+// requestDeadlineResult 请求级墙钟预算用尽时的终态。
+//
+// 与 no_available_account 刻意分开：池子里可能仍有可用账号，失败原因是「等太久」
+// 而不是「没号」。客户端据此可以选择重试，而不用去后台查账号状态。
+func requestDeadlineResult(attempts int) runResult {
+	return errResultWithDetails(http.StatusServiceUnavailable, "request_deadline_exceeded",
+		fmt.Sprintf("请求总耗时超过 %s，已停止换号（已尝试 %d 个账号）", config.RequestDeadline, attempts),
+		map[string]any{
+			"attempts":         attempts,
+			"deadline_seconds": int(config.RequestDeadline.Seconds()),
+		})
 }
 
 // passthroughBodyWithType 解析上游错误体透传；解析失败时构造兜底错误结构。

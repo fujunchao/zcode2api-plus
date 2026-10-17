@@ -171,6 +171,16 @@ var (
 	UpstreamFirstByteTimeout = time.Duration(max(0, envInt("ZCODE_UPSTREAM_FIRST_BYTE_TIMEOUT", 90))) * time.Second
 	// UpstreamTimeoutRetries 上游 408/524 的换号重试次数；0 关闭。
 	UpstreamTimeoutRetries = max(0, envInt("ZCODE_UPSTREAM_TIMEOUT_RETRIES", 1))
+	// RequestDeadline 单次请求的墙钟总预算；0 关闭。
+	//
+	// 首字节预算只约束「一次尝试」，换号重试仍会各拿一份预算：MaxAccountAttempts=5
+	// 时最坏是 5×90s=450s（2026-10-17：5.5MB 请求在 5 条慢线上仍可能转圈 7 分钟）。
+	// 本预算从进入 RunMessages 起算，只在「准备发起下一次尝试」前判定——**不派生
+	// ctx**，已经开始的流式交付不受影响（掐断长回答比慢更糟）。
+	//
+	// 240s 的依据：实测正常大包首字节 30–65s，两次尝试（首次 + 一次换线）≈130s，
+	// 留一倍余量；同时把最坏 450s 压到 240s。
+	RequestDeadline = time.Duration(max(0, envInt("ZCODE_REQUEST_DEADLINE_SECONDS", 240))) * time.Second
 )
 
 // ── 上游风控冷却 ────────────────────────────────────────────────────────────

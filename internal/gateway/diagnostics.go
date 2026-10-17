@@ -38,10 +38,13 @@ type ReqDiag struct {
 	InputRef         string // 入口内容引用，与重放保护键一致；不等于整形后的 BodyHash。
 	ReplayBlocked    bool
 	ReplayWait       time.Duration
-	preserveContext  bool
-	shape            requestShape
-	outbound         outboundSnapshot
-	lastAttemptBase  string
+	// DeadlineHit 请求级墙钟预算（config.RequestDeadline）在收尾前用尽。
+	// 只用于诊断：预算命中不惩罚账号，也不代表上游或账号有问题。
+	DeadlineHit     bool
+	preserveContext bool
+	shape           requestShape
+	outbound        outboundSnapshot
+	lastAttemptBase string
 
 	BodyBytes        int    // 真正发给上游的请求体字节数（注入 system 之后）
 	BodyHash         string // 请求体的 sha256 前 12 位十六进制；空串 = 未构建出请求体
@@ -204,9 +207,9 @@ func (d *ReqDiag) Format() string {
 	// 与 bodyhash 的「空串 = 没构建出请求体」是两回事。
 	msg += fmt.Sprintf(" bodyhash=%s riskscope=%d",
 		dashText(d.BodyHash), d.RiskAccounts)
-	msg += fmt.Sprintf(" ts=%s started_at=%s gateway_request_id=%q protocol=%s input_ref=%s upstream_attempts=%d replay_blocked=%d replay_wait_ms=%d",
+	msg += fmt.Sprintf(" ts=%s started_at=%s gateway_request_id=%q protocol=%s input_ref=%s upstream_attempts=%d replay_blocked=%d replay_wait_ms=%d deadline_hit=%d",
 		diagnosticTime(d.startedAt.Add(d.total)), diagnosticTime(d.startedAt), d.GatewayRequestID, d.Protocol,
-		dashText(d.InputRef), d.upstreamAttempts, boolToInt(d.ReplayBlocked), d.ReplayWait.Milliseconds())
+		dashText(d.InputRef), d.upstreamAttempts, boolToInt(d.ReplayBlocked), d.ReplayWait.Milliseconds(), boolToInt(d.DeadlineHit))
 	msg += d.shape.format(d.preserveContext)
 	return msg
 }
