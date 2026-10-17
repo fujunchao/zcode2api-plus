@@ -92,6 +92,12 @@ type Store struct {
 	line405               line405State                   // 线路级 405 画像与隔离，保存于内部 meta，不进入设置快照。
 	proxyRelaxLoggedAt    int64                          // 选线放宽日志限频（unix ms），仅用于避免日志刷屏。
 	line405RelaxLoggedAt  int64                          // 线路 405 隔离放宽日志限频（unix ms）。
+	lineCapRelaxLoggedAt  int64                          // 单线绑定软上限放宽日志限频（unix ms）。
+	// 定向模型巡检限频与预算：线路隔离只说明「这条线跑不动模型」，要真正清出池子
+	// 得靠巡检。两个字段都是内存态——重启后重新累计，不影响任何正确性。
+	line405ProbeAt    map[string]time.Time // profileID → 最近一次入队时刻
+	line405ProbeHour  int64                // 预算窗口（unix 小时）
+	line405ProbeCount int                  // 窗口内已入队次数
 	// account405 记录每个账号最近一次 405 的出口线路，用于区分「线路的锅」与
 	// 「账号的锅」：同号换过线仍 405 才升账号冷却。内存态，重启丢失只影响一次判定。
 	account405 map[string]account405Mark

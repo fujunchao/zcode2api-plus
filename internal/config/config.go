@@ -295,6 +295,16 @@ var (
 	// 超过这个量级仍 405 的线路应当被巡检删除，而不是无限期隔离。
 	Line405MaxQuarantineMinutes = max(1, envInt("ZCODE_LINE405_MAX_QUARANTINE_MINUTES", 240))
 
+	// Line405ProbeCooldownMinutes 同一条线路触发定向模型巡检的最小间隔（分钟）。
+	// 隔离续期不会重复入队：脏线往往在几次 405 之内连续升档，重复巡检只是烧额度。
+	Line405ProbeCooldownMinutes = max(0, envInt("ZCODE_LINE405_PROBE_COOLDOWN_MINUTES", 30))
+
+	// Line405ProbePerHour 定向模型巡检的全局每小时上限（0 = 只隔离、不巡检）。
+	//
+	// 巡检要消耗账号额度，而免费代理池里「被隔离的线」可能一下几十条；不设预算等于
+	// 拿账号池替脏线买单。超限只记日志，隔离本身不受影响。
+	Line405ProbePerHour = max(0, envInt("ZCODE_LINE405_PROBE_PER_HOUR", 12))
+
 	// RiskRequestLevelLines 判定「请求级风控」所需的不同干净线路数。
 	//
 	// 旧版数的是账号：2 个账号各 405 一次就判内容级。2026-10-17 日志证明这在脏线

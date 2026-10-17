@@ -13,6 +13,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -47,6 +48,13 @@ type Line405Failure struct {
 	FirstAt         int64 `json:"first_at"`
 	LastAt          int64 `json:"last_at"`
 	QuarantineUntil int64 `json:"quarantine_until,omitempty"`
+	// ProbeState 定向模型巡检状态：none / queued / healthy / failed。
+	//
+	// 隔离只让这条线退出选号，真正决定「删不删」的是巡检：网络探针是匿名 GET，
+	// 脏 IP 对 GET 是通的，结构上永远测不到 405。这里记录最近一次结论，供后台与
+	// 日志对齐「隔离中」和「正在验证」两种不同状态。
+	ProbeState string `json:"probe_state,omitempty"`
+	ProbeAt    int64  `json:"probe_at,omitempty"`
 }
 
 type line405State struct {
@@ -96,11 +104,113 @@ func (s *Store) RecordLine405(e ProxyEgress, now time.Time) Line405Decision {
 	if until.UnixMilli() > ent.QuarantineUntil {
 		ent.QuarantineUntil = until.UnixMilli()
 	}
+	decision := Line405Decision{Action: "quarantine", ProfileID: ent.ProfileID, Until: until, Strikes: ent.Strikes}
+	// 隔离生效后触发一次定向模型巡检：隔离只是「暂时别派发」，把它真正清出池子
+	// 需要一次带凭据的模型请求。限频与预算都在这个函数内判定，失败不影响隔离。
+	s.maybeQueueLine405ProbeLocked(&ent, now)
 	s.line405.Entries[e.identity] = ent
 	if err := s.commitLine405Locked(now); err != nil {
 		web.Warn("line405", "线路 405 状态落库失败: "+err.Error())
 	}
-	return Line405Decision{Action: "quarantine", ProfileID: ent.ProfileID, Until: until, Strikes: ent.Strikes}
+	return decision
+}
+
+// maybeQueueLine405ProbeLocked 为刚被隔离的线路入队一次定向模型巡检。
+//
+// 调用方必须持有 s.mu：这里用 queueModelProbeLocked 而不是导出的 QueueModelProbe，
+// 后者会再次加锁（自锁）。入队成功只表示「已排队」，Manager 在下一个 tick 通过
+// TakeModelProbe 取走，30–60 秒的延迟对隔离场景完全可接受。
+func (s *Store) maybeQueueLine405ProbeLocked(ent *Line405Failure, now time.Time) {
+	if ent == nil || ent.ProfileID == "" {
+		return
+	}
+	limit := config.Line405ProbePerHour
+	if limit <= 0 {
+		web.Warn("line405-probe", fmt.Sprintf("skipped id=%s reason=disabled", ent.ProfileID))
+		return
+	}
+	cooldown := time.Duration(config.Line405ProbeCooldownMinutes) * time.Minute
+	if last, ok := s.line405ProbeAt[ent.ProfileID]; ok && cooldown > 0 && now.Sub(last) < cooldown {
+		web.Warn("line405-probe", fmt.Sprintf("skipped id=%s reason=cooldown", ent.ProfileID))
+		return
+	}
+	hour := now.Truncate(time.Hour).Unix()
+	if s.line405ProbeHour != hour {
+		s.line405ProbeHour, s.line405ProbeCount = hour, 0
+	}
+	if s.line405ProbeCount >= limit {
+		web.Warn("line405-probe", fmt.Sprintf("skipped id=%s reason=budget used=%d limit=%d", ent.ProfileID, s.line405ProbeCount, limit))
+		return
+	}
+	if _, err := s.queueModelProbeLocked(ent.ProfileID, "line405", now); err != nil {
+		reason := "unavailable"
+		if errors.Is(err, ErrModelProbeUnavailable) {
+			// 巡检关闭 / 目标不在覆盖范围：静默跳过，隔离照常生效。
+			reason = "disabled"
+		}
+		web.Warn("line405-probe", fmt.Sprintf("skipped id=%s reason=%s", ent.ProfileID, reason))
+		return
+	}
+	if s.line405ProbeAt == nil {
+		s.line405ProbeAt = map[string]time.Time{}
+	}
+	s.line405ProbeAt[ent.ProfileID] = now
+	s.line405ProbeCount++
+	ent.ProbeState, ent.ProbeAt = "queued", now.UnixMilli()
+	web.Warn("line405-probe", fmt.Sprintf("queued id=%s source=line405 budget=%d/%d", ent.ProfileID, s.line405ProbeCount, limit))
+}
+
+// ApplyLine405ProbeVerdict 把一次模型巡检的结论回写到线路画像。
+//
+// 只做两件事：健康结论提前解封；失败结论保留隔离并记状态。删除永远由既有退休链
+// （retireModelProbeLocked → startStrictRetirementLocked）完成，这里绝不自己删——
+// 否则会绕过「两轮确认 + 差分对照 + 保护名单 + 配置代次」四道闸。
+func (s *Store) ApplyLine405ProbeVerdict(profileID, verdict string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applyLine405ProbeVerdictLocked(profileID, verdict, now)
+}
+
+func (s *Store) applyLine405ProbeVerdictLocked(profileID, verdict string, now time.Time) {
+	if s.strictClosed || profileID == "" {
+		return
+	}
+	state := ""
+	switch verdict {
+	case "healthy_recent", "mixed", "account_correlated":
+		// 目标线路自己跑通了一次，或问题出在账号上：线路本身可用。
+		state = "healthy"
+	case "route_correlated", "suspect":
+		// 确认问题在线路上；删除交给退休链，这里只保持隔离并留痕。
+		state = "failed"
+	default:
+		return
+	}
+	var profile ProxyProfile
+	found := false
+	for _, p := range s.listProxyProfilesLocked() {
+		if p.ID == profileID {
+			profile, found = p, true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	identity := strictProxyIdentity(profile.URL)
+	ent, ok := s.line405.Entries[identity]
+	if !ok || ent.Generation != profile.Generation {
+		return
+	}
+	ent.ProbeState, ent.ProbeAt = state, now.UnixMilli()
+	if state == "healthy" {
+		ent.Consecutive405, ent.Strikes, ent.QuarantineUntil = 0, 0, 0
+	}
+	s.line405.Entries[identity] = ent
+	if err := s.commitLine405Locked(now); err != nil {
+		web.Warn("line405", "线路 405 状态落库失败: "+err.Error())
+	}
+	web.Warn("line405-probe", fmt.Sprintf("verdict=%s id=%s", state, profileID))
 }
 
 // RecordLineOK 记录一次完整成功：清零连续计数与隔离档位，并立即解除隔离。

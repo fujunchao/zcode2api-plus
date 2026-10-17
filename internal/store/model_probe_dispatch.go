@@ -502,6 +502,11 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 	if err := s.boundModelProbeEvidenceLocked(now); err != nil {
 		return err
 	}
+	// 结论回写线路 405 画像：健康即提前解封，失败则保持隔离（删除仍走退休链）。
+	// 必须在 retireModelProbeLocked 之前——一旦线路被删除，画像就找不到对应配置了。
+	if copy.State == "completed" {
+		s.applyLine405ProbeVerdictLocked(copy.TargetID, copy.Verdict, now)
+	}
 	if copy.Verdict == "route_correlated" {
 		return s.retireModelProbeLocked(&copy, now)
 	}
