@@ -21,6 +21,7 @@ type networkRound struct {
 	first               map[string]networkprobe.Report
 	confirmAt, deadline time.Time
 	manual              map[string]bool
+	whole               bool
 }
 
 // NewWithNetworkTargets 只替换无凭据目标来源；测试仍使用真实 HTTP 和相同状态机。
@@ -213,11 +214,19 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 			}
 			selected = selected[:48]
 		}
-		m.netNext = now.Add(time.Duration(p.NetworkIntervalMinutes) * time.Minute)
+		// 只有全量轮推进定时器。此前每一轮（含只查一条线路的故障复检）都会把
+		// netNext 顺延一个间隔，活跃期复检间隔中位数十来秒，30 分钟的全量轮
+		// 实际永远等不到——空闲线路的坏点因此从未被扫到。
+		if whole {
+			m.netNext = now.Add(time.Duration(p.NetworkIntervalMinutes) * time.Minute)
+		}
 		if len(selected) == 0 {
 			return false, nil
 		}
-		r := &networkRound{id: fmt.Sprintf("network-%d", now.UnixNano()), key: key, policy: p, profiles: selected, all: all, targets: targets, manual: manual, deadline: now.Add(5*time.Minute + time.Duration(p.NetworkConfirmSeconds)*time.Second)}
+		r := &networkRound{id: fmt.Sprintf("network-%d", now.UnixNano()), key: key, policy: p, profiles: selected, all: all, targets: targets, manual: manual, whole: whole, deadline: now.Add(5*time.Minute + time.Duration(p.NetworkConfirmSeconds)*time.Second)}
+		if whole {
+			web.Warn("proxy-health", fmt.Sprintf("round=%s stage=probe whole=1 checked=%d mode=%s", r.id, len(r.profiles), p.Mode))
+		}
 		r.first = m.networkBatch(ctx, selected, p, targets)
 		if ctx.Err() != nil {
 			return true, ctx.Err()
@@ -347,7 +356,7 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 	if err := m.store.SaveNetworkHealth(p, records); err != nil {
 		return true, err
 	}
-	web.Warn("proxy-health", fmt.Sprintf("round=%s stage=confirmed checked=%d candidates=%d removed=%d mode=%s", r.id, len(r.profiles), len(remove), len(removed), p.Mode))
+	web.Warn("proxy-health", fmt.Sprintf("round=%s stage=confirmed whole=%d checked=%d candidates=%d removed=%d mode=%s", r.id, boolInt(r.whole), len(r.profiles), len(remove), len(removed), p.Mode))
 	m.enqueueNetworkModels(r, records)
 	return true, nil
 }
@@ -398,4 +407,12 @@ func (m *Manager) networkPreflight(ctx context.Context, l *store.ModelProbeLease
 		}
 	}
 	return r.OK
+}
+
+// boolInt 只用于日志字段，保持「whole=0/1」与既有数字型字段一致。
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
