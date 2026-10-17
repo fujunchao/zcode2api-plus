@@ -1728,7 +1728,7 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 //
 // 选号分五层，前一层筛出的池子决定后一层的作用范围：
 //  1. 可选：状态可调度、未被本请求跳过；风控静默隔离（RiskSilentHours，
-//     默认24h）为附加门槛，窗口内账号即使冷却到期也不重新候选。
+//     默认 0 = 关闭，仅按阶梯冷却）为附加门槛，窗口内账号即使冷却到期也不重新候选。
 //  2. 模型分档：该模型 available 者优先，其次 unknown；absent/exhausted 一律排除；
 //  3. 优惠优先：持有未耗尽的一次性优惠额度（one_time）者优先——这类额度不用就过期，
 //     与「谁剩得多」是两回事，故独立成层；
