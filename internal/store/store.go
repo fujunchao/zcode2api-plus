@@ -58,17 +58,22 @@ var ErrAccountArchived = errors.New("账号已归档")
 
 // Store 线程安全的账号 / 设置存储，含轮询游标。
 type Store struct {
-	Requests              *requeststats.Tracker
-	mu                    sync.Mutex
-	db                    *sql.DB
-	processLock           *os.File
-	closeOnce             sync.Once
-	closeErr              error
-	accounts              map[string][]*model.Account
-	initializations       map[string]*InitializationTask
-	initializationRuns    map[string]string
-	settings              map[string]string
-	rotation              map[string]int
+	Requests           *requeststats.Tracker
+	mu                 sync.Mutex
+	db                 *sql.DB
+	processLock        *os.File
+	closeOnce          sync.Once
+	closeErr           error
+	accounts           map[string][]*model.Account
+	initializations    map[string]*InitializationTask
+	initializationRuns map[string]string
+	settings           map[string]string
+	rotation           map[string]int
+	// 单号钉住（运维真机复验）：进程内状态，重启即清——调试用的钉子不该跨重启。
+	// 由 pin.go 维护，选号在资格闸门之后优先命中；失效时静默回落正常选号。
+	pinID                 string
+	pinUntil              time.Time
+	pinMissLogged         bool
 	riskProxyHistory      riskProxyHistory // 按账号保存近期风控出口；不属于对外设置或账号 JSON。
 	quotaRecovery         quotaRecovery    // API Key 模型恢复退避，保存在内部 meta，不进入账号 JSON。
 	quotaProbes           map[quotaProbeKey]*QuotaProbe
@@ -1797,6 +1802,11 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 		}
 	}
 	pool := base
+	// 单号钉住（运维复验）：在资格闸门之后、模型/额度/轮询之前命中。
+	// 钉住的号若不可调度（冷却/停用/线路不可用）或本请求已试过，静默回落正常选号，不失败。
+	if pin := s.pinHitLocked(base, skipIDs, now); pin != nil {
+		return pin.Clone()
+	}
 	if modelName != "" {
 		var available, unknown []*model.Account
 		for _, a := range base {

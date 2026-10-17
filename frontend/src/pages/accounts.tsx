@@ -9,6 +9,8 @@ import {
   HeartPulse,
   Loader2,
   Pencil,
+  Pin,
+  PinOff,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -129,6 +131,11 @@ function LastErrorCell({ account }: { account: Account }) {
   )
 }
 
+/* 釘住剩餘分鐘：向上取整；後端到期後下一輪輪詢會清掉，前端不自行改狀態 */
+function pinRemainMin(until: number): number {
+  return Math.max(0, Math.ceil((until * 1000 - Date.now()) / 60000))
+}
+
 export function AccountsPage() {
   const qc = useQueryClient()
   const { confirm, element: confirmElement } = useConfirm()
@@ -145,6 +152,8 @@ export function AccountsPage() {
   const archivedAccounts = allAccounts.filter((a) => a.archived_at != null)
   const liveAccounts = allAccounts.filter((a) => a.archived_at == null)
   const proxies = data?.proxies ?? []
+  /* 全域單值：最多只有一個帳號被釘住；到期由後端清理，前端只負責顯示剩餘分鐘 */
+  const pinned = data?.pinned ?? null
   const availableModels = data?.models ?? []
   /* 自动选项的空闲数包含归档账号绑定，与后端一致；手工 proxy_url 不占用命名线路。 */
   const usedProxyIds = new Set(
@@ -551,6 +560,27 @@ export function AccountsPage() {
         finally { setBatchBusy(false) }
       },
     })
+  }
+
+  /* ── 釘住單號（真機複驗） ── 固定 30 分鐘，再點解除；更長時長走 API 的 minutes 參數 */
+  async function doPin(a: Account) {
+    try {
+      await api('POST', '/accounts/' + a.id + '/pin', { minutes: 30 })
+      toast.success('已釘住 30 分鐘')
+      invalidate()
+    } catch (e) {
+      toast.error('釘住失敗：' + errMsg(e))
+    }
+  }
+
+  async function doUnpin() {
+    try {
+      await api('DELETE', '/pin')
+      toast.success('已解除釘住')
+      invalidate()
+    } catch (e) {
+      toast.error('解除失敗：' + errMsg(e))
+    }
   }
 
   /* ── 歸檔 ┐─ 歸檔＝停止調用，帳號移入歸檔區僅保留記錄 */
@@ -987,6 +1017,15 @@ export function AccountsPage() {
                             停用 {a.disabled_models.length} 模型
                           </Badge>
                         )}
+                        {pinned && pinned.id === a.id && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 text-[11px] font-normal"
+                            title="真機複驗用：期間全部模型請求優先打到本帳號；到期自動解除"
+                          >
+                            釘住 · 剩 {pinRemainMin(pinned.until)} 分
+                          </Badge>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell className="text-center">
@@ -1083,6 +1122,14 @@ export function AccountsPage() {
                           onClick={() => void toggleEnabled(a)}
                         >
                           {a.enabled ? <XCircle /> : <RotateCcw />}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          title={pinned?.id === a.id ? '解除釘住' : '釘住 30 分鐘（真機複驗）'}
+                          onClick={() => (pinned?.id === a.id ? void doUnpin() : void doPin(a))}
+                        >
+                          {pinned?.id === a.id ? <PinOff /> : <Pin />}
                         </Button>
                         <Button variant="ghost" size="icon-sm" title="歸檔（停止調用）" onClick={() => doArchive(a)}>
                           <Archive />

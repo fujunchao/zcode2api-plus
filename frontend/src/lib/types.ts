@@ -331,6 +331,8 @@ export interface AccountsResponse {
   providers: string[]
   models: string[]
   proxies: ProxyProfile[]
+  /** 單號釘住（全域單值）：真機複驗時把全部模型請求固定到一個帳號；null = 未釘住 */
+  pinned?: { id: string; name: string; until: number } | null
   ts: number
   /** 條件查詢（additive）：過濾後總數與分頁回顯；無過濾參數時 total = 全量 */
   total?: number

@@ -74,7 +74,9 @@ func (h *Handler) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 		"providers":    store.Providers,
 		"models":       gateway.AvailableModels,
 		"proxies":      h.Store.ListProxyProfiles(),
-		"ts":           nowFloat(),
+		// 单号钉住状态（全局单值）：账号行据此显示「釘住 · 剩 N 分」。
+		"pinned": h.Store.PinnedAccount(now),
+		"ts":     nowFloat(),
 		// 过滤后总数与分页回显（limit=0 表示未启用分页）：供前端做分页器。
 		"total":  total,
 		"offset": q.Offset,
@@ -884,4 +886,54 @@ func (h *Handler) handleImport(w http.ResponseWriter, r *http.Request) {
 		"created": len(newIDs), "duplicated": count - len(newIDs), "initializing": initializing,
 		"assigned": len(assigned), "direct_fallback": len(fallback),
 	})
+}
+
+// handlePinAccount 钉住一个账号（真机复验用）。body 可省略，minutes 缺省 30、钳到 5..1440。
+func (h *Handler) handlePinAccount(w http.ResponseWriter, r *http.Request) {
+	acc := h.Store.FindAny(r.PathValue("account_id"))
+	if acc == nil {
+		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	minutes := 30
+	if r.ContentLength != 0 {
+		payload, apiErr := decodeBody(r)
+		if apiErr != nil {
+			writeAPIError(w, apiErr)
+			return
+		}
+		if v, ok := payload["minutes"]; ok {
+			n, valid := pyInt(v)
+			if !valid || n < 5 || n > 1440 {
+				writeAPIError(w, errBadRequest("钉住时长需为 5–1440 分钟"))
+				return
+			}
+			minutes = n
+		}
+	}
+	pinned, err := h.Store.PinAccount(acc.Provider, acc.ID, minutes, time.Now())
+	if errors.Is(err, store.ErrPinArchived) {
+		writeAPIError(w, errBadRequest(err.Error()))
+		return
+	}
+	if err != nil {
+		writeError500(w, err)
+		return
+	}
+	if pinned == nil {
+		writeAPIError(w, errNotFound("账号不存在"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pinned": pinned})
+}
+
+// handleGetPin 当前钉住状态（无则 pinned=null）。
+func (h *Handler) handleGetPin(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"pinned": h.Store.PinnedAccount(time.Now())})
+}
+
+// handleDeletePin 解除钉住（幂等）。
+func (h *Handler) handleDeletePin(w http.ResponseWriter, r *http.Request) {
+	h.Store.UnpinAccount()
+	writeJSON(w, http.StatusOK, map[string]any{"pinned": nil})
 }

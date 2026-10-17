@@ -109,6 +109,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/refresh", guard(h.handleRefreshAccount))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/reset-stats", guard(h.handleResetStats))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/recover", guard(h.handleRecoverAccount))
+	// 单号钉住（运维真机复验）：钉住/查看/解除。钉住是进程内 TTL 状态，不落库。
+	mux.HandleFunc("POST /admin/api/accounts/{account_id}/pin", guard(h.handlePinAccount))
+	mux.HandleFunc("GET /admin/api/pin", guard(h.handleGetPin))
+	mux.HandleFunc("DELETE /admin/api/pin", guard(h.handleDeletePin))
 	mux.HandleFunc("POST /admin/api/accounts/{account_id}/initialization/{action}", guard(h.handleInitializationAction))
 	// 批量管理端点（docs/plan-account-batch-management.md）：字面量段 batch
 	// 不会被 {account_id} 通配吞掉——现有通配路由的尾段都是具体字面量
