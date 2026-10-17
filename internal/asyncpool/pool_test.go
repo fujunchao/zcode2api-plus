@@ -855,9 +855,9 @@ func Test529OverloadRecoversInAsyncPool(t *testing.T) {
 	}
 }
 
-// 405 + 风控文案：异步路径与 sync 同语义——冷却整个账号并按阶梯选档，然后换号。
+// 405 + 风控文案：异步路径与 sync 同语义——首次命中归因于线路，只换线、不冷却账号。
 // 两条路径对同一账号必须标出相同状态（项目硬不变式）。
-func Test405RiskControlInAsyncPool(t *testing.T) {
+func Test405LineAttributedInAsyncPool(t *testing.T) {
 	p, st, _, _ := newTestPool(t)
 	addJWTAccount(t, st, "risk-acc")
 
@@ -871,99 +871,56 @@ func Test405RiskControlInAsyncPool(t *testing.T) {
 	p.processTicket(context.Background(), "ticket-risk")
 
 	acc := st.ListAccounts(model.ProviderZai)[0]
-	if acc.Status != model.StatusCooling {
-		t.Fatalf("风控 405 应冷却整个账号: %s", acc.Status)
+	if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
+		t.Fatalf("线路归因的 405 不应冷却账号: %s until=%v", acc.Status, acc.CoolingUntil)
 	}
-	if acc.RiskControlStreak != 1 {
-		t.Fatalf("连续命中计数应为 1: %d", acc.RiskControlStreak)
+	if acc.RiskControlStreak != 0 {
+		t.Fatalf("不应推进风控阶梯: %d", acc.RiskControlStreak)
 	}
-	if acc.CoolingUntil == nil {
-		t.Fatal("应写入冷却截止时间")
+	if acc.LastRiskControlAt == nil {
+		t.Fatal("命中时刻仍须落库（后台与静默期闸门的唯一来源）")
 	}
 	wantErrorKind(t, acc, model.ErrorKindRiskControl)
 }
 
-// 请求级风控（同一 body 在 ≥2 个不同账号上都被拒）：与 sync 同判定——停止换号，把上游
-// 原文投递一次并终止本票。
-//
-// ⚠️ 2026-09-24 账号级标记模型修正处置：**冷却保留**。每个被尝试的账号都已被服务端
-// 标记（标记期内无论发什么都 405），本地冷却防止它们立即被再次选中；旧语义「不冷却、
-// 回滚」等于替服务端解封账号，已废弃（docs/analysis-auth-chain-vs-official.md §九）。
-func Test405RequestLevelRiskInAsyncPool(t *testing.T) {
+// 同一条线路上的多个账号都被 405 ⇒ 不判请求级：与 sync 同判定——继续换号直到票据预算
+// 耗尽，不冷却账号、不登记重放防护。
+func Test405SameLineInAsyncPool(t *testing.T) {
 	p, st, _, _ := newTestPool(t)
-	// fixture 默认 AsyncMaxRetries=0（只试 1 个账号），而判定成立需要试到第 2 个账号。
-	// 这里放开到 3（生产默认值），第 3 个账号是否被试才成为有意义的断言。
-	// 换号退避是 1<<retries 秒（此用例付出 2s），是该路径既有代价，不为测试改动。
 	config.AsyncMaxRetries = 3
 	t.Cleanup(func() { config.AsyncMaxRetries = 0 })
-	addJWTAccountN(t, st, "req-level-1", 1)
-	addJWTAccountN(t, st, "req-level-2", 2)
-	addJWTAccountN(t, st, "req-level-3", 3)
+	addJWTAccountN(t, st, "same-line-1", 1)
+	addJWTAccountN(t, st, "same-line-2", 2)
+	addJWTAccountN(t, st, "same-line-3", 3)
 
 	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
 	up := &scriptedUpstream{specs: []upstreamSpec{
 		{status: http.StatusMethodNotAllowed, body: riskBody},
 		{status: http.StatusMethodNotAllowed, body: riskBody},
 		{status: http.StatusMethodNotAllowed, body: riskBody},
+		{status: http.StatusMethodNotAllowed, body: riskBody},
 	}}
 	config.UpstreamZai = up.start(t).URL
 
-	tk := insertTicket(p, "ticket-req-level", map[string]any{"model": "GLM-5.3", "messages": []any{}})
-	line, err := st.AddProxyProfile("risk-fallback", config.UpstreamZai, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p.processTicket(context.Background(), "ticket-req-level")
+	tk := insertTicket(p, "ticket-same-line", map[string]any{"model": "GLM-5.3", "messages": []any{}})
+	p.processTicket(context.Background(), "ticket-same-line")
 
+	if n := up.callCount(); n != 3 {
+		t.Fatalf("三个账号都应被试，而不是第 2 个就判请求级: %d", n)
+	}
 	events := drainEvents(tk)
-	last := events[len(events)-1]
-	errObj, _ := last.Data.(map[string]any)["error"].(map[string]any)
-	if errObj == nil || errObj["type"] != "upstream_error" {
-		t.Fatalf("请求级风控应投递上游原文（upstream_error）: %v", events)
+	for _, e := range events {
+		if errObj, _ := e.Data.(map[string]any)["error"].(map[string]any); errObj != nil {
+			if errObj["type"] == "risk_control_cooldown" {
+				t.Fatalf("同线 405 不得登记重放防护: %v", events)
+			}
+		}
 	}
-	if msg, _ := errObj["message"].(string); msg != riskBody {
-		t.Fatalf("应原样投递上游错误体: %q", msg)
-	}
-	// 第 2 个账号给出同一信号即判定成立，第 3 个账号不该再被试。
-	if n := up.callCount(); n != 2 {
-		t.Fatalf("判定成立后应停止换号，上游调用应为 2 次: %d", n)
-	}
-	// 冷却保留：被尝试的两个账号都应处于风控冷却（上游已标记它们），阶梯已推进；
-	// 第 3 个账号必须保持 active —— 判定成立即停止换号，它不该被牵连。
-	cooled, untouched := 0, 0
 	for _, acc := range st.ListAccounts(model.ProviderZai) {
-		if acc.Status == model.StatusCooling && acc.CoolingUntil != nil && acc.RiskControlStreak == 1 {
-			wantErrorKind(t, acc, model.ErrorKindRiskControl)
-			if acc.ProxyID == nil || *acc.ProxyID != line.ID {
-				t.Fatal("请求级风控的两个被标记账号都应自动分配代理（无空闲时共享）")
-			}
-			cooled++
-			continue
+		if acc.Status != model.StatusActive || acc.RiskControlStreak != 0 || acc.CoolingUntil != nil {
+			t.Fatalf("线路归因的 405 不应冷却账号: %s status=%s streak=%d", acc.Name, acc.Status, acc.RiskControlStreak)
 		}
-		if acc.Status == model.StatusActive && acc.RiskControlStreak == 0 && acc.CoolingUntil == nil {
-			if acc.ProxyID != nil {
-				t.Fatal("未尝试账号不应更换代理")
-			}
-			untouched++
-			continue
-		}
-		t.Fatalf("账号 %s 状态不属于任一预期形态: status=%s streak=%d until=%v",
-			acc.Name, acc.Status, acc.RiskControlStreak, acc.CoolingUntil)
-	}
-	if cooled != 2 || untouched != 1 {
-		t.Fatalf("应恰好 2 个账号保留冷却、1 个未被动: cooled=%d untouched=%d", cooled, untouched)
-	}
-	// 重放防护应已登记：同内容再来的票直接快速失败，不打上游。
-	tk2 := insertTicket(p, "ticket-req-level-2", map[string]any{"model": "GLM-5.3", "messages": []any{}})
-	p.processTicket(context.Background(), "ticket-req-level-2")
-	events2 := drainEvents(tk2)
-	last2 := events2[len(events2)-1]
-	errObj2, _ := last2.Data.(map[string]any)["error"].(map[string]any)
-	if errObj2 == nil || errObj2["type"] != "risk_control_cooldown" {
-		t.Fatalf("同内容票应命中重放防护（risk_control_cooldown）: %v", events2)
-	}
-	if n := up.callCount(); n != 2 {
-		t.Fatalf("重放防护生效后上游调用数不得增长: %d", n)
+		wantErrorKind(t, acc, model.ErrorKindRiskControl)
 	}
 }
 
@@ -1016,9 +973,10 @@ func Test405HotAccountSkippedInAsyncPool(t *testing.T) {
 		t.Fatalf("no_account 应说明本地策略，不能声称上游封禁: %q", errObj["message"])
 	}
 	gotClean := st.FindAny(clean.ID)
-	if gotClean.Status != model.StatusCooling || gotClean.RiskControlStreak != 1 {
-		t.Fatalf("干净账号应冷却、阶梯推进一次: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
+	if gotClean.Status != model.StatusActive || gotClean.RiskControlStreak != 0 {
+		t.Fatalf("线路归因的 405 不应冷却账号: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
 	}
+	wantErrorKind(t, gotClean, model.ErrorKindRiskControl)
 	if gotHot := st.FindAny(hot.ID); gotHot.Status != model.StatusActive || gotHot.RiskControlStreak != 0 {
 		t.Fatalf("热账号不应被动过: status=%s streak=%d", gotHot.Status, gotHot.RiskControlStreak)
 	}

@@ -11,94 +11,76 @@ import (
 	"testing"
 	"time"
 
-	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
 )
 
-// 阈值按不同账号 ID 计数，不按命中次数：同一账号因验证码刷新 / 瞬时限流原地重试会重复
-// 进入风控分支，按次数计会把「同一个号被拒两次」误判成第二个身份。
-func TestRiskScopeVerdictCountsDistinctAccounts(t *testing.T) {
+// 阈值按不同「干净线路」计数，不按账号、也不按命中次数。
+//
+// 2026-10-17 日志：9 次请求级判定里 8 次是错的——同一份内容在 41–149 秒后换条线
+// 即可成功，说明触发源是脏出口而非内容。按账号计数会把「抽到两条脏线」误判成
+// 「内容被拒」，进而锁死整条请求。
+func TestRiskScopeVerdictCountsDistinctCleanLines(t *testing.T) {
 	old := RiskControlRequestLevelThreshold
-	RiskControlRequestLevelThreshold = 2
+	RiskControlRequestLevelThreshold = 3
 	t.Cleanup(func() { RiskControlRequestLevelThreshold = old })
 
 	sc := NewRiskScope("model|content")
-	now := time.Now()
 	a := &model.Account{ID: "acc-1"}
 	b := &model.Account{ID: "acc-2"}
+	c := &model.Account{ID: "acc-3"}
 
-	if sc.Verdict(a, now) {
-		t.Fatal("第 1 个账号不该直接判定为请求级")
+	if sc.Verdict(a, "proxy:line-1", false) {
+		t.Fatal("第 1 条线路不该直接判定为请求级")
 	}
-	if sc.Verdict(a, now) {
-		t.Fatal("同一个账号重复命中不得计入阈值——那不是第二个身份")
+	if sc.Verdict(a, "proxy:line-1", false) {
+		t.Fatal("同一条线路重复命中不得计入阈值——那不是第二条线路")
+	}
+	if sc.Lines() != 1 {
+		t.Fatalf("按线路去重后应只有 1 条: %d", sc.Lines())
 	}
 	if sc.Accounts() != 1 {
-		t.Fatalf("按 ID 去重后应只有 1 个账号: %d", sc.Accounts())
+		t.Fatalf("账号计数仅用于日志，应为 1: %d", sc.Accounts())
 	}
-	if !sc.Verdict(b, now) {
-		t.Fatal("第 2 个不同账号应触发请求级判定")
+	if sc.Verdict(b, "proxy:line-2", false) {
+		t.Fatal("第 2 条线路仍不该直接判定为请求级")
+	}
+	if !sc.Verdict(c, "proxy:line-3", false) {
+		t.Fatal("第 3 条不同线路应触发请求级判定")
 	}
 	if sc.ContentKey() != "model|content" {
 		t.Fatalf("ContentKey 应原样保存: %q", sc.ContentKey())
 	}
 }
 
-// 风控静默期内的账号（近期已被上游标记）命中 405 不计入请求级判定：它的 405 只反映
-// 账号自身状态、与内容无关。2026-10-12 晚污染池里「连抽两个热账号」被误判成请求级，
-// 错误地停止换号并封锁同内容——那 33 分钟全池风暴的直接机制。
-func TestRiskScopeVerdictExcludesHotAccounts(t *testing.T) {
+// 命中时已脏的线路不计入：它的 405 只证明「这条线脏」，不能当作「内容有问题」的
+// 证据。否则连着抽两条脏线就会把阈值凑满，把本可成功的内容判死。
+func TestRiskScopeVerdictExcludesDirtyLines(t *testing.T) {
 	old := RiskControlRequestLevelThreshold
-	RiskControlRequestLevelThreshold = 2
+	RiskControlRequestLevelThreshold = 3
 	t.Cleanup(func() { RiskControlRequestLevelThreshold = old })
-	oldHours := config.RiskSilentHours
-	config.RiskSilentHours = 24
-	t.Cleanup(func() { config.RiskSilentHours = oldHours })
-
-	now := time.Now()
-	blockedAt := float64(now.Add(-1*time.Hour).UnixNano()) / 1e9
-	hot := &model.Account{ID: "hot-1", LastRiskControlAt: &blockedAt}
-	hot2 := &model.Account{ID: "hot-2", LastRiskControlAt: &blockedAt}
-	cleanA := &model.Account{ID: "clean-1"}
-	cleanB := &model.Account{ID: "clean-2"}
 
 	sc := NewRiskScope("model|content")
-	if sc.Verdict(hot, now) || sc.Verdict(hot2, now) {
-		t.Fatal("热账号的命中不得计入请求级判定")
+	if sc.Verdict(&model.Account{ID: "acc-1"}, "proxy:line-1", false) {
+		t.Fatal("第 1 条干净线路不该直接请求级")
 	}
-	if sc.Accounts() != 0 {
-		t.Fatalf("热账号不计入，计数应为 0: %d", sc.Accounts())
+	if sc.Verdict(&model.Account{ID: "acc-2"}, "proxy:line-2", true) {
+		t.Fatal("已知脏线的命中不得计入")
 	}
-	if sc.Verdict(cleanA, now) {
-		t.Fatal("第 1 个干净账号不该直接判定为请求级")
+	if sc.Lines() != 1 {
+		t.Fatalf("脏线不计入，应只有 1 条干净线路: %d", sc.Lines())
 	}
-	if !sc.Verdict(cleanB, now) {
-		t.Fatal("第 2 个干净账号应触发请求级判定")
+	if sc.Verdict(&model.Account{ID: "acc-3"}, "proxy:line-3", false) {
+		t.Fatal("只有 2 条干净线路时不该判定请求级")
 	}
-	if sc.Accounts() != 2 {
-		t.Fatalf("应只统计干净账号: %d", sc.Accounts())
+	if !sc.Verdict(&model.Account{ID: "acc-4"}, "proxy:line-4", false) {
+		t.Fatal("第 3 条干净线路应触发请求级判定")
 	}
-
-	// 静默期已过的账号视为干净：命中照常计入（恢复后再次被拒属新证据）。
-	oldBlocked := float64(now.Add(-25*time.Hour).UnixNano()) / 1e9
-	recovered := &model.Account{ID: "recovered-1", LastRiskControlAt: &oldBlocked}
+	// 直连也参与聚合（同一份内容在直连上被拒同样是有效证据）。
 	sc2 := NewRiskScope("model|content")
-	if sc2.Verdict(recovered, now) {
-		t.Fatal("静默期已过的账号应计入判定（第 1 个仍不该直接请求级）")
-	}
-	if sc2.Accounts() != 1 {
-		t.Fatalf("静默期已过的账号应被计入: %d", sc2.Accounts())
-	}
-
-	// 闸门关闭（应急回退）时退回旧行为：任何命中都计入。
-	config.RiskSilentHours = 0
-	sc3 := NewRiskScope("model|content")
-	if sc3.Verdict(hot, now) {
-		t.Fatal("关闭后第 1 个仍不该直接请求级")
-	}
-	if sc3.Accounts() != 1 {
-		t.Fatalf("闸门关闭时热账号也应计入: %d", sc3.Accounts())
+	sc2.Verdict(&model.Account{ID: "d-1"}, "direct", false)
+	if sc2.Lines() != 1 {
+		t.Fatalf("直连应作为一条线路计入: %d", sc2.Lines())
 	}
 }
 
@@ -132,5 +114,28 @@ func TestMarkRiskControlAppliesCooling(t *testing.T) {
 	// 静默期证据章：命中时刻必须落库（选号硬闸门与恢复护栏的唯一判据来源）。
 	if got.LastRiskControlAt == nil {
 		t.Fatal("命中时刻必须落库（LastRiskControlAt），否则静默期闸门失效")
+	}
+}
+
+// 线路归因的 405：证据与命中时刻必须落库，但账号状态与阶梯不得变化。
+func TestNoteRiskControlWithoutCoolingKeepsStatus(t *testing.T) {
+	st := openStore(t)
+	acc, err := st.AddAccount(model.ProviderZai, "nocool", "sk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	NoteRiskControlWithoutCooling(st, acc, "上游风控拦截 HTTP 405（线路归因）: x", time.Now())
+	got := st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive || got.CoolingUntil != nil {
+		t.Fatalf("不应冷却账号: status=%s until=%v", got.Status, got.CoolingUntil)
+	}
+	if got.RiskControlStreak != 0 {
+		t.Fatalf("不应推进阶梯: %d", got.RiskControlStreak)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
+		t.Fatalf("错误归类应落库: %v", got.LastErrorKind)
+	}
+	if got.LastRiskControlAt == nil {
+		t.Fatal("命中时刻应落库")
 	}
 }

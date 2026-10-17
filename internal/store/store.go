@@ -92,6 +92,9 @@ type Store struct {
 	line405               line405State                   // 线路级 405 画像与隔离，保存于内部 meta，不进入设置快照。
 	proxyRelaxLoggedAt    int64                          // 选线放宽日志限频（unix ms），仅用于避免日志刷屏。
 	line405RelaxLoggedAt  int64                          // 线路 405 隔离放宽日志限频（unix ms）。
+	// account405 记录每个账号最近一次 405 的出口线路，用于区分「线路的锅」与
+	// 「账号的锅」：同号换过线仍 405 才升账号冷却。内存态，重启丢失只影响一次判定。
+	account405 map[string]account405Mark
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响

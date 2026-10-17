@@ -607,6 +607,17 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				lastNetworkError = lineTimeout.body
 				break
 			}
+			// 风控 405（账号级）：与 408/524 一样换线重试，但不消耗 timeout 预算 ——
+			// 405 通常是出口线路的问题，留在原线换号没有意义。
+			var line405 errLine405
+			if errors.As(streamErr, &line405) {
+				if line405.avoid != "" {
+					avoid[line405.avoid] = true
+				}
+				networkRetry = true
+				lastNetworkError = line405.body
+				break
+			}
 			if ctx.Err() != nil {
 				return // 票务已被释放，无需继续
 			}
@@ -905,24 +916,28 @@ func (p *Pool) attemptUpstreamOnce(
 			return false, errNetwork{bodyText}
 		}
 
-		// 405 + 风控文案：先分清「账号级」还是「请求级」，与 sync 路径同语义（项目硬不变式：
+		// 405 + 风控文案：先分清「线路级」还是「请求级」，与 sync 同语义（项目硬不变式：
 		// 两条路径不得对同一份 body 给出不同判定）。
 		//
-		// 账号级（换号即成功）→ 整号冷却（按连续命中递进，超限置失效）并换号。
-		// 请求级（同一 body 在 ≥2 个**命中时仍干净**（非静默期）的不同账号上都被拒）
-		// → 达到本地停止换号的保护阈值，不是服务端给出的触发原因，不能据此确定为
-		// 正文问题。热账号的命中不计入判定（它的 405 与内容无关）。
-		// 处置（账号级标记模型，见 gateway.RiskScope 头注释）：停止换号、**保留**本票
-		// 已施加的风控冷却（每个被尝试的账号都已被上游标记）、登记重放防护，把上游原文
-		// 终止性投递给客户端。
+		// 判定单位是**线路**而不是账号：N 条不同且命中时仍干净的线路都被同一内容拒
+		// ⇒ 请求级（停止换号 + 登记重放防护）；否则首次命中归因于线路，只换线、不冷却。
+		// 2026-10-17 日志证明按账号计数几乎全是误判（9 次判定 8 次错）。
 		//
 		// 判定必须先看 body：405 也可能是计费接口的重复查询，或者我方缺 system 注入时上游
 		// 回的错（那种情况每个账号都会一样失败，冷却账号等于把代码缺陷变成账号惩罚）。
 		if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(bodyText) {
 			preview := gateway.ErrorPreview(bodyText)
-			if scope.Verdict(acc, time.Now()) {
-				// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
-				// 相同，差别只在后续：停止换号 + 登记重放防护。
+			// 与 sync 同序：先读「命中前是否已脏」，再落本次 405，避免自己触发的隔离
+			// 成为请求级判定依据。
+			lineKey := egress.LineKey()
+			lineDirty := p.Store.Line405Blocked(egress, time.Now())
+			if d := p.Store.RecordLine405(egress, time.Now()); d.Action == "quarantine" {
+				web.Warn(ticketID, fmt.Sprintf("线路 %s 连续 %d 次 405，隔离至 %s；本票改换线路重试",
+					egress.Label, d.Strikes, d.Until.Format(time.RFC3339)))
+			}
+			if scope.Verdict(acc, lineKey, lineDirty) {
+				// 判定成立：N 条不同且命中时仍干净的线路都被同一内容拒 —— 冷却动作与
+				// 账号级相同，差别只在后续：停止换号 + 登记重放防护。
 				_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,
 					"上游风控拦截 HTTP 405（請求級）: "+preview, time.Now(), riskAttempt)
 				p.replay.Record(scope.ContentKey())
@@ -930,21 +945,36 @@ func (p *Pool) attemptUpstreamOnce(
 					web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（請求級，HTTP %d，%s），已置為失效待人工處理；同內容 %d s 內直接拒絕",
 						acc.Name, streak, resp.StatusCode, preview, gateway.ReplayGuardTTL))
 				} else {
-					web.Warn(ticketID, fmt.Sprintf("已達本地風控重試保護閾值（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（本地階梯保護），同內容 %d s 內直接拒絕",
-						scope.Accounts(), resp.StatusCode, preview, gateway.ReplayGuardTTL))
+					web.Warn(ticketID, fmt.Sprintf("已達本地風控重試保護閾值（已在 %d 條線路上復現、%d 個帳號，HTTP %d，%s），停止換號；冷卻保留（本地階梯保護），同內容 %d s 內直接拒絕",
+						scope.Lines(), scope.Accounts(), resp.StatusCode, preview, gateway.ReplayGuardTTL))
 				}
 				return false, errRequestLevelRisk{body: bodyText}
 			}
-			_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,
-				"上游风控拦截 HTTP 405: "+preview, time.Now(), riskAttempt)
-			if invalid {
-				web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
-					acc.Name, streak, resp.StatusCode, preview))
+			// 首次（或同一条脏线的重复）405 归因于线路：只换线，不冷却账号。
+			lineAttributed := egress.Mode == "proxy" && config.RiskCoolOnFirst == 0 &&
+				p.Store.NoteAccount405(acc.ID, egress.Identity(), time.Now())
+			if lineAttributed {
+				gateway.NoteRiskControlWithoutCooling(p.Store, acc,
+					"上游风控拦截 HTTP 405（线路归因）: "+preview, time.Now(), riskAttempt)
+				web.Warn(ticketID, fmt.Sprintf("账号 %s 命中风控（HTTP 405，线路 %s），本次只换线、不冷却账号",
+					acc.Name, egress.Label))
 			} else {
-				web.Warn(ticketID, fmt.Sprintf("账号 %s 第 %d 次命中风控（HTTP %d，%s），進入冷卻並切換下一個",
-					acc.Name, streak, resp.StatusCode, preview))
+				_, streak, invalid := gateway.MarkRiskControl(p.Store, acc,
+					"上游风控拦截 HTTP 405: "+preview, time.Now(), riskAttempt)
+				if invalid {
+					web.Warn(ticketID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
+						acc.Name, streak, resp.StatusCode, preview))
+				} else {
+					web.Warn(ticketID, fmt.Sprintf("账号 %s 第 %d 次命中风控（HTTP %d，%s），進入冷卻並換線路重試",
+						acc.Name, streak, resp.StatusCode, preview))
+				}
 			}
-			return false, errNetwork{bodyText}
+			// 换线重试：与 408/524 同一条出路，但不消耗 timeout 预算。
+			lineAvoid := ""
+			if egress.Mode == "proxy" {
+				lineAvoid = egress.Identity()
+			}
+			return false, errLine405{body: bodyText, avoid: lineAvoid}
 		}
 
 		// 边缘/代理超时（408/524）：与账号无关，换线重试有限次（预算在票据层共享），
@@ -1056,6 +1086,17 @@ var errDelivered = errors.New("已投递错误事件")
 type errNetwork struct{ body string }
 
 func (e errNetwork) Error() string { return e.body }
+
+// errLine405 风控 405 的账号级处置：换一条线路重试，不消耗 timeout 预算。
+//
+// 与 errNetwork 的唯一区别是「下一枪必须换线」：405 在本项目的线上证据里主要由
+// 脏出口 IP 触发（同一内容 41–149 秒后换线即成功），留在原线路只换号没有意义。
+type errLine405 struct {
+	body  string
+	avoid string
+}
+
+func (e errLine405) Error() string { return e.body }
 
 // errLineTimeout 线路级超时（首字节预算 / 408 / 524）：与账号无关。
 //

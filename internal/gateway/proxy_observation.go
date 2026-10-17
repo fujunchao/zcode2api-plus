@@ -138,6 +138,11 @@ func observeModelAttemptHealth(ctx context.Context, code string, complete bool, 
 		if signal, ok := softOutcomeSignal(kind, o.Status); ok && !o.InvalidRequest {
 			p.store.RecordProxySoftOutcome(p.egress, signal, o.Status, kind == "success", now)
 		}
+		// 线路 405 画像的成功面：一次完整成功即清零连续 405 并解除隔离。
+		// 只记模型请求的完整成功，不把"响应头 200"当成功（口径与软失败一致）。
+		if kind == "success" {
+			p.store.RecordLineOK(p.egress, now)
+		}
 		// 慢样本：成功后仍记录首字节时长，用于后续「同负载优先快线」的排序输入。
 		// 它**不计入失败率**——30–90 秒出首字节但成功的线路是可用的，记成失败会把
 		// 唯一还活着的线路隔离掉。

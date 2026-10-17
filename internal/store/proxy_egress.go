@@ -25,6 +25,22 @@ type ProxyEgress struct {
 // Identity 返回出站线路的规范化身份（不含认证）；可用于按线路去重或回避。
 func (e ProxyEgress) Identity() string { return e.identity }
 
+// LineKey 返回「线路级」聚合去重键：代理线路用 proxy:+identity，直连统一记 direct。
+// 空串表示不参与聚合（无效路由 / 自定义客户端）。
+//
+// 与 boundLineIdentityLocked 的口径刻意分开：前者用于请求级风控判定（需要把直连
+// 也当成一条线），后者用于匹配 line405 画像（只认真实代理线路）。
+func (e ProxyEgress) LineKey() string {
+	if e.Mode == "proxy" && e.identity != "" {
+		return "proxy:" + e.identity
+	}
+	switch e.Mode {
+	case "direct", "direct_fallback", "forced_direct":
+		return "direct"
+	}
+	return ""
+}
+
 func (s *Store) ProxyEgress(acc *model.Account) ProxyEgress {
 	s.mu.Lock()
 	defer s.mu.Unlock()

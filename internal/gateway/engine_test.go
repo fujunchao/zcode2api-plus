@@ -680,78 +680,48 @@ func Test405WithoutRiskBodyDoesNotCool(t *testing.T) {
 	}
 }
 
-// 405 + 风控文案：同一请求体在 ≥2 个不同账号上被拒 ⇒ 判定为「请求级风控」。
+// 同一条线路上的多个账号都被 405 ⇒ **不构成**请求级判定。
 //
-// 2026-09-24 事故（docs/analysis-riskcontrol-pool-cascade-20260924.md）：一个 278,081B 的
-// 请求被上游判风控，网关逐号冷却（MaxAccountAttempts=5）+ 调用方重放 14 次，67 个健康账号
-// 在 2 分钟内被清空。判据的依据是同日对照组——09-23 全天 17 次账号级风控全部在第 2 个账号
-// 上成功，所以「≥2 个不同账号同一信号」这条阈值不会误伤账号级风控。
+// 2026-10-17 日志：21 条线路出过 405 且成功数为 0，同一份内容换条线 41–149 秒后
+// 即可成功。旧逻辑按账号计数（≥2 即判「内容有罪」），9 次判定里 8 次是错的，
+// 把本可成功的请求锁死并封锁 60 秒。
 //
-// ⚠️ 处置已按账号级标记模型修正（docs/analysis-auth-chain-vs-official.md §九）：被尝试的
-// 账号都已被上游标记 ⇒ **冷却保留**（旧语义「不冷却、回滚」等于替服务端解封账号，废弃）；
-// 并登记重放防护 —— 同内容再来的请求直接 503，不再消耗任何账号。
-func Test405RequestLevelRiskKeepsCoolingAndGuardsReplay(t *testing.T) {
+// 新行为：继续换号；账号耗尽后以 no_available_account 结束，且**不登记重放防护**。
+func Test405SameLineDoesNotTriggerRequestLevel(t *testing.T) {
 	f := newFixture(t)
 	upstreamBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
 	f.respond = jsonResp(405, upstreamBody)
-	a1, _ := f.st.AddAccount(model.ProviderZai, "req-level-1", "sk-1")
-	a2, _ := f.st.AddAccount(model.ProviderZai, "req-level-2", "sk-2")
-	a3, _ := f.st.AddAccount(model.ProviderZai, "req-level-3", "sk-3")
-	line, err := f.st.AddProxyProfile("risk-fallback", f.upstream.URL, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	a1, _ := f.st.AddAccount(model.ProviderZai, "same-line-1", "sk-1")
+	a2, _ := f.st.AddAccount(model.ProviderZai, "same-line-2", "sk-2")
+	a3, _ := f.st.AddAccount(model.ProviderZai, "same-line-3", "sk-3")
 
 	status, raw := f.post(t, msgBody(), "sk-test")
-	if status != 405 || raw != upstreamBody {
-		t.Fatalf("请求级风控应原样透传上游 405: %d %q", status, raw)
+	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "no_available_account") {
+		t.Fatalf("同线 405 不该判请求级，账号耗尽后应 503: %d %q", status, raw)
 	}
-	// 第 2 个账号给出同一信号即判定成立，第 3 个不该再被试。
-	if n := f.callCount(); n != 2 {
-		t.Fatalf("判定成立后应停止换号，上游调用应为 2 次: %d", n)
+	if n := f.callCount(); n != 3 {
+		t.Fatalf("三个账号都应被试，上游调用应为 3 次: %d", n)
 	}
-	// 冷却保留：被尝试的两个账号都应处于风控冷却、阶梯已推进（上游已标记它们），
-	// 恰好 2 个；第 3 个纹丝不动。（Select 是轮询，"哪两个被试"不可假设：聚合断言。）
-	cooled, untouched := 0, 0
+	// 首次 405 只换线不冷却：三个账号都应保持 active，但留下风控证据。
 	for _, acc := range []*model.Account{a1, a2, a3} {
 		got := f.st.Find(model.ProviderZai, acc.ID)
-		if got.Status == model.StatusCooling && got.CoolingUntil != nil &&
-			got.RiskControlStreak == 1 &&
-			got.LastErrorKind != nil && *got.LastErrorKind == model.ErrorKindRiskControl {
-			if got.ProxyID == nil || *got.ProxyID != line.ID {
-				t.Fatal("请求级风控的两个被标记账号都应自动分配代理（无空闲时共享）")
-			}
-			cooled++
-			continue
+		if got.Status != model.StatusActive || got.CoolingUntil != nil || got.RiskControlStreak != 0 {
+			t.Fatalf("线路归因的 405 不应冷却账号: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
 		}
-		if got.Status == model.StatusActive && got.RiskControlStreak == 0 && got.CoolingUntil == nil {
-			if got.ProxyID != nil {
-				t.Fatal("未尝试账号不应更换代理")
-			}
-			untouched++
-			continue
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl || got.LastRiskControlAt == nil {
+			t.Fatalf("风控证据仍须落库: %s kind=%v at=%v", got.Name, got.LastErrorKind, got.LastRiskControlAt)
 		}
-		t.Fatalf("账号 %s 状态不属于任一预期形态: status=%s streak=%d until=%v",
-			got.Name, got.Status, got.RiskControlStreak, got.CoolingUntil)
 	}
-	if cooled != 2 || untouched != 1 {
-		t.Fatalf("应恰好 2 个账号保留冷却、1 个未被动: cooled=%d untouched=%d", cooled, untouched)
-	}
-
-	// 重放防护：同内容再来的请求直接 503（risk_control_cooldown），上游零调用。
-	callsBefore := f.callCount()
+	// 未登记重放防护：同内容再来一次不会被 risk_control_cooldown 挡住。
 	status, raw = f.post(t, msgBody(), "sk-test")
-	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "risk_control_cooldown") {
-		t.Fatalf("同内容请求应命中重放防护: %d %q", status, raw)
-	}
-	if n := f.callCount(); n != callsBefore {
-		t.Fatalf("重放防护生效后上游调用数不得增长: %d → %d", callsBefore, n)
+	if status != http.StatusServiceUnavailable || strings.Contains(raw, "risk_control_cooldown") {
+		t.Fatalf("同线 405 不得登记重放防护: %d %q", status, raw)
 	}
 }
 
-// 对照组：只有 1 个账号给出风控信号、第 2 个账号正常 ⇒ 仍是账号级风控，被拒账号必须冷却。
-// 这是「阈值 2 不误伤」的直接守卫——09-23 全天的 17 次零星风控都是这个形态。
-func Test405AccountLevelRiskStillCoolsAndSwitches(t *testing.T) {
+// 对照组：只有 1 个账号给出风控信号、第 2 个账号正常 ⇒ 请求成功。
+// 被拒账号按「线路归因」处置：**不冷却**，只记证据与命中时刻。
+func Test405FirstHitSwitchesWithoutCooling(t *testing.T) {
 	f := newFixture(t)
 	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
 	f.respond = func(call int, _ *http.Request) (int, http.Header, string) {
@@ -770,19 +740,26 @@ func Test405AccountLevelRiskStillCoolsAndSwitches(t *testing.T) {
 	cooled := 0
 	for _, acc := range []*model.Account{a1, a2} {
 		got := f.st.Find(model.ProviderZai, acc.ID)
-		if got.Status != model.StatusCooling {
-			continue
+		if got.Status == model.StatusCooling {
+			cooled++
 		}
-		cooled++
-		if got.RiskControlStreak != 1 {
-			t.Fatalf("账号级风控应推进一次阶梯: %d", got.RiskControlStreak)
-		}
-		if got.CoolingUntil == nil {
-			t.Fatal("账号级风控应写入冷却截止时间")
+		if got.RiskControlStreak != 0 {
+			t.Fatalf("线路归因的 405 不应推进阶梯: %d", got.RiskControlStreak)
 		}
 	}
-	if cooled != 1 {
-		t.Fatalf("账号级风控应恰好冷却被拒的那 1 个账号: %d", cooled)
+	if cooled != 0 {
+		t.Fatalf("首次 405 不应冷却账号: %d", cooled)
+	}
+	// 证据仍须落库：后台要看得到「这个号最近被风控拒过」。
+	evidence := 0
+	for _, acc := range []*model.Account{a1, a2} {
+		got := f.st.Find(model.ProviderZai, acc.ID)
+		if got.LastErrorKind != nil && *got.LastErrorKind == model.ErrorKindRiskControl && got.LastRiskControlAt != nil {
+			evidence++
+		}
+	}
+	if evidence != 1 {
+		t.Fatalf("被拒账号应恰好留下 1 份风控证据: %d", evidence)
 	}
 }
 
@@ -811,18 +788,21 @@ func Test405SkipsHotAccountsInPollutedPool(t *testing.T) {
 	}
 
 	status, raw := f.post(t, msgBody(), "sk-test")
-	if status != 405 || raw != riskBody {
-		t.Fatalf("两个干净账号都被拒应原样透传 405: %d %q", status, raw)
+	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "no_available_account") {
+		t.Fatalf("同一线路上的两个干净账号被拒不该判请求级: %d %q", status, raw)
 	}
 	// 热账号被硬闸门跳过：恰好只尝试两个干净账号。
 	if n := f.callCount(); n != 2 {
 		t.Fatalf("热账号应被跳过，上游调用应为 2 次: %d", n)
 	}
-	// 两个干净账号都冷却、阶梯各推进一次（请求级处置：保留冷却）。
+	// 两个干净账号都按线路归因处置：不冷却、不推进阶梯，但留下证据。
 	for _, acc := range []*model.Account{clean1, clean2} {
 		got := f.st.Find(model.ProviderZai, acc.ID)
-		if got.Status != model.StatusCooling || got.RiskControlStreak != 1 {
-			t.Fatalf("干净账号应冷却且推进一次: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
+		if got.Status != model.StatusActive || got.RiskControlStreak != 0 {
+			t.Fatalf("干净账号不应被冷却: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
+		}
+		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
+			t.Fatalf("干净账号应留下风控证据: %s kind=%v", got.Name, got.LastErrorKind)
 		}
 	}
 	// 热账号纹丝不动：没被喂给请求，不新增冷却/连击。
@@ -830,14 +810,10 @@ func Test405SkipsHotAccountsInPollutedPool(t *testing.T) {
 	if gotHot.Status != model.StatusActive || gotHot.RiskControlStreak != 0 {
 		t.Fatalf("热账号不应被动过: status=%s streak=%d", gotHot.Status, gotHot.RiskControlStreak)
 	}
-	// 重放防护按「两个干净账号」成立：同内容直接拒绝，不再消耗账号。
-	callsBefore := f.callCount()
-	status, raw = f.post(t, msgBody(), "sk-test")
-	if status != http.StatusServiceUnavailable || !strings.Contains(raw, "risk_control_cooldown") {
-		t.Fatalf("同内容请求应命中重放防护: %d %q", status, raw)
-	}
-	if n := f.callCount(); n != callsBefore {
-		t.Fatalf("重放防护生效后上游调用数不得增长: %d → %d", callsBefore, n)
+	// 未登记重放防护：同内容再来一次不会被 risk_control_cooldown 挡住。
+	status2, raw2 := f.post(t, msgBody(), "sk-test")
+	if status2 != http.StatusServiceUnavailable || strings.Contains(raw2, "risk_control_cooldown") {
+		t.Fatalf("同线 405 不得登记重放防护: %d %q", status2, raw2)
 	}
 }
 
@@ -873,21 +849,20 @@ func Test405SingleCleanAccountNoFalseRequestLevel(t *testing.T) {
 		t.Fatalf("只应尝试唯一干净账号: %d", n)
 	}
 	gotClean := f.st.Find(model.ProviderZai, clean.ID)
-	if gotClean.Status != model.StatusCooling || gotClean.RiskControlStreak != 1 {
-		t.Fatalf("干净账号应冷却、阶梯推进一次: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
+	if gotClean.Status != model.StatusActive || gotClean.RiskControlStreak != 0 {
+		t.Fatalf("唯一干净账号应按线路归因处置、不冷却: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
+	}
+	if gotClean.LastErrorKind == nil || *gotClean.LastErrorKind != model.ErrorKindRiskControl {
+		t.Fatalf("应留下风控证据: %v", gotClean.LastErrorKind)
 	}
 	gotHot := f.st.Find(model.ProviderZai, hot.ID)
 	if gotHot.Status != model.StatusActive || gotHot.RiskControlStreak != 0 {
 		t.Fatalf("热账号不应被动过: status=%s streak=%d", gotHot.Status, gotHot.RiskControlStreak)
 	}
-	// 未登记重放防护：同内容再来一次仍是（不消耗任何账号的）503，而不是封锁文案；
-	// 上游调用数不增长。
+	// 未登记重放防护：同内容再来一次仍是（不消耗任何账号的）503，而不是封锁文案。
 	status2, raw2 := f.post(t, msgBody(), "sk-test")
 	if status2 != http.StatusServiceUnavailable || strings.Contains(raw2, "risk_control_cooldown") {
 		t.Fatalf("单干净账号命中不得登记重放防护: %d %q", status2, raw2)
-	}
-	if n := f.callCount(); n != 1 {
-		t.Fatalf("上游调用不得增长: %d", n)
 	}
 }
 

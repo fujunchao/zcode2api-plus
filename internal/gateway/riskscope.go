@@ -14,9 +14,9 @@ import (
 	"zcode2api/internal/web"
 )
 
-// RiskControlRequestLevelThreshold 判定请求级风控所需的不同账号数。
-// 1 = 关闭判定（退回「逐号冷却」的旧行为），作为线上紧急回退开关；默认 2。
-var RiskControlRequestLevelThreshold = 2
+// RiskControlRequestLevelThreshold 判定请求级风控所需的不同「干净线路」数。
+// 1 = 关闭判定（任何一次 405 都算请求级，仅用于极端回退）；默认取配置 3。
+var RiskControlRequestLevelThreshold = config.RiskRequestLevelLines
 
 // RiskScope 一次请求的风控判定范围。
 //
@@ -24,16 +24,21 @@ var RiskControlRequestLevelThreshold = 2
 // Engine 或 Pool 上：两者都是跨请求共享的，任何共享的可变状态都会让并发的两个请求互相
 // 误判——A 请求的账号级风控会被 B 请求的命中计数顶成请求级。
 //
+// 判定单位是**线路**而不是账号：2026-10-17 日志里 21 条线路出过 405 且成功数为 0，
+// 同一份内容换条线 41–149 秒后即可成功；按账号计数会把「抽到两条脏线」误判成
+// 「内容被拒」，进而锁死整条请求（9 次判定 8 次错）。
+//
 // 导出供 asyncpool 复用：两条请求路径对同一份 body 必须给出相同的判定，否则「sync 安全、
 // async 打穿池子」的分歧迟早出现。
 type RiskScope struct {
-	hit        map[string]bool // 给出过风控信号的账号 ID
+	lines      map[string]bool // 给出过 405 的「干净」线路（按 LineKey 去重）
+	accounts   map[string]bool // 仅用于日志：命中过 405 的账号数
 	contentKey string          // 重放防护键（模型 + 内容指纹）；请求级判定成立时登记进 ReplayGuard
 }
 
 // NewRiskScope 创建一次请求的判定范围；contentKey 为重放防护键（可为空，空则不登记）。
 func NewRiskScope(contentKey string) *RiskScope {
-	return &RiskScope{hit: map[string]bool{}, contentKey: contentKey}
+	return &RiskScope{lines: map[string]bool{}, accounts: map[string]bool{}, contentKey: contentKey}
 }
 
 // ContentKey 重放防护键。
@@ -44,24 +49,42 @@ func (s *RiskScope) ContentKey() string {
 	return s.contentKey
 }
 
-// Verdict 按不同账号去重记次；静默隔离中的账号（旧账）不参与本地停止换号阈值。
-// 阈值只看本次请求新命中的账号；结论不表示正文就是风控原因。
-func (s *RiskScope) Verdict(acc *model.Account, now time.Time) bool {
+// Verdict 按不同「干净线路」去重记次。
+//
+// lineDirty 表示本次 405 **之前**该线路已被判脏（隔离中）：脏线的 405 只能证明
+// 「这条线脏」，不能当作「内容有问题」的证据，因此不计入阈值。
+// 结论不表示正文就是风控原因。
+func (s *RiskScope) Verdict(acc *model.Account, lineKey string, lineDirty bool) bool {
 	if s == nil || acc == nil {
 		return false
 	}
-	if !s.hit[acc.ID] && !acc.InRiskControlSilentWindow(now, config.RiskSilentWindow()) {
-		s.hit[acc.ID] = true
+	if s.lines == nil {
+		s.lines = map[string]bool{}
 	}
-	return len(s.hit) >= RiskControlRequestLevelThreshold
+	if s.accounts == nil {
+		s.accounts = map[string]bool{}
+	}
+	s.accounts[acc.ID] = true
+	if !lineDirty && lineKey != "" {
+		s.lines[lineKey] = true
+	}
+	return len(s.lines) >= RiskControlRequestLevelThreshold
 }
 
-// Accounts 已给出风控信号的不同账号数（供日志）。
+// Lines 已命中 405 的不同干净线路数（供日志）。
+func (s *RiskScope) Lines() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.lines)
+}
+
+// Accounts 已给出风控信号的不同账号数（供日志；不参与判定）。
 func (s *RiskScope) Accounts() int {
 	if s == nil {
 		return 0
 	}
-	return len(s.hit)
+	return len(s.accounts)
 }
 
 // MarkRiskControl 施加风控冷却（连续命中次数递进，超阶梯置失效），并自动换代理。
@@ -82,12 +105,7 @@ func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, no
 	if len(attempt) > 0 {
 		observed = attempt[0]
 	}
-	result := store.ProxyRotation{Reason: "egress_override"}
-	var err error
-	// 强制直连/无效代理回退/注入客户端没有使用绑定线路，不污染它的失败历史。
-	if observed.Egress.Mode == "proxy" || observed.Egress.Mode == "direct" {
-		result, err = st.RotateAccountProxyAt(snapshot, now)
-	}
+	result, err := rotateRiskProxy(st, snapshot, observed, now)
 	from, to := observed.Egress, st.ProxyEgress(st.FindAny(snapshot.ID))
 	if result.Reason == "changed" {
 		copy := snapshot.Clone()
@@ -112,4 +130,55 @@ func MarkRiskControl(st *store.Store, snapshot *model.Account, errMsg string, no
 	}
 	web.Warn("risk-proxy", msg)
 	return secs, streak, invalid
+}
+
+// rotateRiskProxy 是「风控后换线」的唯一实现，冷却与不冷却两条路径共用。
+//
+// 强制直连 / 无效代理回退 / 注入客户端没有使用绑定线路时不动绑定：那些出口不是
+// 账号自己的选择，换掉会污染它的失败历史。
+func rotateRiskProxy(st *store.Store, snapshot *model.Account, observed RiskAttempt, now time.Time) (store.ProxyRotation, error) {
+	result := store.ProxyRotation{Reason: "egress_override"}
+	if observed.Egress.Mode != "proxy" && observed.Egress.Mode != "direct" {
+		return result, nil
+	}
+	return st.RotateAccountProxyAt(snapshot, now)
+}
+
+// NoteRiskControlWithoutCooling 记录一次「线路归因」的 405：落错误章与命中时刻、
+// 换一条线路，但**不改账号状态**（不冷却、不推进 RiskControlStreak）。
+//
+// 这是 2026-10-17 日志的直接结论：405 过的账号换线即可成功（5/5），首次 405 冷却
+// 账号等于拿池子容量替脏线买单。只有当同号在不同线路上再次 405 时，才由调用方
+// 升级到 MarkRiskControl 的阶梯冷却。
+func NoteRiskControlWithoutCooling(st *store.Store, snapshot *model.Account, errMsg string, now time.Time, attempt ...RiskAttempt) {
+	_, _ = st.UpdateForRequest(snapshot, func(acc *model.Account) {
+		ts := float64(now.UnixNano()) / 1e9
+		kind := model.ErrorKindRiskControl
+		acc.LastErrorKind, acc.LastErrorAt, acc.LastError = &kind, &ts, &errMsg
+		acc.LastRiskControlAt = &ts
+	})
+	observed := RiskAttempt{Egress: st.ProxyEgress(snapshot)}
+	if len(attempt) > 0 {
+		observed = attempt[0]
+	}
+	if st.FindAny(snapshot.ID) == nil {
+		return // 账号已被并发删除：不换线、不落日志
+	}
+	result, err := rotateRiskProxy(st, snapshot, observed, now)
+	from, to := observed.Egress, st.ProxyEgress(st.FindAny(snapshot.ID))
+	if result.Reason == "changed" {
+		copy := snapshot.Clone()
+		copy.ProxyID, copy.ProxyURL = &result.Next.ID, &result.Next.URL
+		to = st.ProxyEgress(copy)
+	}
+	streak := 0
+	if live := st.FindAny(snapshot.ID); live != nil {
+		streak = live.RiskControlStreak
+	}
+	msg := fmt.Sprintf("账号 %s 命中风控（HTTP 405，线路归因）本次不冷却 req=%q ticket=%q result=%s from_id=%q from_route=%q to_id=%q to_route=%q streak=%d cooling_s=0",
+		snapshot.ID, observed.RequestID, observed.Ticket, result.Reason, from.ID, from.Label, to.ID, to.Label, streak)
+	if err != nil {
+		msg += fmt.Sprintf(" error=%q", err.Error())
+	}
+	web.Warn("risk-proxy", msg)
 }

@@ -755,33 +755,36 @@ func (e *Engine) handleUpstreamError(
 		return attemptResult{switchAccount: true}
 	}
 
-	// 8) 405 + 风控文案：先分清「账号级」还是「请求级」风控，再决定要不要惩罚账号。
+	// 8) 405 + 风控文案：先分清「线路级」还是「请求级」，再决定要不要惩罚账号。
 	//
-	// 账号级（换号即成功——2026-09-23 全天 17 次零星风控，17/17 在第 2 个账号上成功）
-	// → 整号冷却（按连续命中次数递进，超阶梯置失效）并换号，与既有行为一致。
+	// 线路级（换条线即成功——2026-10-17 日志里 405 过的账号换线后 5/5 恢复）
+	// → 只换线、不冷却账号；同号在**不同线路**上仍 405 才升级到阶梯冷却。
 	//
-	// 请求级（同一 body 在 ≥2 个**命中时仍干净**（非静默期）的不同账号上都吃同一
-	// 风控信号——2026-09-24 当日 67/67）→ 达到本地停止继续换号的保护阈值；不据此
-	// 断言提示词是服务端触发原因。热账号的命中不计入判定（它的 405 与内容无关，
-	// 2026-10-12 晚污染池误判事故）。处置（账号级标记模型，见 riskscope.go 头注释）：
-	// 停止换号、**保留**本请求已施加的风控冷却（每个被尝试的账号都已被上游标记，
-	// 本地冷却防止它们立即被再次选中）、登记重放防护（同内容 TTL 内直接快速失败，
-	// 阻止标记扩散）。
+	// 请求级（同一 body 在 N 条**命中时仍干净**的不同线路上都吃同一风控信号）
+	// → 达到本地停止继续换号的保护阈值；N 由配置给出（默认 3）。判定单位是线路而
+	// 不是账号：按账号计数会把「抽到两条脏线」误判成「内容被拒」（9 次判定 8 次错）。
+	// 处置（账号级标记模型，见 riskscope.go 头注释）：停止换号、保留本请求已施加的
+	// 风控冷却、登记重放防护（同内容 TTL 内直接快速失败，阻止标记扩散）。
 	//
 	// 先看 body 再看状态码：405 在本项目里有三种完全不同的含义——风控拦截、计费接口
 	// 的重复查询、以及 JWT 账号缺顶层 system 注入时上游回的 405。最后一种是**我方构造
 	// 请求的缺陷**（见 body.go / upstream/request.go 的说明），换号与冷却都没用，每个
 	// 账号都会一样地失败；只看状态码冷却会把它变成对账号的集体惩罚。请求级判定是同一
 	// 思路的延伸：当身份不是变量时，别惩罚身份。
-	//
-	// 风控看身份维度（账号/设备指纹/出口 IP/请求头），与模型无关，所以账号级处置不换模型、
-	// 直接停整个账号；冷却期间该号 IsSelectable 为 false，本请求自然换下一个。
 	if resp.StatusCode == http.StatusMethodNotAllowed && model.IsRiskControlBody(text) {
 		preview := ErrorPreview(text)
-		if scope.Verdict(acc, e.now()) {
-			// 判定成立：这个账号同样吃了 405、同样被上游标记 —— 冷却动作与账号级
-			// 相同（MarkRiskControl 内部落证据章），差别只在后续：停止换号 + 登记
-			// 重放防护，让同内容请求在窗口内直接失败。
+		// 顺序不能反：先读「这一枪之前该线路是否已脏」，再落本次 405。
+		// 若先落库再读，本枪自己触发的隔离会把自己算成脏线，请求级永远凑不满阈值。
+		lineKey := egress.LineKey()
+		lineDirty := e.Store.Line405Blocked(egress, e.now())
+		if d := e.Store.RecordLine405(egress, e.now()); d.Action == "quarantine" {
+			web.Warn(reqID, fmt.Sprintf("线路 %s 连续 %d 次 405，隔离至 %s；本请求改换线路重试",
+				egress.Label, d.Strikes, d.Until.Format(time.RFC3339)))
+		}
+		if scope.Verdict(acc, lineKey, lineDirty) {
+			// 判定成立：**N 条不同且命中时仍干净的线路**都被同一内容拒 —— 冷却动作与
+			// 账号级相同（MarkRiskControl 内部落证据章），差别只在后续：停止换号 +
+			// 登记重放防护，让同内容请求在窗口内直接失败。
 			secs, streak, invalid := MarkRiskControl(e.Store, acc,
 				"上游风控拦截 HTTP 405（請求級）: "+preview, e.now(), RiskAttempt{RequestID: reqID, Egress: egress})
 			if e.replay != nil {
@@ -791,24 +794,41 @@ func (e *Engine) handleUpstreamError(
 				web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（請求級，HTTP %d，%s），已置為失效待人工處理；同內容 %d s 內直接拒絕",
 					acc.Name, streak, resp.StatusCode, preview, ReplayGuardTTL))
 			} else {
-				web.Warn(reqID, fmt.Sprintf("已達本地風控重試保護閾值（已在 %d 個帳號上復現，HTTP %d，%s），停止換號；冷卻保留（本地階梯保護，%d s），同內容 %d s 內直接拒絕",
-					scope.Accounts(), resp.StatusCode, preview, secs, ReplayGuardTTL))
+				web.Warn(reqID, fmt.Sprintf("已達本地風控重試保護閾值（已在 %d 條線路上復現、%d 個帳號，HTTP %d，%s），停止換號；冷卻保留（本地階梯保護，%d s），同內容 %d s 內直接拒絕",
+					scope.Lines(), scope.Accounts(), resp.StatusCode, preview, secs, ReplayGuardTTL))
 			}
 			return attemptResult{final: withRetryAdvice(runResult{
 				Status: resp.StatusCode,
 				Body:   passthroughBodyWithType(text, "upstream_error"),
 			}, e.replay.Remaining(scope.ContentKey()))}
 		}
-		secs, streak, invalid := MarkRiskControl(e.Store, acc,
-			"上游风控拦截 HTTP 405: "+preview, e.now(), RiskAttempt{RequestID: reqID, Egress: egress})
-		if invalid {
-			web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
-				acc.Name, streak, resp.StatusCode, preview))
+		attemptInfo := RiskAttempt{RequestID: reqID, Egress: egress}
+		// 首次（或同一条脏线的重复）405 归因于线路：只换线，不冷却账号。
+		// 只有同号换过一条线仍然 405 时，才升级到阶梯冷却（NoteAccount405 返回 false）。
+		lineAttributed := egress.Mode == "proxy" && config.RiskCoolOnFirst == 0 &&
+			e.Store.NoteAccount405(acc.ID, egress.Identity(), e.now())
+		if lineAttributed {
+			NoteRiskControlWithoutCooling(e.Store, acc,
+				"上游风控拦截 HTTP 405（线路归因）: "+preview, e.now(), attemptInfo)
+			web.Warn(reqID, fmt.Sprintf("账号 %s 命中风控（HTTP 405，线路 %s），本次只换线、不冷却账号",
+				acc.Name, egress.Label))
 		} else {
-			web.Warn(reqID, fmt.Sprintf("账号 %s 第 %d 次命中风控（HTTP %d，%s），冷却 %d s 后切换下一个",
-				acc.Name, streak, resp.StatusCode, preview, secs))
+			secs, streak, invalid := MarkRiskControl(e.Store, acc,
+				"上游风控拦截 HTTP 405: "+preview, e.now(), attemptInfo)
+			if invalid {
+				web.Warn(reqID, fmt.Sprintf("账号 %s 连续第 %d 次命中风控（HTTP %d，%s），已置為失效待人工處理",
+					acc.Name, streak, resp.StatusCode, preview))
+			} else {
+				web.Warn(reqID, fmt.Sprintf("账号 %s 第 %d 次命中风控（HTTP %d，%s），冷却 %d s 并换线路重试",
+					acc.Name, streak, resp.StatusCode, preview, secs))
+			}
 		}
-		return attemptResult{switchAccount: true}
+		// 换线：与 408/524 同一条出路。直连没有线路可换，avoid 留空。
+		res := attemptResult{switchAccount: true}
+		if egress.Mode == "proxy" && egress.Identity() != "" {
+			res.avoid = egress.Identity()
+		}
+		return res
 	}
 
 	// 8.5) 边缘/代理超时（408/524）：与账号无关，换一条线路重试有限次；预算用尽
