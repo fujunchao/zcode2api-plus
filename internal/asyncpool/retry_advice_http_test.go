@@ -178,8 +178,10 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		}
 		seen[requestID] = true
 	}
-	if len(observed) != 4 || observed[0].Get("Authorization") == observed[1].Get("Authorization") || observed[2].Get("Authorization") != observed[3].Get("Authorization") {
-		t.Fatal("405 应按原预算换号，3009 应按原预算同号重试")
+	// 阈值 1 时首个 405 即登记保护，因此实测是 3 次真实出站：
+	// [0] 首个内容的 405（账号 A）、[1] 另一个内容的 3009（账号 B）、[2] 同号重试成功。
+	if len(observed) != 3 || observed[0].Get("Authorization") == observed[1].Get("Authorization") || observed[1].Get("Authorization") != observed[2].Get("Authorization") {
+		t.Fatal("405 应换号，3009 应同号原地重试")
 	}
 }
 
