@@ -424,16 +424,17 @@ func TestDiagRiskScopeDistinctAccounts(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		f.post(t, msgBody())
+		status, _ := f.post(t, msgBody())
 
 		line := f.buf.diagLine(t)
 		if got := diagField(t, line, "riskscope"); got != "2" {
 			t.Errorf("riskscope=%s，期望 2（两个不同账号）\n行=%s", got, line)
 		}
-		// 两个账号是直连（同一条线路），不构成请求级判定：账号耗尽后 503，
-		// 而不是把上游 405 透传给客户端。
-		if got := diagField(t, line, "status"); got != "503" {
-			t.Errorf("status=%s，期望 503（同线不判请求级）\n行=%s\n日志=%s", got, line, f.buf.String())
+		// 两个账号是直连（同一条线路），不构成请求级判定：账号耗尽后 HTTP 503。
+		// 注意诊断行的 status 保留的是**最后一次上游尝试**的状态（405），终态以
+		// ingress event=end 的 http_status 为准。
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("HTTP 状态=%d，期望 503（同线不判请求级）\n行=%s", status, line)
 		}
 	})
 
