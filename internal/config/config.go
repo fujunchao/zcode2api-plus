@@ -305,6 +305,14 @@ var (
 	// 拿账号池替脏线买单。超限只记日志，隔离本身不受影响。
 	Line405ProbePerHour = max(0, envInt("ZCODE_LINE405_PROBE_PER_HOUR", 12))
 
+	// ProxyMaxBindingsPerLine 单条线路的绑定软上限（0 = 关闭判定）。
+	//
+	// ⚠️ 它不是「分散器」：leastLoadedProxy 永远选绑定最少的线路，只要存在未超限的
+	// 候选就一定先被选中，因此本值不改变选线结果。它的真实用途是容量口径——当选中的
+	// 最空闲线路都已超限时，说明「线路数不足」，日志会记 capacity_short，提示扩池；
+	// 此时仍然分配（不产生 auto_pending_proxy），只是让容量缺口可见。
+	ProxyMaxBindingsPerLine = max(0, envInt("ZCODE_PROXY_MAX_BINDINGS_PER_LINE", 8))
+
 	// RiskRequestLevelLines 判定「请求级风控」所需的不同干净线路数。
 	//
 	// 旧版数的是账号：2 个账号各 405 一次就判内容级。2026-10-17 日志证明这在脏线

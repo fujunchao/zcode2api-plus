@@ -2,9 +2,14 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strings"
+
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/proxysub"
+	"zcode2api/internal/web"
 )
 
 // commitProxyStateLocked 将线路与关联账号作为一个事务提交，再发布内存状态。
@@ -167,7 +172,49 @@ func (s *Store) reassignAccountsLocked(match func(*model.Account) bool, assignab
 		result.Assigned[a.ID] = id
 		setStrictIntent(&next, a, "auto_proxy")
 	}
+	if len(result.Assigned) > 0 {
+		// 落点分布是复盘「删线后账号都压到哪条线上」的唯一证据；只记计数看不出集中度。
+		web.Warn("proxy-reassign", fmt.Sprintf("assigned=%d top_targets=%s", len(result.Assigned), reassignTargets(result.Assigned, 3)))
+	}
 	return result, pending, &next
+}
+
+// reassignTargets 汇总改派落点（accountID → profileID），返回 "p1:6,p2:4,+2" 形式。
+// 按绑定数降序、同数按 ID 升序，保证日志可对比；top<=0 时输出全部。
+func reassignTargets(assigned map[string]string, top int) string {
+	if len(assigned) == 0 {
+		return ""
+	}
+	counts := map[string]int{}
+	for _, id := range assigned {
+		counts[id]++
+	}
+	type target struct {
+		id string
+		n  int
+	}
+	list := make([]target, 0, len(counts))
+	for id, n := range counts {
+		list = append(list, target{id, n})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].n != list[j].n {
+			return list[i].n > list[j].n
+		}
+		return list[i].id < list[j].id
+	})
+	var b strings.Builder
+	for i, t := range list {
+		if top > 0 && i == top {
+			fmt.Fprintf(&b, ",+%d", len(list)-top)
+			break
+		}
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "%s:%d", t.id, t.n)
+	}
+	return b.String()
 }
 
 // reassignOffQuarantineLocked 把绑定在隔离线路上的账号改派走：不改线路配置、不删任何东西。

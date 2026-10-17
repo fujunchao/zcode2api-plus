@@ -37,9 +37,30 @@ func (s *Store) proxyOccupancyLocked() map[string]int {
 
 // leastLoadedProxy 选启用且绑定最少的线路：零绑定自然优先，同负载按列表顺序。
 // 风控换线同时排除旧 ID 和旧 URL，避免不同配置仍指向同一代理地址。
-func leastLoadedProxy(profiles []ProxyProfile, occupancy map[string]int, excludeID, excludeURL string) (ProxyProfile, bool) {
+//
+// cap > 0 时先只在「绑定数 < cap」的线路里选，全部超限才回落全量。注意这只是把
+// 「容量口径」写清楚：任何未超限线路的绑定数都严格小于任何超限线路，所以两趟
+// 结果与单趟必然一致。真正的分散来自「选最少」本身；当最少的都已超限时，说明
+// 线路数不足，chooseProxyLocked 会记 capacity_short 而不是硬拒绝分配。
+func leastLoadedProxy(profiles []ProxyProfile, occupancy map[string]int, excludeID, excludeURL string, cap int) (ProxyProfile, bool) {
 	var best ProxyProfile
-	found := false
+	found, overCap := false, false
+	for _, p := range profiles {
+		if !p.Enabled || p.ID == excludeID || (excludeURL != "" && p.URL == excludeURL) {
+			continue
+		}
+		if cap > 0 && occupancy[p.ID] >= cap {
+			overCap = true
+			continue
+		}
+		if !found || occupancy[p.ID] < occupancy[best.ID] {
+			best, found = p, true
+		}
+	}
+	if found || !overCap {
+		return best, found
+	}
+	// 全部超限：回落旧行为（不硬拒），避免 auto_pending_proxy 堆积。
 	for _, p := range profiles {
 		if !p.Enabled || p.ID == excludeID || (excludeURL != "" && p.URL == excludeURL) {
 			continue

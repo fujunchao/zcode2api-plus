@@ -3,11 +3,14 @@ package store
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/web"
 )
 
 func addSelectionProxy(t *testing.T, s *Store, name string, port int, enabled bool) ProxyProfile {
@@ -268,5 +271,72 @@ func TestConcurrentRiskResponsesRotateOnlyOnce(t *testing.T) {
 	wg.Wait()
 	if changedCount.Load() != 1 {
 		t.Fatalf("同一旧出口的并发风控响应只能换线一次: %d", changedCount.Load())
+	}
+}
+
+// 软上限不能改变选线结果：任何未超限线路的绑定数都严格小于任何超限线路，
+// 所以「先选未超限」与「直接选最少」必然一致。它的作用是容量口径（见下一个用例）。
+func TestLeastLoadedProxySoftCapKeepsLeastLoaded(t *testing.T) {
+	profiles := []ProxyProfile{
+		{ID: "a", URL: "http://a", Enabled: true},
+		{ID: "b", URL: "http://b", Enabled: true},
+		{ID: "c", URL: "http://c", Enabled: true},
+	}
+	occupancy := map[string]int{"a": 9, "b": 8, "c": 3}
+	for _, cap := range []int{0, 8, 4} {
+		got, ok := leastLoadedProxy(profiles, occupancy, "", "", cap)
+		if !ok || got.ID != "c" {
+			t.Fatalf("cap=%d 应选绑定最少的 c，实际 %+v", cap, got)
+		}
+	}
+	// 全部超限时仍能分配（不产生 pending），并回落到绑定最少的那条。
+	allOver := map[string]int{"a": 11, "b": 9, "c": 10}
+	got, ok := leastLoadedProxy(profiles, allOver, "", "", 8)
+	if !ok || got.ID != "b" {
+		t.Fatalf("全部超限时也应分配绑定最少的 b，实际 %+v", got)
+	}
+	if _, ok := leastLoadedProxy(profiles, occupancy, "a", "http://b", 0); !ok {
+		t.Fatal("排除后仍应选出 c")
+	}
+}
+
+// 容量不足要可见：最空闲线路都已超限时记 capacity_short，但不拒绝分配。
+func TestChooseProxyLogsCapacityShort(t *testing.T) {
+	old := config.ProxyMaxBindingsPerLine
+	config.ProxyMaxBindingsPerLine = 1
+	t.Cleanup(func() { config.ProxyMaxBindingsPerLine = old })
+
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "唯一线路", 18311, true)
+	addSelectionAccount(t, s, "容量账号", p.ID)
+
+	buf := &strings.Builder{}
+	web.SetOut(buf)
+	t.Cleanup(func() { web.SetOut(nil) })
+
+	got, ok := s.PickAvailableProxyProfile()
+	if !ok || got.ID != p.ID {
+		t.Fatalf("容量不足时仍应照常分配，实际 %+v/%v", got, ok)
+	}
+	if !strings.Contains(buf.String(), "capacity_short=1") || !strings.Contains(buf.String(), "cap=1") {
+		t.Fatalf("应记录容量不足告警: %s", buf.String())
+	}
+}
+
+func TestReassignTargetsAggregates(t *testing.T) {
+	if got := reassignTargets(nil, 3); got != "" {
+		t.Fatalf("没有改派时不应输出: %q", got)
+	}
+	assigned := map[string]string{
+		"a1": "p1", "a2": "p1", "a3": "p1", "a4": "p1", "a5": "p1", "a6": "p1",
+		"b1": "p2", "b2": "p2", "b3": "p2", "b4": "p2",
+		"c1": "p3", "c2": "p3", "c3": "p3",
+		"d1": "p4", "d2": "p4",
+	}
+	if got := reassignTargets(assigned, 3); got != "p1:6,p2:4,p3:3,+1" {
+		t.Fatalf("落点分布不符: %q", got)
+	}
+	if got := reassignTargets(assigned, 0); !strings.HasPrefix(got, "p1:6,p2:4,p3:3,p4:2") {
+		t.Fatalf("top<=0 应输出全部: %q", got)
 	}
 }

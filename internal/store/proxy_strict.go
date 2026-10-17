@@ -285,7 +285,9 @@ func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]
 		}
 		allowed = append(allowed, p)
 	}
-	if p, ok := leastLoadedProxy(allowed, occupancy, "", ""); ok {
+	cap := config.ProxyMaxBindingsPerLine
+	if p, ok := leastLoadedProxy(allowed, occupancy, "", "", cap); ok {
+		s.logLineCapLocked(now, occupancy[p.ID], cap, len(allowed))
 		return p, true
 	}
 	if len(allowed) == len(eligible) {
@@ -294,7 +296,26 @@ func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]
 	// 全池可选项都被隔离/冷启动门禁挡住时放宽一次：继续用一条「慢但能连」的线路，
 	// 好过没有任何代理而落到直连（直连是风控风险最高的选择）。
 	s.logProxyRelaxLocked(now, len(eligible), len(eligible)-len(allowed))
-	return leastLoadedProxy(eligible, occupancy, "", "")
+	p, ok := leastLoadedProxy(eligible, occupancy, "", "", cap)
+	if ok {
+		s.logLineCapLocked(now, occupancy[p.ID], cap, len(eligible))
+	}
+	return p, ok
+}
+
+// logLineCapLocked 在最空闲线路也已超出软上限时提示「线路数不足」。
+//
+// 这不是分配失败：仍然照常分配，只是把容量缺口变成可见指标——单条线绑 24 个号
+// 时，代码无法凭空变出线路，但运维能立刻看到该扩池了。
+func (s *Store) logLineCapLocked(now time.Time, bindings, cap, candidates int) {
+	if cap <= 0 || bindings < cap {
+		return
+	}
+	if now.UnixMilli()-s.lineCapRelaxLoggedAt < proxyRelaxLogInterval.Milliseconds() {
+		return
+	}
+	s.lineCapRelaxLoggedAt = now.UnixMilli()
+	web.Warn("line-cap", fmt.Sprintf("capacity_short=1 cap=%d bindings=%d candidates=%d", cap, bindings, candidates))
 }
 
 func (s *Store) logProxyRelaxLocked(now time.Time, candidates, blockedCount int) {
