@@ -384,7 +384,7 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 	}
 	s.publishCredentialGenerationsLocked()
 	for key, value := range values {
-		if key == strictProxyStateKey || key == riskProxyHistoryKey || key == proxySoftFailureKey {
+		if key == strictProxyStateKey || key == riskProxyHistoryKey || key == proxySoftFailureKey || key == line405Key {
 			continue
 		}
 		s.settings[key] = value

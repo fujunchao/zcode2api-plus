@@ -89,7 +89,9 @@ type Store struct {
 	modelProbe            modelProbeState
 	proxyFailureRechecks  map[string]proxyFailureRecheck // 运行期异常通知，不是删除证据；重启不续用。
 	proxySoft             proxySoftState                 // 软失败统计与隔离状态，保存于内部 meta，不进入设置快照。
+	line405               line405State                   // 线路级 405 画像与隔离，保存于内部 meta，不进入设置快照。
 	proxyRelaxLoggedAt    int64                          // 选线放宽日志限频（unix ms），仅用于避免日志刷屏。
+	line405RelaxLoggedAt  int64                          // 线路 405 隔离放宽日志限频（unix ms）。
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -300,6 +302,12 @@ func (s *Store) load() error {
 	}
 	delete(settings, proxySoftFailureKey)
 	s.pruneProxySoftLocked(time.Now())
+	if raw := settings[line405Key]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &s.line405); err != nil {
+			return fmt.Errorf("读取线路 405 状态失败: %w", err)
+		}
+	}
+	delete(settings, line405Key)
 	if err := s.loadStrictProxy(settings[strictProxyStateKey]); err != nil {
 		return err
 	}
@@ -485,7 +493,7 @@ func (s *Store) GetSetting(key string) (string, bool) {
 func (s *Store) publishSettings() {
 	cp := make(map[string]string, len(s.settings))
 	for k, v := range s.settings {
-		if k == strictProxyStateKey || k == riskProxyHistoryKey || k == quotaRecoveryKey || k == proxySoftFailureKey {
+		if k == strictProxyStateKey || k == riskProxyHistoryKey || k == quotaRecoveryKey || k == proxySoftFailureKey || k == line405Key {
 			continue
 		}
 		cp[k] = v
@@ -1793,15 +1801,28 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 	defer s.mu.Unlock()
 	now := time.Now()
 	window := config.RiskSilentWindow()
-	var base []*model.Account
+	var base, preferred []*model.Account
+	// 线路 405 隔离：只影响新派发，不动已有绑定；候选为空时回落全量（见下）。
+	lineBlocked := s.line405BlockedLocked(now)
 	for _, a := range s.accounts[provider] {
 		a.Initialization = s.initializationViewLocked(a)
 		a.ModelProbeOnly = s.isModelProbeAccountLocked(a.ID)
 		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (forceDirect || s.proxyBindingAvailableLocked(a)) && !s.accountAvoidsLocked(a, avoid) {
 			base = append(base, a)
+			if !lineBlocked[s.boundLineIdentityLocked(a)] {
+				preferred = append(preferred, a)
+			}
 		}
 	}
-	pool := base
+	pool := preferred
+	if len(pool) == 0 {
+		// 全池线路都被 405 隔离：宁可继续用一条已隔离的线，也不能返回
+		// no_available_account —— 那会把「线路脏」升级成「服务不可用」。
+		pool = base
+		if len(base) > 0 {
+			s.logLine405RelaxLocked(now, len(base), len(base))
+		}
+	}
 	// 单号钉住（运维复验）：在资格闸门之后、模型/额度/轮询之前命中。
 	// 钉住的号若不可调度（冷却/停用/线路不可用）或本请求已试过，静默回落正常选号，不失败。
 	if pin := s.pinHitLocked(base, skipIDs, now); pin != nil {

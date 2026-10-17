@@ -282,6 +282,31 @@ var (
 	// 选号与恢复共用本值，RiskSilentWindow 是唯一换算点；不自动复活失效账号。
 	RiskSilentHours = envInt("ZCODE_RISK_SILENT_HOURS", 0)
 
+	// Line405MinStreak 连续多少次 405 判定一条线路不可派发（0 = 关闭线路隔离）。
+	//
+	// 用「连续」而不是累计：免费代理池里时好时坏的线很多，累计计数会把还能用的线
+	// 永久压死；连续两次 405 之间只要成功一次就清零。
+	Line405MinStreak = max(0, envInt("ZCODE_LINE405_MIN_STREAK", 2))
+
+	// Line405QuarantineMinutes 线路 405 隔离首档时长（分钟），续期按 2 的幂递增。
+	Line405QuarantineMinutes = max(1, envInt("ZCODE_LINE405_QUARANTINE_MINUTES", 30))
+
+	// Line405MaxQuarantineMinutes 隔离续期封顶（分钟）。与软失败一致，最长 4 小时；
+	// 超过这个量级仍 405 的线路应当被巡检删除，而不是无限期隔离。
+	Line405MaxQuarantineMinutes = max(1, envInt("ZCODE_LINE405_MAX_QUARANTINE_MINUTES", 240))
+
+	// RiskRequestLevelLines 判定「请求级风控」所需的不同干净线路数。
+	//
+	// 旧版数的是账号：2 个账号各 405 一次就判内容级。2026-10-17 日志证明这在脏线
+	// 池里几乎全是误判（9 次判定 8 次错，同内容 41–149 秒后换线即成功），故改为按
+	// 线路去重、默认 3；2 = 恢复旧行为（应急回退）。
+	RiskRequestLevelLines = max(1, envInt("ZCODE_RISK_REQUEST_LEVEL_LINES", 3))
+
+	// RiskCoolOnFirst 首次 405 是否直接按阶梯冷却账号。
+	// 0（默认）= 只换线不冷却：本次日志里 405 过的账号换条线即可成功，冷却账号
+	// 等于拿池子容量替脏线买单。1 = 旧行为（首次即冷却），用于回退。
+	RiskCoolOnFirst = envInt("ZCODE_RISK_COOL_ON_FIRST", 0)
+
 	// SelectExpireFirstDays 选号「到期门槛」窗口（天）：持有 N 天内到期、且不会自动
 	// 刷新的额度列（one_time / 周月套餐）的账号优先。0 = 关闭。
 	//

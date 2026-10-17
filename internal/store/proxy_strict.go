@@ -315,6 +315,13 @@ func (s *Store) proxySelectionBlockedLocked(now time.Time) map[string]bool {
 			out[identity] = true
 		}
 	}
+	// 线路 405 隔离与软失败隔离共用「不参与新分配」这一个出口：两者都只影响派发，
+	// 不改已有绑定，也不写删除证据。
+	for identity, until := range s.line405QuarantineLocked(now) {
+		if until.After(now) {
+			out[identity] = true
+		}
+	}
 	ttl := time.Duration(config.ProxyFreshGateSeconds) * time.Second
 	if ttl <= 0 {
 		return out
