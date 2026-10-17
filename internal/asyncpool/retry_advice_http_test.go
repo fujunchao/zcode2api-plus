@@ -147,7 +147,7 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		}
 	}
 	_, raw := post("另一个正常请求")
-	if !strings.Contains(raw, "event: done") || strings.Contains(raw, "wait_same_gateway") || calls.Load() != 2 {
+	if !strings.Contains(raw, "event: done") || strings.Contains(raw, "wait_same_gateway") || calls.Load() != 4 {
 		t.Fatal("局部风控保护不能全局关闭其他请求的 3009 原地重试")
 	}
 	captureMu.Lock()

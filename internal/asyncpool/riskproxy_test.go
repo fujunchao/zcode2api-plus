@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
@@ -48,18 +47,10 @@ func TestAsyncRiskProxyRotationUsesNewEgressAfterCooling(t *testing.T) {
 				return
 			}
 			if got.ProxyID == nil || *got.ProxyID != next.ID || got.ProxyURL == nil || *got.ProxyURL != next.URL ||
-				got.Status != model.StatusCooling || got.RiskControlStreak != 1 || got.CoolingUntil == nil {
-				t.Fatal("异步风控应换线并保留冷却")
+				got.Status != model.StatusActive || got.RiskControlStreak != 0 || got.CoolingUntil != nil {
+				t.Fatal("异步风控应换线且首次不冷却")
 			}
-			// 模拟冷却到期（并且静默期已过）：仅把冷却调旧不足以重新入池——
-			// 被上游标记的账号还要过 24h 风控静默期硬闸门，两个时间证据一起调旧，
-			// 让本用例聚焦异步路径的代理轮换语义。
-			_, _ = st.Update(a.Provider, a.ID, func(live *model.Account) {
-				expired := float64(time.Now().Add(-time.Second).Unix())
-				live.CoolingUntil = &expired
-				past := float64(time.Now().Add(-25 * time.Hour).Unix())
-				live.LastRiskControlAt = &past
-			})
+			// 首次命中归因线路：账号仍 active，下一张票直接走新代理。
 			tk := insertTicket(p, "after-cooling", request)
 			p.processTicket(context.Background(), "after-cooling")
 			events := drainEvents(tk)

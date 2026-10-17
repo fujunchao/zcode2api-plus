@@ -688,6 +688,10 @@ func Test405WithoutRiskBodyDoesNotCool(t *testing.T) {
 //
 // 新行为：继续换号；账号耗尽后以 no_available_account 结束，且**不登记重放防护**。
 func Test405SameLineDoesNotTriggerRequestLevel(t *testing.T) {
+	oldThreshold := RiskControlRequestLevelThreshold
+	RiskControlRequestLevelThreshold = 3
+	t.Cleanup(func() { RiskControlRequestLevelThreshold = oldThreshold })
+
 	f := newFixture(t)
 	upstreamBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
 	f.respond = jsonResp(405, upstreamBody)
@@ -772,6 +776,9 @@ func Test405AccountLevelHitCoolsAndSwitches(t *testing.T) {
 // 极高，被误判成「内容有罪」后错误地停止换号并封锁同内容，这正是 33 分钟全池
 // 风暴的机制。
 func Test405SkipsHotAccountsInPollutedPool(t *testing.T) {
+	oldThreshold := RiskControlRequestLevelThreshold
+	RiskControlRequestLevelThreshold = 3
+	t.Cleanup(func() { RiskControlRequestLevelThreshold = oldThreshold })
 	oldHours := config.RiskSilentHours
 	config.RiskSilentHours = 24
 	t.Cleanup(func() { config.RiskSilentHours = oldHours })

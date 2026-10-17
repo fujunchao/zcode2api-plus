@@ -406,6 +406,11 @@ func TestDiagBodyHashIdentifiesSamePayload(t *testing.T) {
 // TestDiagRiskScopeDistinctAccounts riskscope 把「同一 body 已在几个不同账号上命中
 // 风控」直接落到日志里，让请求级判定在线上可检索，而不必事后统计推断。
 func TestDiagRiskScopeDistinctAccounts(t *testing.T) {
+	// 显式钉住阈值，避免与其它用例对包级变量的临时改写互相影响。
+	oldThreshold := RiskControlRequestLevelThreshold
+	RiskControlRequestLevelThreshold = 3
+	t.Cleanup(func() { RiskControlRequestLevelThreshold = oldThreshold })
+
 	riskUp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -428,7 +433,7 @@ func TestDiagRiskScopeDistinctAccounts(t *testing.T) {
 		// 两个账号是直连（同一条线路），不构成请求级判定：账号耗尽后 503，
 		// 而不是把上游 405 透传给客户端。
 		if got := diagField(t, line, "status"); got != "503" {
-			t.Errorf("status=%s，期望 503（同线不判请求级）\n行=%s", got, line)
+			t.Errorf("status=%s，期望 503（同线不判请求级）\n行=%s\n日志=%s", got, line, f.buf.String())
 		}
 	})
 
