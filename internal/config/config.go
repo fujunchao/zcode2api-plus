@@ -162,6 +162,17 @@ var (
 	ProxyFreshGateSeconds = max(0, envInt("ZCODE_PROXY_FRESH_GATE_SECONDS", 120))
 )
 
+// ── 单次尝试的首字节预算 ────────────────────────────────────────────────────
+// Go 的 ResponseHeaderTimeout 是「**写完 body 之后**」才开始计时，慢线路上 5MB
+// 上传要几百秒，上传阶段等于没有超时（2026-10-17 复盘：5.5MB 请求首字节 283s）。
+// 这里给「建连 + 上传 + 收到响应头」整段设预算：收到响应头即停表，绝不限制长流。
+var (
+	// UpstreamFirstByteTimeout 首字节预算；0 关闭。
+	UpstreamFirstByteTimeout = time.Duration(max(0, envInt("ZCODE_UPSTREAM_FIRST_BYTE_TIMEOUT", 90))) * time.Second
+	// UpstreamTimeoutRetries 上游 408/524 的换号重试次数；0 关闭。
+	UpstreamTimeoutRetries = max(0, envInt("ZCODE_UPSTREAM_TIMEOUT_RETRIES", 1))
+)
+
 // ── 上游风控冷却 ────────────────────────────────────────────────────────────
 // 405 + unusual activity 按账号施加本地阶梯冷却。该处置范围是网关策略，
 // 不能据通用错误文案断言供应商对所有模型的封禁范围。
@@ -291,7 +302,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.10.15-go"
+	AppVersion = "2.10.16-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

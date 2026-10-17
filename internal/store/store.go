@@ -1736,16 +1736,42 @@ func (s *Store) SetArchived(provider, idOrName string, archived bool) (bool, err
 //  5. 轮询：在第 4 层并列的账号之间按 round-robin 游标轮转。
 //
 // skipIDs 保证同一次请求不会重复尝试已失败的账号。
+// accountAvoidsLocked 判断账号绑定的线路是否在本请求的回避集合里。
+// 裸 URL（ProxyID 为空）同样按 identity 判定——它指向的是同一条线路。
+func (s *Store) accountAvoidsLocked(a *model.Account, avoid map[string]bool) bool {
+	if len(avoid) == 0 || a == nil {
+		return false
+	}
+	url := derefStr(a.ProxyURL)
+	if url == "" {
+		return false
+	}
+	return avoid[strictProxyIdentity(url)]
+}
+
 func (s *Store) Select(provider string, skipIDs map[string]bool, modelName string) *model.Account {
-	return s.selectAccount(provider, skipIDs, modelName, false)
+	return s.selectAccount(provider, skipIDs, modelName, false, nil)
+}
+
+// SelectAvoiding 在选号时回避指定线路（identity 集合）。用于「换号即换线」：
+// 首字节超时/408/524 之后，下一次尝试不应再落到同一条慢线路上。
+// 回避把候选清空时自动退回不过滤——宁可再慢一次，也不能报「无可用账号」。
+func (s *Store) SelectAvoiding(provider string, skipIDs map[string]bool, modelName string, avoid map[string]bool) *model.Account {
+	if acc := s.selectAccount(provider, skipIDs, modelName, false, avoid); acc != nil {
+		return acc
+	}
+	if len(avoid) == 0 {
+		return nil
+	}
+	return s.selectAccount(provider, skipIDs, modelName, false, nil)
 }
 
 // SelectForDirect 仅用于显式强制直连。只忽略代理绑定准入，账号、模型和冷却规则不变。
 func (s *Store) SelectForDirect(provider string, skipIDs map[string]bool, modelName string) *model.Account {
-	return s.selectAccount(provider, skipIDs, modelName, true)
+	return s.selectAccount(provider, skipIDs, modelName, true, nil)
 }
 
-func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelName string, forceDirect bool) *model.Account {
+func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelName string, forceDirect bool, avoid map[string]bool) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -1754,7 +1780,7 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 	for _, a := range s.accounts[provider] {
 		a.Initialization = s.initializationViewLocked(a)
 		a.ModelProbeOnly = s.isModelProbeAccountLocked(a.ID)
-		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (forceDirect || s.proxyBindingAvailableLocked(a)) {
+		if a.IsSelectable(now) && !skipIDs[a.ID] && !a.InRiskControlSilentWindow(now, window) && (forceDirect || s.proxyBindingAvailableLocked(a)) && !s.accountAvoidsLocked(a, avoid) {
 			base = append(base, a)
 		}
 	}

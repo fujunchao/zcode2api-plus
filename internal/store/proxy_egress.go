@@ -22,6 +22,9 @@ type ProxyEgress struct {
 	credentialGeneration uint64
 }
 
+// Identity 返回出站线路的规范化身份（不含认证）；可用于按线路去重或回避。
+func (e ProxyEgress) Identity() string { return e.identity }
+
 func (s *Store) ProxyEgress(acc *model.Account) ProxyEgress {
 	s.mu.Lock()
 	defer s.mu.Unlock()

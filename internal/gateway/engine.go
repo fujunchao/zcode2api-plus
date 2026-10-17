@@ -149,7 +149,9 @@ type attemptResult struct {
 	retrySame      bool
 	switchAccount  bool
 	final          runResult
-	quotaRecovered bool // 完整成功交付，供独占 API Key 恢复探测确认使用。
+	quotaRecovered bool   // 完整成功交付，供独占 API Key 恢复探测确认使用。
+	avoid          string // 本次失败的线路 identity；换号时加入请求级回避集合。
+	timeoutRetry   bool   // 本次失败消耗了一次 408/524 换线预算（计数在请求级）。
 }
 
 // attemptBudget 单账号内的三类重试预算，各自独立计数。
@@ -161,6 +163,9 @@ type attemptBudget struct {
 	busy     int // 3010 并发准入等待（上限 len(BusyRetryDelays)）
 	rate     int // 瞬时限流原地重试（上限 MaxRateLimitRetries）
 	overload int // 平台过载退避重试（上限 len(OverloadRetryDelays)）
+	// timeout 是**请求级**计数（跨账号共享）：每换一次号就 +1，
+	// 由 RunMessages 回填，避免每个账号都各拿一份预算。
+	timeout int
 }
 
 // RunMessages 执行完整循环。body 是入口 NormalizeBody 后的请求体；
@@ -220,9 +225,16 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	attr := upstream.NewAttribution(incomingHeaders, upstream.MetadataSessionID(body))
 
 	tried := map[string]bool{}
+	// 请求级线路回避：被首字节预算或 408/524 判过超时的线路，本请求不再选绑定在它
+	// 上面的账号。"换号"因此变成"换线"——否则 24 个账号共享一条慢线时，换谁都是再
+	// 等一个同样的预算。
+	avoid := map[string]bool{}
+	// 408/524 换线预算按请求计数（跨账号共享）：否则每个账号都会各拿一份预算，
+	// 两个账号就会各重试一次，预算形同虚设。
+	timeoutRetries := 0
 	probeTried := false
 	for range MaxAccountAttempts {
-		acc := e.Store.Select(model.ProviderZai, tried, modelName)
+		acc := e.Store.SelectAvoiding(model.ProviderZai, tried, modelName, avoid)
 		var probe *store.QuotaProbe
 		if acc == nil && !probeTried && ctx.Err() == nil {
 			var err error
@@ -249,12 +261,18 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 					}
 				}()
 			}
-			return e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, attr, deliver, diag, scope)
+			return e.tryAccount(ctx, reqID, acc, body, modelName, stream, incomingHeaders, attr, deliver, diag, scope, timeoutRetries)
 		}()
 		if res.retrySame {
 			continue
 		}
+		if res.timeoutRetry {
+			timeoutRetries++
+		}
 		if res.switchAccount {
+			if res.avoid != "" {
+				avoid[res.avoid] = true
+			}
 			continue
 		}
 		return res.final
@@ -305,6 +323,7 @@ func (e *Engine) tryAccount(
 	deliver DeliverFunc,
 	diag *ReqDiag,
 	scope *RiskScope,
+	timeoutRetries int,
 ) attemptResult {
 	// JWT 决定鉴权、system 和错误分类；是否取验证码由模型专用入口独立判断。
 	isJWT := acc.Mode == "jwt"
@@ -318,6 +337,7 @@ func (e *Engine) tryAccount(
 	}
 
 	var b attemptBudget
+	b.timeout = timeoutRetries
 	budget := 1 + MaxCaptchaRetries + len(e.BusyRetryDelays) + MaxRateLimitRetries + len(e.OverloadRetryDelays)
 
 	for range budget {
@@ -405,7 +425,11 @@ func (e *Engine) tryAccount(
 			return attemptResult{final: errResult(http.StatusServiceUnavailable, "selected_proxy_unavailable", "选定路由不可用，请检查代理配置后重试")}
 		}
 		defer release()
-		httpReq = httpReq.WithContext(attemptCtx)
+		// 首字节预算：覆盖建连 + 上传 + 收到响应头。收到响应头即停表（Headers），
+		// 长流不受影响；Stop 在本次尝试结束时释放。
+		watchdog := newFirstByteWatchdog(attemptCtx, config.UpstreamFirstByteTimeout, egress.Identity())
+		defer watchdog.Stop()
+		httpReq = httpReq.WithContext(watchdog.Context())
 		if diag != nil {
 			// 首字节延迟与耗时的基准点：紧贴出站调用。
 			diag.UpstreamStart = diag.Now()
@@ -415,18 +439,32 @@ func (e *Engine) tryAccount(
 		finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq, e.Store.FindAny(acc.ID))
 		resp, err := client.Do(httpReq)
 		finishAttempt(resp, err)
+		watchdog.Headers(resp)
 		if err != nil {
-			ObserveModelAttemptError(attemptCtx, err, e.now())
-			release()
 			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
 				// ——换号只会白烧另一个账号的额度。
 				// 只记「归类 + 时间」而**不覆盖 last_error 文案**：用户按一下 ESC 不该
 				// 把上一次真实故障的文案冲掉，但「这个号最近发生过什么」仍值得留痕。
+				ObserveModelAttemptError(attemptCtx, err, e.now())
+				release()
 				e.recordError(acc, model.ErrorKindClientCanceled, "")
 				web.Warn(reqID, fmt.Sprintf("请求已取消（账号 %s）：%v", acc.Name, err))
 				return attemptResult{final: errResult(http.StatusBadGateway, "request_canceled", "请求已取消")}
 			}
+			if watchdog.Fired() {
+				// 线路在预算内没交出首字节。这不是账号的错：**不冷却账号**（24 个账号
+				// 共享同一条慢线时，逐个冷却会瞬间清空池子），只把这条线路加入本请求的
+				// 回避集合，让下一次换号直接换成换线。
+				ObserveModelAttemptTimeout(attemptCtx, e.now())
+				release()
+				e.recordError(acc, model.ErrorKindConnectionFailed, "上游首字节超时")
+				web.Warn(reqID, fmt.Sprintf("上游 %s 内未返回首字节（账号 %s，线路 %s），换线重试",
+					config.UpstreamFirstByteTimeout, acc.Name, egress.Label))
+				return attemptResult{switchAccount: true, avoid: watchdog.Identity()}
+			}
+			ObserveModelAttemptError(attemptCtx, err, e.now())
+			release()
 			e.mark(acc, model.StatusCooling, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
 			return attemptResult{switchAccount: true}
@@ -719,6 +757,15 @@ func (e *Engine) handleUpstreamError(
 				acc.Name, streak, resp.StatusCode, preview, secs))
 		}
 		return attemptResult{switchAccount: true}
+	}
+
+	// 8.5) 边缘/代理超时（408/524）：与账号无关，换一条线路重试有限次；预算用尽
+	// 才原样透传。慢线路上这类失败换线通常直接成功，原样透传只会让用户白等。
+	if timeoutStatus(resp.StatusCode) && b.timeout < config.UpstreamTimeoutRetries {
+		b.timeout++
+		web.Warn(reqID, fmt.Sprintf("上游 HTTP %d（账号 %s），换线重试（第 %d 次）",
+			resp.StatusCode, acc.Name, b.timeout))
+		return attemptResult{switchAccount: true, avoid: egress.Identity(), timeoutRetry: true}
 	}
 
 	// 9) 其余错误：非已知信号，不做账号状态推断，直接原样继承上游响应

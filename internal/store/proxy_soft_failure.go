@@ -42,6 +42,10 @@ type ProxySoftFailure struct {
 	LastStatus      int    `json:"last_status,omitempty"`
 	Strikes         int    `json:"strikes"`
 	QuarantineUntil int64  `json:"quarantine_until,omitempty"`
+	// Slow 是「首字节超过 30 秒但最终成功」的次数。它只用于观察与后续选线排序，
+	// **不参与隔离判定**：30–90 秒出首字节的线路仍然能用，记成失败会把仅存的
+	// 可用线路也隔离掉。
+	Slow int `json:"slow,omitempty"`
 }
 
 type proxySoftState struct {
@@ -166,6 +170,30 @@ func (s *Store) queueSoftRecheckLocked(ent ProxySoftFailure, now time.Time) {
 		At:             now,
 		Pending:        true,
 	}
+}
+
+// proxySlowFirstByte 首字节超过此值即记一次慢样本；只观察，不计入失败率。
+const proxySlowFirstByte = 30 * time.Second
+
+// RecordProxySlowSample 记录一次「首字节很慢但最终成功」。它不改变 Failures，
+// 因此不会把一条能用的线路推进隔离；只作为后台观察与后续选线排序的输入。
+func (s *Store) RecordProxySlowSample(e ProxyEgress, ttfb time.Duration, now time.Time) {
+	if e.Mode != "proxy" || e.identity == "" || e.ID == "" || ttfb < proxySlowFirstByte {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.strictClosed {
+		return
+	}
+	ent, ok := s.proxySoft.Entries[e.identity]
+	if !ok {
+		// 没有任何样本的线路不为了「慢」单独建档，避免一次性线路污染统计。
+		return
+	}
+	ent.Slow++
+	ent.LastAt = now.UnixMilli()
+	s.proxySoft.Entries[e.identity] = ent
 }
 
 // ProxyQuarantine 返回当前仍在隔离期的线路（identity → 到期时间）。

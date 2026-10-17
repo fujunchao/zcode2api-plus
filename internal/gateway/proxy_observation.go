@@ -42,6 +42,8 @@ type proxyAttemptObservation struct {
 	responseVerified bool
 	responseStatus   int
 	targetRef        string
+	beganAt          time.Time
+	firstByteAt      time.Time
 }
 
 // 判定引用只存在于本进程的十分钟证据窗口，不输出、不持久化。其密钥须稳定到进程结束，
@@ -72,7 +74,7 @@ func BeginProxyAttempt(ctx context.Context, st *store.Store, acc *model.Account,
 	}
 	acc = acc.Clone()
 	value := ModelRequestObservation(acc, request, body, entry)
-	p := &proxyAttemptObservation{store: st, account: acc, egress: egress, value: value, targetRef: observationRef(request.URL.String())}
+	p := &proxyAttemptObservation{store: st, account: acc, egress: egress, value: value, targetRef: observationRef(request.URL.String()), beganAt: time.Now()}
 	attemptCtx := context.WithValue(ctx, proxyObservationKey{}, p)
 	idle := st.TrackModelAccountUse(acc.ID)
 	var once sync.Once
@@ -136,7 +138,19 @@ func observeModelAttemptHealth(ctx context.Context, code string, complete bool, 
 		if signal, ok := softOutcomeSignal(kind, o.Status); ok && !o.InvalidRequest {
 			p.store.RecordProxySoftOutcome(p.egress, signal, o.Status, kind == "success", now)
 		}
+		// 慢样本：成功后仍记录首字节时长，用于后续「同负载优先快线」的排序输入。
+		// 它**不计入失败率**——30–90 秒出首字节但成功的线路是可用的，记成失败会把
+		// 唯一还活着的线路隔离掉。
+		if kind == "success" && !p.beganAt.IsZero() && !p.firstByteAt.IsZero() {
+			p.store.RecordProxySlowSample(p.egress, p.firstByteAt.Sub(p.beganAt), now)
+		}
 	})
+}
+
+// ObserveModelAttemptTimeout 记录「等不到首字节」。它与客户端取消、普通连接失败
+// 都不同：账号未必有问题，但这条线路在预算内交不出首字节，必须记一次软失败。
+func ObserveModelAttemptTimeout(ctx context.Context, now time.Time) {
+	observeModelAttemptHealth(ctx, "", false, "timeout", now)
 }
 
 // softOutcomeSignal 只把与线路相关的结果交给软失败统计：成功计入分母，
@@ -233,6 +247,10 @@ func ConfirmProxyAttemptResponse(ctx context.Context, response *http.Response) {
 	}
 	p.responseVerified = response.Request.Method == p.value.Method && observationRef(response.Request.URL.String()) == p.targetRef
 	p.responseStatus = response.StatusCode
+	// 首字节到达时刻：只用于慢样本统计（>30s 的成功请求），不参与任何判定。
+	if p.firstByteAt.IsZero() {
+		p.firstByteAt = time.Now()
+	}
 }
 
 // ProxyAttemptEgress 把本次真实路由交给断流/成功处理，不能重新读取账号后来修改的绑定。
