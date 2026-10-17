@@ -62,7 +62,7 @@ func (h *Handler) handleHealthSummary(w http.ResponseWriter, r *http.Request) {
 		writeError500(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"model": model, "network": network})
+	writeJSON(w, http.StatusOK, map[string]any{"model": model, "network": network, "soft": h.Store.ProxySoftFailures()})
 }
 
 func (h *Handler) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
