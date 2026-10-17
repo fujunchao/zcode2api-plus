@@ -64,10 +64,11 @@ func (s *fakeSolver) callCount() int {
 type upstreamSpec struct {
 	status      int
 	contentType string
-	body        string   // 非 SSE 应答体
-	lines       []string // SSE 应答逐行写出（自动补 \n\n）
-	abort       bool     // 写完后强制断连（模拟流中断）
-	reset       bool     // 接受连线后立即断开（模拟连线层网络错误）
+	body        string        // 非 SSE 应答体
+	lines       []string      // SSE 应答逐行写出（自动补 \n\n）
+	abort       bool          // 写完后强制断连（模拟流中断）
+	reset       bool          // 接受连线后立即断开（模拟连线层网络错误）
+	delay       time.Duration // 写出任何响应头之前先等待（模拟慢线首字节）
 }
 
 // scriptedUpstream 脚本化上游服务器。
@@ -92,6 +93,10 @@ func (s *scriptedUpstream) start(t *testing.T) *httptest.Server {
 		if spec.reset {
 			// 未写任何响应头即断开：客户端 client.Do 直接返回网络错误
 			panic(http.ErrAbortHandler)
+		}
+		if spec.delay > 0 {
+			// 慢线：预算必须在拿到响应头之前生效，这里不写任何头。
+			time.Sleep(spec.delay)
 		}
 		if spec.lines != nil {
 			w.Header().Set("Content-Type", orDefault(spec.contentType, "text/event-stream"))
@@ -1806,5 +1811,86 @@ func TestSuccessClearsFailureStreaks(t *testing.T) {
 	}
 	if got.Status != model.StatusActive {
 		t.Fatalf("冷却已到期的账号成功后应复位为 active: %s", got.Status)
+	}
+}
+
+// 首字节预算命中：换下一个账号且**不冷却**被超时的账号——慢的是线路，不是账号。
+func TestAsyncFirstByteTimeoutSwitchesLine(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	slow := addJWTAccountN(t, st, "slow-line", 1)
+	addJWTAccountN(t, st, "fast-line", 2)
+
+	oldFB, oldRetries := config.UpstreamFirstByteTimeout, config.AsyncMaxRetries
+	config.UpstreamFirstByteTimeout = 100 * time.Millisecond
+	config.AsyncMaxRetries = 1
+	t.Cleanup(func() {
+		config.UpstreamFirstByteTimeout, config.AsyncMaxRetries = oldFB, oldRetries
+	})
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusOK, delay: 400 * time.Millisecond, lines: []string{`data: {"id":"late"}`}},
+		{status: http.StatusOK, lines: []string{`data: {"id":"ok"}`, `data: {"type":"message_stop"}`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-line-timeout", map[string]any{
+		"model": "GLM-5.3", "max_tokens": 8,
+		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
+	})
+	p.processTicket(context.Background(), "ticket-line-timeout")
+
+	events := drainEvents(tk)
+	if last := events[len(events)-1]; last.Type != "done" {
+		t.Fatalf("换线后应成功交付，实际 %+v", events)
+	}
+	if up.callCount() != 2 {
+		t.Fatalf("应发生两次上游调用，实际 %d", up.callCount())
+	}
+	if got := st.Find(model.ProviderZai, slow.ID); got.Status == model.StatusCooling {
+		t.Fatalf("首字节超时不得冷却账号：%s", got.Status)
+	}
+}
+
+// 408/524 的换线预算按票据计数：预算 1 时只允许再试一个账号，用尽后原样投递。
+func TestAsyncTimeoutStatusRespectsTicketBudget(t *testing.T) {
+	p, st, _, _ := newTestPool(t)
+	addJWTAccountN(t, st, "line-a", 1)
+	addJWTAccountN(t, st, "line-b", 2)
+	addJWTAccountN(t, st, "line-c", 3)
+
+	oldRetries, oldTimeout := config.AsyncMaxRetries, config.UpstreamTimeoutRetries
+	config.AsyncMaxRetries = 3
+	config.UpstreamTimeoutRetries = 1
+	t.Cleanup(func() {
+		config.AsyncMaxRetries, config.UpstreamTimeoutRetries = oldRetries, oldTimeout
+	})
+
+	up := &scriptedUpstream{specs: []upstreamSpec{
+		{status: http.StatusRequestTimeout, body: "origin timeout"},
+		{status: 524, body: "edge timeout"},
+		{status: http.StatusOK, lines: []string{`data: {"id":"never"}`}},
+	}}
+	config.UpstreamZai = up.start(t).URL
+
+	tk := insertTicket(p, "ticket-408", map[string]any{
+		"model": "GLM-5.3", "max_tokens": 8,
+		"messages": []any{map[string]any{"role": "user", "content": "ping"}},
+	})
+	p.processTicket(context.Background(), "ticket-408")
+
+	events := drainEvents(tk)
+	last := events[len(events)-1]
+	if last.Type != "error" {
+		t.Fatalf("预算用尽应投递错误事件，实际 %+v", events)
+	}
+	if up.callCount() != 2 {
+		t.Fatalf("预算 1 只允许重试一次，实际调用 %d 次", up.callCount())
+	}
+	if data, ok := last.Data.(map[string]any); ok {
+		if errObj, ok := data["error"].(map[string]any); ok {
+			if msg, _ := errObj["message"].(string); !strings.Contains(msg, "edge timeout") {
+				t.Fatalf("应透传最后一次上游错误体，实际 %v", errObj)
+			}
+		}
 	}
 }

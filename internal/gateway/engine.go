@@ -231,6 +231,9 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	// 共享同一个会话 id（官方恒等），两处各算一次必然分叉。换号重试沿用同一份，
 	// 因为它仍是同一个入站请求。见 upstream.NewAttribution。
 	attr := upstream.NewAttribution(incomingHeaders, upstream.MetadataSessionID(body))
+	// 会话引用只落哈希：诊断行按它分组比较「同会话连续请求是否换了账号」（粘性实验的
+	// 唯一取数口径），原值不入日志。
+	diag.Session = SessionRef(attr.SessionID)
 
 	tried := map[string]bool{}
 	// 请求级线路回避：被首字节预算或 408/524 判过超时的线路，本请求不再选绑定在它

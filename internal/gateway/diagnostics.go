@@ -63,6 +63,12 @@ type ReqDiag struct {
 
 	AccName string // 最后一次尝试的账号
 	Route   string // 出口线路：线路名 / proxy:***@host / direct
+	// Session 会话引用的稳定哈希前缀（sha256 前 12 位）。
+	//
+	// 与 attempt_log 的 session_ref 刻意不同：那里用按时间轮换的 HMAC（只做短期关联、
+	// 不落原值），无法跨小时分组；这里要回答的是「同一会话的连续请求是否换了账号」，
+	// 必须在一个观察窗口内保持稳定。原值仍不落日志。
+	Session string
 
 	UpstreamStart time.Time // 上游请求发出时刻（首字节与耗时的基准）
 	FirstByte     time.Duration
@@ -183,6 +189,22 @@ func (d *ReqDiag) Finish(now time.Time) {
 	d.total = now.Sub(d.startedAt)
 }
 
+// SessionRef 会话引用的稳定哈希前缀（12 位十六进制）。
+//
+// 唯一用途是诊断行 `session=` 的分组键：回答「同一会话的连续请求是否换了账号」，
+// 从而为会话粘性实验提供取数口径。不输出原值（会话 id 由下游传入），也不用按时间
+// 轮换的 HMAC —— 那会让同一会话在跨小时的数据里裂成多个组，失去观测意义。
+//
+// P5 的粘性映射在 store 侧另有一份同构哈希：store 不能反向依赖 gateway，
+// 两处必须使用同一前缀常量，改动时同步。
+func SessionRef(session string) string {
+	if session == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("zcode-session|" + session))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 // Format 渲染诊断行的消息体（不含前缀与 reqID，由 web.Diag 补）。
 func (d *ReqDiag) Format() string {
 	msg := fmt.Sprintf("model=%s stream=%t effort=%s maxtok=%s body=%s attempts=%d acc=%s route=%s",
@@ -207,9 +229,9 @@ func (d *ReqDiag) Format() string {
 	// 与 bodyhash 的「空串 = 没构建出请求体」是两回事。
 	msg += fmt.Sprintf(" bodyhash=%s riskscope=%d",
 		dashText(d.BodyHash), d.RiskAccounts)
-	msg += fmt.Sprintf(" ts=%s started_at=%s gateway_request_id=%q protocol=%s input_ref=%s upstream_attempts=%d replay_blocked=%d replay_wait_ms=%d deadline_hit=%d",
+	msg += fmt.Sprintf(" ts=%s started_at=%s gateway_request_id=%q protocol=%s input_ref=%s upstream_attempts=%d replay_blocked=%d replay_wait_ms=%d deadline_hit=%d session=%s",
 		diagnosticTime(d.startedAt.Add(d.total)), diagnosticTime(d.startedAt), d.GatewayRequestID, d.Protocol,
-		dashText(d.InputRef), d.upstreamAttempts, boolToInt(d.ReplayBlocked), d.ReplayWait.Milliseconds(), boolToInt(d.DeadlineHit))
+		dashText(d.InputRef), d.upstreamAttempts, boolToInt(d.ReplayBlocked), d.ReplayWait.Milliseconds(), boolToInt(d.DeadlineHit), dashText(d.Session))
 	msg += d.shape.format(d.preserveContext)
 	return msg
 }

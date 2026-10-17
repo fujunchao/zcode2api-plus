@@ -1771,6 +1771,18 @@ func (s *Store) SelectForDirect(provider string, skipIDs map[string]bool, modelN
 	return s.selectAccount(provider, skipIDs, modelName, true, nil)
 }
 
+// SelectForDirectAvoiding 是 SelectForDirect 的回避版本（强制直连 + 请求级线路回避），
+// 供 asyncpool 的 async_force_direct 分支使用。回退语义与 SelectAvoiding 一致。
+func (s *Store) SelectForDirectAvoiding(provider string, skipIDs map[string]bool, modelName string, avoid map[string]bool) *model.Account {
+	if acc := s.selectAccount(provider, skipIDs, modelName, true, avoid); acc != nil {
+		return acc
+	}
+	if len(avoid) == 0 {
+		return nil
+	}
+	return s.selectAccount(provider, skipIDs, modelName, true, nil)
+}
+
 func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelName string, forceDirect bool, avoid map[string]bool) *model.Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()

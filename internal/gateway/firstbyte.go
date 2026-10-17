@@ -64,7 +64,20 @@ func (w *firstByteWatchdog) Fired() bool { return w.fired.Load() }
 // Identity 返回本次出站线路的规范化身份，用于请求级回避集合。
 func (w *firstByteWatchdog) Identity() string { return w.identity }
 
-// timeoutStatus 判断上游状态码是否属于「边缘/代理超时」类，值得换线重试一次。
+// FirstByteWatchdog 是首字节看门狗。导出类型别名供 asyncpool 复用——两条路径对
+// 「首字节超时」必须用同一套语义，否则同一次慢线在 sync 侧换线、async 侧却算账号故障。
+type FirstByteWatchdog = firstByteWatchdog
+
+// NewFirstByteWatchdog 创建看门狗（导出包装，参数与行为同 newFirstByteWatchdog）。
+func NewFirstByteWatchdog(parent context.Context, timeout time.Duration, identity string) *FirstByteWatchdog {
+	return newFirstByteWatchdog(parent, timeout, identity)
+}
+
+// TimeoutStatus 判断上游状态码是否属于「边缘/代理超时」类。导出供 asyncpool 复用：
+// 408/524 与具体账号无关，两条路径都应按「换线重试」处理，而不是记账号失败。
+func TimeoutStatus(status int) bool { return timeoutStatus(status) }
+
+// timeoutStatus 判断上游状态码是否属于「边缘/代理超时」类。
 // 408 是代理侧请求超时，524 是边缘等待源站超时；两者都与具体账号无关。
 func timeoutStatus(status int) bool {
 	return status == http.StatusRequestTimeout || status == 524

@@ -428,6 +428,8 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	diag := gateway.NewReqDiag(tk.shortID, modelName, true, body, time.Now)
 	diag.Ticket = ticketID
 	diag.SetTrace(ctx)
+	// 与 sync 同口径：只落会话的稳定哈希，供「同会话是否换号」分组。
+	diag.Session = gateway.SessionRef(attr.SessionID)
 	// 风控判定范围：**必须按票创建**（Pool 跨票共享，挂上去会让并发票务互相误判）。
 	// 与 sync 路径共用 gateway.RiskScope：同一份 body 在两条路径上必须得到同一判定。
 	// 请求级处置：停止换号、保留本地阶梯冷却、登记重放防护。见 riskscope.go。
@@ -454,8 +456,13 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 	// 每次实际 HTTP 构造更新 request ID；这里不按账号重建会话，也不启用托管身份。
 
 	retries := 0
+	// 线路级超时（首字节预算 / 408 / 524）的换线预算按**票据**计数，跨账号共享：
+	// 每个账号各拿一份预算等于没有预算。
+	timeoutRetries := 0
 	announcedReady := false
 	tried := map[string]bool{}
+	// 请求级线路回避：超时线路不再被本票选中（换号即换线），候选清空时选号层自动回退。
+	avoid := map[string]bool{}
 
 	for {
 		if ctx.Err() != nil {
@@ -465,15 +472,15 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		// 轮到 apiKey 账号时必须跳过并继续找下一个，而不是直接终止整张票——否则池里
 		// 明明有可用 JWT 账号，请求却与账号状态无关地间歇性失败。
 		// 先记 tried 再判断：漏记会让下一次轮询又选中同一账号。
-		selectAccount := p.Store.Select
+		selectAccount := p.Store.SelectAvoiding
 		if p.Store.AsyncForceDirect() {
 			// 强制直连不使用绑定代理，不能因该代理已退役而跳过仍健康的账号。
-			selectAccount = p.Store.SelectForDirect
+			selectAccount = p.Store.SelectForDirectAvoiding
 		}
-		acc := selectAccount(model.ProviderZai, tried, modelName)
+		acc := selectAccount(model.ProviderZai, tried, modelName, avoid)
 		for acc != nil && acc.Mode != "jwt" {
 			tried[acc.ID] = true
-			acc = selectAccount(model.ProviderZai, tried, modelName)
+			acc = selectAccount(model.ProviderZai, tried, modelName, avoid)
 		}
 		if acc == nil {
 			// 与 sync 路径同口径：选不出号要如实说明「为什么」——冷却/风控/停用
@@ -582,6 +589,23 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			if errors.As(streamErr, &reqLevelRisk) {
 				p.emitErrorWithDetails(ctx, ticketID, reqLevelRisk.body, "upstream_error", gateway.RetryAdvice(p.replay.Remaining(scope.ContentKey())))
 				return
+			}
+			// 线路级超时（首字节预算 / 408 / 524）：与账号无关，换线重试；预算按票据共享，
+			// 用尽后把上游原文投递给客户端。与 sync 路径同语义（engine 的 8.5 分支）。
+			var lineTimeout errLineTimeout
+			if errors.As(streamErr, &lineTimeout) {
+				if lineTimeout.avoid != "" {
+					avoid[lineTimeout.avoid] = true
+				}
+				if timeoutRetries >= config.UpstreamTimeoutRetries {
+					p.emitError(ctx, ticketID, lineTimeout.body, "upstream_error")
+					return
+				}
+				timeoutRetries++
+				web.Warn(ticketID, fmt.Sprintf("线路超时（第 %d 次）: %s", timeoutRetries, gateway.ErrorPreview(lineTimeout.body)))
+				networkRetry = true
+				lastNetworkError = lineTimeout.body
+				break
 			}
 			if ctx.Err() != nil {
 				return // 票务已被释放，无需继续
@@ -763,7 +787,12 @@ func (p *Pool) attemptUpstreamOnce(
 	}
 	defer release()
 	ctx = attemptCtx
-	httpReq = httpReq.WithContext(ctx)
+	// 首字节预算与 sync 同一实现：覆盖建连 + 上传 + 收到响应头，收到响应头即停表，
+	// 已开始的流不受影响。异步票的墙钟（AsyncTicketTimeout）不替代本预算——
+	// 慢线白等到 300s 才失败，与「换一条线马上成功」是两回事。
+	watchdog := gateway.NewFirstByteWatchdog(ctx, config.UpstreamFirstByteTimeout, egress.Identity())
+	defer watchdog.Stop()
+	httpReq = httpReq.WithContext(watchdog.Context())
 	riskAttempt := gateway.RiskAttempt{Ticket: ticketID, Egress: egress}
 	if diag != nil {
 		riskAttempt.RequestID = diag.ReqID
@@ -776,7 +805,13 @@ func (p *Pool) attemptUpstreamOnce(
 	finishAttempt := diag.BeginUpstreamAttempt(acc, egress, httpReq, p.Store.FindAny(acc.ID))
 	resp, err := client.Do(httpReq)
 	finishAttempt(resp, err)
+	watchdog.Headers(resp)
 	if err != nil {
+		if watchdog.Fired() {
+			// 慢的是线路，不是账号：只记软失败并换线，不冷却账号（与 sync 同）。
+			gateway.ObserveModelAttemptTimeout(ctx, time.Now())
+			return false, errLineTimeout{body: "上游首字节超时", avoid: watchdog.Identity()}
+		}
 		gateway.ObserveModelAttemptError(ctx, err, time.Now())
 		return false, err
 	}
@@ -912,6 +947,14 @@ func (p *Pool) attemptUpstreamOnce(
 			return false, errNetwork{bodyText}
 		}
 
+		// 边缘/代理超时（408/524）：与账号无关，换线重试有限次（预算在票据层共享），
+		// 用尽才把上游原文投递给客户端。与 sync 路径的 8.5 分支同语义。
+		if gateway.TimeoutStatus(resp.StatusCode) {
+			web.Warn(ticketID, fmt.Sprintf("上游 HTTP %d（账号 %s），换线重试: %s",
+				resp.StatusCode, acc.Name, gateway.ErrorPreview(bodyText)))
+			return false, errLineTimeout{body: bodyText, avoid: egress.Identity()}
+		}
+
 		// 其余错误：原样回传上游错误体，终止本票
 		p.bumpFail(acc, model.ErrorKindUpstreamError)
 		// 日志带上业务码与截断预览（与 sync 路径同）：只记状态码时，关键信息在 body
@@ -1013,6 +1056,17 @@ var errDelivered = errors.New("已投递错误事件")
 type errNetwork struct{ body string }
 
 func (e errNetwork) Error() string { return e.body }
+
+// errLineTimeout 线路级超时（首字节预算 / 408 / 524）：与账号无关。
+//
+// 与 errNetwork 的区别在处置：errNetwork 换号即止（可能仍落在同一慢线），
+// 本类型还会把线路 identity 带出去，让下一次选号跳过这条线；预算由调用方按票据计数。
+type errLineTimeout struct {
+	body  string
+	avoid string
+}
+
+func (e errLineTimeout) Error() string { return e.body }
 
 // errRequestLevelRisk 请求级风控（同一 body 在 ≥2 个不同账号上都被上游判风控）。
 //
