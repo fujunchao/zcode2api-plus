@@ -45,7 +45,7 @@ func (s *Store) PinAccount(provider, idOrName string, minutes int, now time.Time
 	s.pinID = acc.ID
 	s.pinUntil = now.Add(time.Duration(minutes) * time.Minute)
 	s.pinMissLogged = false
-	web.Warn(fmt.Sprintf("已钉住账号 %s（%d 分钟），期间全部模型请求优先打到该账号", acc.Name, minutes))
+	web.Warn("pin", fmt.Sprintf("已钉住账号 %s（%d 分钟），期间全部模型请求优先打到该账号", acc.Name, minutes))
 	return &PinnedAccount{ID: acc.ID, Name: acc.Name, Until: float64(s.pinUntil.UnixNano()) / 1e9}, nil
 }
 
@@ -57,7 +57,7 @@ func (s *Store) UnpinAccount() {
 		return
 	}
 	s.pinID, s.pinUntil, s.pinMissLogged = "", time.Time{}, false
-	web.Warn("已解除账号钉住")
+	web.Warn("pin", "已解除账号钉住")
 }
 
 // PinnedAccount 返回当前有效的钉住状态；已到期时顺手清理。
@@ -103,7 +103,7 @@ func (s *Store) pinHitLocked(base []*model.Account, skipIDs map[string]bool, now
 		if acc := s.findAnyLocked(s.pinID); acc != nil {
 			name = acc.Name
 		}
-		web.Warn(fmt.Sprintf("钉住账号 %s 本次未能命中（%s），已回落正常选号", name, reason))
+		web.Warn("pin", fmt.Sprintf("钉住账号 %s 本次未能命中（%s），已回落正常选号", name, reason))
 	}
 	return nil
 }
