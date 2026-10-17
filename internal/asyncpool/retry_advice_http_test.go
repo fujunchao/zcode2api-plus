@@ -59,6 +59,7 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 	base := time.Now()
 	p.replay = gateway.NewReplayGuard(time.Minute, func() time.Time { return base.Add(time.Duration(clockOffset.Load())) })
 	var calls atomic.Int32
+	var otherCalls atomic.Int32
 	var captureMu sync.Mutex
 	var capturedHeaders []http.Header
 	riskBody := `{"code":3012,"msg":"synthetic risk-control rejection"}`
@@ -76,6 +77,19 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		captureMu.Lock()
 		capturedHeaders = append(capturedHeaders, r.Header.Clone())
 		captureMu.Unlock()
+		// 「另一个正常请求」单独走 3009 → 原地重试 → 成功的路径：它不该被前一个
+		// 内容的局部风控保护波及（阈值置 1 时任何 405 都会登记保护，故这里不返回 405）。
+		if firstContent(body) == "另一个正常请求" {
+			if otherCalls.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, `{"code":3009,"msg":"synthetic concurrency limit"}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, completeProxyFixtureSSE)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if n <= 2 {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -147,7 +161,7 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 		}
 	}
 	_, raw := post("另一个正常请求")
-	if !strings.Contains(raw, "event: done") || strings.Contains(raw, "wait_same_gateway") || calls.Load() != 4 {
+	if !strings.Contains(raw, "event: done") || strings.Contains(raw, "wait_same_gateway") || calls.Load() != 3 {
 		t.Fatalf("局部风控保护不能全局关闭其他请求的 3009 原地重试（calls=%d）", calls.Load())
 	}
 	captureMu.Lock()
@@ -167,4 +181,15 @@ func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.
 	if len(observed) != 4 || observed[0].Get("Authorization") == observed[1].Get("Authorization") || observed[2].Get("Authorization") != observed[3].Get("Authorization") {
 		t.Fatal("405 应按原预算换号，3009 应按原预算同号重试")
 	}
+}
+
+// firstContent 取出首条用户消息文本，供合成上游按内容分流。
+func firstContent(body map[string]any) string {
+	msgs, ok := body["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return ""
+	}
+	m, _ := msgs[0].(map[string]any)
+	s, _ := m["content"].(string)
+	return s
 }
