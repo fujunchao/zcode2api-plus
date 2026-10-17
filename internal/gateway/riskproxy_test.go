@@ -46,21 +46,12 @@ func TestRiskProxyRotationUsesNewEgressAfterCooling(t *testing.T) {
 				return
 			}
 			if status != 503 || got.ProxyID == nil || *got.ProxyID != next.ID || got.ProxyURL == nil || *got.ProxyURL != next.URL ||
-				got.Status != model.StatusCooling || got.RiskControlStreak != 1 || got.CoolingUntil == nil {
-				t.Fatalf("风控后应换线并保留整号冷却: status=%d account=%+v", status, got)
+				got.Status != model.StatusActive || got.RiskControlStreak != 0 || got.CoolingUntil != nil {
+				t.Fatalf("风控后应换线且首次不冷却: status=%d account=%+v", status, got)
 			}
-			// 模拟冷却到期（并且静默期已过），下一次真正出站必须使用新代理。
-			// 注：仅把冷却调到过去并不足以重新入池——被上游标记的账号还有 24h
-			// 风控静默期硬闸门（见 Test405SkipsHotAccountsInPollutedPool），
-			// 两个时间证据一起调旧，让本用例聚焦代理轮换语义。
-			_, _ = f.st.Update(a.Provider, a.ID, func(live *model.Account) {
-				expired := float64(time.Now().Add(-time.Second).Unix())
-				live.CoolingUntil = &expired
-				past := float64(time.Now().Add(-25 * time.Hour).Unix())
-				live.LastRiskControlAt = &past
-			})
+			// 首次命中归因线路：账号仍 active，下一次请求直接走新代理。
 			if status, body := f.post(t, msgBody(), "sk-test"); status != 200 {
-				t.Fatalf("冷却到期后应从新代理成功: %d %s", status, body)
+				t.Fatalf("换线后应从新代理成功: %d %s", status, body)
 			}
 			if newCalls.Load() != 1 || f.callCount() != 1 {
 				t.Fatal("后续请求未使用新代理")

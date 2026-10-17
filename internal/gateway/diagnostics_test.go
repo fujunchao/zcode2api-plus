@@ -412,7 +412,7 @@ func TestDiagRiskScopeDistinctAccounts(t *testing.T) {
 		_, _ = io.WriteString(w, `{"error":{"message":"Request has been blocked due to unusual activity."}}`)
 	})
 
-	t.Run("两个账号被拒即请求级", func(t *testing.T) {
+	t.Run("两个账号被拒仍记 riskscope=2（同线不判请求级）", func(t *testing.T) {
 		f := newDiagFixture(t, riskUp)
 		for _, n := range []string{"risk-a", "risk-b"} {
 			if _, err := f.st.AddAccount(model.ProviderZai, n, "sk-"+n); err != nil {
@@ -425,8 +425,10 @@ func TestDiagRiskScopeDistinctAccounts(t *testing.T) {
 		if got := diagField(t, line, "riskscope"); got != "2" {
 			t.Errorf("riskscope=%s，期望 2（两个不同账号）\n行=%s", got, line)
 		}
-		if got := diagField(t, line, "status"); got != "405" {
-			t.Errorf("status=%s，期望 405\n行=%s", got, line)
+		// 两个账号是直连（同一条线路），不构成请求级判定：账号耗尽后 503，
+		// 而不是把上游 405 透传给客户端。
+		if got := diagField(t, line, "status"); got != "503" {
+			t.Errorf("status=%s，期望 503（同线不判请求级）\n行=%s", got, line)
 		}
 	})
 

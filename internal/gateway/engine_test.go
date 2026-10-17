@@ -702,11 +702,12 @@ func Test405SameLineDoesNotTriggerRequestLevel(t *testing.T) {
 	if n := f.callCount(); n != 3 {
 		t.Fatalf("三个账号都应被试，上游调用应为 3 次: %d", n)
 	}
-	// 首次 405 只换线不冷却：三个账号都应保持 active，但留下风控证据。
+	// 这些账号是直连（没有可换的线路），仍按旧行为冷却；关键是第 2 个账号不再触发
+	// 请求级判定——旧逻辑在第 2 次就返回 405 并封锁内容。
 	for _, acc := range []*model.Account{a1, a2, a3} {
 		got := f.st.Find(model.ProviderZai, acc.ID)
-		if got.Status != model.StatusActive || got.CoolingUntil != nil || got.RiskControlStreak != 0 {
-			t.Fatalf("线路归因的 405 不应冷却账号: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
+		if got.Status != model.StatusCooling || got.RiskControlStreak != 1 {
+			t.Fatalf("直连账号仍应按账号级冷却: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
 		}
 		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl || got.LastRiskControlAt == nil {
 			t.Fatalf("风控证据仍须落库: %s kind=%v at=%v", got.Name, got.LastErrorKind, got.LastRiskControlAt)
@@ -720,8 +721,8 @@ func Test405SameLineDoesNotTriggerRequestLevel(t *testing.T) {
 }
 
 // 对照组：只有 1 个账号给出风控信号、第 2 个账号正常 ⇒ 请求成功。
-// 被拒账号按「线路归因」处置：**不冷却**，只记证据与命中时刻。
-func Test405FirstHitSwitchesWithoutCooling(t *testing.T) {
+// 直连账号没有可换线路，仍按账号级冷却并推进一次阶梯。
+func Test405AccountLevelHitCoolsAndSwitches(t *testing.T) {
 	f := newFixture(t)
 	riskBody := `{"error":{"message":"Request has been blocked due to unusual activity."}}`
 	f.respond = func(call int, _ *http.Request) (int, http.Header, string) {
@@ -740,15 +741,16 @@ func Test405FirstHitSwitchesWithoutCooling(t *testing.T) {
 	cooled := 0
 	for _, acc := range []*model.Account{a1, a2} {
 		got := f.st.Find(model.ProviderZai, acc.ID)
-		if got.Status == model.StatusCooling {
-			cooled++
+		if got.Status != model.StatusCooling {
+			continue
 		}
-		if got.RiskControlStreak != 0 {
-			t.Fatalf("线路归因的 405 不应推进阶梯: %d", got.RiskControlStreak)
+		cooled++
+		if got.RiskControlStreak != 1 || got.CoolingUntil == nil {
+			t.Fatalf("账号级风控应推进一次阶梯并写冷却: streak=%d until=%v", got.RiskControlStreak, got.CoolingUntil)
 		}
 	}
-	if cooled != 0 {
-		t.Fatalf("首次 405 不应冷却账号: %d", cooled)
+	if cooled != 1 {
+		t.Fatalf("应恰好冷却被拒的那 1 个账号: %d", cooled)
 	}
 	// 证据仍须落库：后台要看得到「这个号最近被风控拒过」。
 	evidence := 0
@@ -795,11 +797,11 @@ func Test405SkipsHotAccountsInPollutedPool(t *testing.T) {
 	if n := f.callCount(); n != 2 {
 		t.Fatalf("热账号应被跳过，上游调用应为 2 次: %d", n)
 	}
-	// 两个干净账号都按线路归因处置：不冷却、不推进阶梯，但留下证据。
+	// 两个干净账号都是直连，按账号级冷却并推进一次阶梯；关键是**没有**被判请求级。
 	for _, acc := range []*model.Account{clean1, clean2} {
 		got := f.st.Find(model.ProviderZai, acc.ID)
-		if got.Status != model.StatusActive || got.RiskControlStreak != 0 {
-			t.Fatalf("干净账号不应被冷却: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
+		if got.Status != model.StatusCooling || got.RiskControlStreak != 1 {
+			t.Fatalf("干净账号应冷却且推进一次: %s status=%s streak=%d", got.Name, got.Status, got.RiskControlStreak)
 		}
 		if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindRiskControl {
 			t.Fatalf("干净账号应留下风控证据: %s kind=%v", got.Name, got.LastErrorKind)
@@ -849,8 +851,8 @@ func Test405SingleCleanAccountNoFalseRequestLevel(t *testing.T) {
 		t.Fatalf("只应尝试唯一干净账号: %d", n)
 	}
 	gotClean := f.st.Find(model.ProviderZai, clean.ID)
-	if gotClean.Status != model.StatusActive || gotClean.RiskControlStreak != 0 {
-		t.Fatalf("唯一干净账号应按线路归因处置、不冷却: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
+	if gotClean.Status != model.StatusCooling || gotClean.RiskControlStreak != 1 {
+		t.Fatalf("直连账号仍按账号级冷却: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
 	}
 	if gotClean.LastErrorKind == nil || *gotClean.LastErrorKind != model.ErrorKindRiskControl {
 		t.Fatalf("应留下风控证据: %v", gotClean.LastErrorKind)

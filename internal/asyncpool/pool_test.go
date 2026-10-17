@@ -855,9 +855,9 @@ func Test529OverloadRecoversInAsyncPool(t *testing.T) {
 	}
 }
 
-// 405 + 风控文案：异步路径与 sync 同语义——首次命中归因于线路，只换线、不冷却账号。
+// 405 + 风控文案：异步路径与 sync 同语义——直连账号无线路可换，按账号级冷却选档。
 // 两条路径对同一账号必须标出相同状态（项目硬不变式）。
-func Test405LineAttributedInAsyncPool(t *testing.T) {
+func Test405AccountLevelInAsyncPool(t *testing.T) {
 	p, st, _, _ := newTestPool(t)
 	addJWTAccount(t, st, "risk-acc")
 
@@ -871,11 +871,11 @@ func Test405LineAttributedInAsyncPool(t *testing.T) {
 	p.processTicket(context.Background(), "ticket-risk")
 
 	acc := st.ListAccounts(model.ProviderZai)[0]
-	if acc.Status != model.StatusActive || acc.CoolingUntil != nil {
-		t.Fatalf("线路归因的 405 不应冷却账号: %s until=%v", acc.Status, acc.CoolingUntil)
+	if acc.Status != model.StatusCooling || acc.CoolingUntil == nil {
+		t.Fatalf("账号级 405 应冷却: %s until=%v", acc.Status, acc.CoolingUntil)
 	}
-	if acc.RiskControlStreak != 0 {
-		t.Fatalf("不应推进风控阶梯: %d", acc.RiskControlStreak)
+	if acc.RiskControlStreak != 1 {
+		t.Fatalf("应推进一次阶梯: %d", acc.RiskControlStreak)
 	}
 	if acc.LastRiskControlAt == nil {
 		t.Fatal("命中时刻仍须落库（后台与静默期闸门的唯一来源）")
@@ -910,15 +910,17 @@ func Test405SameLineInAsyncPool(t *testing.T) {
 	}
 	events := drainEvents(tk)
 	for _, e := range events {
-		if errObj, _ := e.Data.(map[string]any)["error"].(map[string]any); errObj != nil {
-			if errObj["type"] == "risk_control_cooldown" {
-				t.Fatalf("同线 405 不得登记重放防护: %v", events)
-			}
+		data, _ := e.Data.(map[string]any)
+		if data == nil {
+			continue
+		}
+		if errObj, _ := data["error"].(map[string]any); errObj != nil && errObj["type"] == "risk_control_cooldown" {
+			t.Fatalf("同线 405 不得登记重放防护: %v", events)
 		}
 	}
 	for _, acc := range st.ListAccounts(model.ProviderZai) {
-		if acc.Status != model.StatusActive || acc.RiskControlStreak != 0 || acc.CoolingUntil != nil {
-			t.Fatalf("线路归因的 405 不应冷却账号: %s status=%s streak=%d", acc.Name, acc.Status, acc.RiskControlStreak)
+		if acc.Status != model.StatusCooling || acc.RiskControlStreak != 1 || acc.CoolingUntil == nil {
+			t.Fatalf("直连账号按账号级冷却: %s status=%s streak=%d", acc.Name, acc.Status, acc.RiskControlStreak)
 		}
 		wantErrorKind(t, acc, model.ErrorKindRiskControl)
 	}
@@ -973,8 +975,8 @@ func Test405HotAccountSkippedInAsyncPool(t *testing.T) {
 		t.Fatalf("no_account 应说明本地策略，不能声称上游封禁: %q", errObj["message"])
 	}
 	gotClean := st.FindAny(clean.ID)
-	if gotClean.Status != model.StatusActive || gotClean.RiskControlStreak != 0 {
-		t.Fatalf("线路归因的 405 不应冷却账号: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
+	if gotClean.Status != model.StatusCooling || gotClean.RiskControlStreak != 1 {
+		t.Fatalf("直连账号应按账号级冷却: status=%s streak=%d", gotClean.Status, gotClean.RiskControlStreak)
 	}
 	wantErrorKind(t, gotClean, model.ErrorKindRiskControl)
 	if gotHot := st.FindAny(hot.ID); gotHot.Status != model.StatusActive || gotHot.RiskControlStreak != 0 {

@@ -12,7 +12,14 @@ import (
 )
 
 // 初次已用完风险尝试预算的405和随后本地503都必须阻止同范围立即重投。
+//
+// 阈值临时置 1：让首次 405 直接落进「请求级」分支（这是现在唯一会原样返回
+// 上游 405 的路径）；默认阈值 3 时同线多账号会继续换号，不再产生 405。
 func TestRetryAdviceCoversRiskExhaustionAndReplay(t *testing.T) {
+	old := RiskControlRequestLevelThreshold
+	RiskControlRequestLevelThreshold = 1
+	t.Cleanup(func() { RiskControlRequestLevelThreshold = old })
+
 	f := newFixture(t)
 	f.respond = jsonResp(405, `{"code":"3012","message":"Request has been blocked due to unusual activity."}`)
 	for _, name := range []string{"one", "two"} {
