@@ -141,7 +141,9 @@ func TestRequestDeadlineDoesNotCutDelivery(t *testing.T) {
 		_, _ = w.Write([]byte(okUpstreamJSON))
 	}))
 	t.Cleanup(slow.Close)
+	// API Key 账号走 UpstreamZaiFallback（JWT 走 UpstreamZai），两处都指到自建慢上游。
 	config.UpstreamZai = slow.URL + "/zai"
+	config.UpstreamZaiFallback = slow.URL + "/fallback"
 
 	status, body := f.post(t, msgBody(), "sk-test")
 	if status != 200 {
