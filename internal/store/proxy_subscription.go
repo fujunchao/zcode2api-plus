@@ -171,6 +171,7 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 		}
 	}
 	r.Added = 0
+	var added []ProxyProfile
 	for _, a := range passed {
 		endpoint, e := proxysub.PublicEndpoint(a.URL)
 		b, blocked := state.Blocks[a.Key]
@@ -189,6 +190,7 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 			name = "订阅-" + id[6:]
 		}
 		profiles = append(profiles, ProxyProfile{ID: id, Name: name, URL: endpoint, Enabled: c.EnableImported})
+		added = append(added, ProxyProfile{ID: id, Name: name, URL: endpoint, Enabled: c.EnableImported})
 		state.Registry[id] = proxysub.Origin{Source: proxysub.SourceID, Key: a.Key, ImportedAt: now.UnixMilli(), LastOK: a.LastOK, ProbedAt: a.ProbedAt, IP: a.IP}
 		keys[a.Key], names[name] = true, true
 		owned++
@@ -201,8 +203,12 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 	err = s.commitProxyBundleLocked(ctx, profiles, nil, nil, &state)
 	if err != nil {
 		r.Added = 0
+		return r, err
 	}
-	return r, err
+	// 新导入线路必须体检后才参与自动选线：这里登记一次冷启动检查，
+	// 巡检下一 tick 取走，结果落库前 chooseProxyLocked 会跳过它。
+	s.queueFreshProxyChecksLocked(added, now)
+	return r, nil
 }
 
 // subscriptionMutationLocked 与线路修改处在同一把 Store 锁/同一事务中。
@@ -378,7 +384,7 @@ func (s *Store) commitProxyBundleStrictLocked(ctx context.Context, profiles []Pr
 	}
 	s.publishCredentialGenerationsLocked()
 	for key, value := range values {
-		if key == strictProxyStateKey || key == riskProxyHistoryKey {
+		if key == strictProxyStateKey || key == riskProxyHistoryKey || key == proxySoftFailureKey {
 			continue
 		}
 		s.settings[key] = value

@@ -131,7 +131,31 @@ func observeModelAttemptHealth(ctx context.Context, code string, complete bool, 
 			return
 		}
 		p.store.ObserveModelAccountOutcome(p.account, o, kind)
+		// 软失败统计与账号结果分开：它只用来判断「这条线路还能不能用」，
+		// 既不参与账号状态，也不构成删除证据（删除仍只由网络复核决定）。
+		if signal, ok := softOutcomeSignal(kind, o.Status); ok && !o.InvalidRequest {
+			p.store.RecordProxySoftOutcome(p.egress, signal, o.Status, kind == "success", now)
+		}
 	})
+}
+
+// softOutcomeSignal 只把与线路相关的结果交给软失败统计：成功计入分母，
+// 超时/连接重置/408/504/524 计入分子。405/402/429 等业务语义不参与，
+// 否则失败率会被与线路无关的上游语义稀释。
+func softOutcomeSignal(kind string, status int) (string, bool) {
+	switch kind {
+	case "success":
+		return "", true
+	case "timeout":
+		return store.ProxySignalTransportTimeout, true
+	case "connection_failed":
+		return store.ProxySignalTransportReset, true
+	}
+	switch status {
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout, 524:
+		return fmt.Sprintf("status_%d", status), true
+	}
+	return "", false
 }
 
 // ObserveModelAttemptError 区分真实连接失败与未派发；严格退役仍不接收这些错误。

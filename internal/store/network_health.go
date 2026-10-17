@@ -126,6 +126,12 @@ func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHe
 			r.State = "changed"
 			r.RecheckAt = 0
 		}
+		// 结果落库是冷启动门禁的唯一正常解除出口：从取走到落库之间线路必须继续被挡住。
+		// 轮次被取消时不会走到这里，由 Fresh 门禁的有效期兜底放行。
+		if hint, ok := s.proxyFailureRechecks[r.ProfileID]; ok {
+			hint.InFlight, hint.InFlightAt, hint.Fresh = false, time.Time{}, false
+			s.proxyFailureRechecks[r.ProfileID] = hint
+		}
 		raw, err := json.Marshal(r)
 		if err != nil {
 			return err

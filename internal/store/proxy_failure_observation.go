@@ -21,6 +21,11 @@ type proxyFailureRecheck struct {
 	PolicyRevision      uint64
 	At, NextAt          time.Time
 	Pending             bool
+	// InFlight 表示已被巡检取走但结果尚未落库；冷启动门禁靠它堵住取走到落库之间的空窗。
+	InFlight   bool
+	InFlightAt time.Time
+	// Fresh 标记新导入线路的首次检查：这类通知没有绑定账号，只校验配置代次。
+	Fresh bool
 }
 
 // ObserveProxyEndpointFailure 只提交网络复核通知，绝不删除配置或改变账号绑定。
@@ -93,14 +98,56 @@ func (s *Store) TakeProxyNetworkRechecks(policy ModelProbeSettings, now time.Tim
 		if !ok || !hint.Pending {
 			continue
 		}
-		account := s.findLocked(hint.Provider, hint.AccountID)
-		if !p.Enabled || p.Generation != hint.Route.Generation || !s.proxyDispatchCurrentLocked(account, hint.Route) {
+		if !p.Enabled || p.Generation != hint.Route.Generation {
 			delete(s.proxyFailureRechecks, p.ID)
 			continue
 		}
-		hint.Pending, hint.NextAt = false, now.Add(proxyFailureRecheckBackoff)
+		// Fresh 通知来自刚导入、可能还没有绑定账号的线路：只校验配置代次。
+		// 有账号的通知识仍然要求「派发身份未变」，避免旧快照驱动的复核误伤新配置。
+		if hint.AccountID != "" {
+			account := s.findLocked(hint.Provider, hint.AccountID)
+			if !s.proxyDispatchCurrentLocked(account, hint.Route) {
+				delete(s.proxyFailureRechecks, p.ID)
+				continue
+			}
+		}
+		hint.Pending, hint.InFlight, hint.InFlightAt = false, true, now
+		hint.NextAt = now.Add(proxyFailureRecheckBackoff)
 		s.proxyFailureRechecks[p.ID] = hint
 		out = append(out, p)
 	}
 	return out
+}
+
+// queueFreshProxyChecksLocked 为新导入线路登记一次冷启动检查；调用方须持有 s.mu。
+// 与故障通知共用队列，不新增调度器；没有绑定账号，因此不设置 AccountID。
+func (s *Store) queueFreshProxyChecksLocked(profiles []ProxyProfile, now time.Time) {
+	if len(profiles) == 0 {
+		return
+	}
+	if s.proxyFailureRechecks == nil {
+		s.proxyFailureRechecks = map[string]proxyFailureRecheck{}
+	}
+	revision := s.modelProbe.Policy.Revision
+	for _, p := range profiles {
+		if p.ID == "" || !p.Enabled {
+			continue
+		}
+		if _, exists := s.proxyFailureRechecks[p.ID]; exists {
+			continue
+		}
+		if len(s.proxyFailureRechecks) >= proxyFailureRecheckLimit {
+			return
+		}
+		s.proxyFailureRechecks[p.ID] = proxyFailureRecheck{
+			Route: ProxyEgress{
+				ID: p.ID, Label: p.Name, Mode: "proxy",
+				Generation: p.Generation, identity: strictProxyIdentity(p.URL),
+			},
+			PolicyRevision: revision,
+			At:             now,
+			Pending:        true,
+			Fresh:          true,
+		}
+	}
 }

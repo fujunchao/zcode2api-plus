@@ -18,6 +18,7 @@ import (
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/proxysub"
+	"zcode2api/internal/web"
 )
 
 const strictProxyStateKey = "strict_proxy_v3"
@@ -261,6 +262,7 @@ func (s *Store) strictSuspectLocked(identity string, now time.Time) bool {
 // chooseProxyLocked 是全部自动选线的唯一准入：待核查不新增绑定，禁止记录不按用途放行。
 func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]int, excludeID, excludeURL string) (ProxyProfile, bool) {
 	allowed := make([]ProxyProfile, 0, len(profiles))
+	eligible := make([]ProxyProfile, 0, len(profiles))
 	now := s.strictObservationNow()
 	s.pruneStrictEvidenceLocked(now)
 	suspects := map[string]bool{}
@@ -272,13 +274,63 @@ func (s *Store) chooseProxyLocked(profiles []ProxyProfile, occupancy map[string]
 			suspects[e.Identity] = true
 		}
 	}
+	blocked := s.proxySelectionBlockedLocked(now)
 	for _, p := range profiles {
 		if !p.Enabled || p.ID == excludeID || (excludeURL != "" && strictProxyIdentity(p.URL) == strictProxyIdentity(excludeURL)) || s.strictProxyBlockedLocked(p.URL) || suspects[strictProxyIdentity(p.URL)] {
 			continue
 		}
+		eligible = append(eligible, p)
+		if blocked[strictProxyIdentity(p.URL)] {
+			continue
+		}
 		allowed = append(allowed, p)
 	}
-	return leastLoadedProxy(allowed, occupancy, "", "")
+	if p, ok := leastLoadedProxy(allowed, occupancy, "", ""); ok {
+		return p, true
+	}
+	if len(allowed) == len(eligible) {
+		return ProxyProfile{}, false
+	}
+	// 全池可选项都被隔离/冷启动门禁挡住时放宽一次：继续用一条「慢但能连」的线路，
+	// 好过没有任何代理而落到直连（直连是风控风险最高的选择）。
+	s.logProxyRelaxLocked(now, len(eligible), len(eligible)-len(allowed))
+	return leastLoadedProxy(eligible, occupancy, "", "")
+}
+
+func (s *Store) logProxyRelaxLocked(now time.Time, candidates, blockedCount int) {
+	if now.UnixMilli()-s.proxyRelaxLoggedAt < proxyRelaxLogInterval.Milliseconds() {
+		return
+	}
+	s.proxyRelaxLoggedAt = now.UnixMilli()
+	web.Warn("proxy-quarantine", fmt.Sprintf("relax=1 candidates=%d blocked=%d", candidates, blockedCount))
+}
+
+// proxySelectionBlockedLocked 汇总「不应参与新分配」的线路身份：
+// 一是软失败隔离，二是新导入线路的冷启动门禁（含取走后结果未落库的空窗）。
+// 两者都只影响新派发，不改变已有绑定，也不写入任何删除证据。
+func (s *Store) proxySelectionBlockedLocked(now time.Time) map[string]bool {
+	out := map[string]bool{}
+	for identity, until := range s.proxyQuarantineLocked(now) {
+		if until.After(now) {
+			out[identity] = true
+		}
+	}
+	ttl := time.Duration(config.ProxyFreshGateSeconds) * time.Second
+	if ttl <= 0 {
+		return out
+	}
+	for _, hint := range s.proxyFailureRechecks {
+		if !hint.Fresh || (!hint.Pending && !hint.InFlight) {
+			continue
+		}
+		if now.Sub(hint.At) >= ttl {
+			continue
+		}
+		if hint.Route.identity != "" {
+			out[hint.Route.identity] = true
+		}
+	}
+	return out
 }
 
 func comparable(a, b strictProxyEvidence) bool {

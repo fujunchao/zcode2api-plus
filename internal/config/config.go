@@ -138,6 +138,30 @@ var (
 	ProxyHealthIntervalMinutes = max(1, envInt("ZCODE_PROXY_HEALTH_INTERVAL", 30))
 )
 
+// ── 代理软失败隔离 ──────────────────────────────────────────────────────────
+// 网络巡检只认传输层失败（连不上）；408/524「能连但跑不动」不构成删除证据，
+// 也没有任何地方统计。这里单独按业务可用率计数：窗口内尝试数、失败数、失败率达到
+// 阈值即把线路临时移出自动选线。隔离不删除配置、不改启停、到期自动回池；
+// 删除仍然只由「两次新鲜网络复核 + 独立对照」决定。
+//
+// 同一约定：环境变量只是默认值，后台写入后以落库值为准（本组暂无后台项）。
+var (
+	// ProxySoftQuarantine 软失败隔离总开关；false 时只记录不隔离。
+	ProxySoftQuarantine = envBool("ZCODE_PROXY_SOFT_QUARANTINE", true)
+	// ProxySoftWindow 统计窗口。
+	ProxySoftWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_WINDOW_SECONDS", 1800))) * time.Second
+	// ProxySoftMinAttempts 窗口内最少尝试数（分母）。
+	ProxySoftMinAttempts = max(2, envInt("ZCODE_PROXY_SOFT_MIN_ATTEMPTS", 3))
+	// ProxySoftMinFailures 窗口内最少软失败数。
+	ProxySoftMinFailures = max(2, envInt("ZCODE_PROXY_SOFT_MIN_FAILURES", 3))
+	// ProxySoftMinRatePercent 失败率下限（百分比）。
+	ProxySoftMinRatePercent = min(100, max(1, envInt("ZCODE_PROXY_SOFT_MIN_RATE_PERCENT", 50)))
+	// ProxySoftQuarantineMinutes 首档隔离时长，续期按 2 的幂递增并封顶 8 倍。
+	ProxySoftQuarantineMinutes = max(1, envInt("ZCODE_PROXY_SOFT_QUARANTINE_MINUTES", 30))
+	// ProxyFreshGateSeconds 新导入线路的冷启动门禁时长；超时未出结果即放行。
+	ProxyFreshGateSeconds = max(0, envInt("ZCODE_PROXY_FRESH_GATE_SECONDS", 120))
+)
+
 // ── 上游风控冷却 ────────────────────────────────────────────────────────────
 // 405 + unusual activity 按账号施加本地阶梯冷却。该处置范围是网关策略，
 // 不能据通用错误文案断言供应商对所有模型的封禁范围。

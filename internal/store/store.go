@@ -83,6 +83,8 @@ type Store struct {
 	strictNow             func() time.Time // 仅替换严格证据的时钟，供确定性窗口回归。
 	modelProbe            modelProbeState
 	proxyFailureRechecks  map[string]proxyFailureRecheck // 运行期异常通知，不是删除证据；重启不续用。
+	proxySoft             proxySoftState                 // 软失败统计与隔离状态，保存于内部 meta，不进入设置快照。
+	proxyRelaxLoggedAt    int64                          // 选线放宽日志限频（unix ms），仅用于避免日志刷屏。
 
 	// lineTruncStrikes / lineTruncTotals：线路级断流熔断计数（proxy profile ID →
 	// 连续 / 累计次数），见 BumpLineTruncate。内存运行态：重启归零无正确性影响
@@ -286,6 +288,13 @@ func (s *Store) load() error {
 		}
 	}
 	delete(settings, quotaRecoveryKey)
+	if raw := settings[proxySoftFailureKey]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &s.proxySoft); err != nil {
+			return fmt.Errorf("读取代理软失败状态失败: %w", err)
+		}
+	}
+	delete(settings, proxySoftFailureKey)
+	s.pruneProxySoftLocked(time.Now())
 	if err := s.loadStrictProxy(settings[strictProxyStateKey]); err != nil {
 		return err
 	}
@@ -471,7 +480,7 @@ func (s *Store) GetSetting(key string) (string, bool) {
 func (s *Store) publishSettings() {
 	cp := make(map[string]string, len(s.settings))
 	for k, v := range s.settings {
-		if k == strictProxyStateKey || k == riskProxyHistoryKey || k == quotaRecoveryKey {
+		if k == strictProxyStateKey || k == riskProxyHistoryKey || k == quotaRecoveryKey || k == proxySoftFailureKey {
 			continue
 		}
 		cp[k] = v

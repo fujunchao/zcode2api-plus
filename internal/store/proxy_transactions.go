@@ -103,15 +103,41 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 		return nil, result, nil
 	}
 	assignable := proxyProfilesExcluding(remaining, excluded)
+	result, pending, next := s.reassignAccountsLocked(func(a *model.Account) bool {
+		return a.ProxyID != nil && allowed[*a.ProxyID]
+	}, assignable, excluded)
+	reason := "automatic"
+	if len(reasons) > 0 {
+		reason = reasons[0]
+	}
+	sub, err := s.subscriptionMutationLocked(remaining, reason)
+	if err != nil {
+		return nil, ProxyReassign{Assigned: map[string]string{}}, err
+	}
+	if err := s.commitProxyBundleStrictLocked(context.Background(), remaining, pending, nil, sub, next); err != nil {
+		return nil, ProxyReassign{Assigned: map[string]string{}}, err
+	}
+	for _, id := range removed {
+		s.clearLineTruncateLocked(id)
+	}
+	return removed, result, nil
+}
+
+// reassignAccountsLocked 把满足 match 的账号改派到 assignable（空闲优先、其次绑定最少）。
+// 删除与软失败隔离两个入口共用同一段改派逻辑，避免出现两套选线策略。
+// 返回的 pending 是尚未提交的账号副本，由调用方决定与哪些数据一起落库。
+func (s *Store) reassignAccountsLocked(match func(*model.Account) bool, assignable []ProxyProfile, excluded map[string]bool) (ProxyReassign, []*model.Account, *strictProxyState) {
+	result := ProxyReassign{Assigned: map[string]string{}}
 	occupancy := s.proxyOccupancyLocked()
 	var pending []*model.Account
 	next := s.cloneStrictProxyLocked()
 	for _, a := range s.allAccountsLocked() {
-		if a.ProxyID != nil && allowed[*a.ProxyID] {
-			copy := a.Clone()
-			copy.ProxyID, copy.ProxyURL = nil, nil
-			pending = append(pending, copy)
+		if !match(a) {
+			continue
 		}
+		copy := a.Clone()
+		copy.ProxyID, copy.ProxyURL = nil, nil
+		pending = append(pending, copy)
 	}
 	for _, a := range pending {
 		if s.initializationManagedLocked(a.ID) {
@@ -125,6 +151,7 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 		}
 		p, ok := s.chooseProxyLocked(assignable, occupancy, "", "")
 		if !ok {
+			// 没有可用替代：保留「待分配」意图而不是落到直连——直连是风控风险最高的选择。
 			result.Direct = append(result.Direct, a.ID)
 			setStrictIntent(&next, a, "auto_pending_proxy")
 			for raw, skip := range excluded {
@@ -140,19 +167,27 @@ func (s *Store) removeProxiesAvoidingLocked(ids map[string]bool, excluded map[st
 		result.Assigned[a.ID] = id
 		setStrictIntent(&next, a, "auto_proxy")
 	}
-	reason := "automatic"
-	if len(reasons) > 0 {
-		reason = reasons[0]
+	return result, pending, next
+}
+
+// reassignOffQuarantineLocked 把绑定在隔离线路上的账号改派走：不改线路配置、不删任何东西。
+// 没有可用替代时保持原绑定（宁可继续用一条慢线路，也不掉直连）。
+func (s *Store) reassignOffQuarantineLocked(quarantined map[string]bool) (ProxyReassign, error) {
+	if len(quarantined) == 0 {
+		return ProxyReassign{Assigned: map[string]string{}}, nil
 	}
-	sub, err := s.subscriptionMutationLocked(remaining, reason)
-	if err != nil {
-		return nil, ProxyReassign{Assigned: map[string]string{}}, err
+	result, pending, next := s.reassignAccountsLocked(func(a *model.Account) bool {
+		if a.ProxyID == nil || *a.ProxyID == "" {
+			return false // 裸 URL 是人工选定的出口，不自动改派。
+		}
+		url := derefStr(a.ProxyURL)
+		return url != "" && quarantined[strictProxyIdentity(url)]
+	}, s.listProxyProfilesLocked(), nil)
+	if len(pending) == 0 {
+		return result, nil
 	}
-	if err := s.commitProxyBundleStrictLocked(context.Background(), remaining, pending, nil, sub, &next); err != nil {
-		return nil, ProxyReassign{Assigned: map[string]string{}}, err
+	if err := s.commitProxyBundleStrictLocked(context.Background(), nil, pending, nil, nil, next); err != nil {
+		return ProxyReassign{Assigned: map[string]string{}}, err
 	}
-	for _, id := range removed {
-		s.clearLineTruncateLocked(id)
-	}
-	return removed, result, nil
+	return result, nil
 }
