@@ -167,7 +167,7 @@ func (s *Store) reassignAccountsLocked(match func(*model.Account) bool, assignab
 		result.Assigned[a.ID] = id
 		setStrictIntent(&next, a, "auto_proxy")
 	}
-	return result, pending, next
+	return result, pending, &next
 }
 
 // reassignOffQuarantineLocked 把绑定在隔离线路上的账号改派走：不改线路配置、不删任何东西。
