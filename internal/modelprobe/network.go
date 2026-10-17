@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -356,9 +357,52 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 	if err := m.store.SaveNetworkHealth(p, records); err != nil {
 		return true, err
 	}
-	web.Warn("proxy-health", fmt.Sprintf("round=%s stage=confirmed whole=%d checked=%d candidates=%d removed=%d mode=%s", r.id, boolInt(r.whole), len(r.profiles), len(remove), len(removed), p.Mode))
+	line := fmt.Sprintf("round=%s stage=confirmed whole=%d checked=%d candidates=%d removed=%d mode=%s", r.id, boolInt(r.whole), len(r.profiles), len(remove), len(removed), p.Mode)
+	if ids := removedIDsField(removed); ids != "" {
+		line += " " + ids
+	}
+	web.Warn("proxy-health", line)
 	m.enqueueNetworkModels(r, records)
 	return true, nil
+}
+
+// removedIDsField 输出可核对的删除明细：最多 20 个 id，其余折成 +N。
+//
+// 只有 removed=14 这种计数，事后既无法核对删了哪条线，也无法复盘误删；而线路
+// 身份又不在其它日志里逐条出现。上限与长度限制只是为了不让一行日志失控。
+func removedIDsField(removed []string) string {
+	if len(removed) == 0 {
+		return ""
+	}
+	const (
+		maxIDs   = 20
+		maxBytes = 512
+	)
+	var b strings.Builder
+	b.WriteString("removed_ids=")
+	n := 0
+	for _, id := range removed {
+		if id == "" {
+			continue
+		}
+		if n == maxIDs {
+			break
+		}
+		add := id
+		if n > 0 {
+			add = "," + id
+		}
+		// 预留 "+NN" 的后缀空间，避免截断把数字截掉。
+		if b.Len()+len(add)+4 > maxBytes {
+			break
+		}
+		b.WriteString(add)
+		n++
+	}
+	if extra := len(removed) - n; extra > 0 {
+		fmt.Fprintf(&b, "+%d", extra)
+	}
+	return b.String()
 }
 
 func (m *Manager) enqueueNetworkModels(r *networkRound, records []store.NetworkHealthRecord) {
