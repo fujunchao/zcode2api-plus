@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // captureLogs 把日志输出重定向到管道，返回「结束并取回全部输出」的函数。
@@ -96,5 +97,38 @@ func TestAllPrimitivesHonorSetOut(t *testing.T) {
 		if !strings.Contains(got, frag) {
 			t.Fatalf("原语未走注入 writer，缺少片段 %q；got=%q", frag, got)
 		}
+	}
+}
+
+// 后台行必须带可解析的时间戳：此前 [~] 行没有 ts=，复盘断流线路时只能靠
+// 文件行序 + 邻近 [attempt] 行反推时间线。
+func TestWarnAndErrCarryTimestamp(t *testing.T) {
+	buf := &strings.Builder{}
+	SetOut(buf)
+	t.Cleanup(func() { SetOut(nil) })
+
+	Warn("line-guard", "线路 X 连续 3 次上游断流")
+	Err("proxy-soft", "软失败状态落库失败")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("应输出两行，实际 %d：%q", len(lines), buf.String())
+	}
+	for _, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "[~]") && !strings.Contains(line, "[!]") {
+			t.Fatalf("标记被破坏：%s", line)
+		}
+		idx := strings.LastIndex(line, " ts=")
+		if idx < 0 {
+			t.Fatalf("缺少 ts=：%s", line)
+		}
+		ts := line[idx+len(" ts="):]
+		parsed, err := time.Parse(time.RFC3339, ts)
+		if err != nil || parsed.IsZero() {
+			t.Fatalf("ts 不可解析：%q（%v）", ts, err)
+		}
+	}
+	if !strings.Contains(buf.String(), "[~] line-guard 线路 X") {
+		t.Fatalf("既有前缀必须保持不变：%q", buf.String())
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 )
 
@@ -92,14 +93,22 @@ func Ok(module, msg string) {
 }
 
 // Warn 警告日志（可重试的失败等）。
+// Warn 后台告警日志。
+//
+// 行尾统一带 ts=：`[~]` 行此前没有时间戳，排障只能靠文件行序 + 邻近 `[attempt]`
+// 行反推时间线（2026-10-18 复盘一条断流线路时踩过）。追加在末尾而不是前缀，
+// 是为了不改 `[~] <module>` 的既有形态，现有 grep/脚本不受影响。
 func Warn(module, msg string) {
-	fmt.Fprintf(logW(), "  %s[~]%s %s%s%s %s\n", ansiYellow, ansiReset, ansiDim, module, ansiReset, msg)
+	fmt.Fprintf(logW(), "  %s[~]%s %s%s%s %s ts=%s\n", ansiYellow, ansiReset, ansiDim, module, ansiReset, msg, logTime())
 }
 
 // Err 错误日志。
 func Err(module, msg string) {
-	fmt.Fprintf(logW(), "  %s[!]%s %s%s%s %s\n", ansiRed, ansiReset, ansiDim, module, ansiReset, msg)
+	fmt.Fprintf(logW(), "  %s[!]%s %s%s%s %s ts=%s\n", ansiRed, ansiReset, ansiDim, module, ansiReset, msg, logTime())
 }
+
+// logTime 后台日志行的本地时间戳（RFC3339，秒级），与诊断行 ts= 同格式。
+func logTime() string { return time.Now().Format(time.RFC3339) }
 
 // Req 请求日志：req_id + 模型 + 是否流式（不含消息内容）。
 func Req(reqID, modelName string, stream bool) {
