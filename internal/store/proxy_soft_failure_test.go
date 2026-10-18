@@ -126,21 +126,96 @@ func TestProxySoftQuarantineExtendsAndCaps(t *testing.T) {
 	}
 }
 
-func TestProxySoftStrikesResetAfterQuiet(t *testing.T) {
+// 隔离到期不等于恢复：到期后第一次失败必须直接升档，而不是从 1 重新数。
+// 2026-10-18 日志：f7eff3 线 17:58 隔离、18:28 到期回池、18:48 又断一次。
+func TestProxySoftProbationEscalatesOnFirstFailure(t *testing.T) {
 	s := newTestStore(t)
-	p := addSelectionProxy(t, s, "静默归零", 18103, true)
-	a := addSelectionAccount(t, s, "静默归零账号", p.ID)
+	p := addSelectionProxy(t, s, "观察期升档", 18103, true)
+	a := addSelectionAccount(t, s, "观察期升档账号", p.ID)
 	e := softEgress(t, s, a)
 	now := time.Now()
+
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
+	first := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second))
+	if first.Action != "quarantine" || first.Strikes != 1 {
+		t.Fatalf("前置失败：应首档隔离：%+v", first)
+	}
+	// 到期后的第一次失败：观察期命中，直接第二档（60 分钟）。
+	at := first.Until.Add(time.Second)
+	d := s.RecordProxySoftOutcome(e, "status_408", 408, false, at)
+	if d.Action != "quarantine" || d.Trigger != "probation" || d.Strikes != 2 {
+		t.Fatalf("到期后首败应按观察期升档：%+v", d)
+	}
+	if got := d.Until.Sub(at); got != 60*time.Minute {
+		t.Fatalf("第二档应为 60 分钟，实际 %v", got)
+	}
+}
+
+// 观察期唯一的正常出口：一次完整成功即清空档位。
+func TestProxySoftProbationSuccessClearsStrikes(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "观察期成功", 18104, true)
+	a := addSelectionAccount(t, s, "观察期成功账号", p.ID)
+	e := softEgress(t, s, a)
+	now := time.Now()
+
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
+	first := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second))
+	s.RecordProxySoftOutcome(e, "", 200, true, first.Until.Add(time.Second))
+
+	got := s.ProxySoftFailures()
+	if len(got) != 1 || got[0].Strikes != 0 || got[0].Probation {
+		t.Fatalf("观察期内成功应清空档位与观察期：%+v", got)
+	}
+	// 清零后恢复普通判据：单次失败不再立即隔离。
+	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, first.Until.Add(2*time.Second)); d.Action != "" {
+		t.Fatalf("已净身的线路单次失败不应隔离：%+v", d)
+	}
+}
+
+// 关掉观察期开关 → 回到旧行为：到期回池，静默 30 分钟后档位清零。
+func TestProxySoftProbationSwitchOffRestoresQuietReset(t *testing.T) {
+	old := config.ProxySoftProbation
+	config.ProxySoftProbation = false
+	t.Cleanup(func() { config.ProxySoftProbation = old })
+
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "关闭观察期", 18105, true)
+	a := addSelectionAccount(t, s, "关闭观察期账号", p.ID)
+	e := softEgress(t, s, a)
+	now := time.Now()
+
 	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
 	s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second))
 	s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(2*time.Second))
-	// 隔离结束后静默 30 分钟以上，连续次数归零。
 	later := now.Add(2*time.Second + 31*time.Minute + 30*time.Minute)
 	s.RecordProxySoftOutcome(e, "status_408", 408, false, later)
 	got := s.ProxySoftFailures()
 	if len(got) != 1 || got[0].Strikes != 0 {
-		t.Fatalf("静默后连续次数应归零：%+v", got)
+		t.Fatalf("开关关闭时静默后应归零：%+v", got)
+	}
+}
+
+// 隔离/观察状态 24 小时无流量会被 TTL 清理（规格里明确的隐式出口，不是洗白漏洞）。
+// 注意观察期是「到期后下一次判定」的瞬时状态：正常情况在同一次调用内就解析
+// （成功清零、失败升档），能长期停留的只有「到期后一直没有流量」的条目。
+func TestProxySoftProbationEntryPrunedAfterTTL(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "观察期TTL", 18106, true)
+	a := addSelectionAccount(t, s, "观察期TTL账号", p.ID)
+	e := softEgress(t, s, a)
+	now := time.Now()
+
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
+	first := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second))
+	// 到期后不再有流量：条目停在观察期。
+	s.ProxySoftFailures()
+	later := first.Until.Add(25 * time.Hour)
+	s.mu.Lock()
+	s.pruneProxySoftLocked(later)
+	s.mu.Unlock()
+	if got := s.ProxySoftFailures(); len(got) != 0 {
+		t.Fatalf("24h 无流量的观察期条目应被清理：%+v", got)
 	}
 }
 

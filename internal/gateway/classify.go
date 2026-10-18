@@ -242,13 +242,20 @@ func RecordUpstreamTruncate(st *store.Store, acc *model.Account, now time.Time, 
 	// 先取标签再熔断：移除后 ProxyLabel 只能给出 proxy-id:<id>，日志里就丢了线路名。
 	label := egress.Label
 	streak := st.BumpLineTruncateForAttempt(acc, egress)
+	removedNow := false
 	if threshold := st.LineTruncateStrikes(); threshold > 0 && streak >= threshold {
 		if removed, reassign, err := st.PurgeFailedAccountProxy(acc, egress); err != nil {
 			web.Warn("line-guard", fmt.Sprintf("线路 %s 连续 %d 次上游断流，但移除失败: %v", label, streak, err))
 		} else if removed {
+			removedNow = true
 			web.Warn("line-guard", fmt.Sprintf("线路 %s 连续 %d 次上游断流，已移除；改派 %d 个账号、%d 个退直连",
 				label, streak, len(reassign.Assigned), len(reassign.Direct)))
 		}
+	}
+	// 断流计入线路软失败：它与连接失败共用「连续 2 次即隔离」，把止损提前到不可逆
+	// 删除之前。线路刚被熔断移除时不再记账——profile 已不存在，记了只会产生孤儿条目。
+	if config.ProxySoftTruncate && !removedNow {
+		st.RecordProxySoftOutcome(egress, store.ProxySignalUpstreamTruncate, 0, false, now)
 	}
 	return total
 }

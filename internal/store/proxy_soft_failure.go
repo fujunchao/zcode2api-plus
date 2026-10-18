@@ -24,6 +24,12 @@ const (
 	// 与 transport_timeout 分开记：超时是「等不到首字节」，uplink_slow 是「明确算出
 	// 传不完」。两者都是线路问题，但前者可能是上游慢，后者只能是这条线的上行带宽。
 	ProxySignalUplinkSlow = "uplink_slow"
+	// ProxySignalUpstreamTruncate 上游中途掐断流：已发出 chunk，客户端拿到残缺响应。
+	//
+	// 它比连接失败更贵——连接失败在请求内可以换线重试，断流不能。所以必须进「线路
+	// 还能不能用」的统计，而不是只由 line-guard 的独立计数管（那个阈值是 3，且动作
+	// 是不可逆删除）。
+	ProxySignalUpstreamTruncate = "upstream_truncate"
 
 	proxySoftFailureKey     = "proxy_soft_failure_state"
 	proxySoftFailureLimit   = 4096
@@ -47,6 +53,12 @@ type ProxySoftFailure struct {
 	LastStatus      int    `json:"last_status,omitempty"`
 	Strikes         int    `json:"strikes"`
 	QuarantineUntil int64  `json:"quarantine_until,omitempty"`
+	// Probation 观察期：隔离到期后线路仍可被选中，但再失败一次立即升档隔离。
+	//
+	// 唯一的正常出口是「一次完整成功」（清空档位）。没有时间窗出口——时间窗会让
+	// 「每小时坏一次」的线路在隔离↔观察之间永久震荡，或在窗口末被无条件洗白。
+	// 条目 24 小时无流量会被 TTL 清理，这等同于重新建档。
+	Probation bool `json:"probation,omitempty"`
 	// Slow 是「首字节超过 30 秒但最终成功」的次数。它只用于观察与后续选线排序，
 	// **不参与隔离判定**：30–90 秒出首字节的线路仍然能用，记成失败会把仅存的
 	// 可用线路也隔离掉。
@@ -67,6 +79,8 @@ type ProxySoftDecision struct {
 	Action  string
 	Until   time.Time
 	Strikes int
+	// Trigger 本次处置的判据：probation / consecutive / rate；空串表示只记账。
+	Trigger string
 }
 
 // RecordProxySoftOutcome 记录一次「业务可用性」样本：ok 为完整成功，否则为软失败。
@@ -102,10 +116,18 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 		ent.Attempts = 0
 		ent.Failures = 0
 	}
-	// 隔离结束且长时间无新失败 → 历史作废：连续次数与档位一起归零，重新观察。
-	// 只清档位不清连续计数的话，下一次失败会立刻用旧证据再隔离一次，「静默归零」等于没写。
-	if ent.Strikes > 0 && ent.QuarantineUntil <= nowMs && ent.LastAt > 0 && nowMs-ent.LastAt >= proxySoftQuietReset.Milliseconds() {
-		ent.Strikes, ent.Consecutive, ent.ConsecutiveSince = 0, 0, 0
+	// 隔离到期：不是直接回归选线池，而是进入观察期（不清档位）。
+	// 2026-10-18 日志里这条线 17:58 隔离、18:28 到期即回池，18:48 与 19:01 又各断一次，
+	// 正是因为「到期」被当成了「恢复」。
+	if ent.QuarantineUntil > 0 && ent.QuarantineUntil <= nowMs {
+		ent.QuarantineUntil = 0
+		if config.ProxySoftProbation {
+			ent.Probation = true
+		}
+	}
+	// 回退开关：关闭观察期时保留旧的「隔离结束且长时间无新失败 → 档位归零」。
+	if !config.ProxySoftProbation && ent.Strikes > 0 && ent.QuarantineUntil <= nowMs && ent.LastAt > 0 && nowMs-ent.LastAt >= proxySoftQuietReset.Milliseconds() {
+		ent.Strikes, ent.Consecutive, ent.ConsecutiveSince, ent.Probation = 0, 0, 0, false
 	}
 	ent.ProfileID, ent.Generation = e.ID, e.Generation
 	ent.Attempts++
@@ -119,6 +141,10 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 		}
 	} else {
 		ent.Consecutive, ent.ConsecutiveSince = 0, 0
+		// 观察期内一次完整成功即洗白：这是观察期唯一的正常出口。
+		if ent.Probation {
+			ent.Probation, ent.Strikes = false, 0
+		}
 	}
 	ent.LastAt = nowMs
 	if signal != "" {
@@ -128,23 +154,36 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 		ent.LastStatus = status
 	}
 	quarantined := ent.QuarantineUntil > nowMs
-	// 判据 A：连续失败。与流量密度无关，稀疏流量下也能在两三次尝试内止损。
+	// 判据 A：观察期内首败。隔离到期只说明「时间到了」，不说明线路恢复；
+	// 一次失败就足以回到隔离，且直接升档（strikes 已在原档位上累加）。
+	probationHit := !ok && config.ProxySoftProbation && ent.Probation
+	// 判据 B：连续失败。与流量密度无关，稀疏流量下也能在两三次尝试内止损。
 	consecutiveHit := !ok && config.ProxySoftConsecutive > 0 && ent.Consecutive >= config.ProxySoftConsecutive &&
 		nowMs-ent.ConsecutiveSince <= config.ProxySoftConsecutiveWindow.Milliseconds()
-	// 判据 B：窗口失败率兜底，防止「成功一次清零」把高频坏线洗白。
+	// 判据 C：窗口失败率兜底，防止「成功一次清零」把高频坏线洗白。
 	rateHit := !ok && ent.Attempts >= config.ProxySoftMinAttempts && ent.Failures >= config.ProxySoftMinFailures &&
 		ent.Failures*100 >= config.ProxySoftMinRatePercent*ent.Attempts
+	trigger := ""
 	switch {
-	case allowQuarantine && !quarantined && (consecutiveHit || rateHit):
+	case allowQuarantine && !quarantined && (probationHit || consecutiveHit || rateHit):
+		switch {
+		case probationHit:
+			trigger = "probation"
+		case consecutiveHit:
+			trigger = "consecutive"
+		default:
+			trigger = "rate"
+		}
 		ent.Strikes++
+		ent.Probation = false
 		ent.LastStrikeAt = nowMs
-		out = ProxySoftDecision{Action: "quarantine", Until: now.Add(s.softQuarantineDuration(ent.Strikes)), Strikes: ent.Strikes}
+		out = ProxySoftDecision{Action: "quarantine", Until: now.Add(s.softQuarantineDuration(ent.Strikes)), Strikes: ent.Strikes, Trigger: trigger}
 		ent.QuarantineUntil = out.Until.UnixMilli()
 	case !ok && allowQuarantine && quarantined && nowMs-ent.LastStrikeAt >= proxySoftStrikeCooldown.Milliseconds():
 		// 隔离期内再命中 → 续期，但最多每 5 分钟升一档，避免一次故障刷满档位。
 		ent.Strikes++
 		ent.LastStrikeAt = nowMs
-		out = ProxySoftDecision{Action: "extended", Until: now.Add(s.softQuarantineDuration(ent.Strikes)), Strikes: ent.Strikes}
+		out = ProxySoftDecision{Action: "extended", Until: now.Add(s.softQuarantineDuration(ent.Strikes)), Strikes: ent.Strikes, Trigger: "extend"}
 		ent.QuarantineUntil = out.Until.UnixMilli()
 	}
 	s.proxySoft.Entries[e.identity] = ent
@@ -163,9 +202,17 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 	} else {
 		reassigned, noAlt = len(result.Assigned), len(result.Direct)
 	}
+	probationFlag, triggerText := 0, out.Trigger
+	if ent.Probation {
+		probationFlag = 1
+	}
+	if triggerText == "" {
+		triggerText = "-"
+	}
 	web.Warn("proxy-soft", fmt.Sprintf(
-		"id=%s signal=%s failures=%d attempts=%d rate=%d%% consecutive=%d action=%s until=%s strikes=%d reassigned=%d no_alt=%d",
-		ent.ProfileID, ent.LastSignal, ent.Failures, ent.Attempts, proxySoftRatePercent(ent), ent.Consecutive, out.Action,
+		"id=%s signal=%s failures=%d attempts=%d rate=%d%% consecutive=%d probation=%d trigger=%s action=%s until=%s strikes=%d reassigned=%d no_alt=%d",
+		ent.ProfileID, ent.LastSignal, ent.Failures, ent.Attempts, proxySoftRatePercent(ent), ent.Consecutive,
+		probationFlag, triggerText, out.Action,
 		out.Until.Format(time.RFC3339), ent.Strikes, reassigned, noAlt))
 	return out
 }

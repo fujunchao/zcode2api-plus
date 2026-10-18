@@ -148,6 +148,16 @@ var (
 var (
 	// ProxySoftQuarantine 软失败隔离总开关；false 时只记录不隔离。
 	ProxySoftQuarantine = envBool("ZCODE_PROXY_SOFT_QUARANTINE", true)
+	// ProxySoftTruncate 上游中途断流是否计入线路软失败；false 时只走 line-guard 熔断。
+	//
+	// 断流对客户端可见且无法重试：连接失败可以换线重试，断流不能。默认计入，
+	// 让它与连接失败共用「连续 2 次即隔离」，而不是等到第 3 次才不可逆删除。
+	ProxySoftTruncate = envBool("ZCODE_PROXY_SOFT_TRUNCATE", true)
+	// ProxySoftProbation 隔离到期是否进入观察期（默认开）。
+	//
+	// 关掉 = 旧行为：到期直接回选线池，并在静默 30 分钟后把档位清零。2026-10-18
+	// 日志证明这条旧路径等于「免费复活」：18:28 到期回池，18:48 又断一次。
+	ProxySoftProbation = envBool("ZCODE_PROXY_SOFT_PROBATION", true)
 	// ProxySoftWindow 统计窗口。
 	ProxySoftWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_WINDOW_SECONDS", 1800))) * time.Second
 	// ProxySoftMinAttempts 窗口内最少尝试数（分母）。
