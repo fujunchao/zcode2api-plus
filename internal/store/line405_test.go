@@ -379,3 +379,107 @@ func TestApplyLine405ProbeVerdict(t *testing.T) {
 	// 不存在的 profile 幂等。
 	s.ApplyLine405ProbeVerdict("missing", "healthy_recent", now.Add(5*time.Second))
 }
+
+// probeRetireFixture 造一条「已隔离两次 + 巡检 failed」的线路，返回 profile 与 identity。
+func probeRetireFixture(t *testing.T) (*Store, ProxyProfile, string) {
+	t.Helper()
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "双证线路", 18401, true)
+	a := addSelectionAccount(t, s, "双证账号", p.ID)
+	e := line405Egress(t, s, a)
+	now := time.Now()
+	// 第一次隔离。
+	s.RecordLine405(e, now)
+	s.RecordLine405(e, now.Add(time.Second))
+	// 隔离到期后再犯 → Strikes=2（「放出去又犯」一次）。
+	later := now.Add(31 * time.Minute)
+	s.RecordLine405(e, later)
+	return s, p, strictProxyIdentity(p.URL)
+}
+
+func line405ProbeRun(p ProxyProfile, mode string) *ModelProbeRun {
+	r := &ModelProbeRun{TargetID: p.ID, targetURL: "https://zcode.z.ai", policy: ModelProbeSettings{Mode: mode}}
+	r.proofs = []modelProbeEvidence{{ProxyObservation: ProxyObservation{RequestID: "req-evidence-1"}}}
+	return r
+}
+
+func profileExists(s *Store, id string) bool {
+	for _, p := range s.ListProxyProfiles() {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// 双证退休：真实流量两次 405（Strikes≥2）+ 巡检 failed + auto_retire → 删除。
+// 这是 v2.10.22 没能做到的部分：22 条巡检结论全 suspect、0 次删除。
+func TestLine405ProbeRetireWithTwoStrikes(t *testing.T) {
+	s, p, identity := probeRetireFixture(t)
+	ent := s.Line405Failures()[0]
+	if ent.Strikes < 2 {
+		t.Fatalf("前置失败：应有 2 次隔离，实际 %+v", ent)
+	}
+	run := line405ProbeRun(p, "auto_retire")
+	s.mu.Lock()
+	s.modelProbe.Policy.Mode = "auto_retire"
+	s.maybeRetireLine405ProbeLocked(run, identity, time.Now())
+	s.mu.Unlock()
+
+	if profileExists(s, p.ID) {
+		t.Fatal("双证成立时线路应被退休删除")
+	}
+}
+
+// 只隔离过一次就删太激进：放出去又犯才是「这条线反复脏」的证据。
+func TestLine405ProbeRetireNeedsTwoStrikes(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "单次隔离线路", 18402, true)
+	a := addSelectionAccount(t, s, "单次隔离账号", p.ID)
+	e := line405Egress(t, s, a)
+	now := time.Now()
+	s.RecordLine405(e, now)
+	s.RecordLine405(e, now.Add(time.Second))
+
+	run := line405ProbeRun(p, "auto_retire")
+	s.mu.Lock()
+	s.modelProbe.Policy.Mode = "auto_retire"
+	s.maybeRetireLine405ProbeLocked(run, strictProxyIdentity(p.URL), now.Add(time.Minute))
+	s.mu.Unlock()
+
+	if !profileExists(s, p.ID) {
+		t.Fatal("Strikes=1 时不应删除")
+	}
+}
+
+// observe 模式只观察：即便双证成立也不删（自动处置必须先被显式开启）。
+func TestLine405ProbeRetireRespectsObserveMode(t *testing.T) {
+	s, p, identity := probeRetireFixture(t)
+	run := line405ProbeRun(p, "observe")
+	s.mu.Lock()
+	s.modelProbe.Policy.Mode = "observe"
+	s.maybeRetireLine405ProbeLocked(run, identity, time.Now())
+	s.mu.Unlock()
+
+	if !profileExists(s, p.ID) {
+		t.Fatal("observe 模式不应删除")
+	}
+}
+
+// 开关关闭时退回 v2.10.24 行为：只隔离不删。
+func TestLine405ProbeRetireSwitchOff(t *testing.T) {
+	old := config.Line405ProbeRetire
+	config.Line405ProbeRetire = false
+	t.Cleanup(func() { config.Line405ProbeRetire = old })
+
+	s, p, identity := probeRetireFixture(t)
+	run := line405ProbeRun(p, "auto_retire")
+	s.mu.Lock()
+	s.modelProbe.Policy.Mode = "auto_retire"
+	s.maybeRetireLine405ProbeLocked(run, identity, time.Now())
+	s.mu.Unlock()
+
+	if !profileExists(s, p.ID) {
+		t.Fatal("开关关闭时不应删除")
+	}
+}

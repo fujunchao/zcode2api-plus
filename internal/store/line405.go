@@ -171,9 +171,11 @@ func (s *Store) ApplyLine405ProbeVerdict(profileID, verdict string, now time.Tim
 	s.applyLine405ProbeVerdictLocked(profileID, verdict, now)
 }
 
-func (s *Store) applyLine405ProbeVerdictLocked(profileID, verdict string, now time.Time) {
+// applyLine405ProbeVerdictLocked 返回 (state, identity, ok)：调用方（CompleteModelProbe）
+// 需要知道结论是否落在一条「反复隔离」的线路上，以决定要不要走双证退休。
+func (s *Store) applyLine405ProbeVerdictLocked(profileID, verdict string, now time.Time) (string, string, bool) {
 	if s.strictClosed || profileID == "" {
-		return
+		return "", "", false
 	}
 	state := ""
 	switch verdict {
@@ -184,7 +186,7 @@ func (s *Store) applyLine405ProbeVerdictLocked(profileID, verdict string, now ti
 		// 确认问题在线路上；删除交给退休链，这里只保持隔离并留痕。
 		state = "failed"
 	default:
-		return
+		return "", "", false
 	}
 	var profile ProxyProfile
 	found := false
@@ -195,12 +197,12 @@ func (s *Store) applyLine405ProbeVerdictLocked(profileID, verdict string, now ti
 		}
 	}
 	if !found {
-		return
+		return "", "", false
 	}
 	identity := strictProxyIdentity(profile.URL)
 	ent, ok := s.line405.Entries[identity]
 	if !ok || ent.Generation != profile.Generation {
-		return
+		return "", "", false
 	}
 	ent.ProbeState, ent.ProbeAt = state, now.UnixMilli()
 	if state == "healthy" {
@@ -211,6 +213,53 @@ func (s *Store) applyLine405ProbeVerdictLocked(profileID, verdict string, now ti
 		web.Warn("line405", "线路 405 状态落库失败: "+err.Error())
 	}
 	web.Warn("line405-probe", fmt.Sprintf("verdict=%s id=%s", state, profileID))
+	return state, identity, true
+}
+
+// maybeRetireLine405ProbeLocked 用「真实流量 + 巡检」双证退休一条 405 线路。
+//
+// 判据：该线路已被隔离过 ZCODE_LINE405_RETIRE_MIN_STRIKES 次（Strikes≥2 意味着
+// 30 分钟放出去后又被真实流量 405 了一次），且巡检也给出 failed。
+// 两条证据互相独立，比「同一个探针跑两轮」更接近真实使用，也才在线上可达。
+func (s *Store) maybeRetireLine405ProbeLocked(r *ModelProbeRun, identity string, now time.Time) {
+	if r == nil || identity == "" || !config.Line405ProbeRetire {
+		return
+	}
+	if r.policy.Mode != "auto_retire" {
+		return
+	}
+	ent, ok := s.line405.Entries[identity]
+	if !ok || ent.Strikes < config.Line405RetireMinStrikes {
+		return
+	}
+	rawURL := ""
+	for _, p := range s.listProxyProfilesLocked() {
+		if strictProxyIdentity(p.URL) == identity {
+			rawURL = p.URL
+			break
+		}
+	}
+	if rawURL == "" {
+		return
+	}
+	refs := make([]string, 0, 4)
+	for _, e := range r.proofs {
+		if e.RequestID == "" || len(refs) == 4 {
+			continue
+		}
+		refs = append(refs, e.RequestID)
+	}
+	d, err := s.startStrictRetirementLocked(identity, rawURL, "line405_probe_control", r.targetURL, ModelProbeRuleVersion, refs, now)
+	if err != nil {
+		web.Warn("line405-probe", "退休失败: "+err.Error())
+		return
+	}
+	if d.DecisionID == "" {
+		web.Warn("line405-probe", fmt.Sprintf("retire-skipped id=%s reason=%s", r.TargetID, d.Reason))
+		return
+	}
+	web.Warn("line405-probe", fmt.Sprintf("retire id=%s decision=%s removed=%d reassigned=%d strikes=%d",
+		r.TargetID, d.DecisionID, len(d.Removed), d.Assigned, ent.Strikes))
 }
 
 // RecordLineOK 记录一次完整成功：清零连续计数与隔离档位，并立即解除隔离。

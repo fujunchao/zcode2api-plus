@@ -505,7 +505,10 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 	// 结论回写线路 405 画像：健康即提前解封，失败则保持隔离（删除仍走退休链）。
 	// 必须在 retireModelProbeLocked 之前——一旦线路被删除，画像就找不到对应配置了。
 	if copy.State == "completed" {
-		s.applyLine405ProbeVerdictLocked(copy.TargetID, copy.Verdict, now)
+		if state, identity, ok := s.applyLine405ProbeVerdictLocked(copy.TargetID, copy.Verdict, now); ok && state == "failed" {
+			// 双证退休：真实流量已两次 405（隔离放出去又犯）+ 巡检也 405。
+			s.maybeRetireLine405ProbeLocked(&copy, identity, now)
+		}
 	}
 	if copy.Verdict == "route_correlated" {
 		return s.retireModelProbeLocked(&copy, now)

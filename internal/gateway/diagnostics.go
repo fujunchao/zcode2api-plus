@@ -76,6 +76,12 @@ type ReqDiag struct {
 	Bytes         int64 // 从上游读到的总字节数
 	lastRead      time.Time
 
+	// UpKBps 最后一次尝试的实测上行速率（KB/s）；0 = 未采样或未启用上行闸门。
+	// UplinkAborts 本请求被上行速率闸门淘汰的尝试次数：>0 说明问题在出口带宽，
+	// 不是账号也不是上游。
+	UpKBps       float64
+	UplinkAborts int
+
 	Status        int
 	Usage         model.Usage
 	UsageComplete bool
@@ -233,6 +239,8 @@ func (d *ReqDiag) Format() string {
 		diagnosticTime(d.startedAt.Add(d.total)), diagnosticTime(d.startedAt), d.GatewayRequestID, d.Protocol,
 		dashText(d.InputRef), d.upstreamAttempts, boolToInt(d.ReplayBlocked), d.ReplayWait.Milliseconds(), boolToInt(d.DeadlineHit), dashText(d.Session))
 	msg += d.shape.format(d.preserveContext)
+	// 上行闸门字段追加在最末：既有字段位置保持不变，外部分析脚本按 key=value 取值不受影响。
+	msg += fmt.Sprintf(" up_kbps=%s uplink_abort=%d", dashKBps(d.UpKBps), d.UplinkAborts)
 	return msg
 }
 
@@ -246,6 +254,14 @@ func dashText(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// dashKBps 上行速率：0 表示未采样（未启用闸门 / 小请求），打印为 -。
+func dashKBps(v float64) string {
+	if v <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.0f", v)
 }
 
 func dashInt(v int) string {

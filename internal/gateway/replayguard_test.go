@@ -4,7 +4,18 @@ package gateway
 import (
 	"testing"
 	"time"
+
+	"zcode2api/internal/config"
 )
+
+// withoutReplayAllowance 关闭「判定后放行一次」，用于验证防护闸本身仍然生效。
+// 默认开（见 config.ReplayAllowOnce），需要「第二枪必被挡」的用例显式关掉。
+func withoutReplayAllowance(t *testing.T) {
+	t.Helper()
+	old := config.ReplayAllowOnce
+	config.ReplayAllowOnce = false
+	t.Cleanup(func() { config.ReplayAllowOnce = old })
+}
 
 func TestReplayGuardBlocksWithinTTL(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
@@ -107,5 +118,47 @@ func TestContentKeyStable(t *testing.T) {
 	body2 := map[string]any{"model": "GLM-5.3", "messages": []any{map[string]any{"role": "user", "content": "hi!"}}}
 	if ContentKey("GLM-5.3", body2) == k1 {
 		t.Fatal("内容变化键应变化")
+	}
+}
+
+// 判定成立后允许同内容再试一次：真正的请求级风控会让这次重试再次撞墙，
+// 而「三条脏线连击」会被这次重试救回来（2026-10-18 日志）。
+func TestReplayTakeAllowsOncePerWindow(t *testing.T) {
+	old := config.ReplayAllowOnce
+	config.ReplayAllowOnce = true
+	t.Cleanup(func() { config.ReplayAllowOnce = old })
+
+	now := time.Unix(1_800_000_000, 0)
+	g := NewReplayGuard(time.Minute, func() time.Time { return now })
+	g.Record("k")
+
+	if blocked, _ := g.Take("k"); blocked {
+		t.Fatal("判定后第一次应放行")
+	}
+	if blocked, remaining := g.Take("k"); !blocked || remaining <= 0 {
+		t.Fatal("放行余额用完后应拦截")
+	}
+	// 同窗口重复登记不得重新武装：否则客户端重试风暴会把脏线当免费额度。
+	g.Record("k")
+	if blocked, _ := g.Take("k"); !blocked {
+		t.Fatal("同窗口重复登记不得再次放行")
+	}
+	// 新窗口重新武装一次。
+	now = now.Add(61 * time.Second)
+	g.Record("k")
+	if blocked, _ := g.Take("k"); blocked {
+		t.Fatal("新窗口应重新放行一次")
+	}
+}
+
+func TestReplayTakeRespectsSwitchOff(t *testing.T) {
+	old := config.ReplayAllowOnce
+	config.ReplayAllowOnce = false
+	t.Cleanup(func() { config.ReplayAllowOnce = old })
+
+	g := NewReplayGuard(time.Minute, time.Now)
+	g.Record("k")
+	if blocked, _ := g.Take("k"); !blocked {
+		t.Fatal("关闭一次性放行后应立即拦截")
 	}
 }

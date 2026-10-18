@@ -295,6 +295,13 @@ var (
 	// 上游账号标记随换号重试扩散（2026-09-24 整池雪崩的直接机制）。0 = 禁用（应急回退）。
 	ReplayGuardTTLSeconds = envInt("ZCODE_REPLAY_GUARD_TTL_SECONDS", 60)
 
+	// ReplayAllowOnce 判定请求级风控后，是否允许同内容再试一次（默认开）。
+	//
+	// 2026-10-18 日志：三条「各自首次命中」的脏线连击触发判定后，客户端 57 秒内重试
+	// 11 次全被挡；而 207 秒后同内容换线即成功——内容没问题，是脏线运气。放行一次
+	// 让这种情况自愈；每 60 秒窗口只放行一次，代价有界（最多多试 3 条线）。
+	ReplayAllowOnce = envBool("ZCODE_RISK_REPLAY_ALLOW_ONCE", true)
+
 	// RiskSilentHours 可选的额外本地隔离窗口（小时），默认 0，仅按阶梯冷却。
 	// 405 可能与请求、账号或代理出口有关，不据本地历史推断供应商封禁期限。
 	// 显式大于 0 时仍可额外隔离，并在人工恢复时施加保护冷却；升级不覆盖手动配置。
@@ -324,6 +331,15 @@ var (
 	// 拿账号池替脏线买单。超限只记日志，隔离本身不受影响。
 	Line405ProbePerHour = max(0, envInt("ZCODE_LINE405_PROBE_PER_HOUR", 12))
 
+	// Line405ProbeRetire 巡检判定失败且线路已被反复隔离时，是否走退休链删除。
+	//
+	// 为什么不用既有 route_correlated：它要求「两轮 target 405 + 参考线成功」，实测
+	// 22 条结论全是 suspect、0 次删除——门槛在真实节奏下不可达。改为两条独立证据：
+	// 真实流量 405 两次（Strikes≥2，即隔离放出去又犯）+ 巡检 405。
+	Line405ProbeRetire = envBool("ZCODE_LINE405_PROBE_RETIRE", true)
+	// Line405RetireMinStrikes 触发退休所需的隔离次数（=「放出去又犯」次数）。
+	Line405RetireMinStrikes = max(1, envInt("ZCODE_LINE405_RETIRE_MIN_STRIKES", 2))
+
 	// ProxyMaxBindingsPerLine 单条线路的绑定软上限（0 = 关闭判定）。
 	//
 	// ⚠️ 它不是「分散器」：leastLoadedProxy 永远选绑定最少的线路，只要存在未超限的
@@ -331,6 +347,25 @@ var (
 	// 最空闲线路都已超限时，说明「线路数不足」，日志会记 capacity_short，提示扩池；
 	// 此时仍然分配（不产生 auto_pending_proxy），只是让容量缺口可见。
 	ProxyMaxBindingsPerLine = max(0, envInt("ZCODE_PROXY_MAX_BINDINGS_PER_LINE", 8))
+
+	// ── 上行速率闸门 ────────────────────────────────────────────────────────
+	// 首字节看门狗只给整段预算，上传阶段没有独立判据：8.3 MiB 在 19 KB/s 的线上要
+	// 450 秒，必然超预算，但代码要等满 90 秒才知道。闸门按实测速率外推剩余上传时间，
+	// 明显超出本次尝试预算就立即中断，把「等 90 秒」变成「2 秒换线」。
+	UplinkGate = envBool("ZCODE_UPLINK_GATE", true)
+	// UplinkGateMinBytes 低于该体量完全不判定：小请求的慢启动不能代表线路带宽。
+	UplinkGateMinBytes = max(0, envInt("ZCODE_UPLINK_GATE_MIN_BYTES", 262144))
+	// UplinkGateMinMS 最短采样时长：TLS 握手与首包可能吃掉一两秒，先让速率稳定。
+	UplinkGateMinMS = max(0, envInt("ZCODE_UPLINK_GATE_MIN_MS", 1000))
+	// UplinkGateMarginSeconds 判定余量：ETA 要超过「预算 - 余量」才放弃，避免边界抖动。
+	UplinkGateMarginSeconds = max(0, envInt("ZCODE_UPLINK_GATE_MARGIN_SECONDS", 3))
+
+	// CoolOnConnectionFailure 传输层连接失败是否按旧行为冷却账号 300 秒。
+	//
+	// 默认 false：dial / TLS / 写入失败按定义是线路问题，账号本身没问题。旧行为在
+	// 2.10.24 把拨号超时从 60–80s 压到 ≤32s 之后更容易触发——死线会更快把冷却记到
+	// 账号头上，反而缩小可用池。1 = 回退旧行为。
+	CoolOnConnectionFailure = envBool("ZCODE_COOL_ON_CONNECTION_FAILURE", false)
 
 	// RiskRequestLevelLines 判定「请求级风控」所需的不同干净线路数。
 	//
@@ -382,7 +417,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.10.24-go"
+	AppVersion = "2.10.25-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

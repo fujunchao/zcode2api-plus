@@ -776,6 +776,7 @@ func Test405AccountLevelHitCoolsAndSwitches(t *testing.T) {
 // 极高，被误判成「内容有罪」后错误地停止换号并封锁同内容，这正是 33 分钟全池
 // 风暴的机制。
 func Test405SkipsHotAccountsInPollutedPool(t *testing.T) {
+	withoutReplayAllowance(t)
 	oldThreshold := RiskControlRequestLevelThreshold
 	RiskControlRequestLevelThreshold = 3
 	t.Cleanup(func() { RiskControlRequestLevelThreshold = oldThreshold })
@@ -1305,3 +1306,63 @@ func (s stubSolver) Solve(_ context.Context, _ captcha.Config) (string, error) {
 }
 
 func (s stubSolver) Close() error { return nil }
+
+// 连接失败（dial / TLS / 重置）按定义是线路问题：默认不冷却账号，只记证据并换线。
+// 2026-10-18 日志：8.34 MiB 请求三次尝试全在死线上，若按旧行为会冷却三个健康账号。
+func TestConnectionFailureDoesNotCoolAccountByDefault(t *testing.T) {
+	old := config.CoolOnConnectionFailure
+	config.CoolOnConnectionFailure = false
+	t.Cleanup(func() { config.CoolOnConnectionFailure = old })
+
+	f := newFixture(t)
+	acc, err := f.st.AddAccount(model.ProviderZai, "dead-line", "sk-dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := f.st.AddProxyProfile("dead", "http://127.0.0.1:1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.AssignProxyProfile(acc.ID, line.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if status, _ := f.post(t, msgBody(), "sk-test"); status == http.StatusOK {
+		t.Fatal("死线不应成功")
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusActive || got.CoolingUntil != nil {
+		t.Fatalf("连接失败不应冷却账号: status=%s until=%v", got.Status, got.CoolingUntil)
+	}
+	if got.LastErrorKind == nil || *got.LastErrorKind != model.ErrorKindConnectionFailed {
+		t.Fatalf("仍应留下连接失败证据: %v", got.LastErrorKind)
+	}
+}
+
+// 回退开关：置 1 时恢复「连接失败即冷却」的旧行为。
+func TestConnectionFailureCoolsWhenSwitchOn(t *testing.T) {
+	old := config.CoolOnConnectionFailure
+	config.CoolOnConnectionFailure = true
+	t.Cleanup(func() { config.CoolOnConnectionFailure = old })
+
+	f := newFixture(t)
+	acc, err := f.st.AddAccount(model.ProviderZai, "dead-line-legacy", "sk-dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := f.st.AddProxyProfile("dead-legacy", "http://127.0.0.1:1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.AssignProxyProfile(acc.ID, line.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if status, _ := f.post(t, msgBody(), "sk-test"); status == http.StatusOK {
+		t.Fatal("死线不应成功")
+	}
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.Status != model.StatusCooling || got.CoolingUntil == nil {
+		t.Fatalf("开关打开时应恢复旧行为: status=%s until=%v", got.Status, got.CoolingUntil)
+	}
+}

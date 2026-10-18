@@ -29,9 +29,19 @@ const replayGuardMaxEntries = 1024
 // ReplayGuard 按「内容指纹 + 模型」记录最近一次请求级风控判定。
 type ReplayGuard struct {
 	mu      sync.Mutex
-	entries map[string]time.Time
+	entries map[string]replayEntry
 	ttl     time.Duration
 	now     func() time.Time
+}
+
+// replayEntry 一条防护记录。
+//
+// allowances 是「一次性放行」余额：判定成立后允许同内容再试一次，用来区分
+// 「内容确实被拒」与「连撞几条脏线」。2026-10-18 日志里后者占多数——客户端
+// 57 秒内重试 11 次全被挡，而 207 秒后同内容换线即成功。
+type replayEntry struct {
+	at         time.Time
+	allowances int
 }
 
 // NewReplayGuard 创建防护表；ttl <= 0 返回 nil（禁用，调用方判空跳过）。
@@ -42,7 +52,7 @@ func NewReplayGuard(ttl time.Duration, now func() time.Time) *ReplayGuard {
 	if now == nil {
 		now = time.Now
 	}
-	return &ReplayGuard{entries: map[string]time.Time{}, ttl: ttl, now: now}
+	return &ReplayGuard{entries: map[string]replayEntry{}, ttl: ttl, now: now}
 }
 
 // Blocked 该内容指纹是否仍在防护窗口内。
@@ -58,11 +68,11 @@ func (g *ReplayGuard) Remaining(key string) time.Duration {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	at, ok := g.entries[key]
+	ent, ok := g.entries[key]
 	if !ok {
 		return 0
 	}
-	remaining := g.ttl - g.now().Sub(at)
+	remaining := g.ttl - g.now().Sub(ent.at)
 	if remaining <= 0 {
 		delete(g.entries, key)
 		return 0
@@ -70,7 +80,38 @@ func (g *ReplayGuard) Remaining(key string) time.Duration {
 	return remaining
 }
 
+// Take 是入口检查：返回是否应拦截，以及剩余时间。
+//
+// 与 Remaining 的区别是它会**消耗一次性放行余额**。判定成立后允许同内容再试一次
+// （默认开，见 config.ReplayAllowOnce）：真正的请求级风控会让这次重试再次撞墙，
+// 而「三条脏线连击」会被这次重试救回来。余额每窗口只武装一次，不会形成无限放行。
+func (g *ReplayGuard) Take(key string) (bool, time.Duration) {
+	if g == nil || key == "" {
+		return false, 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ent, ok := g.entries[key]
+	if !ok {
+		return false, 0
+	}
+	remaining := g.ttl - g.now().Sub(ent.at)
+	if remaining <= 0 {
+		delete(g.entries, key)
+		return false, 0
+	}
+	if ent.allowances > 0 {
+		ent.allowances--
+		g.entries[key] = ent
+		return false, 0
+	}
+	return true, remaining
+}
+
 // Record 登记一次请求级风控判定；顺带懒清理过期项。
+//
+// 同一窗口内重复登记**不重新武装**放行余额：否则每次判定都放行一次，客户端重试
+// 风暴会把脏线当免费额度用。
 func (g *ReplayGuard) Record(key string) {
 	if g == nil || key == "" {
 		return
@@ -78,15 +119,22 @@ func (g *ReplayGuard) Record(key string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	now := g.now()
-	for k, at := range g.entries {
-		if now.Sub(at) >= g.ttl {
+	for k, ent := range g.entries {
+		if now.Sub(ent.at) >= g.ttl {
 			delete(g.entries, k)
 		}
 	}
 	if len(g.entries) >= replayGuardMaxEntries {
-		g.entries = map[string]time.Time{}
+		g.entries = map[string]replayEntry{}
 	}
-	g.entries[key] = now
+	allowances := 0
+	if ent, ok := g.entries[key]; ok {
+		// 窗口内已登记：保留现有余额（含已用完的 0），不重新武装。
+		allowances = ent.allowances
+	} else if config.ReplayAllowOnce {
+		allowances = 1
+	}
+	g.entries[key] = replayEntry{at: now, allowances: allowances}
 }
 
 // ContentKey 重放防护的键：模型 + 内容指纹（请求体 sha256 前 12 位）。

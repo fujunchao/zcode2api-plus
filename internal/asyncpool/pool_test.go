@@ -930,6 +930,7 @@ func Test405SameLineInAsyncPool(t *testing.T) {
 // （风控静默期内）被选号硬闸门跳过，不得再被喂给请求；单干净账号的 405 不构成
 // 请求级判定，池子耗尽走 no_account（文案带上静默期成因），不登记重放防护。
 func Test405HotAccountSkippedInAsyncPool(t *testing.T) {
+	withoutReplayAllowance(t)
 	oldHours := config.RiskSilentHours
 	config.RiskSilentHours = 24
 	t.Cleanup(func() { config.RiskSilentHours = oldHours })

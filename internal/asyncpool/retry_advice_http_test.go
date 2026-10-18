@@ -36,6 +36,7 @@ func asyncErrorFromSSE(t *testing.T, raw string) map[string]any {
 }
 
 func TestAsyncRetryAdviceUsesAcceptedTicketTerminalAndDecreasingWait(t *testing.T) {
+	withoutReplayAllowance(t)
 	// 阈值置 1：本用例只验证「票据终态 + 等待建议」，需要首个 405 就落进请求级
 	// 分支；默认阈值 3 时同一条线路上的账号会继续换号，不会登记重放防护。
 	oldThreshold := gateway.RiskControlRequestLevelThreshold

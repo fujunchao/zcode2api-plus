@@ -158,6 +158,12 @@ func ObserveModelAttemptTimeout(ctx context.Context, now time.Time) {
 	observeModelAttemptHealth(ctx, "", false, "timeout", now)
 }
 
+// ObserveModelAttemptUplinkSlow 记录「上行传不完」：按实测速率外推，请求体在本次
+// 尝试预算内无法写完。与首字节超时分开统计——它只能是线路的上行带宽问题。
+func ObserveModelAttemptUplinkSlow(ctx context.Context, now time.Time) {
+	observeModelAttemptHealth(ctx, "", false, "uplink_slow", now)
+}
+
 // softOutcomeSignal 只把与线路相关的结果交给软失败统计：成功计入分母，
 // 超时/连接重置/408/504/524 计入分子。405/402/429 等业务语义不参与，
 // 否则失败率会被与线路无关的上游语义稀释。
@@ -169,6 +175,8 @@ func softOutcomeSignal(kind string, status int) (string, bool) {
 		return store.ProxySignalTransportTimeout, true
 	case "connection_failed":
 		return store.ProxySignalTransportReset, true
+	case "uplink_slow":
+		return store.ProxySignalUplinkSlow, true
 	}
 	switch status {
 	case http.StatusRequestTimeout, http.StatusGatewayTimeout, 524:

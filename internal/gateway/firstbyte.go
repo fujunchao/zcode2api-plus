@@ -61,6 +61,16 @@ func (w *firstByteWatchdog) Stop() {
 // Fired 表示本次尝试是被首字节预算打断的（而不是客户端取消或普通连接失败）。
 func (w *firstByteWatchdog) Fired() bool { return w.fired.Load() }
 
+// Abort 用给定原因提前结束本次尝试（上行速率闸门用）。
+//
+// 刻意不置 fired：调用方必须能区分「预算到点、不知道还要多久」与「按实测速率算
+// 剩余字节根本传不完」——两者的日志与终态不同。
+func (w *firstByteWatchdog) Abort(cause error) {
+	if cause != nil {
+		w.cancel(cause)
+	}
+}
+
 // Identity 返回本次出站线路的规范化身份，用于请求级回避集合。
 func (w *firstByteWatchdog) Identity() string { return w.identity }
 

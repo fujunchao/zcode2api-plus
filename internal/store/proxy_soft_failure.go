@@ -19,6 +19,11 @@ const (
 	ProxySignalTransportTimeout = "transport_timeout"
 	// ProxySignalTransportReset 连接被重置或读到 EOF。
 	ProxySignalTransportReset = "transport_reset"
+	// ProxySignalUplinkSlow 上行带宽不足：按实测速率算，请求体在本次尝试预算内传不完。
+	//
+	// 与 transport_timeout 分开记：超时是「等不到首字节」，uplink_slow 是「明确算出
+	// 传不完」。两者都是线路问题，但前者可能是上游慢，后者只能是这条线的上行带宽。
+	ProxySignalUplinkSlow = "uplink_slow"
 
 	proxySoftFailureKey     = "proxy_soft_failure_state"
 	proxySoftFailureLimit   = 4096

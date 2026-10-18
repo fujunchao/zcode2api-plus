@@ -152,6 +152,7 @@ type attemptResult struct {
 	quotaRecovered bool   // 完整成功交付，供独占 API Key 恢复探测确认使用。
 	avoid          string // 本次失败的线路 identity；换号时加入请求级回避集合。
 	timeoutRetry   bool   // 本次失败消耗了一次 408/524 换线预算（计数在请求级）。
+	uplinkSlow     bool   // 本次失败被上行速率闸门判定「传不完」（线路带宽问题）。
 }
 
 // attemptBudget 单账号内的三类重试预算，各自独立计数。
@@ -218,7 +219,8 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		web.Diag(diag.ReqID, diag.Format())
 	}()
 	// 先安装收尾再判断重放；零出站的调用也必须可关联、可计时。
-	if remaining := e.replay.Remaining(contentKey); remaining > 0 {
+	// Take 会消耗一次性放行余额（判定后允许同内容再试一次），Remaining 不会。
+	if blocked, remaining := e.replay.Take(contentKey); blocked {
 		diag.ReplayBlocked, diag.ReplayWait = true, remaining
 		diag.ErrText = "risk_control_cooldown"
 		web.ReqErr(reqID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
@@ -243,6 +245,9 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	// 408/524 换线预算按请求计数（跨账号共享）：否则每个账号都会各拿一份预算，
 	// 两个账号就会各重试一次，预算形同虚设。
 	timeoutRetries := 0
+	// 上行速率闸门淘汰次数：用于终态判定——全部尝试都因「传不完」被淘汰时，
+	// 如实返回「线路带宽不足」，而不是伪装成 524 或 no_available_account。
+	uplinkSlow := 0
 	probeTried := false
 	for range MaxAccountAttempts {
 		if !deadlineAt.IsZero() && !e.now().Before(deadlineAt) {
@@ -287,6 +292,9 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		if res.timeoutRetry {
 			timeoutRetries++
 		}
+		if res.uplinkSlow {
+			uplinkSlow++
+		}
 		if res.switchAccount {
 			if res.avoid != "" {
 				avoid[res.avoid] = true
@@ -294,6 +302,15 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 			continue
 		}
 		return res.final
+	}
+
+	// 全部尝试都因上行不达标被淘汰：如实说「线路传不动」，并给 30 秒后重试的建议。
+	// 不能落到 no_available_account —— 账号是好的，问题在出口带宽。
+	if uplinkSlow > 0 {
+		web.ReqErr(reqID, fmt.Sprintf("所有候选线路上行带宽不足（已淘汰 %d 条），请求体 %s",
+			uplinkSlow, dashBytes(diag.BodyBytes)))
+		return withRetryAdvice(errResult(http.StatusServiceUnavailable, "upstream_uplink_too_slow",
+			"当前可用代理线路的上行带宽不足以传完本次请求，请稍后重试或减小上下文"), 30*time.Second)
 	}
 
 	// 选不出号 ≠ 「账号没绑定模型/额度用完」：冷却、风控、停用、整号耗尽都会走到
@@ -482,6 +499,9 @@ func (e *Engine) tryAccount(
 		watchdog := newFirstByteWatchdog(attemptCtx, firstByteBudget, egress.Identity())
 		defer watchdog.Stop()
 		httpReq = httpReq.WithContext(watchdog.Context())
+		// 上行速率闸门：只包装请求体，不重建请求（ContentLength 必须保留，否则出站
+		// 会退化成 chunked，字节形态偏离官方客户端）。小请求不参与判定。
+		uplink := AttachUplinkGate(httpReq, firstByteBudget, watchdog.Abort, e.now)
 		if diag != nil {
 			// 首字节延迟与耗时的基准点：紧贴出站调用。
 			diag.UpstreamStart = diag.Now()
@@ -492,6 +512,12 @@ func (e *Engine) tryAccount(
 		resp, err := client.Do(httpReq)
 		finishAttempt(resp, err)
 		watchdog.Headers(resp)
+		if uplink != nil && diag != nil {
+			diag.UpKBps = uplink.RateKBps()
+			if uplink.Aborted() {
+				diag.UplinkAborts++
+			}
+		}
 		if err != nil {
 			if isClientGone(ctx) {
 				// 客户端已断开（或本请求已被取消）：账号本身没问题，不冷却、也不换号
@@ -503,6 +529,17 @@ func (e *Engine) tryAccount(
 				e.recordError(acc, model.ErrorKindClientCanceled, "")
 				web.Warn(reqID, fmt.Sprintf("请求已取消（账号 %s）：%v", acc.Name, err))
 				return attemptResult{final: errResult(http.StatusBadGateway, "request_canceled", "请求已取消")}
+			}
+			// 上行速率闸门必须排在 watchdog 之前：两者都会结束 ctx，但闸门是先 cancel
+			// 的那个（context.Cause 只保留第一个原因）。判错方向会把「这条线传不动」
+			// 误报成「上游慢」，运维会去查错地方。
+			if UplinkTooSlow(watchdog.Context()) {
+				ObserveModelAttemptUplinkSlow(attemptCtx, e.now())
+				release()
+				e.recordError(acc, model.ErrorKindConnectionFailed, "上行速率不足")
+				web.Warn(reqID, fmt.Sprintf("上行速率不足（账号 %s，线路 %s，%.0f KB/s），换线重试",
+					acc.Name, egress.Label, uplinkRateKBps(uplink)))
+				return attemptResult{switchAccount: true, avoid: egress.Identity(), uplinkSlow: true}
 			}
 			if watchdog.Fired() {
 				// 线路在预算内没交出首字节。这不是账号的错：**不冷却账号**（24 个账号
@@ -517,8 +554,16 @@ func (e *Engine) tryAccount(
 			}
 			ObserveModelAttemptError(attemptCtx, err, e.now())
 			release()
-			e.mark(acc, model.StatusCooling, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
-			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
+			if config.CoolOnConnectionFailure {
+				e.mark(acc, model.StatusCooling, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
+			} else {
+				// 传输层失败（dial / TLS / 写入 / 重置）按定义是线路问题：账号本身
+				// 没问题，冷却只会把「线路的锅」记到账号头上、缩小可用池。
+				// 线路级止损交给软失败「连续 2 次即隔离」（uplink_slow / transport_reset
+				// 都计入），不依赖账号冷却。
+				e.recordError(acc, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
+			}
+			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败（线路 %s），换线重试", acc.Name, egress.Label))
 			// 连接失败说明这条线路此刻不可用：加入本请求的回避集合，
 			// 避免多个账号共享同一条死线时反复等同一个超时。
 			return attemptResult{switchAccount: true, avoid: egress.Identity()}

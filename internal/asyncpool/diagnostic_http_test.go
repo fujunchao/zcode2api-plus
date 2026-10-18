@@ -159,6 +159,7 @@ func TestDiagnosticReadFailureBothHTTPRoutes(t *testing.T) {
 }
 
 func TestDiagnosticAsyncReplayHasSummary(t *testing.T) {
+	withoutReplayAllowance(t)
 	p, srv, buf := newDiagnosticHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { t.Error("重放不能出站"); w.WriteHeader(500) }))
 	raw := `{"model":"GLM-5.3","messages":[{"role":"user","content":"private-body"}]}`
 	var body map[string]any

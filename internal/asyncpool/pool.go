@@ -445,7 +445,7 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 		diag.SetRiskAccounts(scope.Accounts())
 		web.Diag(diag.ReqID, diag.Format())
 	}()
-	if remaining := p.replay.Remaining(contentKey); remaining > 0 {
+	if blocked, remaining := p.replay.Take(contentKey); blocked {
 		diag.ReplayBlocked, diag.ReplayWait = true, remaining
 		diag.ErrText = "risk_control_cooldown"
 		web.ReqErr(ticketID, "重放防护命中：相同内容刚被判定请求级风控，窗口内不再消耗账号")
@@ -605,6 +605,23 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				web.Warn(ticketID, fmt.Sprintf("线路超时（第 %d 次）: %s", timeoutRetries, gateway.ErrorPreview(lineTimeout.body)))
 				networkRetry = true
 				lastNetworkError = lineTimeout.body
+				break
+			}
+			// 线路上行带宽不足 / 连接失败：与线路超时同一条出路（换线、按票据共享预算），
+			// 但日志文案必须区分——否则会让人去查上游而不是查出口线路。
+			var lineTransport errLineTransport
+			if errors.As(streamErr, &lineTransport) {
+				if lineTransport.avoid != "" {
+					avoid[lineTransport.avoid] = true
+				}
+				if timeoutRetries >= config.UpstreamTimeoutRetries {
+					p.emitError(ctx, ticketID, lineTransport.body, "upstream_error")
+					return
+				}
+				timeoutRetries++
+				web.Warn(ticketID, fmt.Sprintf("%s（第 %d 次），换线重试", lineTransport.label, timeoutRetries))
+				networkRetry = true
+				lastNetworkError = lineTransport.body
 				break
 			}
 			// 风控 405（账号级）：与 408/524 一样换线重试，但不消耗 timeout 预算 ——
@@ -804,6 +821,8 @@ func (p *Pool) attemptUpstreamOnce(
 	watchdog := gateway.NewFirstByteWatchdog(ctx, config.UpstreamFirstByteTimeout, egress.Identity())
 	defer watchdog.Stop()
 	httpReq = httpReq.WithContext(watchdog.Context())
+	// 上行速率闸门：与 sync 同一实现，只包装 body、保留 ContentLength。
+	uplink := gateway.AttachUplinkGate(httpReq, config.UpstreamFirstByteTimeout, watchdog.Abort, time.Now)
 	riskAttempt := gateway.RiskAttempt{Ticket: ticketID, Egress: egress}
 	if diag != nil {
 		riskAttempt.RequestID = diag.ReqID
@@ -817,14 +836,26 @@ func (p *Pool) attemptUpstreamOnce(
 	resp, err := client.Do(httpReq)
 	finishAttempt(resp, err)
 	watchdog.Headers(resp)
+	if uplink != nil && diag != nil {
+		diag.UpKBps = uplink.RateKBps()
+		if uplink.Aborted() {
+			diag.UplinkAborts++
+		}
+	}
 	if err != nil {
+		// 闸门先于看门狗判断：两者都结束了 ctx，但闸门是先 cancel 的那个。
+		if gateway.UplinkTooSlow(watchdog.Context()) {
+			gateway.ObserveModelAttemptUplinkSlow(ctx, time.Now())
+			return false, errLineTransport{body: "上行带宽不足", avoid: egress.Identity(), label: "上行带宽不足"}
+		}
 		if watchdog.Fired() {
 			// 慢的是线路，不是账号：只记软失败并换线，不冷却账号（与 sync 同）。
 			gateway.ObserveModelAttemptTimeout(ctx, time.Now())
 			return false, errLineTimeout{body: "上游首字节超时", avoid: watchdog.Identity()}
 		}
 		gateway.ObserveModelAttemptError(ctx, err, time.Now())
-		return false, err
+		// 连接失败也是线路问题：与 sync 一致，不冷却账号、换线重试。
+		return false, errLineTransport{body: err.Error(), avoid: egress.Identity(), label: "线路连接失败"}
 	}
 	gateway.ConfirmProxyAttemptResponse(ctx, resp)
 	defer resp.Body.Close()
@@ -1097,6 +1128,19 @@ type errLine405 struct {
 }
 
 func (e errLine405) Error() string { return e.body }
+
+// errLineTransport 线路级传输失败（连接失败 / 上行带宽不足）：换线重试。
+//
+// 与 errLineTimeout 同样是「换线」，差别在语义与日志：超时是等不到首字节；
+// 这里要么已经明确算出传不完（label=上行带宽不足），要么连不上（label=线路连接失败）。
+// 两者都与账号无关，不得冷却账号。
+type errLineTransport struct {
+	body  string
+	avoid string
+	label string
+}
+
+func (e errLineTransport) Error() string { return e.body }
 
 // errLineTimeout 线路级超时（首字节预算 / 408 / 524）：与账号无关。
 //
