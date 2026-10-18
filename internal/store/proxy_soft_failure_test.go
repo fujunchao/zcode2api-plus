@@ -280,3 +280,23 @@ func TestProxySoftIgnoresDisabledSwitch(t *testing.T) {
 		t.Fatalf("关闭隔离后不得产生隔离状态：%v", q)
 	}
 }
+
+// 到期后静默数小时再来失败，判据与立即失败一致（观察期是惰性判定，不靠计时器）。
+func TestProxySoftProbationAfterLongSilence(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "观察期长静默", 18107, true)
+	a := addSelectionAccount(t, s, "观察期长静默账号", p.ID)
+	e := softEgress(t, s, a)
+	now := time.Now()
+
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
+	first := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second))
+	at := first.Until.Add(6 * time.Hour)
+	d := s.RecordProxySoftOutcome(e, "status_408", 408, false, at)
+	if d.Action != "quarantine" || d.Trigger != "probation" || d.Strikes != 2 {
+		t.Fatalf("静默 6 小时后首败仍应按观察期升档：%+v", d)
+	}
+	if got := d.Until.Sub(at); got != 60*time.Minute {
+		t.Fatalf("第二档应为 60 分钟，实际 %v", got)
+	}
+}

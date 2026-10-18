@@ -321,3 +321,82 @@ func fieldOf(line, prefix string) string {
 	}
 	return ""
 }
+
+// TestTruncateQuarantinePrecedesLineRemoval：两次断流先触发软失败隔离并改派账号，
+// 因此 line-guard 的 3 连击删除不会在同一条线路的同一批流量里发生——这正是
+// v2.10.26「断流计入软失败」想要改变的优先级。被 disableSoftTruncate 关掉记账的
+// line-guard 用例不覆盖这条交互。
+func TestTruncateQuarantinePrecedesLineRemoval(t *testing.T) {
+	up := &cutUp{abortN: map[int]bool{1: true, 2: true, 3: true}}
+	f := newDiagFixture(t, up)
+	acc, err := f.st.AddAccount(model.ProviderZai, "quar-acct", "sk-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	badID, goodID := bindToLine(t, f.st, acc, f.ups.URL)
+	for _, kv := range [][2]string{
+		{store.LineTruncateStrikesKey, "3"},
+		{store.LineTruncateAvoidSecondsKey, "0"},
+	} {
+		if err := f.st.SetSetting(kv[0], kv[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		f.post(t, msgBody())
+	}
+
+	// 线路仍在池里（只是被软失败隔离），没有走不可逆删除。
+	if !hasProfile(f.st, badID) {
+		t.Fatal("两次断流应只隔离，不该删除线路")
+	}
+	soft := f.st.ProxySoftFailures()
+	if len(soft) != 1 || soft[0].LastSignal != store.ProxySignalUpstreamTruncate {
+		t.Fatalf("应留下一条 upstream_truncate 软失败画像：%+v", soft)
+	}
+	if soft[0].Strikes < 1 {
+		t.Fatalf("连续两次断流应触发隔离：%+v", soft[0])
+	}
+	if soft[0].ProfileID != badID {
+		t.Fatalf("画像应指向坏线：%+v", soft[0])
+	}
+
+	// 账号已被改派到替代线路；第三次断流不会再落到坏线（坏线调用数停在 2）。
+	got := f.st.Find(model.ProviderZai, acc.ID)
+	if got.ProxyID == nil || *got.ProxyID != goodID {
+		t.Fatalf("账号应被改派到替代线路，实际 %v", got.ProxyID)
+	}
+	if up.calls != 2 {
+		t.Fatalf("坏线不应再收到请求，实际调用 %d 次", up.calls)
+	}
+}
+
+// TestTruncateRemovedLineSkipsSoftFailure：熔断阈值 1 时线路在第一次断流就被删除，
+// 此时不得再写软失败画像（profile 已不存在，只会留孤儿条目）。
+func TestTruncateRemovedLineSkipsSoftFailure(t *testing.T) {
+	up := &cutUp{abortN: map[int]bool{1: true}}
+	f := newDiagFixture(t, up)
+	acc, err := f.st.AddAccount(model.ProviderZai, "removed-acct", "sk-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	badID, _ := bindToLine(t, f.st, acc, f.ups.URL)
+	for _, kv := range [][2]string{
+		{store.LineTruncateStrikesKey, "1"},
+		{store.LineTruncateAvoidSecondsKey, "0"},
+	} {
+		if err := f.st.SetSetting(kv[0], kv[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	f.post(t, msgBody())
+
+	if hasProfile(f.st, badID) {
+		t.Fatal("阈值 1 时线路应被删除")
+	}
+	if soft := f.st.ProxySoftFailures(); len(soft) != 0 {
+		t.Fatalf("已删除的线路不应留下软失败画像：%+v", soft)
+	}
+}
