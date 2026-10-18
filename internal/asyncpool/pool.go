@@ -607,19 +607,15 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 				lastNetworkError = lineTimeout.body
 				break
 			}
-			// 线路上行带宽不足 / 连接失败：与线路超时同一条出路（换线、按票据共享预算），
-			// 但日志文案必须区分——否则会让人去查上游而不是查出口线路。
+			// 线路上行带宽不足 / 连接失败：与超时同一条出路（换线），但**不消耗**
+			// 408/524 的换线预算——那份额度只有 1 次，用它会让连接失败比改造前更早
+			// 放弃（旧行为走的是 AsyncMaxRetries）。这里仍受 AsyncMaxRetries 约束。
 			var lineTransport errLineTransport
 			if errors.As(streamErr, &lineTransport) {
 				if lineTransport.avoid != "" {
 					avoid[lineTransport.avoid] = true
 				}
-				if timeoutRetries >= config.UpstreamTimeoutRetries {
-					p.emitError(ctx, ticketID, lineTransport.body, "upstream_error")
-					return
-				}
-				timeoutRetries++
-				web.Warn(ticketID, fmt.Sprintf("%s（第 %d 次），换线重试", lineTransport.label, timeoutRetries))
+				web.Warn(ticketID, fmt.Sprintf("%s，换线重试: %s", lineTransport.label, gateway.ErrorPreview(lineTransport.body)))
 				networkRetry = true
 				lastNetworkError = lineTransport.body
 				break
