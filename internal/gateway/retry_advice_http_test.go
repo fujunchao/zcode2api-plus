@@ -16,6 +16,8 @@ import (
 // 阈值临时置 1：让首次 405 直接落进「请求级」分支（这是现在唯一会原样返回
 // 上游 405 的路径）；默认阈值 3 时同线多账号会继续换号，不再产生 405。
 func TestRetryAdviceCoversRiskExhaustionAndReplay(t *testing.T) {
+	// 本用例验证「判定后立即封锁」这条路径，需显式关掉一次性放行（默认开）。
+	withoutReplayAllowance(t)
 	old := RiskControlRequestLevelThreshold
 	RiskControlRequestLevelThreshold = 1
 	t.Cleanup(func() { RiskControlRequestLevelThreshold = old })

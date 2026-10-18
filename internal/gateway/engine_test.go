@@ -1166,10 +1166,17 @@ func TestClientCancelDoesNotCoolAccount(t *testing.T) {
 	}
 }
 
-// 拨号超时（错误链携带 DeadlineExceeded，但请求 ctx 未结束）是线路故障：
-// 必须冷却该账号并换号重试。修复前它被「错误值像取消」的旧判据误判成客户端
-// 取消——不冷却、不换号，客户端还会收到误导性的 502「请求已取消」。
+// 拨号超时（错误链携带 DeadlineExceeded，但请求 ctx 未结束）是线路故障。
+// v2.10.25 起默认**不冷却账号**（只换线），这里验证显式打开
+// ZCODE_COOL_ON_CONNECTION_FAILURE 后的旧行为仍然可用（回退路径）。
 func TestDialTimeoutCoolsAccountAndSwitches(t *testing.T) {
+	// 本用例锁定的是「旧行为」：显式打开 ZCODE_COOL_ON_CONNECTION_FAILURE 时，
+	// 拨号失败仍按账号故障冷却。默认值已改为「不冷却」（见
+	// TestConnectionFailureDoesNotCoolAccountByDefault）。
+	old := config.CoolOnConnectionFailure
+	config.CoolOnConnectionFailure = true
+	t.Cleanup(func() { config.CoolOnConnectionFailure = old })
+
 	f := newFixture(t)
 	f.respond = jsonResp(200, okUpstreamJSON)
 

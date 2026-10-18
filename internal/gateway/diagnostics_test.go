@@ -486,7 +486,7 @@ func TestDiagNewFieldsAppendedAtTail(t *testing.T) {
 		"ts", "started_at", "gateway_request_id", "protocol", "input_ref", "upstream_attempts", "replay_blocked", "replay_wait_ms",
 		"preserve_context", "shape_stage", "system_source", "system_form", "system_blocks", "messages",
 		"roles_user", "roles_assistant", "roles_system", "roles_developer", "roles_tool", "roles_other", "tools",
-		"tool_use_blocks", "tool_result_blocks", "mcs_declared",
+		"tool_use_blocks", "tool_result_blocks", "mcs_declared", "up_kbps", "uplink_abort",
 	} {
 		key := " " + field + "="
 		index := strings.Index(line, key)
@@ -495,7 +495,7 @@ func TestDiagNewFieldsAppendedAtTail(t *testing.T) {
 		}
 		last = index
 	}
-	if !strings.HasSuffix(line, " mcs_declared=false") {
+	if !strings.HasSuffix(line, " mcs_declared=false up_kbps=- uplink_abort=0") {
 		t.Fatalf("最终追加字段或实际能力声明不符：%s", line)
 	}
 }

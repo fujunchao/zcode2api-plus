@@ -53,7 +53,9 @@ func withUplinkGate(t *testing.T, minBytes, minMS, margin int) {
 func TestUplinkGateAbortsWhenBodyCannotFinish(t *testing.T) {
 	withUplinkGate(t, 262144, 1000, 0)
 	clock := time.Unix(1_800_000_000, 0)
-	r := &timedReader{chunk: 32 << 10, left: 1 << 20, step: time.Second, clock: &clock}
+	// io.Copy 对 io.Discard 走 ReaderFrom，每次 Read 只给 8 KiB 缓冲；按 8 KiB / 250ms
+	// 建模即 32 KB/s，与真实链路「每次写 socket 阻塞一会儿」的采样口径一致。
+	r := &timedReader{chunk: 8 << 10, left: 1 << 20, step: 250 * time.Millisecond, clock: &clock}
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
 	m := newUplinkMeter(r, int64(r.left), 10*time.Second, cancel, func() time.Time { return clock })
