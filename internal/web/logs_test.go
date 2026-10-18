@@ -129,7 +129,8 @@ func TestWarnAndErrCarryTimestamp(t *testing.T) {
 			t.Fatalf("ts 不可解析：%q（%v）", ts, err)
 		}
 	}
-	if !strings.Contains(buf.String(), "[~] line-guard 线路 X") {
-		t.Fatalf("既有前缀必须保持不变：%q", buf.String())
+	plain := ansiPattern.ReplaceAllString(buf.String(), "")
+	if !strings.Contains(plain, "[~] line-guard 线路 X") {
+		t.Fatalf("既有前缀必须保持不变：%q", plain)
 	}
 }
