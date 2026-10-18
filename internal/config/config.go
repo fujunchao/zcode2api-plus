@@ -158,8 +158,27 @@ var (
 	ProxySoftMinRatePercent = min(100, max(1, envInt("ZCODE_PROXY_SOFT_MIN_RATE_PERCENT", 50)))
 	// ProxySoftQuarantineMinutes 首档隔离时长，续期按 2 的幂递增并封顶 8 倍。
 	ProxySoftQuarantineMinutes = max(1, envInt("ZCODE_PROXY_SOFT_QUARANTINE_MINUTES", 30))
+	// ProxySoftConsecutive 连续软失败多少次即隔离；0 关闭连续判据，只保留失败率兜底。
+	//
+	// 为什么需要它：池子大、流量散时（实测单线 2.5 次/3 小时），「30 分钟内 ≥3 次失败」
+	// 永远达不到——判据形状对、数量级错。连续失败与流量密度无关，一两次就能止损。
+	ProxySoftConsecutive = max(0, envInt("ZCODE_PROXY_SOFT_CONSECUTIVE", 2))
+	// ProxySoftConsecutiveWindow 连续计数有效期：超过则重新从 1 计。
+	// 防止「早上失败一次、傍晚失败一次」这种跨越半天的孤立失败被当成连续。
+	ProxySoftConsecutiveWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_CONSECUTIVE_WINDOW_SECONDS", 7200))) * time.Second
 	// ProxyFreshGateSeconds 新导入线路的冷启动门禁时长；超时未出结果即放行。
 	ProxyFreshGateSeconds = max(0, envInt("ZCODE_PROXY_FRESH_GATE_SECONDS", 120))
+)
+
+// ── 出站连接超时 ────────────────────────────────────────────────────────────
+// 死线路的代价此前是「连代理 30s + 握手 30s」，一次尝试 60–80 秒；三次尝试串起来
+// 就是撞 240 秒请求上限（2026-10-18 复盘：8.7MB 请求 3 次 connection_failed 各约 70s）。
+// 拆成两个值：连代理通常 <1s，真正需要余量的是「代理由此连到目标」。
+var (
+	// ProxyDialTimeout 连接到代理服务器本身；≤0 时不生效（回落默认）。
+	ProxyDialTimeout = time.Duration(max(1, envInt("ZCODE_PROXY_DIAL_TIMEOUT_SECONDS", 12))) * time.Second
+	// ProxyHandshakeTimeout SOCKS 握手 / CONNECT 到目标；跨境线路 5–10s 常见。
+	ProxyHandshakeTimeout = time.Duration(max(1, envInt("ZCODE_PROXY_HANDSHAKE_TIMEOUT_SECONDS", 20))) * time.Second
 )
 
 // ── 单次尝试的首字节预算 ────────────────────────────────────────────────────
@@ -363,7 +382,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.10.23-go"
+	AppVersion = "2.10.24-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

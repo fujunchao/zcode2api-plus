@@ -44,6 +44,7 @@ func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgr
 	// 当前状态在发送前取样并冻结；响应到达期间额度/冷却变化不能改写这份证据。
 	extra += d.outboundAttemptSummary(acc, observed, request, d.Now())
 	web.Attempt(d.ReqID, "event=start "+base+summary+extra+" ts="+diagnosticTime(d.Now()))
+	started := d.Now()
 	return func(resp *http.Response, err error) {
 		status := 0
 		if resp != nil {
@@ -61,7 +62,9 @@ func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgr
 			}
 		}
 		// 新字段始终追加，不挪动原有日志字段；开始与结果使用同一份请求快照。
-		web.Attempt(d.ReqID, fmt.Sprintf("event=%s %s status=%d err_kind=%s%s%s%s ts=%s", event, base, status, kind, summary, extra, responseHeaderSummary(resp), diagnosticTime(d.Now())))
+		// elapsed_ms 让「超时到底生效没有」可直接验证：死线路此前每次 60–80 秒，
+		// 收紧拨号/握手后应落到 25–35 秒。
+		web.Attempt(d.ReqID, fmt.Sprintf("event=%s %s status=%d err_kind=%s elapsed_ms=%d%s%s%s ts=%s", event, base, status, kind, d.Now().Sub(started).Milliseconds(), summary, extra, responseHeaderSummary(resp), diagnosticTime(d.Now())))
 	}
 }
 

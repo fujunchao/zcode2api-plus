@@ -15,10 +15,34 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"zcode2api/internal/config"
 )
 
-// 直连客户端的拨号参数（对齐 Python 默认语义：连接超时 30s）。
-const dialTimeout = 30 * time.Second
+const (
+	// fallbackDialTimeout 配置缺失或非法时的连接超时。
+	fallbackDialTimeout = 30 * time.Second
+	// fallbackHandshakeTimeout 配置缺失或非法时的握手超时。
+	fallbackHandshakeTimeout = 30 * time.Second
+)
+
+// dialTimeout 连接到代理服务器本身的超时。死线路此前要等满 30 秒才开始握手，
+// 一次尝试就是 60–80 秒；收紧后最坏 32 秒（2026-10-18 复盘）。
+func dialTimeout() time.Duration {
+	if config.ProxyDialTimeout > 0 {
+		return config.ProxyDialTimeout
+	}
+	return fallbackDialTimeout
+}
+
+// handshakeTimeout SOCKS 握手 / CONNECT 到目标的超时。跨境线路 5–10 秒常见，
+// 默认 20 秒留足余量，同时不再继承请求级 240 秒预算。
+func handshakeTimeout() time.Duration {
+	if config.ProxyHandshakeTimeout > 0 {
+		return config.ProxyHandshakeTimeout
+	}
+	return fallbackHandshakeTimeout
+}
 
 // DefaultResponseHeaderTimeout 网关与额度查询等短请求的响应头超时。
 // async 池需要更宽松的上限，见 TransportForTimeout。
@@ -94,7 +118,7 @@ func NewTransport(raw string, responseHeaderTimeout time.Duration) (*http.Transp
 		return nil, err
 	}
 	t := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: dialTimeout(), KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		MaxIdleConnsPerHost:   8,
@@ -142,7 +166,7 @@ func ClientFor(raw string, timeout time.Duration) (*http.Client, error) {
 // socksDialer 构造 SOCKS 出站拨号函数。socks4=true 走 SOCKS4 协议
 // （域名本地解析后以 IPv4 连接）；socks5 本地解析，socks5h 远端解析。
 func socksDialer(u *url.URL, v4 bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	forward := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+	forward := &net.Dialer{Timeout: dialTimeout(), KeepAlive: 30 * time.Second}
 	remoteResolve := strings.EqualFold(u.Scheme, "socks5h")
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		proxyAddr := hostPort(u)
@@ -189,11 +213,13 @@ func hostPort(u *url.URL) string {
 
 // socks5Handshake 执行 RFC 1928 握手（可选用户名/密码鉴权）与 CONNECT。
 func socks5Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string, remoteResolve bool) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	} else {
-		_ = conn.SetDeadline(time.Now().Add(dialTimeout))
+	// 取「握手预算」与「ctx 截止时间」中更早的那个：请求级 240 秒预算不派生 ctx，
+	// 但调用方若自带更紧的 deadline 必须尊重，绝不让握手等到 240 秒。
+	deadline := time.Now().Add(handshakeTimeout())
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
+	_ = conn.SetDeadline(deadline)
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
 	// 方法协商：无需鉴权；URL 含用户名密码时追加 user/pass 方法。
@@ -327,6 +353,10 @@ func socks5Auth(conn net.Conn, u *url.URL) error {
 // 域名总是以 4a 的形式发给代理解析（httpx 的 socks4 本地解析语义在
 // IPv4-only 场景等价，4a 兼容面更广且不会暴露解析失败差异）。
 func socks4Handshake(conn net.Conn, u *url.URL, addr string, _ bool) error {
+	// socks4 此前完全没有 deadline：readFull 只受 conn 自身读超时约束，而没人设过，
+	// 半死不活的代理能把握手无限期挂住。与 socks5 共用同一份握手预算。
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout()))
+	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("目标地址无效: %v", err)

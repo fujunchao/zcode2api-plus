@@ -18,7 +18,8 @@ func softEgress(t *testing.T, s *Store, a *model.Account) ProxyEgress {
 	return e
 }
 
-func TestProxySoftQuarantineOnWindowThreshold(t *testing.T) {
+// 连续 2 次软失败即隔离：与窗口内尝试数无关，稀疏流量下也能生效。
+func TestProxySoftQuarantineOnConsecutiveFailures(t *testing.T) {
 	s := newTestStore(t)
 	p := addSelectionProxy(t, s, "软失败线路", 18100, true)
 	a := addSelectionAccount(t, s, "软失败账号", p.ID)
@@ -27,21 +28,64 @@ func TestProxySoftQuarantineOnWindowThreshold(t *testing.T) {
 	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now); d.Action != "" {
 		t.Fatalf("首次失败不应隔离：%+v", d)
 	}
-	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(10*time.Second)); d.Action != "" {
-		t.Fatalf("第二次失败不应隔离：%+v", d)
-	}
-	d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(20*time.Second))
+	d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(10*time.Second))
 	if d.Action != "quarantine" || d.Strikes != 1 {
-		t.Fatalf("3 次失败/3 次尝试应触发隔离：%+v", d)
+		t.Fatalf("连续 2 次失败应触发隔离：%+v", d)
 	}
-	if got := d.Until.Sub(now.Add(20 * time.Second)); got != 30*time.Minute {
+	if got := d.Until.Sub(now.Add(10 * time.Second)); got != 30*time.Minute {
 		t.Fatalf("首档隔离时长应为 30 分钟，实际 %v", got)
 	}
-	if q := s.ProxyQuarantine(now.Add(20 * time.Second)); len(q) != 1 {
+	if q := s.ProxyQuarantine(now.Add(10 * time.Second)); len(q) != 1 {
 		t.Fatalf("隔离应立即生效：%v", q)
 	}
 	if q := s.ProxyQuarantine(now.Add(40 * time.Minute)); len(q) != 0 {
 		t.Fatalf("隔离到期后应自动回池：%v", q)
+	}
+}
+
+// 成功一次即打断连续计数：抖一下的线路不能被连续判据冤枉。
+func TestProxySoftConsecutiveResetOnSuccess(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "抖动线路", 18106, true)
+	a := addSelectionAccount(t, s, "抖动账号", p.ID)
+	e := softEgress(t, s, a)
+	now := time.Now()
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
+	s.RecordProxySoftOutcome(e, "", 200, true, now.Add(time.Second))
+	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(2*time.Second)); d.Action != "" {
+		t.Fatalf("中间有成功就不算连续：%+v", d)
+	}
+}
+
+// 两次失败隔得太久（超过连续计数有效期）→ 重新计数，不隔离。
+func TestProxySoftConsecutiveWindowExpires(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "久隔线路", 18107, true)
+	a := addSelectionAccount(t, s, "久隔账号", p.ID)
+	e := softEgress(t, s, a)
+	now := time.Now()
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
+	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(3*time.Hour)); d.Action != "" {
+		t.Fatalf("跨半天的两次孤立失败不应算连续：%+v", d)
+	}
+}
+
+// 关闭连续判据后，失败率兜底仍然生效。
+func TestProxySoftRateFallbackWhenConsecutiveDisabled(t *testing.T) {
+	old := config.ProxySoftConsecutive
+	config.ProxySoftConsecutive = 0
+	t.Cleanup(func() { config.ProxySoftConsecutive = old })
+
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "兜底线路", 18108, true)
+	a := addSelectionAccount(t, s, "兜底账号", p.ID)
+	e := softEgress(t, s, a)
+	now := time.Now()
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
+	s.RecordProxySoftOutcome(e, "", 200, true, now.Add(time.Second))
+	s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(2*time.Second))
+	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(3*time.Second)); d.Action != "quarantine" {
+		t.Fatalf("3 次失败/4 次尝试应由失败率兜底触发：%+v", d)
 	}
 }
 
@@ -65,12 +109,11 @@ func TestProxySoftQuarantineExtendsAndCaps(t *testing.T) {
 	e := softEgress(t, s, a)
 	now := time.Now()
 	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
-	s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second))
-	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(2*time.Second)); d.Action != "quarantine" {
-		t.Fatalf("应触发首档隔离：%+v", d)
+	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second)); d.Action != "quarantine" {
+		t.Fatalf("连续 2 次失败应触发首档隔离：%+v", d)
 	}
 	want := []time.Duration{60 * time.Minute, 120 * time.Minute, 240 * time.Minute, 240 * time.Minute}
-	at := now.Add(2 * time.Second)
+	at := now.Add(time.Second)
 	for i, expect := range want {
 		at = at.Add(5 * time.Minute)
 		d := s.RecordProxySoftOutcome(e, "status_408", 408, false, at)
@@ -127,8 +170,7 @@ func TestProxySoftQuarantineSurvivesReopen(t *testing.T) {
 	e := softEgress(t, s, a)
 	now := time.Now()
 	s.RecordProxySoftOutcome(e, "status_408", 408, false, now)
-	s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second))
-	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(2*time.Second)); d.Action != "quarantine" {
+	if d := s.RecordProxySoftOutcome(e, "status_408", 408, false, now.Add(time.Second)); d.Action != "quarantine" {
 		t.Fatalf("应触发隔离：%+v", d)
 	}
 	if err := s.Close(); err != nil {

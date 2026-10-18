@@ -519,7 +519,9 @@ func (e *Engine) tryAccount(
 			release()
 			e.mark(acc, model.StatusCooling, model.ErrorKindConnectionFailed, "连接失败: "+err.Error())
 			web.Warn(reqID, fmt.Sprintf("账号 %s 连接失败，切换下一个", acc.Name))
-			return attemptResult{switchAccount: true}
+			// 连接失败说明这条线路此刻不可用：加入本请求的回避集合，
+			// 避免多个账号共享同一条死线时反复等同一个超时。
+			return attemptResult{switchAccount: true, avoid: egress.Identity()}
 		}
 		ConfirmProxyAttemptResponse(attemptCtx, resp)
 
