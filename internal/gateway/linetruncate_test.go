@@ -12,9 +12,20 @@ import (
 	"testing"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/store"
 )
+
+// disableSoftTruncate 关掉「断流计入线路软失败」，让本文件只验证 line-guard 自身。
+// v2.10.26 起断流会先触发软失败隔离（2 连击）并改派账号，线路不再收到第 3 次断流；
+// 两者叠加时的优先级由 TestTruncateQuarantinePrecedesLineRemoval 覆盖。
+func disableSoftTruncate(t *testing.T) {
+	t.Helper()
+	old := config.ProxySoftTruncate
+	config.ProxySoftTruncate = false
+	t.Cleanup(func() { config.ProxySoftTruncate = old })
+}
 
 // diagLines 取出捕获日志里的全部 `[#]` 诊断行（去 ANSI）。
 func (b *syncBuffer) diagLines(t *testing.T) []string {
@@ -105,6 +116,7 @@ func setQuota(t *testing.T, st *store.Store, idOrName string, remaining float64)
 // 线路必须被移除、绑定账号被改派到幸存线路——2026-09-22 事故里 3 连切全部落在
 // mihomo-zai-024 同一账号同一线路（trunc_total 1→2→3），当时没有任何机制止损。
 func TestLineTruncateStrikesPurgeLineAndReassign(t *testing.T) {
+	disableSoftTruncate(t)
 	up := &cutUp{abortN: map[int]bool{1: true, 2: true, 3: true}}
 	f := newDiagFixture(t, up)
 	acc, err := f.st.AddAccount(model.ProviderZai, "strike-acct", "sk-abc")
@@ -164,6 +176,7 @@ func TestLineTruncateStrikesPurgeLineAndReassign(t *testing.T) {
 
 // TestLineTruncateStrikesZeroDisables：阈值 0 = 关闭熔断——只计数不动线路。
 func TestLineTruncateStrikesZeroDisables(t *testing.T) {
+	disableSoftTruncate(t)
 	up := &cutUp{abortN: map[int]bool{1: true, 2: true, 3: true, 4: true}}
 	f := newDiagFixture(t, up)
 	acc, err := f.st.AddAccount(model.ProviderZai, "off-acct", "sk-abc")
@@ -193,6 +206,7 @@ func TestLineTruncateStrikesZeroDisables(t *testing.T) {
 // TestLineTruncateSuccessResetsStreak：熔断判据是「无一次完整成功的连击」。第
 // 1、2 次断流后插一次完整成功，连击必须归零——否则成功反而救不了好线路。
 func TestLineTruncateSuccessResetsStreak(t *testing.T) {
+	disableSoftTruncate(t)
 	up := &cutUp{abortN: map[int]bool{1: true, 2: true, 4: true, 5: true}}
 	f := newDiagFixture(t, up)
 	acc, err := f.st.AddAccount(model.ProviderZai, "reset-acct", "sk-abc")

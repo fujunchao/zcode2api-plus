@@ -15,6 +15,15 @@ import (
 	"zcode2api/internal/web"
 )
 
+// disableSoftTruncate 关掉「断流计入线路软失败」，让本文件只验证 line-guard 自身。
+// v2.10.26 起断流会先触发软失败隔离（2 连击）并改派账号，线路不再收到第 3 次断流。
+func disableSoftTruncate(t *testing.T) {
+	t.Helper()
+	old := config.ProxySoftTruncate
+	config.ProxySoftTruncate = false
+	t.Cleanup(func() { config.ProxySoftTruncate = old })
+}
+
 // bindAsyncLine 创建两个真实不同的受控代理地址，不能把同 URL 的别名当作幸存线路。
 func bindAsyncLine(t *testing.T, st *store.Store, acc *model.Account, proxyURL string) (badID, goodID string) {
 	t.Helper()
@@ -49,6 +58,7 @@ func hasAsyncProfile(st *store.Store, id string) bool {
 // TestAsyncLineTruncateStrikesPurgeLine：async 路径与 sync 同一套线路熔断——
 // 同一线路连续 3 次上游侧断流即移除并改派；同时断流要触发额度刷新钩子。
 func TestAsyncLineTruncateStrikesPurgeLine(t *testing.T) {
+	disableSoftTruncate(t)
 	p, st, _, _ := newTestPool(t)
 	acc := addJWTAccount(t, st, "async-strike")
 
@@ -141,6 +151,7 @@ func TestAsyncForwardSSENilDiagStillRecords(t *testing.T) {
 
 // TestAsyncSuccessResetsLineStreak：async 成功交付同样复位线路连击（与 sync 同口径）。
 func TestAsyncSuccessResetsLineStreak(t *testing.T) {
+	disableSoftTruncate(t)
 	p, st, _, _ := newTestPool(t)
 	acc := addJWTAccount(t, st, "async-reset")
 	_ = acc

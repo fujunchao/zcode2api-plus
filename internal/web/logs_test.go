@@ -115,8 +115,9 @@ func TestWarnAndErrCarryTimestamp(t *testing.T) {
 		t.Fatalf("应输出两行，实际 %d：%q", len(lines), buf.String())
 	}
 	for _, line := range lines {
-		if !strings.HasPrefix(strings.TrimSpace(line), "[~]") && !strings.Contains(line, "[!]") {
-			t.Fatalf("标记被破坏：%s", line)
+		plain := ansiPattern.ReplaceAllString(line, "")
+		if !strings.HasPrefix(strings.TrimSpace(plain), "[~]") && !strings.Contains(plain, "[!]") {
+			t.Fatalf("标记被破坏：%s", plain)
 		}
 		idx := strings.LastIndex(line, " ts=")
 		if idx < 0 {
