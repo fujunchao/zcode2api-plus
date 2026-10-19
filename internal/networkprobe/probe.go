@@ -39,6 +39,75 @@ type Report struct {
 	Error   string   `json:"error"`
 	MS      int64    `json:"ms"`
 	Targets []Target `json:"targets"`
+	// Tunnel 是可选的上传能力测量（隧道裸写）。指针 + omitempty：旧记录没有这个字段，
+	// 反序列化后为 nil，不影响既有判定。
+	Tunnel *TunnelReport `json:"tunnel,omitempty"`
+}
+
+// TunnelReport 是一次隧道裸写的结果。Bytes/MS/Kbps 是原始测量值，OK 是分级判定。
+type TunnelReport struct {
+	OK        bool   `json:"ok"`
+	Bytes     int64  `json:"bytes"`
+	MS        int64  `json:"ms"`
+	Kbps      int64  `json:"kbps"`
+	EarlyStop bool   `json:"early_stop,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// CheckTunnelWrite 走裸隧道向 target 写 size 字节，用「写了多少 / 用了多久」判断上传能力。
+//
+// 判据分级（对端早关 ≠ 链路慢）：
+//  1. 预算内写满 → OK
+//  2. 写错误但已写 ≥ minBytes、用时 < 预算的 2/3 且速率 ≥ minKbps → OK（对端提前关闭是正常现象）
+//  3. 其余（含撞上写超时）→ 失败
+//
+// 刻意**不**用「已写 ≥ minBytes 且平均速率达标」判 OK：内核缓冲会先吞掉几百 KB，
+// 之后对端不读、写阻塞到超时，平均速率仍然好看——那正是要抓的「传不动」。
+func CheckTunnelWrite(ctx context.Context, proxyURL, target string, size int64, budget time.Duration, minBytes, minKbps int64) TunnelReport {
+	rep := TunnelReport{}
+	start := time.Now()
+	conn, err := proxy.DialTunnel(ctx, proxyURL, target)
+	if err != nil {
+		rep.MS = time.Since(start).Milliseconds()
+		rep.Error = err.Error()
+		return rep
+	}
+	defer conn.Close()
+
+	_ = conn.SetWriteDeadline(start.Add(budget))
+	buf := make([]byte, 32<<10)
+	for i := range buf {
+		buf[i] = 'x'
+	}
+	var writeErr error
+	for rep.Bytes < size {
+		chunk := int64(len(buf))
+		if left := size - rep.Bytes; left < chunk {
+			chunk = left
+		}
+		n, err := conn.Write(buf[:chunk])
+		rep.Bytes += int64(n)
+		if err != nil {
+			writeErr = err
+			rep.EarlyStop = true
+			break
+		}
+	}
+	rep.MS = time.Since(start).Milliseconds()
+	if rep.MS > 0 {
+		rep.Kbps = rep.Bytes * 1000 / rep.MS / 1024
+	}
+	budgetMS := budget.Milliseconds()
+	switch {
+	case rep.Bytes >= size:
+		rep.OK = true
+	case writeErr != nil && rep.Bytes >= minBytes && rep.MS < budgetMS*2/3 && rep.Kbps >= minKbps:
+		rep.OK = true
+	}
+	if writeErr != nil {
+		rep.Error = writeErr.Error()
+	}
+	return rep
 }
 
 func Targets() []string {

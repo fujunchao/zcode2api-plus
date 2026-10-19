@@ -195,6 +195,37 @@ var (
 	ProxyHandshakeTimeout = time.Duration(max(1, envInt("ZCODE_PROXY_HANDSHAKE_TIMEOUT_SECONDS", 20))) * time.Second
 )
 
+// ── 隧道吞吐探针 ────────────────────────────────────────────────────────────
+// 浅探针只证明「能连」：探针对目标根路径发一次 6 秒 GET，能连但大包传不动的线路
+// 每次判健康（2026-10-17：5.5MB 请求首字节 283 秒，探针全程绿灯）。
+// 这里走裸隧道直接写字节测上传能力；默认 shadow 只记录，不参与任何判定。
+var (
+	// DeepProbe off | shadow | enforce；非法值按 shadow 处理（不改判定，最安全）。
+	DeepProbe = env("ZCODE_PROXY_DEEP_PROBE", "shadow")
+	// DeepTarget 只接受 host:port，不接受 URL——避免把凭据写进配置。
+	DeepTarget = env("ZCODE_PROXY_DEEP_TARGET", "zcode.z.ai:443")
+	// DeepBytes 单次写入量。
+	DeepBytes = int64(max(65536, envInt("ZCODE_PROXY_DEEP_BYTES", 1048576)))
+	// DeepBudget 单次预算。
+	DeepBudget = time.Duration(max(1000, envInt("ZCODE_PROXY_DEEP_BUDGET_MS", 12000))) * time.Millisecond
+	// DeepMinBytes 早停判定下限：写满这个量且够快，就认为链路没问题。
+	DeepMinBytes = int64(max(1024, envInt("ZCODE_PROXY_DEEP_MIN_BYTES", 262144)))
+	// DeepMinKbps 速率下限（KB/s）：实测「慢但能用」约 68，故障线路 20 量级。
+	DeepMinKbps = int64(max(1, envInt("ZCODE_PROXY_DEEP_MIN_KBPS", 85)))
+)
+
+// DeepProbeMode 归一化开关：只有明确 off/enforce 才改变行为，其余一律 shadow。
+func DeepProbeMode() string {
+	switch strings.ToLower(strings.TrimSpace(DeepProbe)) {
+	case "off":
+		return "off"
+	case "enforce":
+		return "enforce"
+	default:
+		return "shadow"
+	}
+}
+
 // ── 单次尝试的首字节预算 ────────────────────────────────────────────────────
 // Go 的 ResponseHeaderTimeout 是「**写完 body 之后**」才开始计时，慢线路上 5MB
 // 上传要几百秒，上传阶段等于没有超时（2026-10-17 复盘：5.5MB 请求首字节 283s）。
@@ -431,7 +462,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.10.27-go"
+	AppVersion = "2.10.28-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

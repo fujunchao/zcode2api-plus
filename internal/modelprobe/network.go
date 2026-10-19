@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/networkprobe"
 	"zcode2api/internal/proxy"
 	"zcode2api/internal/store"
@@ -86,15 +87,39 @@ func networkTargetsKey(targets []string) string {
 	return networkprobe.TargetsKey(targets)
 }
 
-func (m *Manager) checkNetwork(ctx context.Context, p store.ProxyProfile, policy store.ModelProbeSettings, targets []string) networkprobe.Report {
+func (m *Manager) checkNetwork(ctx context.Context, p store.ProxyProfile, policy store.ModelProbeSettings, targets []string, deep bool) networkprobe.Report {
 	client, err := networkprobe.Client(p.URL)
 	if err != nil {
 		return networkprobe.Report{Error: "invalid_proxy", Targets: []networkprobe.Target{}}
 	}
-	return networkprobe.Check(ctx, m.store.GuardNetworkHealthClient(client, policy, p), targets)
+	report := networkprobe.Check(ctx, m.store.GuardNetworkHealthClient(client, policy, p), targets)
+	return withDeepProbe(ctx, p, report, deep)
 }
 
-func (m *Manager) networkBatch(ctx context.Context, profiles []store.ProxyProfile, p store.ModelProbeSettings, targets []string) map[string]networkprobe.Report {
+// withDeepProbe 只在巡检 first 阶段跑隧道裸写。
+//
+// 为什么不在 second / direct / preflight 跑：
+//   - second 只是对失败线路复核可达性，first 的隧道结果已经入库；
+//   - direct 没有代理 URL，隧道无意义；
+//   - preflight 每个模型探测租约都会跑，在那里写 1MiB 会把流量与特征放大到每次租约。
+//
+// shadow 只记录、不改 OK；enforce 才把隧道失败并入判定。
+func withDeepProbe(ctx context.Context, p store.ProxyProfile, report networkprobe.Report, deep bool) networkprobe.Report {
+	mode := config.DeepProbeMode()
+	if !deep || mode == "off" || p.URL == "" {
+		return report
+	}
+	t := networkprobe.CheckTunnelWrite(ctx, p.URL, config.DeepTarget, config.DeepBytes, config.DeepBudget, config.DeepMinBytes, config.DeepMinKbps)
+	report.Tunnel = &t
+	if mode == "enforce" {
+		report.OK = report.OK && t.OK
+	}
+	web.Warn("proxy-deep", fmt.Sprintf("id=%s mode=%s ok=%t bytes=%d ms=%d kbps=%d target=%s early_stop=%t",
+		p.ID, mode, t.OK, t.Bytes, t.MS, t.Kbps, config.DeepTarget, t.EarlyStop))
+	return report
+}
+
+func (m *Manager) networkBatch(ctx context.Context, profiles []store.ProxyProfile, p store.ModelProbeSettings, targets []string, deep bool) map[string]networkprobe.Report {
 	result := map[string]networkprobe.Report{}
 	var lock sync.Mutex
 	var wg sync.WaitGroup
@@ -115,7 +140,7 @@ func (m *Manager) networkBatch(ctx context.Context, profiles []store.ProxyProfil
 						r = networkprobe.Report{Error: "internal_error"}
 					}
 				}()
-				return m.checkNetwork(ctx, profile, p, targets)
+				return m.checkNetwork(ctx, profile, p, targets, deep)
 			}()
 			lock.Lock()
 			result[profile.ID] = r
@@ -228,7 +253,7 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 		if whole {
 			web.Warn("proxy-health", fmt.Sprintf("round=%s stage=probe whole=1 checked=%d mode=%s", r.id, len(r.profiles), p.Mode))
 		}
-		r.first = m.networkBatch(ctx, selected, p, targets)
+		r.first = m.networkBatch(ctx, selected, p, targets, true)
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
@@ -282,7 +307,7 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 			}
 		}
 	}
-	second := m.networkBatch(ctx, append(slices.Clone(bad), controls...), p, r.targets)
+	second := m.networkBatch(ctx, append(slices.Clone(bad), controls...), p, r.targets, false)
 	var direct *networkprobe.Report
 	needsDirect := false
 	for _, b := range bad {
@@ -300,7 +325,7 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 		}
 	}
 	if needsDirect {
-		v := m.checkNetwork(ctx, store.ProxyProfile{}, p, r.targets)
+		v := m.checkNetwork(ctx, store.ProxyProfile{}, p, r.targets, false)
 		direct = &v
 	}
 	if ctx.Err() != nil || !m.now().Before(r.deadline) {
@@ -437,7 +462,7 @@ func (m *Manager) networkPreflight(ctx context.Context, l *store.ModelProbeLease
 			}
 		}
 	}
-	r := m.checkNetwork(ctx, profile, p, targets)
+	r := m.checkNetwork(ctx, profile, p, targets, false)
 	if profile.ID != "" {
 		state := "healthy"
 		if !r.OK {
