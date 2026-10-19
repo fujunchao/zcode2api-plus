@@ -178,6 +178,10 @@ var (
 	ProxySoftConsecutiveWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_CONSECUTIVE_WINDOW_SECONDS", 7200))) * time.Second
 	// ProxyFreshGateSeconds 新导入线路的冷启动门禁时长；超时未出结果即放行。
 	ProxyFreshGateSeconds = max(0, envInt("ZCODE_PROXY_FRESH_GATE_SECONDS", 120))
+	// ProxyProtectRecentHours 巡检自动删除前的「最近成功」保护窗口；0 关闭。
+	// 只看账号 LastUsedAt（上游成功交付时写），且**只作用于巡检删除**：
+	// 严格退役、断流熔断、登录清理与手动删除都不受它影响。
+	ProxyProtectRecentHours = max(0, envInt("ZCODE_PROXY_PROTECT_RECENT_HOURS", 24))
 )
 
 // ── 出站连接超时 ────────────────────────────────────────────────────────────
@@ -427,7 +431,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.10.26-go"
+	AppVersion = "2.10.27-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

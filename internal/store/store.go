@@ -91,6 +91,7 @@ type Store struct {
 	proxySoft             proxySoftState                 // 软失败统计与隔离状态，保存于内部 meta，不进入设置快照。
 	line405               line405State                   // 线路级 405 画像与隔离，保存于内部 meta，不进入设置快照。
 	proxyRelaxLoggedAt    int64                          // 选线放宽日志限频（unix ms），仅用于避免日志刷屏。
+	proxyProtectLogged    map[string]int64               // 「最近成功免删」日志限频（profile ID → 上次输出 ms），仅内存。
 	line405RelaxLoggedAt  int64                          // 线路 405 隔离放宽日志限频（unix ms）。
 	lineCapRelaxLoggedAt  int64                          // 单线绑定软上限放宽日志限频（unix ms）。
 	// 定向模型巡检限频与预算：线路隔离只说明「这条线跑不动模型」，要真正清出池子
@@ -912,6 +913,9 @@ func (s *Store) AddProxyProfile(name, url string, enabled bool, protection ...bo
 		return ProxyProfile{}, err
 	}
 	profile.Generation = s.strictProxy.Generations[profile.ID]
+	// 与订阅导入共用同一行格式：删除有日志、导入也必须可对账。
+	// 持有 s.mu，故异步输出（web.Warn 是同步 stdout 写）。
+	go web.Warn("proxy-import", fmt.Sprintf("source=manual id=%s total=%d", profile.ID, len(profiles)))
 	return profile, nil
 }
 

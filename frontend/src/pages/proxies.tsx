@@ -55,6 +55,7 @@ function protectionText(p?: ProxyProfile): string {
     case 'default_proxy': return '默认业务出口，自动保护'
     case 'managed_default': return '托管账号默认出口，自动保护'
     case 'policy_unavailable': return '默认出口策略待修复，保守保护'
+    case 'recent_success': return '最近 24 小时有成功流量，自动保护'
     case 'manual': return p.auto_delete_protected ? '已开启手工保护' : '同路由节点已开启保护'
     default: return p?.auto_delete_protected ? '已开启手工保护' : ''
   }

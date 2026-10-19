@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxy"
@@ -79,6 +80,20 @@ func (s *Store) purgeProxyProfilesIfCurrentLocked(expected []ProxyProfile) ([]st
 				strictProxyIdentity(p.URL) == strictProxyIdentity(snapshot.URL) {
 				wanted[p.ID] = true
 				break
+			}
+		}
+	}
+	// 巡检专用：最近 24h 有过成功交付的线路不进删除名单。
+	// 只影响这一条删除路径——严格退役、断流熔断、登录清理与手动删除都不看它。
+	if recent := s.recentSuccessProtectionsLocked(time.Now()); len(recent) > 0 {
+		for id := range wanted {
+			p, ok := s.probeProfileLocked(id)
+			if !ok {
+				continue
+			}
+			if at, hit := recent[strictProxyIdentity(p.URL)]; hit {
+				delete(wanted, id)
+				s.logRecentProtectLocked(id, at, time.Now())
 			}
 		}
 	}

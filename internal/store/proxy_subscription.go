@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"zcode2api/internal/model"
 	"zcode2api/internal/proxysub"
+	"zcode2api/internal/web"
 )
 
 func (s *Store) subscriptionLocked() (proxysub.State, error) {
@@ -208,6 +210,12 @@ func (s *Store) FinishSubscriptionRun(ctx context.Context, r proxysub.Run, passe
 	// 新导入线路必须体检后才参与自动选线：这里登记一次冷启动检查，
 	// 巡检下一 tick 取走，结果落库前 chooseProxyLocked 会跳过它。
 	s.queueFreshProxyChecksLocked(added, now)
+	if r.Added > 0 {
+		// 与 proxy-health 的 removed=N 对账：删除有日志，导入也必须留痕。
+		// 本函数全程持有 s.mu，故异步输出。
+		go web.Warn("proxy-import", fmt.Sprintf("source=%s added=%d skipped=%d received=%d total=%d",
+			r.ID, r.Added, r.CommitSkipped, r.Received, len(profiles)))
+	}
 	return r, nil
 }
 
