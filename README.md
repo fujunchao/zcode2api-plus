@@ -56,6 +56,12 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 默认客户端版本已同步至 `3.15.3`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。版本特定的内部状态与回滚要求见下方发布说明。
 
+`v2.10.28-go` 增加 **隧道吞吐探针**：浅探针只证明「能连」，看不到「传不动」（5.5MB 请求
+首字节 283 秒时探针全程绿灯）。新探针建连后直接往隧道写 1MiB，按写了多少/多久判断上传能力；
+默认 `shadow` 只记录、**不参与任何判定**，跑 24 小时核对相关性后再切 `enforce`。
+只挂巡检 first 阶段，`preflight`/`direct`/`second` 不深探。
+详见 [发布说明](docs/releases/v2.10.28-go.md)。
+
 `v2.10.27-go` 补上 **导入记账** 与 **最近成功免删**：订阅导入与手工新增各打一行
 `proxy-import … total=N`，与巡检的 `removed=N` 直接对账；巡检删除前跳过「最近 24 小时有过
 上游成功交付」的线路（`ZCODE_PROXY_PROTECT_RECENT_HOURS`，0 关闭），但**严格退役、断流熔断、
