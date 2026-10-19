@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/proxysub"
 	"zcode2api/internal/web"
 )
 
@@ -148,5 +150,91 @@ func TestRecentSuccessDoesNotBlockStrictRetirement(t *testing.T) {
 
 	if reason := s.automaticProxyRemovalReasonLocked(strictProxyIdentity(p.URL)); reason != "" {
 		t.Fatalf("严格退役不得被最近成功否决：%s", reason)
+	}
+}
+
+// 断流熔断走 PurgeFailedAccountProxy → removeProxiesLocked，只受基础保护约束。
+//
+// 这是收窄方案的结构守门：若有人把「最近成功」过滤从 purgeProxyProfilesIfCurrentLocked
+// 「顺手统一」挪进 removeProxiesLocked / removeProxiesAvoidingLocked，上面那条严格退役
+// 用例仍然是绿的（它走 automaticProxyRemovalReasonLocked），只有这条会红。
+func TestRecentSuccessDoesNotBlockTruncatePurge(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "断流线路", 18505, true)
+	a := addSelectionAccount(t, s, "断流账号", p.ID)
+	enableAutoRetire(t, s)
+	setLastUsed(t, s, a, time.Now().Add(-time.Minute))
+
+	removed, _, err := s.PurgeFailedAccountProxy(s.FindAny(a.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("断流熔断必须能删除线路：最近成功只豁免巡检，不得豁免断流")
+	}
+	if left := len(s.ListProxyProfiles()); left != 0 {
+		t.Fatalf("线路未被删除：%d", left)
+	}
+}
+
+// 订阅导入与 proxy-health 的 removed=N 对账依赖这一行；没有它收支永远对不上。
+func TestSubscriptionImportLogsForReconciliation(t *testing.T) {
+	s := newTestStore(t)
+	c := subscriptionFixture(t, s)
+	buf := captureLog(t)
+
+	r := subscriptionRun(t, s, c, "import-log")
+	result, err := s.FinishSubscriptionRun(context.Background(), r, []proxysub.Candidate{subscriptionCandidate(0)})
+	if err != nil || result.Added != 1 {
+		t.Fatalf("导入结果 %+v %v", result, err)
+	}
+	waitForLog(t, buf, "proxy-import")
+	waitForLog(t, buf, "source=import-log")
+	waitForLog(t, buf, "added=1")
+	waitForLog(t, buf, "total=1")
+}
+
+// 一条没新增时不打日志：自动同步每 15 分钟一次，空导入刷屏会淹掉真正的变更。
+func TestSubscriptionImportSilentWhenNothingAdded(t *testing.T) {
+	s := newTestStore(t)
+	c := subscriptionFixture(t, s)
+
+	// 先把手工新增那条异步日志等出来再换缓冲，否则它会飘进后面的断言。
+	manual := captureLog(t)
+	if _, err := s.AddProxyProfile("已有线路", subscriptionCandidate(0).URL, false); err != nil {
+		t.Fatal(err)
+	}
+	waitForLog(t, manual, "proxy-import")
+
+	buf := captureLog(t)
+	r := subscriptionRun(t, s, c, "import-empty")
+	if _, err := s.FinishSubscriptionRun(context.Background(), r, []proxysub.Candidate{subscriptionCandidate(0)}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := buf.String(); strings.Contains(got, "proxy-import") {
+		t.Fatalf("没有新增线路时不应打导入日志：%s", got)
+	}
+}
+
+// 保护原因只补空位：既是默认出口又最近成功过时，界面应继续显示 default_proxy——
+// 否则「默认出口」这个更根本的原因会被一条瞬时证据盖掉。
+func TestDefaultProxyReasonWinsOverRecentSuccess(t *testing.T) {
+	s := newTestStore(t)
+	p := addSelectionProxy(t, s, "默认出口", 18506, true)
+	a := addSelectionAccount(t, s, "默认出口账号", p.ID)
+	setLastUsed(t, s, a, time.Now().Add(-time.Minute))
+
+	policy, err := s.NewAccountProxyPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Enabled = true
+	policy.DefaultProxyID = p.ID
+	if _, err := s.SaveNewAccountProxyPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.ProxyAutoDeleteProtections()[p.ID]; got != "default_proxy" {
+		t.Fatalf("展示原因应保持 default_proxy，实际 %q", got)
 	}
 }
