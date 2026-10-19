@@ -1315,10 +1315,18 @@ var ansiRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 func (b *diagBuf) diagLine(t *testing.T) string {
 	t.Helper()
-	for _, line := range strings.Split(b.String(), "\n") {
-		if strings.Contains(line, "[#]") {
-			return ansiRE.ReplaceAllString(line, "")
+	// 异步票的 `[#]` 行由后台 worker 在响应返回之后才写：CI 负载高时晚一拍，
+	// 立即读会假失败（2026-10-19 实测）。轮询到出现或超时，不做固定 sleep。
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		for _, line := range strings.Split(b.String(), "\n") {
+			if strings.Contains(line, "[#]") {
+				return ansiRE.ReplaceAllString(line, "")
+			}
 		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("async 日志里没有诊断行：\n%s", ansiRE.ReplaceAllString(b.String(), ""))
 	return ""
