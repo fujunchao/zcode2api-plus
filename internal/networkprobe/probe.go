@@ -94,9 +94,12 @@ func CheckTunnelWrite(ctx context.Context, proxyURL, target string, size int64, 
 		}
 	}
 	rep.MS = time.Since(start).Milliseconds()
-	if rep.MS > 0 {
-		rep.Kbps = rep.Bytes * 1000 / rep.MS / 1024
+	// 毫秒级完成时 MS 可能为 0：用 1ms 兜底，避免把「极快」算成 0 KB/s。
+	elapsedMS := rep.MS
+	if elapsedMS < 1 {
+		elapsedMS = 1
 	}
+	rep.Kbps = rep.Bytes * 1000 / elapsedMS / 1024
 	budgetMS := budget.Milliseconds()
 	switch {
 	case rep.Bytes >= size:

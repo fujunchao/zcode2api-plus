@@ -82,7 +82,7 @@ func targetServer(t *testing.T, mode string, limit int64) string {
 					_, _ = io.CopyN(io.Discard, c, limit)
 				case "stall":
 					// 不读、不关：写端会阻塞到自己的 deadline。
-					time.Sleep(3 * time.Second)
+					time.Sleep(5 * time.Second)
 				}
 			}(conn)
 		}
@@ -117,7 +117,8 @@ func TestCheckTunnelWriteStallFails(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "stall", 0)
 	start := time.Now()
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 4<<20, 400*time.Millisecond, 64<<10, 85)
+	// 64MB 远大于两端内核缓冲之和：缓冲被填满后写必然阻塞到 deadline。
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 300*time.Millisecond, 64<<10, 85)
 	if rep.OK {
 		t.Fatalf("写不动必须判失败：%+v", rep)
 	}
