@@ -70,7 +70,7 @@ function fixture() {
       account('miss-exhausted', { status: 'exhausted', quota: {} }),
       account('archived-hit', { quota: {}, archived_at: 1_700_000_000 }),
     ],
-    model_quotas: [{ model: 'GLM-5.3', total: 3_000_000, used: 0, remaining: 3_000_000, accounts: 1, items: 1, partial: false }],
+    model_quotas: [{ model: 'GLM-5.3', total: 1000, used: 100, remaining: 900, accounts: 1, items: 1, partial: false }],
     stats: {}, models: [], proxies: [], ts: 1,
   }
 }
@@ -108,7 +108,7 @@ test('无额度分组按口径计数，只显示普通 JWT 账号，排除初始
   expect(visibleIDs()).toEqual(['hit-active', 'hit-cooling', 'hit-null'])
   // 归档账号不参与筛选与计数；全池额度汇总不随筛选变化。
   expect(visibleIDs()).not.toContain('archived-hit')
-  expect(within(screen.getByRole('region', { name: 'GLM-5.3 额度' })).getByText('3,000,000')).toBeTruthy()
+  expect(within(screen.getByRole('region', { name: 'GLM-5.3 额度' })).getByText('900')).toBeTruthy()
   expect(mock.api.mock.calls.every(([method, path]) => method === 'GET' && path === '/accounts')).toBe(true)
 })
 
