@@ -83,6 +83,10 @@ func targetServer(t *testing.T, mode string, limit int64) string {
 				case "stall":
 					// 不读、不关：写端会阻塞到自己的 deadline。
 					time.Sleep(5 * time.Second)
+				case "early_stall":
+					// 先读掉 limit（模拟「缓冲先吞几百 KB」），之后既不读也不关。
+					_, _ = io.CopyN(io.Discard, c, limit)
+					time.Sleep(5 * time.Second)
 				}
 			}(conn)
 		}
@@ -132,5 +136,45 @@ func TestCheckTunnelWriteDialFailure(t *testing.T) {
 	rep := CheckTunnelWrite(context.Background(), "http://127.0.0.1:1", "127.0.0.1:443", 1024, time.Second, 512, 85)
 	if rep.OK || rep.Bytes != 0 || rep.Error == "" {
 		t.Fatalf("建连失败应直接判失败：%+v", rep)
+	}
+}
+
+// 128KB 早停下限要覆盖「对端在 150KB 附近关闭」的健康线：
+// 2026-10-20 的 8221 条 shadow 记录里，这类早停占多数，256KB 判据会把它们判坏。
+func TestDeepMinBytesCoversEarlyCloseAt150KB(t *testing.T) {
+	proxyURL := startConnectProxy(t)
+	target := targetServer(t, "early", 150<<10)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 1<<20, 2*time.Second, 128<<10, 85)
+	if !rep.OK || !rep.EarlyStop {
+		t.Fatalf("150KB 早停 + 128KB 下限应判 OK：%+v", rep)
+	}
+	if rep.Bytes < 128<<10 {
+		t.Fatalf("前置失败：写入量应已覆盖下限：%+v", rep)
+	}
+}
+
+// 下限不是无限制放宽：32KB 就关的线路仍然必须失败。
+func TestDeepMinBytesRejectsEarlyCloseBelowFloor(t *testing.T) {
+	proxyURL := startConnectProxy(t)
+	target := targetServer(t, "early", 32<<10)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 1<<20, 2*time.Second, 128<<10, 85)
+	if rep.OK {
+		t.Fatalf("远低于下限的早停不应判 OK：%+v", rep)
+	}
+}
+
+// 锁住 DeepBytes 不缩小的理由：对端先吞 300KB、随后不读不关，
+// 只要写入量仍要求 1MiB，就会在预算内暴露成失败。
+// 若把 size 降到 256KB，探针会在卡死发生前停止写入并被判 OK。
+func TestDeepBytesStallAfterPartialWriteFails(t *testing.T) {
+	proxyURL := startConnectProxy(t)
+	target := targetServer(t, "early_stall", 300<<10)
+	start := time.Now()
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 300*time.Millisecond, 128<<10, 85)
+	if rep.OK {
+		t.Fatalf("突发后卡死必须判失败：%+v", rep)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("必须按预算结束：%v", elapsed)
 	}
 }

@@ -209,7 +209,16 @@ var (
 	// DeepBudget 单次预算。
 	DeepBudget = time.Duration(max(1000, envInt("ZCODE_PROXY_DEEP_BUDGET_MS", 12000))) * time.Millisecond
 	// DeepMinBytes 早停判定下限：写满这个量且够快，就认为链路没问题。
-	DeepMinBytes = int64(max(1024, envInt("ZCODE_PROXY_DEEP_MIN_BYTES", 262144)))
+	//
+	// 256KB → 128KB 的依据不是「曲线平缓」，而是 96KB 与 128KB 对真实成功线路的
+	// 覆盖率完全相同（77/81）——128KB 是达到满覆盖的最小值，再往下没有收益。
+	// 早停是「对端主动关闭」（写错误），与「缓冲区吃满后阻塞」不同：后者会撞满预算，
+	// 被 `ms < budget*2/3` 挡掉，所以放宽下限不会把传不动的线放进来。
+	//
+	// ⚠️ 不要单独下调 DeepBytes 来省流量：满写分支不受 kbps/ms 约束，1MiB/12s 就是
+	// 85KB/s 的隐式速率底线（正好等于 DeepMinKbps）。降 size 会让「突发后卡死」的
+	// 线在卡死前停止写入、被判 OK——2026-10-20 日志里有 78 条这样的样本。
+	DeepMinBytes = int64(max(1024, envInt("ZCODE_PROXY_DEEP_MIN_BYTES", 131072)))
 	// DeepMinKbps 速率下限（KB/s）：实测「慢但能用」约 68，故障线路 20 量级。
 	DeepMinKbps = int64(max(1, envInt("ZCODE_PROXY_DEEP_MIN_KBPS", 85)))
 )
