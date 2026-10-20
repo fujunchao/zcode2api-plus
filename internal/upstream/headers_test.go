@@ -196,12 +196,14 @@ func TestAttributionHeaderEmptyValuesTreatedAsMissing(t *testing.T) {
 // 后者由 attributionHeaders 从原始 incoming 取回并作为固定头写出，与透传循环里
 // 对 x-zcode-* 的一刀切丢弃无关。本用例同时钉住这两点：若有人删掉归因合成，
 // 后两个断言会红；若有人放开未知 x-zcode-* 的透传，第一个断言会红。
+// 新版官方客户端新增的 X-ZCode-Authorization（可选代理路由头）也按未知头处理。
 func TestClientZcodeHeadersOutcome(t *testing.T) {
 	incoming := map[string]string{
 		"x-zcode-trace-id":        "trace-from-client",
 		"x-zcode-session-type":    "subagent",
 		"x-zcode-rpc-client-mode": "weird",
 		"x-zcode-app-version":     "9.9.9",
+		"x-zcode-authorization":   "Bearer synthetic-downstream",
 	}
 	req, err := BuildRequest(jwtAccount(), "", "", incoming)
 	if err != nil {
@@ -211,6 +213,9 @@ func TestClientZcodeHeadersOutcome(t *testing.T) {
 
 	if _, ok := h["X-Zcode-Rpc-Client-Mode"]; ok {
 		t.Error("未知 x-zcode-* 不应透传")
+	}
+	if _, ok := h["X-ZCode-Authorization"]; ok {
+		t.Error("X-ZCode-Authorization 不应透传（官方客户端对官方服务端的可选代理路由头）")
 	}
 	if h["X-ZCode-App-Version"] != config.ZcodeClientVersion {
 		t.Errorf("透传不得覆盖版本头，实际 %q", h["X-ZCode-App-Version"])
