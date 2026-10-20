@@ -135,3 +135,31 @@
 - 不回滚、不删除既有未跟踪文件；不把 docs/temp 纳入提交；
 - 不修改 `data/`、`.zcode/`；不读取账号材料；
 - 发布门禁按 AGENTS.md：本次不触发 `release.yml`，不创建版本标签。
+
+## 11. 执行与发布记录（2026-10-20，用户追加要求发版 2.11.0）
+
+> 用户在本计划确认后追加「完成后推送并发 2.11.0 版本」，故 §10 的「不发版」被该显式指令覆盖；实际执行结果如下。
+
+### 11.1 代码与 CI
+
+- 分支 `codex/zcode-3.16.2-version-sync`：`ecaa4c5`（版本声明同步）、`1a5b92e`（防御回归）；CI run [39414412701](https://github.com/fujunchao/zcode2api-plus/actions/runs/39414412701) 全绿（12 个 job）。
+- `go-rewrite` 快进合并到 `1a5b92e`；发版提交 `5eff10c`（`chore: 发布 v2.11.0-go`）；发布前分支 CI run [39415273282](https://github.com/fujunchao/zcode2api-plus/actions/runs/39415273282) 全绿。
+- 标签 `v2.11.0-go`（annotated，tag object `3f5573dee5216652eac7fbd19b42f3d9e7e2e530` → commit `5eff10c3db29c2b3399c2bb25394959e4384ea52`）；远端 `refs/tags/v2.11.0-go` 已确认。
+
+### 11.2 发布流水线
+
+- release run [39416214649](https://github.com/fujunchao/zcode2api-plus/actions/runs/39416214649) 成功：validate（复用 ci.yml 全部 job）全绿；build 矩阵 5/5 成功；image 成功。
+- Release：https://github.com/fujunchao/zcode2api-plus/releases/tag/v2.11.0-go（非 draft/prerelease，published 2026-10-20T11:45:10Z）。
+- 附件（均 uploaded）：`zcode2api-linux-amd64` 18,673,848 B；`zcode2api-linux-arm64` 18,088,120 B；`zcode2api-darwin-amd64` 19,176,640 B；`zcode2api-darwin-arm64` 18,611,682 B；`zcode2api-windows-amd64.exe` 17,881,600 B。
+- 镜像：`ghcr.io/fujunchao/zcode2api-plus` 的 `2.11.0-go` 与 `latest` 均可匿名拉取，OCI index 含 linux/amd64、linux/arm64（另有 provenance 清单）；两个 tag 指向同一 multi-arch 索引。
+- 产物抽查：下载 `zcode2api-windows-amd64.exe`，PE 头 `MZ`、内嵌 `2.11.0-go` 1 处、无 `2.10.30-go`；SHA256 `1edd687274e08c584ec8a6c4ce59a399556e2d92a3e60aecdb65fcdf09b7a6a0`。
+- 发布说明正文 = `docs/releases/v2.11.0-go.md`（已抽查首段一致）。
+
+### 11.3 回滚
+
+- 运行期：`ZCODE_CLIENT_VERSION=3.15.3`（UA / `X-ZCode-App-Version` / `app_version` 自动回退，无需重编）；
+- 代码：revert `ecaa4c5`/`1a5b92e`；本次无数据迁移、无接口变更。
+
+### 11.4 发布后观察
+
+- 观察上游按 `app_version` 分级配置与验证码/领取行为，以及 401/405 与验证码比例；异常时按 §11.3 回退。
