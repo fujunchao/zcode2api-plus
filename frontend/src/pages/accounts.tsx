@@ -94,7 +94,7 @@ const STATUS_BADGE: Record<AccountStatus, string> = {
   disabled: 'bg-muted text-muted-foreground',
 }
 
-type FilterKey = 'all' | 'initializing' | AccountStatus
+type FilterKey = 'all' | 'initializing' | 'no_quota' | AccountStatus
 
 /* 錯誤類型篩選：'fault' 是按「是否歸因於帳號自身」聚合，其餘是具體類型。
    聚合項讓「一鍵找出有問題的號」成立，而不必在下拉裡逐個類型點一遍。 */
@@ -107,6 +107,24 @@ function errorKindLabel(kind: string): string {
 
 function errorKindBadge(kind: string): string {
   return ERROR_KIND_BADGE[kind as AccountErrorKind] ?? 'bg-muted text-muted-foreground'
+}
+
+/**
+ * 「无额度」派生分组：额度快照为空、仍可调度的普通 JWT 业务账号。
+ *
+ * 排除：初始化阻塞（含「待固定代理」。它们优先归「初始化」组）、用完/停用/失效、
+ * 本地风控隔离、探测专用与 apiKey 账号。空额度有两种来源——体验套餐到期后上游
+ * 返回空快照，或额度查询从未成功——两者都计入本组，界面用 tooltip 说明。
+ */
+function hasEmptyQuota(a: Account): boolean {
+  if (a.enabled === false) return false
+  if (a.model_probe_only) return false
+  if (a.mode !== 'jwt') return false
+  if (a.local_scheduling_reason === 'risk_isolation') return false
+  if (a.initialization?.blocked) return false
+  if (a.status !== 'active' && a.status !== 'cooling') return false
+  // 后端 nil map 会序列化成 null；空对象才是「未取得」的稳定形态。
+  return Object.keys(a.quota ?? {}).length === 0
 }
 
 /* 「最近錯誤」列：小徽章 + 相對時間；完整錯誤文案放 title（欄寬只有 104px）。 */
@@ -214,13 +232,15 @@ export function AccountsPage() {
   const stats = data?.stats
 
   /* ── 篩選（歸檔帳號不參與） ── */
-  const counts: Record<string, number> = { all: liveAccounts.length, exhausted: 0, disabled: 0 }
+  const counts: Record<string, number> = { all: liveAccounts.length, exhausted: 0, disabled: 0, no_quota: 0 }
   /* 錯誤類型計數：只統計最近一次錯誤的歸類；無錯誤的帳號不進任何一項。 */
   const errCounts: Record<string, number> = {}
   let faultCount = 0
   liveAccounts.forEach((a) => {
     const status = a.initialization?.blocked ? 'initializing' : a.status
     counts[status] = (counts[status] || 0) + 1
+    // 必须在 last_error_kind 早退之前统计：典型无额度账号没有 last_error_kind。
+    if (hasEmptyQuota(a)) counts.no_quota += 1
     const kind = a.last_error_kind
     if (!kind) return
     errCounts[kind] = (errCounts[kind] || 0) + 1
@@ -230,7 +250,13 @@ export function AccountsPage() {
      'fault' 用歸因布林值過濾，因此 client_canceled（用戶端取消，不計為帳號故障）
      不會混進「帳號故障」視圖——但它仍可從下拉單獨選出。 */
   const filtered = liveAccounts
-    .filter((a) => filter === 'all' || (a.initialization?.blocked ? 'initializing' : a.status) === filter)
+    .filter(
+      (a) =>
+        filter === 'all' ||
+        (filter === 'no_quota'
+          ? hasEmptyQuota(a)
+          : (a.initialization?.blocked ? 'initializing' : a.status) === filter),
+    )
     .filter((a) => {
       if (errFilter === 'all') return true
       const kind = a.last_error_kind
@@ -874,6 +900,7 @@ export function AccountsPage() {
             ['all', '全部'],
             ['initializing', '初始化'],
             ['exhausted', '用完'],
+            ['no_quota', '无额度'],
             ['invalid', '异常'],
             ['disabled', '停用'],
           ] as [FilterKey, string][]
@@ -884,6 +911,7 @@ export function AccountsPage() {
             variant={filter === k ? 'default' : 'outline'}
             aria-pressed={filter === k}
             className="h-8 rounded-full"
+            title={k === 'no_quota' ? '非归档 JWT 账号中额度快照为空；含直连新增/查询未成功账号，不含初始化中/待固定代理、用完、停用、失效、本地隔离及探测专用账号' : undefined}
             onClick={() => changeFilter(k)}
           >
             {l}
@@ -996,7 +1024,7 @@ export function AccountsPage() {
               {!filtered.length ? (
                 <TableRow>
                   <TableCell colSpan={11} className="py-10 text-center text-sm text-muted-foreground">
-                    {filter === 'invalid' ? '暂无符合筛选条件的异常账号' : '尚無帳號，請點擊右上角「新增」'}
+                    {filter === 'invalid' ? '暂无符合筛选条件的异常账号' : filter === 'no_quota' ? '暂无符合筛选条件的无额度账号' : '尚無帳號，請點擊右上角「新增」'}
                   </TableCell>
                 </TableRow>
               ) : (
