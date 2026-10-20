@@ -141,10 +141,13 @@ func TestCheckTunnelWriteDialFailure(t *testing.T) {
 
 // 128KB 早停下限要覆盖「对端在 150KB 附近关闭」的健康线：
 // 2026-10-20 的 8221 条 shadow 记录里，这类早停占多数，256KB 判据会把它们判坏。
+//
+// 写入量必须远大于两端缓冲（这里用 64MB），否则 loopback 缓冲会把请求整段吞掉、
+// 探针根本走不到早停分支（CI 实证：1MiB 时 Bytes=1048576、EarlyStop=false）。
 func TestDeepMinBytesCoversEarlyCloseAt150KB(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "early", 150<<10)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 1<<20, 2*time.Second, 128<<10, 85)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 2*time.Second, 128<<10, 85)
 	if !rep.OK || !rep.EarlyStop {
 		t.Fatalf("150KB 早停 + 128KB 下限应判 OK：%+v", rep)
 	}
@@ -153,15 +156,14 @@ func TestDeepMinBytesCoversEarlyCloseAt150KB(t *testing.T) {
 	}
 }
 
-// 下限不是无限制放宽：写入量不够下限时必须失败。
+// 下限不是无限制放宽：同样一条 150KB 早停的线，把下限提到 4MB 就必须失败。
 //
-// 负向用例用 4MB 下限而不是 128KB：loopback 上内核 + CONNECT 代理的缓冲会先吞掉
-// 数百 KB（对端只读 32KB 时，写端仍可能成功写入 800KB+），拿 128KB 当负向阈值
-// 测到的是缓冲量而不是判据。这里验证的是「不够下限即失败」这条判据本身。
+// 用 4MB 而不是 128KB 作负向阈值：loopback 缓冲会先吞掉数百 KB（对端只读 150KB 时
+// 写端仍可能写入 1MB+），拿 128KB 做负向边界，测到的是缓冲量而不是判据。
 func TestDeepMinBytesRejectsEarlyCloseBelowFloor(t *testing.T) {
 	proxyURL := startConnectProxy(t)
-	target := targetServer(t, "early", 32<<10)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 8<<20, 2*time.Second, 4<<20, 85)
+	target := targetServer(t, "early", 150<<10)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 2*time.Second, 4<<20, 85)
 	if rep.OK {
 		t.Fatalf("写入量低于下限不应判 OK：%+v", rep)
 	}
