@@ -242,6 +242,13 @@ func DeepProbeMode() string {
 var (
 	// UpstreamFirstByteTimeout 首字节预算；0 关闭。
 	UpstreamFirstByteTimeout = time.Duration(max(0, envInt("ZCODE_UPSTREAM_FIRST_BYTE_TIMEOUT", 90))) * time.Second
+	// BusySwitchAfter 3009 并发准入的换号实验开关：原地重试 N 次后改用另一个账号。
+	//
+	// 0（默认）= 保持既有假设「模型级准入、换号无用」：重试预算用尽后原样透传 429。
+	// >0 = 实验组：N 次原地重试后换号（不冷却账号，靠外层 tried 集合避免重复选中）。
+	// 2026-10-20 日志里 5 条 3009 分布在 5 个不同账号/线路，且同样内容之后都成功；
+	// 但另有 2 条是同账号延迟后成功——证据不足以推翻假设，只能靠对照数据判断。
+	BusySwitchAfter = max(0, envInt("ZCODE_BUSY_SWITCH_AFTER", 0))
 	// UpstreamTimeoutRetries 上游 408/524 的换号重试次数；0 关闭。
 	UpstreamTimeoutRetries = max(0, envInt("ZCODE_UPSTREAM_TIMEOUT_RETRIES", 1))
 	// RequestDeadline 单次请求的墙钟总预算；0 关闭。

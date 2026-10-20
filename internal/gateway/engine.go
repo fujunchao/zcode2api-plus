@@ -712,6 +712,12 @@ func (e *Engine) handleUpstreamError(
 	if IsModelConcurrencyLimit(resp.StatusCode, text) {
 		// 账号状态不变，但这次失败要留痕（并发准入是模型级限制，与账号健康无关）。
 		e.recordError(acc, model.ErrorKindModelBusy, "模型并发准入受限 HTTP 429 code="+ModelConcurrencyCode(resp.StatusCode, text))
+		// 实验开关（默认关）：原地重试 N 次后换号。3009 是准入限制、不是账号健康
+		// 问题，所以换号也不冷却账号；请求级上界仍由 MaxAccountAttempts 兜住。
+		if config.BusySwitchAfter > 0 && b.busy >= config.BusySwitchAfter {
+			web.Warn(reqID, fmt.Sprintf("模型并发准入受限 %d 次，换号重试%s", b.busy, ErrorDetail(text)))
+			return attemptResult{switchAccount: true}
+		}
 		if b.busy < len(e.BusyRetryDelays) {
 			delay := e.BusyRetryDelays[b.busy]
 			b.busy++
