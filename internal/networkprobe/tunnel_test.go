@@ -153,13 +153,17 @@ func TestDeepMinBytesCoversEarlyCloseAt150KB(t *testing.T) {
 	}
 }
 
-// 下限不是无限制放宽：32KB 就关的线路仍然必须失败。
+// 下限不是无限制放宽：写入量不够下限时必须失败。
+//
+// 负向用例用 4MB 下限而不是 128KB：loopback 上内核 + CONNECT 代理的缓冲会先吞掉
+// 数百 KB（对端只读 32KB 时，写端仍可能成功写入 800KB+），拿 128KB 当负向阈值
+// 测到的是缓冲量而不是判据。这里验证的是「不够下限即失败」这条判据本身。
 func TestDeepMinBytesRejectsEarlyCloseBelowFloor(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "early", 32<<10)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 1<<20, 2*time.Second, 128<<10, 85)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 8<<20, 2*time.Second, 4<<20, 85)
 	if rep.OK {
-		t.Fatalf("远低于下限的早停不应判 OK：%+v", rep)
+		t.Fatalf("写入量低于下限不应判 OK：%+v", rep)
 	}
 }
 
