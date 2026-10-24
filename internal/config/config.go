@@ -456,7 +456,8 @@ var (
 	// 2026-10-09 同步本机确认的 3.14.5；此次客户端修复不改变模型/重置协议。
 	// 2026-10-14 同步 3.15.3；普通路由与核心提示词保持，未支持的账号上下文显式拒绝。
 	// 2026-10-20 同步本机确认的 3.16.2；逆向核验模型请求形态与提示词未变，仅版本值更新。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.16.2")
+	// 2026-10-24 同步本机确认的 3.16.3；来源头/归因头/metadata.user_id/端点/提示词均未变，仅版本值更新。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.16.3")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
