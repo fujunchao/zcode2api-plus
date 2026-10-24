@@ -82,12 +82,12 @@
 ## 7. 完成定义（DoD）
 
 - [x] §1.2 文件按预期修改；本地 `gofmt`/diff 自查通过；
-- [ ] 两个 commit 已推送到 `origin/codex/zcode-3.16.3-version-sync`；
-- [ ] 分支最新 SHA 的完整 CI 全绿；失败已修复复验，未删除/跳过测试；
-- [ ] `go-rewrite` 已快进合并并推送；
-- [ ] `v2.11.1-go` annotated tag 已推送，`release.yml` 全绿；
-- [ ] Release 附件/镜像/正文与产物内嵌版本核对通过；
-- [ ] 发布记录回写本计划，未把本机分析目录纳入提交。
+- [x] 两个 commit 已推送到 `origin/codex/zcode-3.16.3-version-sync`；
+- [x] 分支最新 SHA 的完整 CI 全绿；失败已修复复验，未删除/跳过测试；
+- [x] `go-rewrite` 已快进合并并推送；
+- [x] `v2.11.1-go` annotated tag 已推送，`release.yml` 全绿；
+- [x] Release 附件/镜像/正文与产物内嵌版本核对通过；
+- [x] 发布记录回写本计划，未把本机分析目录纳入提交。
 
 ## 8. 执行边界确认
 
@@ -96,6 +96,30 @@
 - 不修改 `data/`、`.zcode/`；不读取账号材料；
 - 发布门禁按 AGENTS.md：先等分支 CI 全绿，再由 tag 触发 `release.yml` 复用完整 `ci.yml`。
 
-## 9. 执行与发布记录
+## 9. 执行与发布记录（2026-10-24，用户显式要求发版 v2.11.1-go）
 
-> 待发布完成后回写（分支/提交 SHA、CI run、Release URL、附件大小/哈希、镜像 tag、产物内嵌版本核对结果）。
+> 用户在本计划确认后要求「按 P1 进行一次版本同步，并发布小版本」；以下为实际执行结果。
+
+### 9.1 代码与 CI
+
+- 分支 `codex/zcode-3.16.3-version-sync`：`6e8b4f6`（版本声明同步）、`91074a1`（`chore: 发布 v2.11.1-go`）；分支 CI run [40056932838](https://github.com/fujunchao/zcode2api-plus/actions/runs/40056932838) 全绿（12 个 job，SHA `91074a1`）。
+- `go-rewrite` 快进合并到 `91074a1` 并推送；同名 SHA 的 go-rewrite CI run [40057586575](https://github.com/fujunchao/zcode2api-plus/actions/runs/40057586575) 全绿。
+- 标签 `v2.11.1-go`（annotated，tag object `4caec8b03df9dfa94677d8776f4348dc0af0531a` → commit `91074a197fbc9f1c8b0333bb96776c318d4756df`）；远端 `refs/tags/v2.11.1-go` 已确认。
+
+### 9.2 发布流水线
+
+- release run [40057596890](https://github.com/fujunchao/zcode2api-plus/actions/runs/40057596890) 成功：validate（复用 `ci.yml` 全部 job）全绿；build 矩阵 5/5 成功；image 成功。
+- Release：https://github.com/fujunchao/zcode2api-plus/releases/tag/v2.11.1-go（非 draft/prerelease，published 2026-10-24T03:23:41Z）。
+- 附件（5 个，均 uploaded）：`zcode2api-linux-amd64` 18,673,848 B；`zcode2api-linux-arm64` 18,088,120 B；`zcode2api-darwin-amd64` 19,176,640 B；`zcode2api-darwin-arm64` 18,611,682 B；`zcode2api-windows-amd64.exe` 17,881,600 B。
+- 镜像：`ghcr.io/fujunchao/zcode2api-plus` 的 `2.11.1-go` 与 `latest` 指向同一 OCI image index `sha256:418e59c76fcca64134d4ea3a8acec69a7bce5b9feb20b506272a9352a61fd080`，含 `linux/amd64`、`linux/arm64`（匿名 pull 校验通过，另有 provenance 清单）。
+- 产物抽查：下载 `zcode2api-windows-amd64.exe`，PE 头 `MZ`；内嵌 `2.11.1-go` 1 处、`2.11.0-go` 0 处；内嵌 `3.16.3` 1 处、`3.16.2` 0 处；SHA256 `174e7cc7b4d1ab73505a81c7f744979f8d96afb475faf87e91c56d2ef763c89a`。
+- 发布说明正文 = `docs/releases/v2.11.1-go.md`（已抽查首段一致）。
+
+### 9.3 回滚
+
+- 运行期：`ZCODE_CLIENT_VERSION=3.16.2`（UA / `X-ZCode-App-Version` / `app_version` 自动回退，无需重编）；
+- 代码：revert `6e8b4f6` / `91074a1`；本次无数据迁移、无接口变更。
+
+### 9.4 发布后观察
+
+- 观察上游按 `app_version` 分级配置与验证码/领取行为，以及 401/405 与验证码比例；异常时按 §9.3 回退。
