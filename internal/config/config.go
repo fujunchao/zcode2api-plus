@@ -406,6 +406,16 @@ var (
 	// Line405RetireMinStrikes 触发退休所需的隔离次数（=「放出去又犯」次数）。
 	Line405RetireMinStrikes = max(1, envInt("ZCODE_LINE405_RETIRE_MIN_STRIKES", 2))
 
+	// ProbeRiskPenalty 模型巡检 405 时对执行账号的惩罚范围。
+	//
+	// 巡检的 screen/target 阶段只证明「目标线路被拦」，账号责任要等 reference 对照才成立；
+	// 在归因之前就冷却账号，会让健康账号替脏线买单，还会让 reference 对照等冷却白白拖慢。
+	//   reference（默认）：只有 reference 阶段失败才写账号冷却/错误；
+	//   all：旧行为，screen/target/reference 全部惩罚（回滚用）；
+	//   off：巡检完全不写账号状态，只保留 run/proofs 与线路证据。
+	// 非法值按 reference 处理：宁可少罚，不可误罚。
+	ProbeRiskPenalty = env("ZCODE_MODEL_PROBE_RISK_PENALTY", "reference")
+
 	// ProxyMaxBindingsPerLine 单条线路的绑定软上限（0 = 关闭判定）。
 	//
 	// ⚠️ 它不是「分散器」：leastLoadedProxy 永远选绑定最少的线路，只要存在未超限的

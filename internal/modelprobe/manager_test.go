@@ -162,6 +162,8 @@ func TestModelProbeHTTPComparableRouteControlRetires(t *testing.T) {
 		if live.ProxyID != nil || live.ProxyURL != nil || live.UseCount != 0 {
 			t.Fatal("跨线路探测不能改持久绑定或业务调用次数")
 		}
+		// 线路相关的 405 只淘汰线路；执行巡检的账号不应被写风控/冷却。
+		requireNoAccountRisk(t, live)
 	}
 }
 
