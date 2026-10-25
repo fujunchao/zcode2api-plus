@@ -265,3 +265,20 @@ func probeRiskPenaltyApplies(role string) bool {
    - 运维反馈账号列表出现明显的「巡检导致的风控」误报。
 3. 日志行已补 `run=` / `target=` 字段，用于按 run 关联 run samples 与后续账号业务表现，
    让上面的判定不需要额外加探针。
+
+---
+
+## 9. 发布与核对结果（v2.11.2-go，2026-10-25）
+
+- **合并**：`codex/proxy-protect-window`（fa85855 → 61378e3）与 `codex/probe-risk-attribution`
+  （d58af80 → e71545e）以 cherry-pick 线性合入 `go-rewrite`；发布提交 `8552428`
+  （`chore: 发布 v2.11.2-go`）。
+- **分支 CI**：`go-rewrite` 8552428 全绿（run 40203275763，12/12 jobs）。
+- **发布**：annotated tag `v2.11.2-go` 指向 8552428；release 工作流 run 40203845063 全绿
+  （validate 复用完整 ci.yml + build 5 平台 + image 双架构）。
+- **Release 附件**（5 个，均上传成功）：linux/darwin × amd64/arm64、windows/amd64。
+- **容器镜像**：`ghcr.io/fujunchao/zcode2api-plus:2.11.2-go` 与 `:latest`，
+  manifest digest `sha256:c0c5fb8016a46062b8cb51ea199b523999ab6566c2149442d8cda5a45027ded0`，
+  平台 linux/amd64 + linux/arm64。
+- **Release 说明**：来自 `docs/releases/v2.11.2-go.md`，GitHub Release body 已核对。
+- **远端状态**：origin/go-rewrite 已推送；tag 与 release 均已推送且可匿名拉取镜像。
