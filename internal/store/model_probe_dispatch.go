@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"sort"
@@ -11,6 +12,7 @@ import (
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/web"
 )
 
 type modelProbeEvidence struct {
@@ -450,7 +452,17 @@ func (s *Store) CompleteModelProbe(l *ModelProbeLease, o ProxyObservation, kind 
 		account.AccumulateTokens(usage)
 		if current && account.AcceptsRequestResult(l.account) {
 			if kind == "risk_control" {
-				model.ApplyRiskControl(account, "模型巡检收到风控响应 HTTP 405", now, s.RiskCoolingSteps())
+				// 只有 reference 阶段的 405 才是账号侧证据；screen/target 只是目标线路嫌疑，
+				// 在归因前惩罚账号会让健康账号替脏线买单（见 probeRiskPenaltyApplies）。
+				if probeRiskPenaltyApplies(l.role) {
+					secs, streak, invalid := model.ApplyRiskControl(account, "模型巡检收到风控响应 HTTP 405", now, s.RiskCoolingSteps())
+					// 锁内不能同步写 stdout；仅 405 时输出，量很小，作为线上灰度与复盘依据。
+					go web.Warn("model-probe", fmt.Sprintf("risk run=%s target=%s role=%s account=%s penalty=account streak=%d cooling_s=%d invalid=%t",
+						l.runID, l.routeID, l.role, account.ID, streak, secs, invalid))
+				} else {
+					go web.Warn("model-probe", fmt.Sprintf("risk run=%s target=%s role=%s account=%s penalty=skipped",
+						l.runID, l.routeID, l.role, account.ID))
+				}
 			}
 			if kind == "success" && o.Complete {
 				account.RiskControlStreak = 0
@@ -535,4 +547,24 @@ func safeProbeCode(code string) string {
 		return code
 	}
 	return "unrecognized"
+}
+
+// probeRiskPenaltyApplies 决定巡检 405 是否惩罚执行账号。
+//
+// screen/target 阶段只证明「目标线路被拦」，账号责任要等 reference 对照成立——判定链
+// （probeAccountCorrelatedLocked）也是以「同一账号两条线都 405、另一个账号两条线都成功」
+// 定义账号相关。在归因之前就冷却账号，会让健康账号替脏线买单，还会让 reference 对照
+// 等冷却白白拖慢；只有 reference 失败才构成账号侧证据。
+//
+// config.ProbeRiskPenalty 是回滚/灰度开关：all = 旧行为；off = 巡检完全不写账号；
+// 其余（含非法值）按 reference 处理：宁可少罚，不可误罚。
+func probeRiskPenaltyApplies(role string) bool {
+	switch config.ProbeRiskPenalty {
+	case "all":
+		return true
+	case "off":
+		return false
+	default:
+		return role == "reference"
+	}
 }
