@@ -140,6 +140,34 @@ func TestRecentSuccessDisabledByConfig(t *testing.T) {
 	}
 }
 
+// 窗口必须真的按配置生效：显式设 6 小时，5 小时前成功→保留，7 小时前成功→删除。
+// 默认值从 24 调整到 6 后，这条用例守住「配置值 = 判定值」不被日志文案或别处常量带偏。
+func TestRecentSuccessUsesConfiguredWindow(t *testing.T) {
+	old := config.ProxyProtectRecentHours
+	config.ProxyProtectRecentHours = 6
+	t.Cleanup(func() { config.ProxyProtectRecentHours = old })
+
+	s := newTestStore(t)
+	kept := addSelectionProxy(t, s, "窗口内线路", 18507, true)
+	keptAccount := addSelectionAccount(t, s, "窗口内账号", kept.ID)
+	expired := addSelectionProxy(t, s, "超窗线路", 18508, true)
+	expiredAccount := addSelectionAccount(t, s, "超窗账号", expired.ID)
+	enableAutoRetire(t, s)
+	setLastUsed(t, s, keptAccount, time.Now().Add(-5*time.Hour))
+	setLastUsed(t, s, expiredAccount, time.Now().Add(-7*time.Hour))
+
+	removed, _, err := s.ApplyNetworkHealth(t.Context(), s.ModelProbeSettings(), s.ListProxyProfiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != expired.ID {
+		t.Fatalf("6 小时窗口应只保留窗口内的线路，实际删除：%v", removed)
+	}
+	if prot := s.ProxyAutoDeleteProtections(); prot[kept.ID] != "recent_success" {
+		t.Fatalf("窗口内线路应显示 recent_success：%v", prot)
+	}
+}
+
 // 最近成功只挡巡检删除，不能否决严格退役：脏线不能靠「有账号在上面成功过」拿到免死金牌。
 func TestRecentSuccessDoesNotBlockStrictRetirement(t *testing.T) {
 	s := newTestStore(t)

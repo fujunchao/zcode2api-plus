@@ -46,7 +46,11 @@ func (h *Handler) handleListProxies(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"profiles": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"profiles": out,
+		// 巡检删除的「最近成功」保护窗口由服务端下发，前端不得再硬编码展示时长。
+		"protection_recent_hours": config.ProxyProtectRecentHours,
+	})
 }
 
 func (h *Handler) handleAddProxy(w http.ResponseWriter, r *http.Request) {

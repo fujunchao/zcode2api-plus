@@ -11,10 +11,10 @@ vi.mock('@/components/proxy-subscription', () => ({ ProxySubscription: () => nul
 vi.mock('@/components/new-account-policy', () => ({ NewAccountPolicy: () => null }))
 vi.mock('@/components/health/panel', () => ({ HealthPanel: () => null }))
 
-function page(profiles: ProxyProfile[] = []) {
+function page(profiles: ProxyProfile[] = [], extra: { protection_recent_hours?: number } = {}) {
   mock.api.mockReset()
   mock.api.mockImplementation(async (method: string, path: string) => {
-    if (method === 'GET' && path === '/proxies') return { profiles }
+    if (method === 'GET' && path === '/proxies') return { profiles, ...extra }
     if (method === 'POST' || method === 'PUT') return { ok: true }
     throw new Error(`未预期的请求：${method} ${path}`)
   })
@@ -68,5 +68,18 @@ test('默认出口的有效保护不能用编辑开关绕过，也不误写成�
   await waitFor(() => expect(mock.api).toHaveBeenCalledWith('PUT', '/proxies/home', {
     name: '家庭默认出口', url: 'http://127.0.0.1:18080', enabled: true, auto_delete_protected: false,
   }))
+  client.clear()
+})
+
+test('最近成功保护显示服务端下发的真实窗口小时数', async () => {
+  const client = page([{ id: 'recent', name: '有成功流量的线路', url: 'http://127.0.0.1:18081', enabled: true, auto_delete_protected: false, auto_delete_protection: 'recent_success' }], { protection_recent_hours: 6 })
+  expect(await screen.findByText('禁止自动删除 · 最近 6 小时有成功流量，自动保护')).toBeTruthy()
+  client.clear()
+})
+
+test('缺少窗口字段时不硬编码 24 小时', async () => {
+  const client = page([{ id: 'recent', name: '有成功流量的线路', url: 'http://127.0.0.1:18081', enabled: true, auto_delete_protected: false, auto_delete_protection: 'recent_success' }])
+  expect(await screen.findByText('禁止自动删除 · 最近有成功流量，自动保护')).toBeTruthy()
+  expect(screen.queryByText(/24 小时/)).toBeNull()
   client.clear()
 })
