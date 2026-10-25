@@ -31,6 +31,8 @@ import type {
 
 interface ProxiesResponse {
   profiles: ProxyProfile[]
+  /* 巡检「最近成功免删」的真实窗口（小时）；缺字段时按 0 展示不带数字的文案。 */
+  protection_recent_hours?: number
 }
 
 /* 伺服器直連探測狀態 */
@@ -50,12 +52,12 @@ function maskUrl(url: string): string {
   return String(url || '').replace(/\/\/([^@/]+)@/, '//***@')
 }
 
-function protectionText(p?: ProxyProfile): string {
+function protectionText(p?: ProxyProfile, recentHours = 0): string {
   switch (p?.auto_delete_protection) {
     case 'default_proxy': return '默认业务出口，自动保护'
     case 'managed_default': return '托管账号默认出口，自动保护'
     case 'policy_unavailable': return '默认出口策略待修复，保守保护'
-    case 'recent_success': return '最近 24 小时有成功流量，自动保护'
+    case 'recent_success': return recentHours > 0 ? `最近 ${recentHours} 小时有成功流量，自动保护` : '最近有成功流量，自动保护'
     case 'manual': return p.auto_delete_protected ? '已开启手工保护' : '同路由节点已开启保护'
     default: return p?.auto_delete_protected ? '已开启手工保护' : ''
   }
@@ -103,6 +105,8 @@ export function ProxiesPage() {
     queryFn: () => api<ProxiesResponse>('GET', '/proxies'),
   })
   const profiles = data?.profiles ?? []
+  /* 窗口由服务端下发；缺字段或 0 时不显示具体小时数。 */
+  const protectRecentHours = data?.protection_recent_hours ?? 0
 
   const [current, setCurrent] = useState<CurrentResult>({ state: 'idle' })
   const [testingCurrent, setTestingCurrent] = useState(false)
@@ -379,7 +383,7 @@ export function ProxiesPage() {
                     </span>
                     <div className="min-w-0 flex-1 leading-tight">
                       <strong className="block truncate text-sm">{p.name}</strong>
-                      {protectionText(p) && <small className="block text-xs text-amber-700">禁止自动删除 · {protectionText(p)}</small>}
+                      {protectionText(p, protectRecentHours) && <small className="block text-xs text-amber-700">禁止自动删除 · {protectionText(p, protectRecentHours)}</small>}
                       {p.subscription && <small className="block text-xs text-muted-foreground" title={'导入：' + new Date(p.subscription.imported_at).toLocaleString()}>
                         订阅来源 · 最近复检 {new Date(p.subscription.probed_at).toLocaleString()}
                       </small>}
@@ -517,7 +521,7 @@ export function ProxiesPage() {
                 <input id="proxy-protected" type="checkbox" className="size-4 accent-primary" checked={protectedFlag || inheritedProtection} disabled={inheritedProtection} onChange={(e) => setProtectedFlag(e.target.checked)} />
                 禁止自动删除
               </Label>
-              <p className="text-xs text-muted-foreground">{inheritedProtection ? `${protectionText(editingProfile)}，需先调整对应默认出口或同路由保护设置。` : '适用于家庭服务器等手工维护节点。异常仍会显示，但不会自动删除或因删除改派账号；手动删除不受此保护限制。'}</p>
+              <p className="text-xs text-muted-foreground">{inheritedProtection ? `${protectionText(editingProfile, protectRecentHours)}，需先调整对应默认出口或同路由保护设置。` : '适用于家庭服务器等手工维护节点。异常仍会显示，但不会自动删除或因删除改派账号；手动删除不受此保护限制。'}</p>
             </div>
           </div>
           <DialogFooter>

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/modelprobe"
 	"zcode2api/internal/proxy"
@@ -157,4 +158,22 @@ func TestProxyEndpointDefaultProtectionIsVisibleWithoutManualFlag(t *testing.T) 
 		}
 	}
 	t.Fatal("默认节点丢失")
+}
+
+// 列表响应必须下发巡检「最近成功免删」的真实窗口：前端据此展示，不能再硬编码 24 小时。
+func TestProxyEndpointExposesProtectionRecentHours(t *testing.T) {
+	old := config.ProxyProtectRecentHours
+	config.ProxyProtectRecentHours = 6
+	t.Cleanup(func() { config.ProxyProtectRecentHours = old })
+
+	f := newAccountQuotaFixture(t, newAccountAllocatedBalance, newAccountAllocatedBalance)
+	mux := http.NewServeMux()
+	f.h.Register(mux)
+	code, listed := do(t, mux, f.h.Store, http.MethodGet, "/admin/api/proxies", nil)
+	if code != http.StatusOK {
+		t.Fatalf("读取代理失败：%d", code)
+	}
+	if got := listed["protection_recent_hours"]; got != float64(6) {
+		t.Fatalf("列表应下发实时保护窗口 6，实际 %#v", got)
+	}
 }

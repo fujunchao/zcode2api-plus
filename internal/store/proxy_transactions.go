@@ -83,8 +83,9 @@ func (s *Store) purgeProxyProfilesIfCurrentLocked(expected []ProxyProfile) ([]st
 			}
 		}
 	}
-	// 巡检专用：最近 24h 有过成功交付的线路不进删除名单。
-	// 只影响这一条删除路径——严格退役、断流熔断、登录清理与手动删除都不看它。
+	// 巡检专用：最近成功保护窗口（ProxyProtectRecentHours）内有过成功交付的线路
+	// 不进删除名单。只影响这一条删除路径——严格退役、断流熔断、登录清理与手动
+	// 删除都不看它。
 	if recent := s.recentSuccessProtectionsLocked(time.Now()); len(recent) > 0 {
 		for id := range wanted {
 			p, ok := s.probeProfileLocked(id)

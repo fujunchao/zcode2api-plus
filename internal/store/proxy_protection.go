@@ -12,7 +12,7 @@ import (
 //
 // 数据源是账号的 LastUsedAt（MarkSuccess 在上游成功交付时写，含 async）：它是**事实**，
 // 不是状态推断，不需要额外维护一张表。只用于巡检删除的免删判断——严格退役不看它，
-// 否则脏线只要还有账号在上面成功过就永远有 24 小时免死金牌（见计划 3.4）。
+// 否则脏线只要还有账号在上面成功过就能拿到整个保护窗口的免死金牌（见计划 3.4）。
 func (s *Store) recentSuccessProtectionsLocked(now time.Time) map[string]time.Time {
 	out := map[string]time.Time{}
 	window := time.Duration(config.ProxyProtectRecentHours) * time.Hour

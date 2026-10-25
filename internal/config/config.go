@@ -178,10 +178,15 @@ var (
 	ProxySoftConsecutiveWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_CONSECUTIVE_WINDOW_SECONDS", 7200))) * time.Second
 	// ProxyFreshGateSeconds 新导入线路的冷启动门禁时长；超时未出结果即放行。
 	ProxyFreshGateSeconds = max(0, envInt("ZCODE_PROXY_FRESH_GATE_SECONDS", 120))
-	// ProxyProtectRecentHours 巡检自动删除前的「最近成功」保护窗口；0 关闭。
+	// ProxyProtectRecentHours 巡检自动删除前的「最近成功」保护窗口（小时）；0 关闭。
 	// 只看账号 LastUsedAt（上游成功交付时写），且**只作用于巡检删除**：
 	// 严格退役、断流熔断、登录清理与手动删除都不受它影响。
-	ProxyProtectRecentHours = max(0, envInt("ZCODE_PROXY_PROTECT_RECENT_HOURS", 24))
+	//
+	// 默认 6 小时（v2.10.27 引入时为 24）。依据 2026-10-25 的 7.5 小时日志：94 次免删
+	// 覆盖 32 条线路，其中 69% 的依据是 ≥3 小时前的成功——多半已是死线；真正在保护期
+	// 内仍交付成功的 9 条线路，首次被保护时成功都在 4.8 小时内。24 小时还会让 4 条持续
+	// 死亡线路反复触发「计费请求未完成」观察（占全部观察 64%）。环境变量可覆盖。
+	ProxyProtectRecentHours = max(0, envInt("ZCODE_PROXY_PROTECT_RECENT_HOURS", 6))
 )
 
 // ── 出站连接超时 ────────────────────────────────────────────────────────────
