@@ -52,9 +52,18 @@ ZCODE_CAPTCHA_BROWSER=true ./zcode2api serve
 ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `true` 时，
 同步、异步及 OpenAI 兼容模型请求均跳过验证码，不依赖浏览器或人工回填；
 **套餐领取仍保留验证码**，因此自动领取场景不要关闭浏览器求解开关。
-该策略使用既有配置缓存（默认 10 分钟），字段缺失或配置获取失败时保留原验证要求。
+该策略使用验证码配置缓存（默认 1 小时，失败保留 last-good），字段缺失或配置获取失败时保留原验证要求。
 默认客户端版本已同步至 `3.16.3`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。版本特定的内部状态与回滚要求见下方发布说明。
+
+`v2.11.3-go` 合入 **Start Plan system 对齐 + 验证码热路径**：
+①网关补 system 时按官方三块结构组装（block 0 无 cache、block 1/2 带 ephemeral，补
+`# Communicating with the user` / `# Context management`，currentDate 合并进首条 user 消息）；
+②JWT 验证码改为预求解 token 池（按 `sceneId|region|prefix` 分桶、一次性 + TTL、后台
+refill、池空 2 路竞速），配置缓存默认 1 小时且失败保留 last-good，拿不到 token 仍
+503 不裸发；新增 CPU governor 与 `captcha_*` 指标。Docker 建议
+`ZCODE_CAPTCHA_BROWSER_WORKERS=2`、2 CPU / 2 GB 起步。
+详见 [发布说明](docs/releases/v2.11.3-go.md)。
 
 `v2.11.2-go` 修正 **巡检的两处归因**：
 ①「最近成功免删」默认窗口 `24h → 6h`（`ZCODE_PROXY_PROTECT_RECENT_HOURS`，设 `0` 关闭）——
