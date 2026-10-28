@@ -123,8 +123,8 @@
 | 瞬时限流冷却阶梯 | 同一账号连续被限流 30s → 60s → 120s → `COOLING_SECONDS`；任意一次成功调用后归零 |
 | 领取冷却（仅自动路径） | 优先用上游 `data.plan.ends_at`；缺失时按成因分档：验证码类与 1005/1003 取 `CLAIM_CAPTCHA_COOLDOWN=3600`，其余取 `CLAIM_RETRY_COOLDOWN=600`（秒） |
 | 「刷新资格」节流 | `CLAIM_PREVIEW_COOLDOWN=60`（秒，内存态；0=关闭） |
-| 验证码缓存 | Node/人工令牌 45s；配置 600s；浏览器令牌**不缓存** |
-| 验证码池 | workers=1、startup=90s、request=45s、queue=60s、shutdown=10s、失败冷却=60s |
+| 验证码缓存 | Node/人工令牌 45s；上游配置默认 1h（成功才写、失败保留 last-good）；浏览器令牌走 token 池（一次性、TTL 95s） |
+| 验证码池 | token 池 min=2/max=6、空池最多 2 路竞速；Chromium workers=1（Docker 建议 2）、startup=90s、request=45s、queue=60s、shutdown=10s、失败冷却=60s |
 | 后台限速 | 单 IP 滑动窗口 300s 内失败 10 次 → 一律 429，成功清零 |
 | 额度缓存 | 结果 TTL 15s + inflight 去重 + 删除账号清理 |
 | 端口 / 密钥 | 3000；admin_key 缺失随机生成（历史默认 `zcode` 强制轮换）；gateway_key `sk-` 前缀，fail-closed |

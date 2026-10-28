@@ -1,9 +1,10 @@
 // Package captcha 阿里云无痕验证码的配置获取、令牌缓存与求解器编排。
 // 对应 Python 版 app/captcha.py。
 //
-// M1 范围：配置缓存（10 分钟）、人工回填令牌缓存（45 秒）、Solver 接口与失效语义；
-// 浏览器求解器（rod 驱动 cloakbrowser 的 Chromium）在 M4 提供——此前 JWT 账号
-// 依赖后台人工回填（/admin/captcha）兜底。令牌只在内存，不落盘、不进日志。
+// 范围：配置缓存（默认 1 小时 + last-good）、人工回填令牌缓存（45 秒）、
+// Solver 接口与失效语义、可选预求解 token 池（token_pool.go，一次性 + TTL）。
+// 浏览器求解器（rod 驱动 cloakbrowser 的 Chromium）在 M4 提供。令牌只在内存，
+// 不落盘、不进日志；token 池同样不打印 token 原文。
 package captcha
 
 import (
@@ -18,12 +19,16 @@ import (
 	"time"
 
 	"zcode2api/internal/config"
+	"zcode2api/internal/web"
 )
 
 // Token 一次无痕验证的结果。
 type Token struct {
 	VerifyParam string // base64(JSON{certifyId, sceneId, isSign, securityToken})
 	Region      string // 请求头 X-Aliyun-Captcha-Verify-Region 所需
+	// TakeStats 本次获取的诊断信息（等待/池大小/是否空池/补解失败数），
+	// 只用于日志与指标，不包含 token 原文。
+	TakeStats TakeStats
 }
 
 // Config 上游下发的验证码配置。
@@ -54,20 +59,28 @@ type ConfigProvider func(ctx context.Context) (Config, error)
 // configURL 验证码配置端点（测试可覆写）。
 var configURL = "https://zcode.z.ai/api/v1/client/configs"
 
-// Manager 令牌缓存 + 配置缓存 + 求解器编排。
+// Manager 令牌缓存 + 配置缓存 + 求解器编排 + 可选 token 池。
 type Manager struct {
 	solver         Solver
 	configProvider ConfigProvider
 
-	mu            sync.Mutex
-	cached        *Token
-	cachedAt      time.Time
-	cachedTTL     time.Duration
-	configCache   *Config
-	configCacheAt time.Time
+	mu        sync.Mutex
+	cached    *Token
+	cachedAt  time.Time
+	cachedTTL time.Duration
+	// lastGoodConfig 最后一次成功拉取的上游配置；配置接口故障时继续使用。
+	lastGoodConfig *Config
+	lastGoodAt     time.Time
+	// configFailUntil 配置刷新失败后的短暂退避截止：last-good 存在时避免每个
+	// JWT 请求都去打故障中的配置接口。到点前直接返回 last-good。
+	configFailUntil time.Time
+	pool            *tokenPool
 
 	now func() time.Time
 }
+
+// captchaConfigFailureBackoff 配置接口失败后、last-good 仍可用时的重试间隔。
+const captchaConfigFailureBackoff = 30 * time.Second
 
 // NewManager 创建管理器。
 func NewManager() *Manager {
@@ -77,8 +90,52 @@ func NewManager() *Manager {
 // SetSolver 注入浏览器求解器（M4）；nil 表示暂无。
 func (m *Manager) SetSolver(s Solver) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.solver = s
+	pool := m.pool
+	m.mu.Unlock()
+	if pool != nil {
+		pool.SetSolver(s)
+	}
+}
+
+// EnableTokenPool 开启/关闭预求解 token 池。关闭时同步停止 refill 与在途 mint；
+// 池开启后仍需 SetConfig（由 FetchConfig 成功路径完成）才进入可服务状态。
+func (m *Manager) EnableTokenPool(enabled bool) {
+	m.mu.Lock()
+	if !enabled {
+		pool := m.pool
+		m.pool = nil
+		m.mu.Unlock()
+		if pool != nil {
+			_ = pool.Close()
+		}
+		return
+	}
+	if m.pool != nil {
+		m.mu.Unlock()
+		return
+	}
+	pool := newTokenPool(m.solver, defaultTokenPoolOptions(), m.now)
+	cfg := m.lastGoodConfig
+	m.pool = pool
+	m.mu.Unlock()
+	if cfg != nil {
+		pool.SetConfig(*cfg, true)
+	}
+}
+
+// TokenPoolStats 返回 token 池指标；未启用时返回零值。
+func (m *Manager) TokenPoolStats() TokenPoolStats {
+	if m == nil {
+		return TokenPoolStats{}
+	}
+	m.mu.Lock()
+	pool := m.pool
+	m.mu.Unlock()
+	if pool == nil {
+		return TokenPoolStats{}
+	}
+	return pool.Stats()
 }
 
 // SetConfigProvider 注入配置获取函数（测试用）。
@@ -89,27 +146,72 @@ func (m *Manager) SetConfigProvider(p ConfigProvider) {
 }
 
 // SetNow 注入时钟（测试用）。
-func (m *Manager) SetNow(fn func() time.Time) { m.now = fn }
+func (m *Manager) SetNow(fn func() time.Time) {
+	m.mu.Lock()
+	m.now = fn
+	pool := m.pool
+	m.mu.Unlock()
+	if pool != nil {
+		pool.SetNow(fn)
+	}
+}
 
-// FetchConfig 拉取上游验证码配置；成功缓存 10 分钟，失败回退默认值（不缓存失败）。
+// FetchConfig 拉取上游验证码配置。
+//
+// 语义（P0-B）：
+//   - 成功才写缓存，TTL 默认 1 小时（CaptchaConfigCacheTTL，env 可覆盖）；
+//   - 失败不覆盖、不清空 last-good；有 last-good 时继续返回它，
+//     并在 30 秒退避窗口内不再重复打故障接口；
+//   - 无 last-good 时保持既有回退：返回 DefaultConfig（Enabled=true），
+//     由调用方按原有严格获取语义决定是否求解。
 func (m *Manager) FetchConfig(ctx context.Context) Config {
 	m.mu.Lock()
-	if m.configCache != nil &&
-		m.now().Sub(m.configCacheAt) < time.Duration(config.CaptchaConfigCacheTTL)*time.Millisecond {
-		cfg := *m.configCache
+	now := m.now()
+	if m.lastGoodConfig != nil &&
+		now.Sub(m.lastGoodAt) < time.Duration(config.CaptchaConfigCacheTTL)*time.Millisecond {
+		cfg := *m.lastGoodConfig
+		m.mu.Unlock()
+		return cfg
+	}
+	if m.lastGoodConfig != nil && now.Before(m.configFailUntil) {
+		cfg := *m.lastGoodConfig
 		m.mu.Unlock()
 		return cfg
 	}
 	m.mu.Unlock()
 
 	cfg, err := m.configProvider(ctx)
+	now = m.now()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if err != nil {
+		if m.lastGoodConfig != nil {
+			m.configFailUntil = now.Add(captchaConfigFailureBackoff)
+			lastGood := *m.lastGoodConfig
+			m.mu.Unlock()
+			web.Warn("captcha", fmt.Sprintf(
+				"验证码配置刷新失败，继续使用 last-good（%s 内不重试）: %s",
+				captchaConfigFailureBackoff, redact(err.Error())))
+			return lastGood
+		}
+		m.mu.Unlock()
 		return DefaultConfig
 	}
-	m.configCache = &cfg
-	m.configCacheAt = m.now()
+	oldKey := ""
+	if m.lastGoodConfig != nil {
+		oldKey = captchaConfigKey(*m.lastGoodConfig)
+	}
+	m.lastGoodConfig = &cfg
+	m.lastGoodAt = now
+	m.configFailUntil = time.Time{}
+	pool := m.pool
+	m.mu.Unlock()
+	// 成功配置只在锁外通知池：SetConfig 会清旧桶，不能与 Manager 锁交叉。
+	if pool != nil {
+		pool.SetConfig(cfg, true)
+		if oldKey != "" && oldKey != captchaConfigKey(cfg) {
+			web.Ok("captcha", "验证码配置键变化，token 池已切换到新配置")
+		}
+	}
 	return cfg
 }
 
@@ -172,8 +274,8 @@ func fetchConfigHTTP(ctx context.Context) (Config, error) {
 }
 
 // GetVerifyParam 返回领取等非模型操作的验证码令牌，不受 SkipModelRequest 影响。
-// 语义对齐 Python 版：缓存命中直接返回；配置禁用返回 (nil, nil)（无需验证码）；
-// 浏览器求解的令牌可能是一次性的，不写缓存；人工回填令牌按 TTL 复用。
+// 语义：人工回填缓存命中直接返回；配置禁用返回 (nil, nil)（无需验证码）；
+// 浏览器令牌优先走 token 池（一次性 + TTL），池未启用时逐请求求解，不写人工缓存。
 func (m *Manager) GetVerifyParam(ctx context.Context) (*Token, error) {
 	return m.getVerifyParam(ctx, false)
 }
@@ -213,11 +315,16 @@ func (m *Manager) getVerifyParam(ctx context.Context, modelRequest bool) (*Token
 		return nil, nil
 	}
 
-	// 浏览器求解路径
+	// 浏览器求解路径：优先从 token 池热取；池不可用时退回逐请求求解。
 	m.mu.Lock()
 	solver := m.solver
+	pool := m.pool
 	m.mu.Unlock()
 	if config.CaptchaBrowserEnabled && solver != nil {
+		if pool != nil && pool.Ready(cfg) {
+			return pool.Take(ctx, cfg)
+		}
+		started := time.Now()
 		param, err := solver.Solve(ctx, cfg)
 		if err != nil {
 			return nil, err
@@ -225,7 +332,11 @@ func (m *Manager) getVerifyParam(ctx context.Context, modelRequest bool) (*Token
 		if strings.TrimSpace(param) == "" {
 			return nil, errors.New("真实浏览器验证码求解器返回空结果")
 		}
-		return &Token{VerifyParam: param, Region: cfg.Region}, nil
+		return &Token{
+			VerifyParam: param,
+			Region:      cfg.Region,
+			TakeStats:   TakeStats{Valid: true, Wait: time.Since(started)},
+		}, nil
 	}
 
 	return nil, ErrUnavailable
@@ -260,13 +371,18 @@ func (m *Manager) Invalidate() {
 	m.cachedTTL = 0
 }
 
-// Close 释放求解器资源（浏览器池）。
-// 求解器的 Close 可能阻塞（池关闭需等待 worker 收尾），故在锁外调用，
+// Close 停止 token 池（refill 与在途 mint），再释放求解器资源（浏览器池）。
+// 两者的 Close 都可能阻塞（池关闭需等待 worker 收尾），故在锁外调用，
 // 避免阻塞并发的 GetVerifyParam。
 func (m *Manager) Close() error {
 	m.mu.Lock()
+	pool := m.pool
+	m.pool = nil
 	s := m.solver
 	m.mu.Unlock()
+	if pool != nil {
+		_ = pool.Close()
+	}
 	if s != nil {
 		return s.Close()
 	}

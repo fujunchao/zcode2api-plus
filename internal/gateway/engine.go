@@ -395,7 +395,19 @@ func (e *Engine) tryAccount(
 		attr = attr.WithFreshRequestID()
 		var verifyParam, verifyRegion string
 		if isJWT {
+			captchaStarted := time.Now()
 			token, err := e.Captcha.GetModelVerifyParam(ctx)
+			if err == nil && token != nil && token.TakeStats.Valid {
+				diag.SetCaptchaTake(token.TakeStats.Wait, token.TakeStats.PoolSize,
+					token.TakeStats.EmptyTake, token.TakeStats.MintFail)
+			} else if err != nil {
+				stats := captcha.TakeStatsFromError(err)
+				wait := stats.Wait
+				if !stats.Valid {
+					wait = time.Since(captchaStarted)
+				}
+				diag.SetCaptchaTake(wait, stats.PoolSize, stats.EmptyTake, stats.MintFail)
+			}
 			if err != nil {
 				e.Captcha.Invalidate()
 				b.captcha++

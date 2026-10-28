@@ -542,6 +542,14 @@ func TestMonitorAndUsage(t *testing.T) {
 	if reqs["success_rate"] != nil || reqs["scope"] != "process" {
 		t.Fatalf("无新请求时成功率应为 null：%v", reqs)
 	}
+	// 验证码指标对象必须存在；未启用 token 池时计数为 0。
+	captchaStats := body["captcha"].(map[string]any)
+	if _, ok := captchaStats["pool_size"]; !ok {
+		t.Fatalf("监控缺少 captcha.pool_size: %v", captchaStats)
+	}
+	if _, ok := captchaStats["wait_p95_ms"]; !ok {
+		t.Fatalf("监控缺少 captcha.wait_p95_ms: %v", captchaStats)
+	}
 	if got := body["uptime_sec"].(float64); got < 0 {
 		t.Fatalf("uptime 应非负: %v", got)
 	}

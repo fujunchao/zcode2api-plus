@@ -115,6 +115,9 @@ func serve() int {
 	if config.CaptchaBrowserEnabled {
 		cm.SetSolver(captcha.NewBrowserSolver())
 	}
+	// token 池（P0-B）：浏览器求解可用时默认开启，可用 ZCODE_CAPTCHA_POOL_ENABLED=false
+	// 退回逐请求求解；配置首次成功前不会后台预解。
+	cm.EnableTokenPool(config.CaptchaBrowserEnabled && config.CaptchaPoolEnabled)
 
 	// 额度查询：网关成功/耗尽路径触发刷新，后台管理端点与周期监控共用
 	qs := quota.NewServiceContext(ctx, st)

@@ -539,3 +539,25 @@ Codex 多轮不再 400；custom/namespace/tool_search 工具可转换与还原�
 - 未做 staging A/B 的 3012 / 405 观测；本批只完成代码与 CI 回归，不能据此宣称生产上游无新增 3012。
 - 未实现计划中提到的 `ZCODE_SYSTEM_PROFILE=legacy|3.16` 回滚开关（handoff 未将其列入 P0-A 必需项；当前只能通过回退镜像/版本回滚）。
 - 未执行 M0 的 24h 真实流量采集；本次 golden fixture 仅覆盖脱敏结构、长度和标题，不包含真实账号数据或请求正文。
+
+### M2 / P0-B（2026-10-28）
+
+- 分支：`codex/server-start-plan-m2-p0b`
+- 范围：验证码 token 池、配置 last-good、严格获取回归、CPU governor、指标与 Docker 资源建议。
+- 代码与测试提交：待推送后填写（本节在 CI 通过后更新最终 SHA / run URL）。
+- CI：待运行。
+
+#### 本次完成项
+
+- 新增 `internal/captcha/token_pool.go`：按 `sceneId|region|prefix` 分桶；token 一次性、TTL 默认 95s；后台 refill（min=2 / max=6，1s 节拍）；池空最多 2 路并发 solve 竞速并回填多余结果；CertifyIdRegistry 按 certifyId（或 token 摘要）去重；配置键变化清空旧桶；`Manager.Close` 停止 refill 与在途 mint。
+- 新增 `internal/captcha/cpu_governor.go`：Linux `/proc/stat`、其他平台 `runtime/metrics` 进程 CPU 折算；CPU ≥70% 降半速、≥85% 降到 1/4；空闲 120s 缩到 1、900s 停补（保留 1 条唤醒）。
+- 配置缓存：`CaptchaConfigCacheTTL` 默认 1 小时（`CAPTCHA_CONFIG_CACHE_TTL` 可覆盖）；成功才写、失败保留 last-good 且 30s 退避；`enabled` / `skip_model_request` 语义不变。
+- 严格获取：拿不到 token 仍 503 `captcha_required`；3007/header/F001 有限重试逻辑未改；新增池空失败与并发 JWT 的唯一性回归。
+- 指标：`/admin/api/monitor` 增加 `captcha`（pool_size、take_total、empty_take_total、mint_total、mint_fail_total、wait_p50_ms、wait_p95_ms）；`[#]` 诊断行尾部增加 `captcha_wait_ms / captcha_pool_size / captcha_empty_take / captcha_mint_fail`；不打印 token。
+- Docker：compose 建议 `ZCODE_CAPTCHA_BROWSER_WORKERS=2` 起步、2 CPU / 2 GB 内存；README/PLAN 同步。
+
+#### 验证与未完成
+
+- 新增单测覆盖：池热一次性、空池 2 路竞速、并发唯一 token、TTL、配置切换清池、重复 certifyId、Manager.Close、空闲缩容/停补、CPU governor、last-good 与 env 覆盖；网关侧覆盖池空不裸发与并发 JWT 唯一 token。
+- 本地未运行自动化测试（按 AGENTS 约定）；以当前提交 SHA 的 GitHub Actions 完整 CI 为验收。staging 的池热 p95 与 24h soak 需在部署环境用 `captcha_wait_ms` / `captcha_pool_size` 复测，不在本机压测。
+- M3 可直接在本分支基础上做 session observe；验证码 Manager 的公开方法保持兼容。

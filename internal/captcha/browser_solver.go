@@ -79,11 +79,7 @@ func (s *BrowserSolver) Solve(ctx context.Context, cfg Config) (string, error) {
 	if ctx == nil {
 		ctx = context.Background() // GetVerifyParam(nil) 允许 nil ctx
 	}
-	key := strings.Join([]string{
-		strings.TrimSpace(cfg.SceneID),
-		strings.TrimSpace(cfg.Region),
-		strings.TrimSpace(cfg.Prefix),
-	}, "|")
+	key := captchaConfigKey(cfg)
 	if key == "||" {
 		return "", fmt.Errorf("%w：验证码配置缺少 sceneId、region 或 prefix", ErrUnavailable)
 	}

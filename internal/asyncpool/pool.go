@@ -526,7 +526,19 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			// 内层（同账号验证码重试）也是独立的上游 HTTP 请求，同样换新请求 id。
 			attr = attr.WithFreshRequestID()
 			var verifyParam, verifyRegion string
+			captchaStarted := time.Now()
 			token, err := p.Captcha.GetModelVerifyParam(ctx)
+			if err == nil && token != nil && token.TakeStats.Valid {
+				diag.SetCaptchaTake(token.TakeStats.Wait, token.TakeStats.PoolSize,
+					token.TakeStats.EmptyTake, token.TakeStats.MintFail)
+			} else if err != nil {
+				stats := captcha.TakeStatsFromError(err)
+				wait := stats.Wait
+				if !stats.Valid {
+					wait = time.Since(captchaStarted)
+				}
+				diag.SetCaptchaTake(wait, stats.PoolSize, stats.EmptyTake, stats.MintFail)
+			}
 			if err != nil {
 				p.Captcha.Invalidate()
 				if attempt+1 < gateway.MaxCaptchaRetries {

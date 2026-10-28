@@ -27,6 +27,10 @@ func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 	if config.CaptchaBrowserEnabled {
 		browserStatus, browserDetail = "online", "Chromium"
 	}
+	var captchaPool any = map[string]any{}
+	if h.Captcha != nil {
+		captchaPool = h.Captcha.TokenPoolStats()
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ts":         nowFloat(),
@@ -37,6 +41,9 @@ func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 			"memory":    memorySnapshot(),
 		},
 		"requests": requests,
+		// 验证码 token 池指标：pool_size/take/empty_take/mint/mint_fail/wait p50/p95。
+		// 只输出计数与耗时，不含 token 原文。
+		"captcha": captchaPool,
 		"accounts": map[string]any{
 			"total":     stats["total"],
 			"active":    stats["active"],

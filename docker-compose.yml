@@ -29,6 +29,11 @@ services:
     restart: unless-stopped
     # 容器内会拉起 Chromium 子进程，用 init 收尸，避免僵尸进程堆积
     init: true
+    # 验证码池资源建议（不改镜像基础结构，仅部署参数）：
+    #   2 CPU / 2 GB 内存起步；每个额外 Chromium worker 约再预留 0.5–1 GB。
+    #   compose 非 swarm 模式可写：deploy.resources.limits.cpus: "2"、
+    #   memory: 2g；或 docker run --cpus=2 --memory=2g。
+    # 空闲 15 分钟后 token 池会缩到 1 条并停止预解，CPU 自动回落。
     ports:
       # 直连访问（浏览器直接开 http://<主机>:3000）就保持原样。
       # 若前面挂了 Nginx / Caddy 等反向代理，请改成只绑回环：
@@ -50,6 +55,11 @@ services:
       # 补丁 Chromium 到 /data/cloakbrowser（只需一次，走卷持久化）。
       # 只用 API Key 账号、或打算后台人工回填，可设 "false" 免掉这 200MB。
       ZCODE_CAPTCHA_BROWSER: ${ZCODE_CAPTCHA_BROWSER:-true}
+      # 预求解 token 池：池热时 JWT 请求直接取 token；false 退回逐请求求解。
+      ZCODE_CAPTCHA_POOL_ENABLED: ${ZCODE_CAPTCHA_POOL_ENABLED:-true}
+      # Chromium worker 数；建议 2 起步（默认代码值为 1，compose 默认给 2）。
+      # 每个 worker 是一个常驻 Chromium，CPU/内存按 worker 数线性增长。
+      ZCODE_CAPTCHA_BROWSER_WORKERS: ${ZCODE_CAPTCHA_BROWSER_WORKERS:-2}
       # 后台自动刷新额度的间隔（秒），0 关闭
       ZCODE_QUOTA_REFRESH_INTERVAL: ${ZCODE_QUOTA_REFRESH_INTERVAL:-60}
       # 限流冷却时长（秒）

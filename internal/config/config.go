@@ -79,9 +79,11 @@ var (
 
 // ── 验证码 ──────────────────────────────────────────────────────────────────
 var (
-	CaptchaCacheTTL       = int64(envInt("CAPTCHA_CACHE_TTL", 45_000))         // ms，Node/人工令牌
-	CaptchaConfigCacheTTL = int64(envInt("CAPTCHA_CONFIG_CACHE_TTL", 600_000)) // ms，上游配置
-	CaptchaManualCacheTTL = int64(envInt("CAPTCHA_MANUAL_CACHE_TTL", 45_000))  // ms，人工回填
+	CaptchaCacheTTL = int64(envInt("CAPTCHA_CACHE_TTL", 45_000)) // ms，Node/人工令牌
+	// 上游配置缓存：默认 1 小时（与官方客户端一致），env 可覆盖。
+	// 只有成功响应才写缓存；失败保留 last-good，不写负缓存。
+	CaptchaConfigCacheTTL = int64(envInt("CAPTCHA_CONFIG_CACHE_TTL", 3_600_000)) // ms，上游配置
+	CaptchaManualCacheTTL = int64(envInt("CAPTCHA_MANUAL_CACHE_TTL", 45_000))    // ms，人工回填
 
 	CaptchaSolveRetries = envInt("ZCODE_CAPTCHA_RETRIES", 4)
 	// 加下界：0 或负数会让每次求解的 deadline 立刻到期（本项与同组其它超时项一致）。
@@ -95,6 +97,21 @@ var (
 	CaptchaBrowserQueueTimeout    = max(1, envInt("ZCODE_CAPTCHA_BROWSER_QUEUE_TIMEOUT", 60))
 	CaptchaBrowserShutdownTimeout = max(1, envInt("ZCODE_CAPTCHA_BROWSER_SHUTDOWN_TIMEOUT", 10))
 	CaptchaBrowserFailureCooldown = max(1, envInt("ZCODE_CAPTCHA_BROWSER_FAILURE_COOLDOWN", 60))
+
+	// 预求解 token 池（P0-B）。池按 sceneId|region|prefix 分桶，token 一次性、
+	// TTL 到期即丢弃；池空时最多 1–2 路并发求解竞速。关闭后退回逐请求求解。
+	CaptchaPoolEnabled       = envBool("ZCODE_CAPTCHA_POOL_ENABLED", true)
+	CaptchaPoolTTL           = int64(max(10_000, envInt("ZCODE_CAPTCHA_POOL_TTL_MS", 95_000))) // ms
+	CaptchaPoolMin           = max(1, envInt("ZCODE_CAPTCHA_POOL_MIN", 2))
+	CaptchaPoolMax           = max(CaptchaPoolMin, envInt("ZCODE_CAPTCHA_POOL_MAX", 6))
+	CaptchaPoolRefillMS      = max(200, envInt("ZCODE_CAPTCHA_POOL_REFILL_MS", 1_000))
+	CaptchaPoolEmptySolve    = min(2, max(1, envInt("ZCODE_CAPTCHA_POOL_EMPTY_SOLVE", 2)))
+	CaptchaPoolIdleShrinkSec = max(10, envInt("ZCODE_CAPTCHA_POOL_IDLE_SHRINK_SECONDS", 120))
+	CaptchaPoolIdleStopSec   = max(CaptchaPoolIdleShrinkSec+1, envInt("ZCODE_CAPTCHA_POOL_IDLE_STOP_SECONDS", 900))
+	// CPU governor：按 /proc/stat（Linux）或 runtime/metrics 进程 CPU 折算占用，
+	// 高负载时降低 refill 并发与池目标；本地不引入新依赖。
+	CaptchaCPUGovernorEnabled = envBool("ZCODE_CAPTCHA_CPU_GOVERNOR", true)
+
 	// 显式指定浏览器可执行文件；缺省时按 cloakbrowser 缓存目录自动发现
 	//（CLOAKBROWSER_BINARY_PATH / CLOAKBROWSER_CACHE_DIR，见 internal/captcha/solve.go）。
 	CaptchaBrowserBin = env("ZCODE_CAPTCHA_BROWSER_BIN", "")

@@ -420,6 +420,11 @@ Restart=on-failure
 > 下載源可用 `CLOAKBROWSER_DOWNLOAD_URL` 覆蓋；`ZCODE_CAPTCHA_BROWSER_BIN` 可指向
 > 任意已有瀏覽器。實測部分發行版自帶 Chromium（如 Debian 150）會被風控拒絕——
 > 自動下載的補丁二進制即為此問題的內建解法。
+>
+> 資源建議：容器至少 **2 CPU / 2 GB 記憶體**起；每個 Chromium worker 約再預留
+> 0.5–1 GB。Docker 部署建議 `ZCODE_CAPTCHA_BROWSER_WORKERS=2` 起步，依
+> `captcha_pool_size` / `empty_take` / CPU 指標調整；空閒 15 分鐘後 token 池會
+> 縮到 1 條並停止預解。
 
 ## 配置（環境變量）
 
@@ -430,6 +435,11 @@ Restart=on-failure
 | `ZCODE_PORT` / `ZCODE_HOST` | 3000 / 0.0.0.0 | 監聽地址 |
 | `ZCODE_DATA_DIR` | `./data` | 賬號庫、密鑰、全局設備指紋（每賬號指紋存於賬號庫） |
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
+| `ZCODE_CAPTCHA_BROWSER_WORKERS` | 1 | Chromium worker 數；Docker 建議 2 起步（需 2 CPU / 2 GB 起） |
+| `ZCODE_CAPTCHA_POOL_ENABLED` | true | 預求解 token 池；false 退回逐請求求解 |
+| `ZCODE_CAPTCHA_POOL_TTL_MS` | 95000 | 池內 token TTL（毫秒）；一次性、取走即刪除 |
+| `ZCODE_CAPTCHA_POOL_MIN` / `MAX` | 2 / 6 | refill 目標水位與上限 |
+| `CAPTCHA_CONFIG_CACHE_TTL` | 3600000 | 上游驗證碼配置緩存（毫秒，默認 1 小時，失敗保留 last-good） |
 | `ZCODE_CAPTCHA_BROWSER_BIN` | 自動發現 | Chromium 二進制路徑 |
 | `ZCODE_ASYNC_ENABLED` | — | 掛載 /async/v1/messages 空閒池 |
 | `ZCODE_LINE_TRUNCATE_STRIKES` | 3 | 同一線路連續 N 次上游側斷流即移除線路並改派綁定賬號（0=關閉；後台可在線改） |

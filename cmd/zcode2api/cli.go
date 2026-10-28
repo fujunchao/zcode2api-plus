@@ -189,6 +189,7 @@ func cmdLogin(args []string) {
 		cm := captcha.NewManager()
 		if config.CaptchaBrowserEnabled {
 			cm.SetSolver(captcha.NewBrowserSolver())
+			cm.EnableTokenPool(config.CaptchaPoolEnabled)
 		}
 		outcomes := claimCLIAccount(st, acc, cm)
 		for _, o := range outcomes {

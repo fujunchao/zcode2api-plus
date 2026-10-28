@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,5 +156,72 @@ func TestSetManualParamEmptyRejected(t *testing.T) {
 	m := NewManager()
 	if err := m.SetManualParam("  ", ""); err == nil {
 		t.Fatal("空令牌应报错")
+	}
+}
+
+func TestFetchConfigFailureKeepsLastGood(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	body := atomic.Value{}
+	body.Store(`{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px-a","region":"cn","sceneId":"sc-a"}}}}`)
+	setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if status.Load() != http.StatusOK {
+			w.WriteHeader(int(status.Load()))
+			return
+		}
+		_, _ = w.Write([]byte(body.Load().(string)))
+	})
+	m := NewManager()
+	now := time.Unix(1700000000, 0)
+	m.SetNow(func() time.Time { return now })
+
+	first := m.FetchConfig(context.Background())
+	if first.Prefix != "px-a" || first.SceneID != "sc-a" {
+		t.Fatalf("首次成功配置不符: %+v", first)
+	}
+
+	// 缓存过期后配置接口故障：必须继续返回 last-good，不能回退 DefaultConfig。
+	status.Store(http.StatusInternalServerError)
+	now = now.Add(time.Duration(config.CaptchaConfigCacheTTL+1000) * time.Millisecond)
+	got := m.FetchConfig(context.Background())
+	if got != first {
+		t.Fatalf("配置故障时应保留 last-good: %+v", got)
+	}
+	if got == DefaultConfig {
+		t.Fatal("不得用 DefaultConfig 覆盖 last-good")
+	}
+
+	// 退避窗口内不应反复打故障接口；窗口过后成功配置可替换 last-good。
+	body.Store(`{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px-b","region":"sg","sceneId":"sc-b"}}}}`)
+	status.Store(http.StatusOK)
+	now = now.Add(31 * time.Second)
+	next := m.FetchConfig(context.Background())
+	if next.Prefix != "px-b" || next.Region != "sg" {
+		t.Fatalf("恢复后应更新 last-good: %+v", next)
+	}
+}
+
+func TestModelCaptchaPolicyContinuesWithLastGood(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if status.Load() != http.StatusOK {
+			w.WriteHeader(int(status.Load()))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"configs":{"captcha":{"enabled":true,"skip_model_request":true}}}}`))
+	})
+	setBrowserEnabled(t, false)
+	m := NewManager()
+	now := time.Unix(1700000000, 0)
+	m.SetNow(func() time.Time { return now })
+
+	if token, err := m.GetModelVerifyParam(nil); err != nil || token != nil {
+		t.Fatalf("首次应识别模型跳过: %+v %v", token, err)
+	}
+	status.Store(http.StatusInternalServerError)
+	now = now.Add(time.Duration(config.CaptchaConfigCacheTTL+1000) * time.Millisecond)
+	if token, err := m.GetModelVerifyParam(nil); err != nil || token != nil {
+		t.Fatalf("配置故障时应沿用 last-good 的 skip_model_request: %+v %v", token, err)
 	}
 }

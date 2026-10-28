@@ -88,6 +88,12 @@ type ReqDiag struct {
 	TruncTotal    int // 账号侧累计被掐断次数（进程内）
 	ErrText       string
 
+	// 验证码热路径诊断：等待时长与池状态（不包含 token 原文）。
+	CaptchaWait      time.Duration
+	CaptchaPoolSize  int
+	CaptchaEmptyTake int
+	CaptchaMintFail  int
+
 	startedAt time.Time
 	total     time.Duration
 	clock     func() time.Time
@@ -161,6 +167,18 @@ func (d *ReqDiag) SetRiskAccounts(n int) {
 		return
 	}
 	d.RiskAccounts = n
+}
+
+// SetCaptchaTake 记录一次验证码获取的等待与池状态；0 是合法值（池热命中），
+// 因此渲染时不能用 dash 把 0 变成 “-”。
+func (d *ReqDiag) SetCaptchaTake(wait time.Duration, poolSize int, emptyTake bool, mintFail int) {
+	if d == nil {
+		return
+	}
+	d.CaptchaWait = wait
+	d.CaptchaPoolSize = poolSize
+	d.CaptchaEmptyTake = boolToInt(emptyTake)
+	d.CaptchaMintFail = mintFail
 }
 
 // MarkRead 记录一次「从上游读到 n 字节」。
@@ -241,6 +259,9 @@ func (d *ReqDiag) Format() string {
 	msg += d.shape.format(d.preserveContext)
 	// 上行闸门字段追加在最末：既有字段位置保持不变，外部分析脚本按 key=value 取值不受影响。
 	msg += fmt.Sprintf(" up_kbps=%s uplink_abort=%d", dashKBps(d.UpKBps), d.UplinkAborts)
+	// 验证码热路径字段同样追加在行尾；0 表示池热命中，必须原样打印。
+	msg += fmt.Sprintf(" captcha_wait_ms=%d captcha_pool_size=%d captcha_empty_take=%d captcha_mint_fail=%d",
+		d.CaptchaWait.Milliseconds(), d.CaptchaPoolSize, d.CaptchaEmptyTake, d.CaptchaMintFail)
 	return msg
 }
 
