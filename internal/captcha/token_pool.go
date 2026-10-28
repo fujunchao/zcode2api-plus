@@ -96,6 +96,18 @@ type poolToken struct {
 	expiresAt time.Time
 }
 
+// tokenWaitResult 一次等待的结果；tok 与 err 二选一。
+type tokenWaitResult struct {
+	tok poolToken
+	err error
+}
+
+// tokenWaiter 一个空池等待者。channel 容量 1，发送方永不阻塞。
+type tokenWaiter struct {
+	key string
+	ch  chan tokenWaitResult
+}
+
 // tokenPoolOptions 池参数；零值由 newTokenPool 填默认。
 type tokenPoolOptions struct {
 	ttl         time.Duration
@@ -167,22 +179,22 @@ type tokenPool struct {
 	key    string
 	active bool
 
-	buckets   map[string][]poolToken
-	issued    map[string]time.Time // dedupe key -> 可再次 mint 的时间
-	inflight  map[string]int
-	lastErr   map[string]error
+	buckets  map[string][]poolToken
+	issued   map[string]time.Time // dedupe key -> 可再次 mint 的时间
+	inflight map[string]int
+	lastErr  map[string]error
+	waiters  []*tokenWaiter
+	// mintFailStreak 连续 mint 失败次数（成功归零）：用于在一轮全失败后
+	// 让等待者拿到错误，而不是无限重试。
+	mintFailStreak int
+
 	target    int
 	lastTake  time.Time
 	lastEmpty time.Time
 	lastDecay time.Time
 	idleLog   bool
 
-	roundActive bool
-	roundKey    string
-	roundErr    error
-
-	waitCh      chan struct{}
-	waitSamples []int64 // 成功/失败 Take 的等待毫秒数，容量有界
+	waitSamples []int64 // Take 的等待毫秒数，容量有界
 
 	takeTotal      int64
 	emptyTakeTotal int64
@@ -213,7 +225,6 @@ func newTokenPool(solver Solver, opts tokenPoolOptions, now func() time.Time) *t
 		target:     opts.min,
 		lastTake:   now(),
 		lastDecay:  now(),
-		waitCh:     make(chan struct{}),
 	}
 	if opts.cpuGovernor {
 		p.governor = newCPUGovernor(nil)
@@ -278,9 +289,8 @@ func (p *tokenPool) SetConfig(cfg Config, verified bool) {
 		p.idleLog = false
 		p.lastTake = now
 		p.lastDecay = now
-		// 旧配置的池空轮次作废；旧 mint 完成后只按 inflight 归零，不再影响新配置。
-		p.roundActive = false
-		p.roundErr = nil
+		p.mintFailStreak = 0
+		p.failWaitersLocked(fmt.Errorf("%w: 验证码配置已切换", ErrUnavailable))
 	}
 	p.key = key
 	p.cfg = cfg
@@ -288,6 +298,7 @@ func (p *tokenPool) SetConfig(cfg Config, verified bool) {
 	if !p.active {
 		p.buckets = make(map[string][]poolToken)
 		p.issued = make(map[string]time.Time)
+		p.failWaitersLocked(fmt.Errorf("%w: 验证码配置不可用", ErrUnavailable))
 	}
 	if changed && verified {
 		logMsg = fmt.Sprintf("验证码配置变化，已清空 token 池（scene=%s region=%s prefix=%s）",
@@ -310,7 +321,7 @@ func (p *tokenPool) Clear() {
 	p.mu.Unlock()
 }
 
-// Take 取一条未过期 token；池空时发起有界并发求解并等待最先成功的结果。
+// Take 取一条未过期 token；池空时登记等待者并发起有界求解。
 func (p *tokenPool) Take(ctx context.Context, cfg Config) (*Token, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -341,68 +352,35 @@ func (p *tokenPool) Take(ctx context.Context, cfg Config) (*Token, error) {
 	p.lastEmpty = now
 	p.bumpTargetLocked()
 	mintFailStart := p.mintFailTotal
-	waitCh := p.waitCh
+	if len(p.waiters) == 0 {
+		p.mintFailStreak = 0
+	}
+	w := &tokenWaiter{key: key, ch: make(chan tokenWaitResult, 1)}
+	p.waiters = append(p.waiters, w)
+	p.ensureMintsLocked()
 	p.mu.Unlock()
 
 	web.Warn("captcha", fmt.Sprintf("token 池为空，触发并发求解（captcha_empty_take=%d）", p.emptyCount()))
 
-	startedRound := false
-	for {
+	select {
+	case res := <-w.ch:
 		p.mu.Lock()
-		if p.closed {
-			stats := p.finishTakeLocked(start, true, mintFailStart)
-			p.mu.Unlock()
-			return nil, &TakeError{Err: ErrPoolClosed, Stats: stats}
-		}
-		p.pruneLocked(p.now())
-		if tok, ok := p.popLocked(key); ok {
-			stats := p.finishTakeLocked(start, true, mintFailStart)
-			p.mu.Unlock()
-			return tokenFromPool(tok, stats), nil
-		}
-		if p.roundActive && p.roundKey == key {
-			waitCh = p.waitCh
-			p.mu.Unlock()
-			select {
-			case <-waitCh:
-				continue
-			case <-ctx.Done():
-				return nil, p.cancelTake(start, mintFailStart, ctx.Err())
-			case <-p.stopCh:
-				return nil, p.cancelTake(start, mintFailStart, ErrPoolClosed)
-			}
-		}
-		if !startedRound && p.inflight[key] > 0 {
-			// 后台 refill 已在补货：先等它，避免同一个池再叠 2 路求解。
-			waitCh = p.waitCh
-			p.mu.Unlock()
-			select {
-			case <-waitCh:
-				continue
-			case <-ctx.Done():
-				return nil, p.cancelTake(start, mintFailStart, ctx.Err())
-			case <-p.stopCh:
-				return nil, p.cancelTake(start, mintFailStart, ErrPoolClosed)
-			}
-		}
-		if !startedRound {
-			startedRound = true
-			p.startEmptyRoundLocked()
-			waitCh = p.waitCh
-			p.mu.Unlock()
-			continue
-		}
-		// 本轮已结束且没有 token：返回本轮错误（可能为空池/求解失败）。
-		err := p.roundErr
-		if err == nil {
-			err = ErrUnavailable
-		}
 		stats := p.finishTakeLocked(start, true, mintFailStart)
 		p.mu.Unlock()
-		return nil, &TakeError{Err: fmt.Errorf("%w: %s", ErrUnavailable, redact(err.Error())), Stats: stats}
+		if res.err != nil {
+			return nil, &TakeError{Err: res.err, Stats: stats}
+		}
+		return tokenFromPool(res.tok, stats), nil
+	case <-ctx.Done():
+		p.removeWaiter(w, true)
+		return nil, p.cancelTake(start, mintFailStart, ctx.Err())
+	case <-p.stopCh:
+		p.removeWaiter(w, true)
+		return nil, p.cancelTake(start, mintFailStart, ErrPoolClosed)
 	}
 }
 
+// cancelTake 生成带诊断的取消/关闭错误（调用方已从等待队列移除）。
 func (p *tokenPool) cancelTake(start time.Time, mintFailStart int64, err error) error {
 	p.mu.Lock()
 	stats := p.finishTakeLocked(start, true, mintFailStart)
@@ -437,40 +415,67 @@ func (p *tokenPool) emptyCount() int64 {
 	return p.emptyTakeTotal
 }
 
-// startEmptyRoundLocked 发起一轮池空竞速（最多 2 路）；已有轮次时不重复发起。
-func (p *tokenPool) startEmptyRoundLocked() {
-	if p.roundActive {
-		return
-	}
-	p.roundActive = true
-	p.roundKey = p.key
-	p.roundErr = nil
-	if p.solver == nil {
-		p.roundActive = false
-		p.roundErr = ErrUnavailable
-		p.signalLocked()
-		return
-	}
-	p.launchMintsLocked(p.cfg, p.key, p.opts.emptySolve)
-}
-
-// launchMintsLocked 启动 n 个后台 mint；结果由 mint 完成后写入桶并广播。
+// launchMintsLocked 启动 n 个后台 mint；调用方持锁。
 func (p *tokenPool) launchMintsLocked(cfg Config, key string, n int) {
-	if n <= 0 || p.solver == nil || p.closed {
+	solver := p.solver
+	if n <= 0 || solver == nil || p.closed {
 		return
 	}
 	for i := 0; i < n; i++ {
 		p.inflight[key]++
 		p.mintTotal++
 		p.wg.Add(1)
-		go p.mint(cfg, key)
+		go p.mint(solver, cfg, key)
 	}
 }
 
-// mint 执行一次后台求解；成功则入桶，失败只计数，不阻塞 refill 循环。
-func (p *tokenPool) mint(cfg Config, key string) {
+// ensureMintsLocked 在有空池等待者时保证有界并发求解；调用方持锁。
+func (p *tokenPool) ensureMintsLocked() {
+	if p.closed || !p.active || p.solver == nil {
+		p.failWaitersLocked(ErrUnavailable)
+		return
+	}
+	if len(p.waiters) == 0 || p.inflight[p.key] > 0 {
+		return
+	}
+	if p.deliverBucketToWaitersLocked() {
+		return
+	}
+	if p.mintFailStreak >= p.opts.emptySolve {
+		err := p.lastErr[p.key]
+		if err == nil {
+			err = ErrUnavailable
+		}
+		p.failWaitersLocked(fmt.Errorf("%w: %s", ErrUnavailable, redact(err.Error())))
+		return
+	}
+	p.launchMintsLocked(p.cfg, p.key, p.opts.emptySolve)
+}
+
+// deliverBucketToWaitersLocked 把池中已有 token 优先交付给等待者。
+// 返回 true 表示至少交付了一条。
+func (p *tokenPool) deliverBucketToWaitersLocked() bool {
+	delivered := false
+	for len(p.waiters) > 0 {
+		tok, ok := p.popLocked(p.key)
+		if !ok {
+			break
+		}
+		w := p.popWaiterLocked()
+		if w == nil {
+			p.appendBucketLocked(p.key, tok)
+			break
+		}
+		w.ch <- tokenWaitResult{tok: tok}
+		delivered = true
+	}
+	return delivered
+}
+
+// mint 执行一次后台求解；成功优先交付等待者，其次入桶。
+func (p *tokenPool) mint(solver Solver, cfg Config, key string) {
 	defer p.wg.Done()
-	param, err := p.solver.Solve(p.mintCtx, cfg)
+	param, err := solver.Solve(p.mintCtx, cfg)
 	now := p.now()
 	var logMsg string
 	p.mu.Lock()
@@ -481,10 +486,12 @@ func (p *tokenPool) mint(cfg Config, key string) {
 	switch {
 	case err != nil:
 		p.mintFailTotal++
+		p.mintFailStreak++
 		p.lastErr[key] = err
 		logMsg = fmt.Sprintf("token 补解失败 captcha_mint_fail=%d: %s", p.mintFailTotal, redact(err.Error()))
 	case strings.TrimSpace(param) == "":
 		p.mintFailTotal++
+		p.mintFailStreak++
 		p.lastErr[key] = errors.New("求解器返回空 token")
 		logMsg = fmt.Sprintf("token 补解失败 captcha_mint_fail=%d: 空结果", p.mintFailTotal)
 	case p.key == key && p.active:
@@ -498,27 +505,79 @@ func (p *tokenPool) mint(cfg Config, key string) {
 		dedupe := tokenDedupeKey(tok.param, tok.certifyID)
 		if exp, exists := p.issued[dedupe]; exists && now.Before(exp) {
 			p.mintFailTotal++
+			p.mintFailStreak++
 			p.lastErr[key] = errors.New("重复 certifyId/token")
 			logMsg = fmt.Sprintf("token 补解失败 captcha_mint_fail=%d: 重复 certifyId/token", p.mintFailTotal)
 			break
 		}
 		p.issued[dedupe] = now.Add(p.opts.ttl + time.Minute)
-		p.buckets[key] = append(p.buckets[key], tok)
-		if len(p.buckets[key]) > p.opts.max {
-			p.buckets[key] = p.buckets[key][len(p.buckets[key])-p.opts.max:]
-		}
+		p.mintFailStreak = 0
 		p.lastErr[key] = nil
+		if w := p.popWaiterLocked(); w != nil {
+			w.ch <- tokenWaitResult{tok: tok}
+		} else {
+			p.appendBucketLocked(key, tok)
+		}
 	default:
 		// 配置已变化：本次结果丢弃，不跨配置复用。
 	}
-	if p.roundActive && p.roundKey == key && p.inflight[key] == 0 {
-		p.roundActive = false
-		p.roundErr = p.lastErr[key]
-	}
-	p.signalLocked()
+	p.ensureMintsLocked()
 	p.mu.Unlock()
 	if logMsg != "" {
 		web.Warn("captcha", logMsg)
+	}
+}
+
+// popWaiterLocked 取最早等待者；调用方持锁。
+func (p *tokenPool) popWaiterLocked() *tokenWaiter {
+	if len(p.waiters) == 0 {
+		return nil
+	}
+	w := p.waiters[0]
+	p.waiters = p.waiters[1:]
+	return w
+}
+
+// removeWaiter 调用方取消/关闭时移除等待者；若结果已投递则把 token 放回桶。
+func (p *tokenPool) removeWaiter(w *tokenWaiter, restoreToken bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, item := range p.waiters {
+		if item == w {
+			p.waiters = append(p.waiters[:i], p.waiters[i+1:]...)
+			return
+		}
+	}
+	if restoreToken {
+		select {
+		case res := <-w.ch:
+			if res.err == nil && p.active && p.key == w.key {
+				p.appendBucketLocked(w.key, res.tok)
+			}
+		default:
+		}
+	}
+}
+
+// failWaitersLocked 把错误投递给所有等待者并清空队列；调用方持锁。
+func (p *tokenPool) failWaitersLocked(err error) {
+	if len(p.waiters) == 0 {
+		return
+	}
+	if err == nil {
+		err = ErrUnavailable
+	}
+	for _, w := range p.waiters {
+		w.ch <- tokenWaitResult{err: err}
+	}
+	p.waiters = nil
+}
+
+// appendBucketLocked 入桶并按 max 截断最旧 token；调用方持锁。
+func (p *tokenPool) appendBucketLocked(key string, tok poolToken) {
+	p.buckets[key] = append(p.buckets[key], tok)
+	if len(p.buckets[key]) > p.opts.max {
+		p.buckets[key] = p.buckets[key][len(p.buckets[key])-p.opts.max:]
 	}
 }
 
@@ -571,11 +630,6 @@ func (p *tokenPool) bumpTargetLocked() {
 	}
 }
 
-func (p *tokenPool) signalLocked() {
-	close(p.waitCh)
-	p.waitCh = make(chan struct{})
-}
-
 // loop refill 主循环；Close 关闭 stopCh 后退出。
 func (p *tokenPool) loop() {
 	defer p.wg.Done()
@@ -605,6 +659,11 @@ func (p *tokenPool) refillOnce(now time.Time) {
 		return
 	}
 	p.pruneLocked(now)
+	if len(p.waiters) > 0 {
+		p.ensureMintsLocked()
+		p.mu.Unlock()
+		return
+	}
 	idle := now.Sub(p.lastTake)
 	target := p.target
 	deepIdle := false
@@ -646,7 +705,7 @@ func (p *tokenPool) refillOnce(now time.Time) {
 	if deepIdle && size >= 1 {
 		need = 0
 	}
-	if need > 0 && !p.roundActive {
+	if need > 0 {
 		if need > concurrency {
 			need = concurrency
 		}
@@ -711,9 +770,9 @@ func (p *tokenPool) Close() error {
 	p.active = false
 	p.buckets = make(map[string][]poolToken)
 	p.issued = make(map[string]time.Time)
+	p.failWaitersLocked(ErrPoolClosed)
 	close(p.stopCh)
 	p.mintCancel()
-	p.signalLocked()
 	p.mu.Unlock()
 
 	done := make(chan struct{})
