@@ -21,12 +21,23 @@ import (
 //go:embed zcode_system.json
 var zcodeSystemJSON []byte
 
+type zcodeDynamicSections struct {
+	BeforeEnvironment string `json:"beforeEnvironment"`
+	AfterEnvironment  string `json:"afterEnvironment"`
+}
+
+type zcodeSystemFile struct {
+	Blocks          []any                `json:"blocks"`
+	DynamicSections zcodeDynamicSections `json:"dynamicSections"`
+}
+
 var (
 	zcodeOnce         sync.Once
 	zcodeStaticBlocks []any
+	zcodeDynamic      zcodeDynamicSections
 )
 
-// ZcodeSystemBlocks 返回 ZCode 官方系统提示词块（JSON 解析失败时为空，对齐 Python 版）。
+// ZcodeSystemBlocks 返回 ZCode 官方系统提示词的静态块（JSON 解析失败时为空，对齐 Python 版）。
 // 用于 JWT 缺省上下文、回退合并与官方前缀判定；调用者自带官方前缀（或显式空值 /
 // 消息内 system）时由网关原样保留其内容，其余走合并路径前置标准块。
 //
@@ -38,15 +49,27 @@ var (
 // 两条分支都必须返回**新切片**：调用方会就地 append，共享切片会让一个请求污染后续
 // 所有请求（见 TestSystemBlocksReturnFreshSlice）。
 func ZcodeSystemBlocks() []any {
+	blocks := copyZcodeStaticBlocks()
+	if config.UpstreamInjectEnvironment {
+		return appendEnvironmentBlock(blocks)
+	}
+	return blocks
+}
+
+// copyZcodeStaticBlocks 复制静态块并落实 3.15.1 起的缓存布局：
+// 块 0（CLI Prefix）不带 cache_control，块 1（稳定身份段）保留 ephemeral。
+// 所有档案一致，不再只对 electron 删除。
+func copyZcodeStaticBlocks() []any {
 	zcodeOnce.Do(func() {
-		var blocks []any
-		if err := json.Unmarshal(zcodeSystemJSON, &blocks); err != nil {
-			blocks = []any{}
+		var parsed zcodeSystemFile
+		if err := json.Unmarshal(zcodeSystemJSON, &parsed); err != nil {
+			zcodeStaticBlocks = []any{}
+			zcodeDynamic = zcodeDynamicSections{}
+			return
 		}
-		zcodeStaticBlocks = blocks
+		zcodeStaticBlocks = parsed.Blocks
+		zcodeDynamic = parsed.DynamicSections
 	})
-	// 缓存布局只调整桌面回退；每次复制块对象，不能改写共享静态 map。
-	desktop := config.ZcodeClientProfile().SourceTitle == "electron"
 	blocks := make([]any, 0, len(zcodeStaticBlocks))
 	for i, raw := range zcodeStaticBlocks {
 		block, ok := raw.(map[string]any)
@@ -58,13 +81,10 @@ func ZcodeSystemBlocks() []any {
 		if cache, ok := block["cache_control"].(map[string]any); ok {
 			block["cache_control"] = maps.Clone(cache)
 		}
-		if i == 0 && desktop {
+		if i == 0 {
 			delete(block, "cache_control")
 		}
 		blocks = append(blocks, block)
-	}
-	if config.UpstreamInjectEnvironment {
-		return appendEnvironmentBlock(blocks)
 	}
 	return blocks
 }

@@ -87,8 +87,8 @@ func TestEnvironmentBlockTracksProfile(t *testing.T) {
 // TestSystemBlocksShape 块结构与顺序：CLI Prefix → Agent Identity（→ # Environment）。
 // 顺序与官方的分段排序一致（system+stable 先于 system+dynamic），否则前缀缓存命中会变差。
 //
-// 默认只注入前两块：# Environment 由 config.UpstreamInjectEnvironment 控制，
-// 关闭时上游照样返回 200（它只校验到身份段末尾）。开关打开即恢复三段。
+// 默认只返回前两块静态段：# Environment 由 config.UpstreamInjectEnvironment 控制；
+// 推理回退路径始终由 BuildFallbackSystem 生成三块（见 start_plan_p0a_test.go）。
 func TestSystemBlocksShape(t *testing.T) {
 	oldInject := config.UpstreamInjectEnvironment
 	t.Cleanup(func() { config.UpstreamInjectEnvironment = oldInject })
@@ -135,9 +135,9 @@ func TestSystemBlocksShape(t *testing.T) {
 				if !strings.HasPrefix(text, want) {
 					t.Fatalf("第 %d 段前缀不符：\n got=%q\nwant前缀=%q", i, text[:min(60, len(text))], want)
 				}
-				if i == 0 && config.ZcodeClientSourceTitle == "electron" {
+				if i == 0 {
 					if _, ok := m["cache_control"]; ok {
-						t.Fatal("桌面固定前缀不得附 cache_control")
+						t.Fatal("固定前缀块不得附 cache_control（所有档案一致）")
 					}
 				} else if cache, ok := m["cache_control"].(map[string]any); !ok || cache["type"] != "ephemeral" {
 					t.Fatalf("第 %d 段必须保留 ephemeral cache_control", i)
@@ -197,7 +197,7 @@ func TestEmbeddedSystemJSONHasNoEnvBlock(t *testing.T) {
 func TestIdentityBlockMatchesInstalledClient(t *testing.T) {
 	blocks := ZcodeSystemBlocks()
 	if len(blocks) < 2 {
-		t.Fatalf("应为 3 段，实得 %d", len(blocks))
+		t.Fatalf("静态段至少应为 2 段，实得 %d", len(blocks))
 	}
 	m, _ := blocks[1].(map[string]any)
 	text, _ := m["text"].(string)

@@ -14,9 +14,7 @@ func TestDiagnosticShapeSourcesAndCounts(t *testing.T) {
 	old := config.PreserveClientContext
 	t.Cleanup(func() { config.PreserveClientContext = old })
 
-	// 网关注入的标准块数由 config.UpstreamInjectEnvironment 决定（默认两块，
-	// 关掉 # Environment 后就是两块），派生而不是写死：写死会让「切换注入开关」
-	// 与「裁剪 Environment 段」这两件事互相打架。
+	// 回退路径固定三块；调用者非官方 system 的文本会并入 block 2，不增加块数。
 	injected := len(upstream.ZcodeFallbackSystemBlocks())
 	for _, tc := range []struct {
 		name          string
@@ -32,11 +30,10 @@ func TestDiagnosticShapeSourcesAndCounts(t *testing.T) {
 		{"empty_text", true, true, "", true, false, "input", "string", 1},
 		{"empty_blocks", true, true, []any{}, true, false, "input", "blocks", 0},
 		{"mid_only", true, true, nil, false, true, "input_messages", "missing", 0},
-		// legacy_merge（含 preserve 下非官方前缀的回退）会把调用者的字符串
-		// system 并成一块，排在注入块之后。
-		{"legacy", false, true, "private-system-sentinel", true, true, "legacy_merge", "blocks", injected + 1},
+		// legacy_merge（含 preserve 下非官方前缀的回退）会把调用者文本并入 block 2。
+		{"legacy", false, true, "private-system-sentinel", true, true, "legacy_merge", "blocks", injected},
 		// preserve=true 但首段非官方前缀：同样回退合并（2026-10-12 DSH 回归守卫）。
-		{"foreign_preserve", true, true, "private-system-sentinel", true, false, "legacy_merge", "blocks", injected + 1},
+		{"foreign_preserve", true, true, "private-system-sentinel", true, false, "legacy_merge", "blocks", injected},
 		{"other", false, true, false, true, false, "input", "other", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

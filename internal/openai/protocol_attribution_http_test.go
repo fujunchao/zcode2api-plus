@@ -193,10 +193,12 @@ func assertProtocolSystem(t *testing.T, path, kind string, input map[string]any,
 	if kind == "default" || kind == "custom" {
 		want := upstream.ZcodeFallbackSystemBlocks()
 		if kind == "custom" {
-			want = append(want, map[string]any{"type": "text", "text": "客户端自有规则，保留 MCS/Gen UI 这些普通文字，不按关键词删除。"})
+			want = upstream.BuildFallbackSystem(map[string]any{
+				"system": "客户端自有规则，保留 MCS/Gen UI 这些普通文字，不按关键词删除。",
+			}, config.ZcodeClientProfile())
 		}
 		if !reflect.DeepEqual(blocks, want) {
-			t.Fatal("实际 HTTP fallback 应为首块无缓存、稳定块保留缓存、真实能力及原文精确合并")
+			t.Fatal("实际 HTTP fallback 应为三块：block 0 无缓存、block 1/2 有缓存，第三方文本并入 block 2")
 		}
 		return
 	}

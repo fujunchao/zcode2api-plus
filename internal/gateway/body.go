@@ -3,9 +3,8 @@ package gateway
 
 import (
 	"maps"
-	"reflect"
-	"slices"
 	"strings"
+	"time"
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/upstream"
@@ -18,7 +17,8 @@ import (
 //     调用者（含显式空值与消息内 system）原样保留，其余回退下方的前置合并——
 //     上游逐字节校验首段，非官方前缀必然 3012（2026-10-12 DeepSeek Harness 实证）。
 //
-// 回退模式保留旧版标准块前置与精确去重，不通过关键词删除调用者内容。
+// 回退模式固定生成三块官方形状；第三方 system 文本并入 dynamic 块（block 2），
+// 不追加第 4 块，也不通过关键词删除调用者内容。
 func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 	if raw, ok := body["model"].(string); ok {
 		m := raw
@@ -62,28 +62,12 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 		if config.PreserveClientContext && upstream.ShouldPreserveCallerSystem(body) {
 			return body
 		}
-		blocks := upstream.ZcodeFallbackSystemBlocks()
-		switch existing := body["system"].(type) {
-		case nil:
-			// 键不存在或为 null（对应 Python existing_system is None）
-			body["system"] = blocks
-		case string:
-			merged := make([]any, 0, len(blocks)+1)
-			merged = append(merged, blocks...)
-			merged = append(merged, map[string]any{"type": "text", "text": existing})
-			body["system"] = merged
-		case []any:
-			merged := make([]any, 0, len(blocks)+len(existing))
-			merged = append(merged, blocks...)
-			for _, block := range existing {
-				if slices.ContainsFunc(blocks, func(standard any) bool {
-					return reflect.DeepEqual(block, standard)
-				}) {
-					continue
-				}
-				merged = append(merged, block)
-			}
-			body["system"] = merged
+		switch body["system"].(type) {
+		case nil, string, []any:
+			// 官方 3 块形状：block 0 无 cache、block 1/2 ephemeral。第三方 system
+			// 文本并入 block 2，不再追加第 4 块；currentDate 只在这一路径合并进首条 user。
+			body["system"] = upstream.BuildFallbackSystem(body, config.ZcodeClientProfile())
+			upstream.InjectContextPrefix(body, time.Now(), upstream.ClientTimezoneLocation())
 		default:
 			// 其余类型保持原样（对齐 Python 版的 elif 链）
 		}

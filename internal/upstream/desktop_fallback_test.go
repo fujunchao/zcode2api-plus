@@ -1,65 +1,75 @@
 package upstream
 
 import (
-	"reflect"
 	"strings"
 	"testing"
 
 	"zcode2api/internal/config"
 )
 
-func TestDesktopFallbackPrefixHasNoCacheControl(t *testing.T) {
+func TestPrefixCacheLayoutAcrossProfiles(t *testing.T) {
 	oldSource, oldInject := config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment
 	t.Cleanup(func() {
 		config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment = oldSource, oldInject
 	})
-	config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment = "electron", false
-	blocks := ZcodeSystemBlocks()
-	if len(blocks) < 2 {
-		t.Fatalf("桌面回退至少保留两个固定块：got=%d", len(blocks))
-	}
-	first := blocks[0].(map[string]any)
-	if _, exists := first["cache_control"]; exists {
-		t.Fatal("官方桌面固定前缀块不得附 cache_control")
-	}
-	for i, raw := range blocks[1:] {
-		block := raw.(map[string]any)
-		cache, _ := block["cache_control"].(map[string]any)
-		if cache["type"] != "ephemeral" {
-			t.Fatalf("后续稳定块 %d 应保留 ephemeral", i+1)
-		}
+	config.UpstreamInjectEnvironment = false
+
+	for _, source := range []string{"electron", "cli"} {
+		t.Run(source, func(t *testing.T) {
+			config.ZcodeClientSourceTitle = source
+			blocks := ZcodeSystemBlocks()
+			if len(blocks) != 2 {
+				t.Fatalf("静态段应保持 2 块，实际 %d", len(blocks))
+			}
+			first := blocks[0].(map[string]any)
+			if _, exists := first["cache_control"]; exists {
+				t.Fatal("所有档案的固定前缀块都不得附 cache_control")
+			}
+			cache, _ := blocks[1].(map[string]any)["cache_control"].(map[string]any)
+			if cache["type"] != "ephemeral" {
+				t.Fatal("稳定身份块应保留 ephemeral")
+			}
+		})
 	}
 }
 
-func TestDesktopCapabilitiesLimitedToGeneratedFallback(t *testing.T) {
+func TestFallbackHasNoCapabilitiesFourthBlock(t *testing.T) {
 	oldSource, oldInject := config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment
 	t.Cleanup(func() { config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment = oldSource, oldInject })
 	config.UpstreamInjectEnvironment = false
+
 	for _, source := range []string{"electron", "cli"} {
-		config.ZcodeClientSourceTitle = source
-		standard, fallback := ZcodeSystemBlocks(), ZcodeFallbackSystemBlocks()
-		if source != "electron" {
-			if !reflect.DeepEqual(standard, fallback) {
-				t.Fatal("非桌面档案不得追加 Gen UI 能力段")
+		t.Run(source, func(t *testing.T) {
+			config.ZcodeClientSourceTitle = source
+			blocks := ZcodeFallbackSystemBlocks()
+			if len(blocks) != 3 {
+				t.Fatalf("回退路径应固定 3 块，实际 %d", len(blocks))
 			}
-			if _, cached := standard[0].(map[string]any)["cache_control"]; !cached {
-				t.Fatal("本批不得改动 CLI 首块缓存行为")
+			first := blocks[0].(map[string]any)
+			if _, exists := first["cache_control"]; exists {
+				t.Fatal("block 0 不得附 cache_control")
 			}
-			continue
-		}
-		if len(fallback) != len(standard)+1 || !reflect.DeepEqual(fallback[:len(standard)], standard) {
-			t.Fatal("桌面回退应保留官方固定块，独立追加真实能力")
-		}
-		last := fallback[len(fallback)-1].(map[string]any)
-		text, _ := last["text"].(string)
-		if !strings.Contains(text, "no Gen UI output directory") || !strings.Contains(text, "only the tools declared in this request") {
-			t.Fatal("回退能力必须说明目录/渲染不可用且不虚构工具")
-		}
-		for _, block := range standard {
-			if strings.Contains(block.(map[string]any)["text"].(string), "# Gateway Desktop Capabilities") {
-				t.Fatal("官方前缀识别函数不能追加网关能力段")
+			for i := 1; i < len(blocks); i++ {
+				cache, _ := blocks[i].(map[string]any)["cache_control"].(map[string]any)
+				if cache["type"] != "ephemeral" {
+					t.Fatalf("block %d 应保留 ephemeral", i)
+				}
 			}
-		}
+			dynamic, _ := blocks[2].(map[string]any)["text"].(string)
+			if !strings.HasPrefix(dynamic, "\n\n# Communicating with the user") {
+				t.Fatalf("block 2 应以两个换行和 dynamic 首段开头: %q", dynamic[:min(80, len(dynamic))])
+			}
+			for _, want := range []string{"# Environment", "# Context management"} {
+				if !strings.Contains(dynamic, want) {
+					t.Fatalf("block 2 缺少 %q", want)
+				}
+			}
+			for _, raw := range blocks {
+				if strings.Contains(raw.(map[string]any)["text"].(string), "# Gateway Desktop Capabilities") {
+					t.Fatal("不得再出现独立的 Gateway Desktop Capabilities 段")
+				}
+			}
+		})
 	}
 }
 
@@ -67,6 +77,7 @@ func TestSystemBlockObjectsAndNestedCachesAreIsolated(t *testing.T) {
 	oldSource := config.ZcodeClientSourceTitle
 	config.ZcodeClientSourceTitle = "electron"
 	t.Cleanup(func() { config.ZcodeClientSourceTitle = oldSource })
+
 	first, second := ZcodeFallbackSystemBlocks(), ZcodeFallbackSystemBlocks()
 	for _, raw := range first {
 		block := raw.(map[string]any)
@@ -81,7 +92,13 @@ func TestSystemBlockObjectsAndNestedCachesAreIsolated(t *testing.T) {
 			if block["text"] == "污染" {
 				t.Fatal("调用者不得污染静态块或其他请求")
 			}
-			if i > 0 && block["cache_control"].(map[string]any)["type"] != "ephemeral" {
+			if i == 0 {
+				if _, ok := block["cache_control"]; ok {
+					t.Fatal("block 0 不应带缓存")
+				}
+				continue
+			}
+			if block["cache_control"].(map[string]any)["type"] != "ephemeral" {
 				t.Fatal("嵌套缓存也必须逐请求复制")
 			}
 		}

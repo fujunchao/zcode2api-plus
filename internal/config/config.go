@@ -336,20 +336,9 @@ var (
 	// 不发的头，与少发一样是可交叉比对的差异。见 docs/plan-client-format-parity.md GAP-7。
 	UpstreamSendDeviceMid = envBool("ZCODE_UPSTREAM_SEND_DEVICE_MID", false)
 
-	// UpstreamInjectEnvironment 是否在**推理请求**的 system 里注入 # Environment 段。
-	//
-	// 官方客户端确实发送这一段（见 docs/plan-client-format-parity.md §1.8），所以关闭它
-	// 是一次**主动偏离 golden 形态**：模型请求的 system 只剩「固定前缀 + 身份段」两块。
-	// 依据是服务端的校验边界——它只从第 0 个字节逐字节比对到身份段末尾为止，之后的
-	// Desktop Context / Session guidance / Environment 等段落可有可无（实测整段删掉照样
-	// 200，而改动身份段里任意一个字符即返回 3012）。
-	//
-	// 关闭的收益：省掉每次请求的 Environment 段；GAP-3 / GAP-5 那类「body 与请求头平台
-	// 互相矛盾」的面彻底消失——该段不存在，也就无从矛盾。
-	//
-	// ⚠️「删掉不报错」**不等于**「与官方不可区分」：段数与长度结构本身就是可被指纹化的
-	// 特征。故默认关闭 + 保留开关 + 上线前必须真实账号验证；一旦出现 405 / 3012 迹象，
-	// 设 true 重启即可回退。
+	// UpstreamInjectEnvironment 是否让 ZcodeSystemBlocks 的静态返回追加 # Environment。
+	// 该入口只用于测试、诊断与旧调用方；推理回退路径由 upstream.BuildFallbackSystem
+	// 固定生成三块 dynamic 段，不受本开关影响。
 	UpstreamInjectEnvironment = envBool("ZCODE_UPSTREAM_INJECT_ENVIRONMENT", false)
 
 	// 调用者自带官方前缀（或显式空值 / 消息内 system）时原样保留其指令上下文，

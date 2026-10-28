@@ -106,9 +106,8 @@ func TestClientContextAcrossCompatibleAPIs(t *testing.T) {
 					up := f.lastUpstream()
 					wantSystem := mustJSON(t, `[{"type":"text","text":"客户端基础指令"},{"type":"text","text":"客户端补充指令"}]`)
 					if jwt {
-						// JWT 通道上非官方前缀的调用者系统会回退「官方块前置」：上游从
-						// 第 0 字节校验到身份段末尾，缺前缀必然被 3012 拦截（v2.9.16 起）。
-						wantSystem = append(upstream.ZcodeFallbackSystemBlocks(), wantSystem.([]any)...)
+						// JWT 通道上非官方前缀的调用者系统回退三块 fallback，原文并入 block 2。
+						wantSystem = upstream.BuildFallbackSystem(map[string]any{"system": wantSystem}, config.ZcodeClientProfile())
 					}
 					if !reflect.DeepEqual(up.Body["system"], wantSystem) {
 						t.Fatalf("初始指令与官方前缀的顶层形态不符: %v", up.Body["system"])

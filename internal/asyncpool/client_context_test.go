@@ -90,19 +90,20 @@ func TestAsyncClientContextReachesActualUpstream(t *testing.T) {
 	}
 	select {
 	case actual := <-calls:
-		// 非官方前缀的调用者 system 在出站前会前置官方标准块（2026-10-12 前缀感知修复），
-		// 客户端原文必须原样保留在标准块之后；工具与采样参数不受影响。
-		blocks := upstream.ZcodeFallbackSystemBlocks()
+		// 非官方前缀的调用者 system 在出站前回退三块 fallback，客户端原文并入 block 2；
+		// 工具与采样参数不受影响。
+		clientSystem := "本地客户端规则，不提供服务器工具。"
+		blocks := upstream.BuildFallbackSystem(map[string]any{"system": clientSystem}, config.ZcodeClientProfile())
 		system, ok := actual.body["system"].([]any)
-		if !ok || len(system) != len(blocks)+1 {
-			t.Fatalf("异步出站 system 应为「官方块 + 客户端原文」: %v", actual.body["system"])
+		if !ok || len(system) != len(blocks) {
+			t.Fatalf("异步出站 system 应为三块且客户端原文并入 block 2: %v", actual.body["system"])
 		}
 		first, _ := system[0].(map[string]any)
 		if text, _ := first["text"].(string); !strings.HasPrefix(text, "You are ZCode, an interactive coding agent") {
 			t.Fatalf("首段必须是官方固定前缀: %v", first)
 		}
-		if last, _ := system[len(system)-1].(map[string]any); last["text"] != "本地客户端规则，不提供服务器工具。" {
-			t.Fatalf("客户端原文必须原样保留在官方块之后: %v", system)
+		if last, _ := system[len(system)-1].(map[string]any); !strings.Contains(last["text"].(string), clientSystem) {
+			t.Fatalf("客户端原文必须保留在 dynamic 块: %v", system)
 		}
 		if !reflect.DeepEqual(actual.body["tools"], body["tools"]) || actual.body["max_tokens"] != float64(64) {
 			t.Fatalf("后台处理不能改写本地客户端的工具与采样参数: %v", actual.body)

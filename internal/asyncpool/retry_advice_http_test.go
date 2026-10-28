@@ -200,7 +200,8 @@ func firstContent(body map[string]any) string {
 	case []any:
 		for _, block := range v {
 			bm, _ := block.(map[string]any)
-			if s, ok := bm["text"].(string); ok {
+			s, ok := bm["text"].(string)
+			if ok && !strings.Contains(s, "# currentDate") {
 				return s
 			}
 		}

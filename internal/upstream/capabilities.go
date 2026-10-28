@@ -8,23 +8,10 @@ import (
 
 const midConversationSystemBeta = "mid-conversation-system-2026-04-07"
 
-// 这段只描述网关回退上下文的实际能力，不复制采集机路径，也不凭空增加工具。
-const desktopFallbackCapabilitiesText = "# Gateway Desktop Capabilities\n" +
-	"This gateway fallback context has no Gen UI output directory or built-in Gen UI rendering capability. " +
-	"Return results as text or Markdown unless the caller explicitly supplies suitable tools. " +
-	"Use only the tools declared in this request; do not assume desktop filesystem or preview tools are available."
-
-// ZcodeFallbackSystemBlocks 只用于网关自行补齐 system 的分支。
-// 调用者自带完整官方/GUI 上下文、显式空值或 MCS 时不应调用；非桌面档案保持原样。
+// ZcodeFallbackSystemBlocks 返回网关自行补齐 system 的默认三块形状。
+// 调用者自带完整官方/GUI 上下文、显式空值或 MCS 时不应调用。
 func ZcodeFallbackSystemBlocks() []any {
-	blocks := ZcodeSystemBlocks()
-	if config.ZcodeClientProfile().SourceTitle != "electron" {
-		return blocks
-	}
-	return append(blocks, map[string]any{
-		"type": "text", "text": desktopFallbackCapabilitiesText,
-		"cache_control": map[string]any{"type": "ephemeral"},
-	})
+	return BuildFallbackSystem(nil, config.ZcodeClientProfile())
 }
 
 // HasSystemMessages 只检查消息序列，不把顶层 system 当成中途系统消息。
@@ -44,7 +31,7 @@ func HasSystemMessages(body map[string]any) bool {
 // 上游从 system 的第 0 个字节逐字节校验到身份段末尾：只有**首段已是官方固定前缀**
 // 的 system（官方系客户端自带完整上下文）才能安全原样透传；第三方 harness 的提示词
 // 首段不是官方前缀，透传必被上游以 3012 拦截（2026-10-12 DeepSeek Harness 实证），
-// 必须回退「官方块前置 + 精确去重」。显式空值与消息内 system（MCS）沿用 v2.9.11
+// 必须回退「三块 fallback + 第三方文本并入 dynamic」。显式空值与消息内 system（MCS）沿用 v2.9.11
 // 语义：调用者声明「无指令 / 自有中途指令」时，网关不叠加自己的身份块。
 func ShouldPreserveCallerSystem(body map[string]any) bool {
 	switch value := body["system"].(type) {

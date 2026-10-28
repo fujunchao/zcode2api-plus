@@ -65,28 +65,27 @@ func TestNormalizeBodySystemInjection(t *testing.T) {
 		t.Fatalf("缺失 system 应整体注入: %v", body["system"])
 	}
 
-	// 字符串 system → blocks + 用户文本
+	// 字符串 system → 并入 block 2，块数仍为 3
 	body2 := map[string]any{"system": "be brief"}
 	NormalizeBody(body2, true)
 	sys2 := body2["system"].([]any)
-	if len(sys2) != len(blocks)+1 {
-		t.Fatalf("字符串 system 应拼接在 blocks 之后: %d", len(sys2))
+	if len(sys2) != len(blocks) {
+		t.Fatalf("第三方 system 合并后应保持 %d 块，实际 %d", len(blocks), len(sys2))
 	}
-	last := sys2[len(sys2)-1].(map[string]any)
-	if last["text"] != "be brief" {
-		t.Fatalf("用户文本应在末尾: %v", last)
+	if !strings.Contains(sys2[len(sys2)-1].(map[string]any)["text"].(string), "be brief") {
+		t.Fatalf("用户文本应并入 dynamic 块: %v", sys2[len(sys2)-1])
 	}
 
-	// 列表 system → blocks + 列表
+	// 列表 system → 并入 block 2，块数仍为 3
 	userBlocks := []any{map[string]any{"type": "text", "text": "user"}}
 	body3 := map[string]any{"system": userBlocks}
 	NormalizeBody(body3, true)
 	sys3 := body3["system"].([]any)
-	if len(sys3) != len(blocks)+1 {
-		t.Fatalf("列表 system 应拼接: %d", len(sys3))
+	if len(sys3) != len(blocks) {
+		t.Fatalf("列表 system 合并后应保持 %d 块，实际 %d", len(blocks), len(sys3))
 	}
-	if !reflect.DeepEqual(sys3[len(sys3)-1], userBlocks[0]) {
-		t.Fatal("用户块应原样保留在末尾")
+	if !strings.Contains(sys3[len(sys3)-1].(map[string]any)["text"].(string), "user") {
+		t.Fatal("用户块文本应并入 dynamic 块")
 	}
 
 	// 其它类型不动（对齐 Python elif 链）
@@ -134,8 +133,14 @@ func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
 	body := map[string]any{"model": "GLM-5.3", "system": incoming}
 	NormalizeBody(body, true)
 	system := body["system"].([]any)
-	if len(system) != len(blocks)+len(tail) || !reflect.DeepEqual(system[len(blocks):], tail) {
-		t.Fatalf("只应前置一份标准块并原样保留调用者段落，实际共 %d 块（标准块 %d）", len(system), len(blocks))
+	if len(system) != len(blocks) {
+		t.Fatalf("非官方 system 应并入 block 2，实际共 %d 块（标准块 %d）", len(system), len(blocks))
+	}
+	dynamic, _ := system[len(system)-1].(map[string]any)["text"].(string)
+	for _, want := range []string{"保留调用者的原始指令", "必须保留", "调用者扩展的身份"} {
+		if !strings.Contains(dynamic, want) {
+			t.Fatalf("调用者段落 %q 未并入 block 2: %s", want, dynamic)
+		}
 	}
 	after, err := json.Marshal(incoming)
 	if err != nil || string(after) != string(before) {
@@ -208,16 +213,19 @@ func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
 	body := map[string]any{"model": "GLM-5.3", "system": foreign}
 	NormalizeBody(body, true)
 	system := body["system"].([]any)
-	if len(system) != len(blocks)+len(foreign) {
-		t.Fatalf("第三方 system 应前置官方块并原样保留，实际 %d 块", len(system))
+	if len(system) != len(blocks) {
+		t.Fatalf("第三方 system 合并后应保持 %d 块，实际 %d", len(blocks), len(system))
 	}
 	for i := range blocks {
 		if !reflect.DeepEqual(system[i], blocks[i]) {
 			t.Fatalf("第 %d 块应为官方标准块: %v", i, system[i])
 		}
 	}
-	if !reflect.DeepEqual(system[len(blocks):], foreign) {
-		t.Fatal("第三方内容必须原样保留在官方块之后，不得被删除或改写")
+	dynamic, _ := system[len(system)-1].(map[string]any)["text"].(string)
+	for _, want := range []string{"You are an AI agent powered by DeepSeekRuntime.", "第三方补充指令"} {
+		if !strings.Contains(dynamic, want) {
+			t.Fatalf("第三方内容 %q 必须保留在 block 2，不得被删除或改写", want)
+		}
 	}
 	first, err := json.Marshal(body)
 	if err != nil {
@@ -234,18 +242,18 @@ func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
 	}
 }
 
-// 字符串形态的第三方 system 同样回退前置合并，并排在官方块之后。
+// 字符串形态的第三方 system 同样回退三块 fallback，并并入 dynamic 块。
 func TestNormalizeBodyForeignStringSystemGetsOfficialPrefix(t *testing.T) {
 	blocks := upstream.ZcodeFallbackSystemBlocks()
 	body := map[string]any{"model": "GLM-5.3", "system": "第三方指令"}
 	NormalizeBody(body, true)
 	system := body["system"].([]any)
-	if len(system) != len(blocks)+1 {
-		t.Fatalf("字符串 system 应并成一块排在官方块之后，实际 %d 块", len(system))
+	if len(system) != len(blocks) {
+		t.Fatalf("字符串 system 合并后应保持 %d 块，实际 %d", len(blocks), len(system))
 	}
-	last := system[len(system)-1].(map[string]any)
-	if last["text"] != "第三方指令" {
-		t.Fatalf("第三方文本必须原样保留: %v", last)
+	dynamic, _ := system[len(system)-1].(map[string]any)["text"].(string)
+	if !strings.Contains(dynamic, "第三方指令") {
+		t.Fatalf("第三方文本必须保留在 block 2: %v", system[len(system)-1])
 	}
 	firstText, _ := system[0].(map[string]any)["text"].(string)
 	if !strings.HasPrefix(firstText, "You are ZCode, an interactive coding agent") {
@@ -262,5 +270,69 @@ func TestInlineSystemOwnsContextWithoutTopLevelSystem(t *testing.T) {
 	}
 	if _, ok := message["content"].([]any); !ok {
 		t.Fatal("MCS 规范化不能改写调用者持有的原消息")
+	}
+}
+
+// currentDate 只合并进网关自行补 system 的首条 user 消息；已有 currentDate 或调用者
+// 自带官方 system 时必须保持原样，避免重复注入和破坏客户端上下文。
+func TestNormalizeBodyInjectsCurrentDateOnlyOnFallback(t *testing.T) {
+	oldPreserve := config.PreserveClientContext
+	config.PreserveClientContext = true
+	t.Cleanup(func() { config.PreserveClientContext = oldPreserve })
+
+	body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "你好"}}}
+	NormalizeBody(body, true)
+	messages := body["messages"].([]any)
+	content, ok := messages[0].(map[string]any)["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("fallback 首条 user 应合并 currentDate + 原文: %v", messages[0])
+	}
+	if text, _ := content[0].(map[string]any)["text"].(string); !strings.Contains(text, "# currentDate") || !strings.Contains(text, "Today's date is 20") {
+		t.Fatalf("currentDate 应按官方 system-reminder 形态生成: %q", text)
+	}
+	NormalizeBody(body, true)
+	content = body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("重复规范化不得重复插入 currentDate: %d", len(content))
+	}
+
+	official := "You are ZCode, an interactive coding agent\n调用者完整上下文"
+	preserved := map[string]any{
+		"system":   official,
+		"messages": []any{map[string]any{"role": "user", "content": "你好"}},
+	}
+	NormalizeBody(preserved, true)
+	if preserved["system"] != official {
+		t.Fatal("调用者官方 system 必须原样保留")
+	}
+	preservedContent, _ := preserved["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(preservedContent) != 1 || preservedContent[0].(map[string]any)["text"] != "你好" {
+		t.Fatal("调用者官方 system 路径不得注入 currentDate（content 只应桥接原文块）")
+	}
+}
+
+// 调用者自带的官方三块 system 必须逐字节保留，不能重新组装或混入 currentDate。
+func TestNormalizeBodyOfficialThreeBlockSystemPreserved(t *testing.T) {
+	oldPreserve := config.PreserveClientContext
+	config.PreserveClientContext = true
+	t.Cleanup(func() { config.PreserveClientContext = oldPreserve })
+
+	official := upstream.ZcodeFallbackSystemBlocks()
+	before, err := json.Marshal(official)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{
+		"system":   official,
+		"messages": []any{map[string]any{"role": "user", "content": "客户端原文"}},
+	}
+	NormalizeBody(body, true)
+	after, err := json.Marshal(body["system"])
+	if err != nil || string(after) != string(before) {
+		t.Fatal("调用者官方三块 system 必须原样保留")
+	}
+	content, _ := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "客户端原文" {
+		t.Fatal("保留官方 system 时不得注入 currentDate（content 只应桥接原文块）")
 	}
 }

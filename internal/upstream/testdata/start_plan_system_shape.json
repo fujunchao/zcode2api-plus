@@ -1,0 +1,33 @@
+{
+  "source": "M0 system_shape probe；仅保留脱敏结构、长度和标题，不含凭据或真实请求正文",
+  "profile": {
+    "bare_platform": "win32",
+    "arch": "x64",
+    "os_release": "10.0.26100",
+    "shell": "cmd.exe",
+    "cwd": "C:\\projects\\demo"
+  },
+  "blocks": 3,
+  "block_chars": [
+    42,
+    2313,
+    5193
+  ],
+  "block_bytes": [
+    42,
+    2317,
+    5223
+  ],
+  "cache_control": [
+    false,
+    true,
+    true
+  ],
+  "block2_prefix": "\n\n# Communicating with the user",
+  "block2_contains": [
+    "# Environment",
+    "# Context management"
+  ],
+  "forbidden": "# Gateway Desktop Capabilities",
+  "current_date_block_chars": 305
+}

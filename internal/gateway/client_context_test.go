@@ -14,7 +14,7 @@ import (
 )
 
 func TestJWTKeepsCallerSystemOverHTTP(t *testing.T) {
-	// 官方前缀形态的调用者 context 原样保留；非官方前缀回退「官方块前置 + 精确去重」——
+	// 官方前缀形态的调用者 context 原样保留；非官方前缀回退三块 fallback，文本并入 block 2——
 	// 上游从 system 第 0 字节校验到身份段末尾，缺前缀必然 3012（2026-10-12 前缀感知修复）。
 	foreignText := "只使用本地客户端声明的工具，工作目录为 /client/work。"
 	foreignBlocks := []any{
@@ -26,10 +26,10 @@ func TestJWTKeepsCallerSystemOverHTTP(t *testing.T) {
 		system any
 		want   any
 	}{
-		{"foreign_text", foreignText, append(upstream.ZcodeFallbackSystemBlocks(), map[string]any{"type": "text", "text": foreignText})},
+		{"foreign_text", foreignText, upstream.BuildFallbackSystem(map[string]any{"system": foreignText}, config.ZcodeClientProfile())},
 		{"empty_text", "", ""},
 		{"empty_blocks", []any{}, []any{}},
-		{"foreign_blocks_with_extensions", foreignBlocks, append(upstream.ZcodeFallbackSystemBlocks(), foreignBlocks...)},
+		{"foreign_blocks_with_extensions", foreignBlocks, upstream.BuildFallbackSystem(map[string]any{"system": foreignBlocks}, config.ZcodeClientProfile())},
 		{"complete_client_context", []any{
 			map[string]any{"type": "text", "text": "You are ZCode, an interactive coding agent", "cache_control": map[string]any{"type": "ephemeral"}},
 			map[string]any{"type": "text", "text": "这是客户端提供的扩展身份与交互规则。"},
