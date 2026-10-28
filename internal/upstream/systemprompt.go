@@ -139,8 +139,11 @@ func callerSystemText(raw any, generated []any) string {
 	switch value := raw.(type) {
 	case string:
 		trimmed := strings.TrimSpace(value)
-		if trimmed == "" || (baseDynamic != "" && strings.HasPrefix(trimmed, baseDynamic)) {
+		if trimmed == "" {
 			return ""
+		}
+		if baseDynamic != "" && strings.HasPrefix(value, baseDynamic) {
+			return strings.TrimPrefix(strings.TrimPrefix(value, baseDynamic), "\n\n")
 		}
 		for _, item := range generated {
 			if block, ok := item.(map[string]any); ok && block["text"] == trimmed {
@@ -167,7 +170,13 @@ func callerSystemText(raw any, generated []any) string {
 			}
 			text, _ := block["text"].(string)
 			trimmed := strings.TrimSpace(text)
-			if trimmed == "" || (baseDynamic != "" && strings.HasPrefix(trimmed, baseDynamic)) {
+			if trimmed == "" {
+				continue
+			}
+			if baseDynamic != "" && strings.HasPrefix(text, baseDynamic) {
+				if suffix := strings.TrimPrefix(strings.TrimPrefix(text, baseDynamic), "\n\n"); strings.TrimSpace(suffix) != "" {
+					parts = append(parts, suffix)
+				}
 				continue
 			}
 			parts = append(parts, text)
