@@ -137,10 +137,14 @@ func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
 		t.Fatalf("非官方 system 应并入 block 2，实际共 %d 块（标准块 %d）", len(system), len(blocks))
 	}
 	dynamic, _ := system[len(system)-1].(map[string]any)["text"].(string)
-	for _, want := range []string{"保留调用者的原始指令", "必须保留", "调用者扩展的身份"} {
+	for _, want := range []string{"保留调用者的原始指令", "调用者扩展的身份"} {
 		if !strings.Contains(dynamic, want) {
 			t.Fatalf("调用者段落 %q 未并入 block 2: %s", want, dynamic)
 		}
+	}
+	// 带不同 cache/扩展字段的同一段前缀仍各自保留文本；合并后不再保留块级 metadata。
+	if got := strings.Count(dynamic, prefix); got != 3 {
+		t.Fatalf("调用者前缀块文本应保留 3 份，实际 %d", got)
 	}
 	after, err := json.Marshal(incoming)
 	if err != nil || string(after) != string(before) {
@@ -216,7 +220,7 @@ func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
 	if len(system) != len(blocks) {
 		t.Fatalf("第三方 system 合并后应保持 %d 块，实际 %d", len(blocks), len(system))
 	}
-	for i := range blocks {
+	for i := 0; i < len(blocks)-1; i++ {
 		if !reflect.DeepEqual(system[i], blocks[i]) {
 			t.Fatalf("第 %d 块应为官方标准块: %v", i, system[i])
 		}

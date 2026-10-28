@@ -182,16 +182,13 @@ func callerSystemText(raw any, generated []any) string {
 // 默认 Asia/Shanghai；time/tzdata 已嵌入，Docker 运行镜像无需安装 zoneinfo。
 func ClientTimezoneLocation() *time.Location {
 	name := strings.TrimSpace(config.ZcodeClientTimezone)
-	if name == "" {
-		name = "Asia/Shanghai"
+	if name != "" {
+		if loc, err := time.LoadLocation(name); err == nil {
+			return loc
+		}
 	}
-	if loc, err := time.LoadLocation(name); err == nil {
-		return loc
-	}
-	if name == "Asia/Shanghai" {
-		return time.FixedZone(name, 8*60*60)
-	}
-	return time.UTC
+	// config 默认已是 Asia/Shanghai；空值/未知时保留客户端默认的 UTC+8 日历日。
+	return time.FixedZone("client-timezone", 8*60*60)
 }
 
 // InjectContextPrefix 把官方 currentDate system-reminder 合并进首条 user 消息。
