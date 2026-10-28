@@ -544,8 +544,9 @@ Codex 多轮不再 400；custom/namespace/tool_search 工具可转换与还原�
 
 - 分支：`codex/server-start-plan-m2-p0b`
 - 范围：验证码 token 池、配置 last-good、严格获取回归、CPU governor、指标与 Docker 资源建议。
-- 代码与测试提交：待推送后填写（本节在 CI 通过后更新最终 SHA / run URL）。
-- CI：待运行。
+- 最终代码提交：`2fb7e97b600e47745a3db574f8e110ea362fd4d3`（`fix(captcha): deliver pool tokens through waiter queue` 为最后代码提交；此前 `447d185`/`2052a3b` 为同一分支修复历史）。
+- 代码验证 CI：GitHub Actions `ci` run [40628849663](https://github.com/fujunchao/zcode2api-plus/actions/runs/40628849663)，conclusion = **success**。
+- CI 覆盖：workflows、frontend、test（go build / vet / 全量测试 / 重复回归 / `-race`）、sdk-compat、newapi-compat、windows-proxy-journal、cross-build 五平台矩阵、docker 镜像构建；全部 job 通过。
 
 #### 本次完成项
 
