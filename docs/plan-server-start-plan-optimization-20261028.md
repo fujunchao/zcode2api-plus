@@ -562,3 +562,13 @@ Codex 多轮不再 400；custom/namespace/tool_search 工具可转换与还原�
 - 新增单测覆盖：池热一次性、空池 2 路竞速、并发唯一 token、TTL、配置切换清池、重复 certifyId、Manager.Close、空闲缩容/停补、CPU governor、last-good 与 env 覆盖；网关侧覆盖池空不裸发与并发 JWT 唯一 token。
 - 本地未运行自动化测试（按 AGENTS 约定）；以当前提交 SHA 的 GitHub Actions 完整 CI 为验收。staging 的池热 p95 与 24h soak 需在部署环境用 `captcha_wait_ms` / `captcha_pool_size` 复测，不在本机压测。
 - M3 可直接在本分支基础上做 session observe；验证码 Manager 的公开方法保持兼容。
+
+### v2.11.3-go 发布记录（2026-10-28）
+
+- 发布内容：M1/P0-A（Start Plan system 三块组装）与 M2/P0-B（验证码 token 池 / last-good / CPU governor / 指标）合并后的首个正式版本；自 v2.11.2-go 无数据库结构变更。
+- 版本提交：`2f0e1f76df84c25691b55a7569a36bf2194f452b`（`chore: 发布 v2.11.3-go`），annotated tag `v2.11.3-go` 指向同一提交。
+- 分支：`go-rewrite` 已 fast-forward 到 M2 分支（含 M1+M2 共 10 个提交）并推送 origin。
+- Release 工作流：run [40632719069](https://github.com/fujunchao/zcode2api-plus/actions/runs/40632719069)，conclusion = **success**；validate 复用完整 `ci.yml`（含 `-race`、五平台交叉编译、docker、sdk/newapi 兼容）。
+- GitHub Release：[v2.11.3-go](https://github.com/fujunchao/zcode2api-plus/releases/tag/v2.11.3-go)，附件包含 linux/amd64、linux/arm64、darwin/amd64、darwin/arm64、windows/amd64.exe；Release body 来自 `docs/releases/v2.11.3-go.md`。
+- 容器镜像：`ghcr.io/fujunchao/zcode2api-plus:2.11.3-go` 与 `:latest`，manifest list digest `sha256:3a8a094e6ec5a1d4ef912323e4df8d9c51099f886c6694e3652f2617c878f679`。
+- 回滚：验证码可用 `ZCODE_CAPTCHA_POOL_ENABLED=false` / `CAPTCHA_CONFIG_CACHE_TTL=600000` / `ZCODE_CAPTCHA_BROWSER_WORKERS=1`；system 组装回退需回退镜像/版本。
