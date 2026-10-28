@@ -67,18 +67,6 @@ func newTestTokenPool(t *testing.T, solver Solver, opts tokenPoolOptions) *token
 	return p
 }
 
-func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	t.Fatalf("等待超时：%s", msg)
-}
-
 func TestTokenPoolWarmTakeIsOneShot(t *testing.T) {
 	solver := &fakeTokenSolver{fn: func(_ context.Context, n int) (string, error) {
 		return fmt.Sprintf("token-%d", n), nil
