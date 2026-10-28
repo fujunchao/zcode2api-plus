@@ -235,7 +235,7 @@ func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
 	}
 	for _, want := range []string{"You are an AI agent powered by DeepSeekRuntime.", "第三方补充指令"} {
 		if !strings.Contains(dynamic, want) {
-			t.Fatalf("第三方内容 %q 必须保留在 block 2，不得被删除或改写", want)
+			t.Fatalf("第三方内容 %q 必须保留在 block 2，不得被删除或改写: system=%#v dynamic=%q", want, system, dynamic)
 		}
 	}
 	first, err := json.Marshal(body)
