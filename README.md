@@ -58,6 +58,14 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 升级不改变任何接口、配置项与数据结构：用户无需操作；想固定或回退时设置
 `ZCODE_CLIENT_VERSION`（Compose 需在 `environment:` 显式引用该变量才会进容器）。
 
+`v2.11.4-go` 同步 **ZCode 3.17.1 客户端声明**（模型请求协议未变）：默认伪装版本
+`3.16.3 → 3.17.1`，UA / `X-ZCode-App-Version` / `app_version` 随常量派生；伪装头集合、
+模型请求 UA 组成（ai-sdk 4.0.27 / node 24）与模型、计费端点均未变。3.17.1 的改动集中在
+客户端本地面（Sites 插件、统一远程数据同步、远程服务停止/重启、MCP 内置 npm、CUA 多会话
+光标、遥测归因、插件市场导入重写），不影响网关模型链路；新增的 Kimi K3.1 Pro / MiniMax
+M3.1 Flash 属第三方 BYO-key 模板元数据，不是官方账户新通路。
+详见 [发布说明](docs/releases/v2.11.4-go.md)。
+
 `v2.11.3-go` 合入 **Start Plan system 对齐 + 验证码热路径**：
 ①网关补 system 时按官方三块结构组装（block 0 无 cache、block 1/2 带 ephemeral，补
 `# Communicating with the user` / `# Context management`，currentDate 合并进首条 user 消息）；
