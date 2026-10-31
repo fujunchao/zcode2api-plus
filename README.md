@@ -53,8 +53,10 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 同步、异步及 OpenAI 兼容模型请求均跳过验证码，不依赖浏览器或人工回填；
 **套餐领取仍保留验证码**，因此自动领取场景不要关闭浏览器求解开关。
 该策略使用验证码配置缓存（默认 1 小时，失败保留 last-good），字段缺失或配置获取失败时保留原验证要求。
-默认客户端版本已同步至 `3.16.3`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
+默认客户端版本已同步至 `3.17.1`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。版本特定的内部状态与回滚要求见下方发布说明。
+升级不改变任何接口、配置项与数据结构：用户无需操作；想固定或回退时设置
+`ZCODE_CLIENT_VERSION`（Compose 需在 `environment:` 显式引用该变量才会进容器）。
 
 `v2.11.3-go` 合入 **Start Plan system 对齐 + 验证码热路径**：
 ①网关补 system 时按官方三块结构组装（block 0 无 cache、block 1/2 带 ephemeral，补
