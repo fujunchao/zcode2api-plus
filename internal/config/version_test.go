@@ -42,6 +42,8 @@ func TestDefaultClientVersionHasVerifiedPromptPair(t *testing.T) {
 // profile.go 与 config.go 同级豁免：2026-09-24 起伪装身份的默认值集中在 profile.go
 // （见 profile_literals_test.go），ai-sdk / node 版本号也在那里定义一次。
 //
+	// zcode_system_profile.go 也豁免：它把「版本号 → 官方 system 文案档案」写成对照表，
+	// 版本字面量在这里就是定义处本身（与 config.go 同级），不是散落的第二份真相。
 // 刻意跳过 _test.go：测试夹具允许出现字面量（如故意伪装的透传头、OS 版本哨兵值）。
 func TestNoHardcodedClientVersion(t *testing.T) {
 	pat := regexp.MustCompile(`"\d+\.\d+\.\d+"`)
@@ -50,7 +52,7 @@ func TestNoHardcodedClientVersion(t *testing.T) {
 		"zcode-switch": true, ".workbuddy": true, "data": true,
 	}
 	// 定义处豁免：版本号默认值只能在这里写一次。
-	skipFiles := map[string]bool{"config.go": true, "profile.go": true}
+	skipFiles := map[string]bool{"config.go": true, "profile.go": true, "zcode_system_profile.go": true}
 	var bad []string
 	root := filepath.Join("..", "..")
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
