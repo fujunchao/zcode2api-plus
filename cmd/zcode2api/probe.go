@@ -191,8 +191,10 @@ func queryProbeAccounts(dsn string) ([]probeCandidate, error) {
 		if err := rows.Scan(&id, &name, &data); err != nil {
 			return nil, err
 		}
-		var acc model.Account
-		if err := json.Unmarshal(data, &acc); err != nil {
+		// 每行独立分配：model.Account 内嵌 sync.Mutex，按值复制会被 go vet 的
+		// copylocks 拦下（也确实不安全），所以直接反序列化到新指针。
+		acc := new(model.Account)
+		if err := json.Unmarshal(data, acc); err != nil {
 			continue
 		}
 		if acc.ID == "" {
@@ -201,13 +203,11 @@ func queryProbeAccounts(dsn string) ([]probeCandidate, error) {
 		if acc.Name == "" {
 			acc.Name = name
 		}
-		if !probeEligible(&acc) {
+		if !probeEligible(acc) {
 			continue
 		}
-		// 显式复制：候选持有自己的账号指针，避免循环变量复用把所有人指向同一个号。
-		copied := acc
 		out = append(out, probeCandidate{
-			ID: acc.ID, Name: acc.Name, Status: acc.Status, LastUsed: acc.LastUsedAt, acc: &copied,
+			ID: acc.ID, Name: acc.Name, Status: acc.Status, LastUsed: acc.LastUsedAt, acc: acc,
 		})
 	}
 	if err := rows.Err(); err != nil {
