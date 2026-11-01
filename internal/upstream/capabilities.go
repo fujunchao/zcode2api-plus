@@ -46,15 +46,41 @@ func ShouldPreserveCallerSystem(body map[string]any) bool {
 		if len(value) == 0 {
 			return true
 		}
-		first, ok := value[0].(map[string]any)
-		if !ok {
-			return false
-		}
-		text, _ := first["text"].(string)
-		return hasOfficialSystemPrefix(text)
+		// 块形态必须「首段 + 身份段」都对才保留：块 0 在前缀相近的两个版本间很容易撞上
+		// （3.16.x 与 3.17.1 只差几个字），只比对前缀会把身份段不匹配的请求原样送出，
+		// 被上游判 3012（2026-11-01 生产事故：preserve 误判导致全量拦截）。
+		return callerBlocksMatchOfficial(value)
 	default:
 		return false
 	}
+}
+
+
+// callerBlocksMatchOfficial 判断块形态的 system 是否与当前档案的「首段 + 身份段」逐字节一致。
+//
+// 只要求前两块一致、允许调用者追加自己的块（例如 Environment/currentDate）：
+// 上游的校验范围是「第 0 字节 → 身份段末尾」，后面追加什么不影响它。
+func callerBlocksMatchOfficial(blocks []any) bool {
+	standard := ZcodeSystemBlocks()
+	if len(standard) < 2 || len(blocks) < 2 {
+		return false
+	}
+	for i := range 2 {
+		got, ok := blocks[i].(map[string]any)
+		if !ok {
+			return false
+		}
+		want, ok := standard[i].(map[string]any)
+		if !ok {
+			return false
+		}
+		gotText, _ := got["text"].(string)
+		wantText, _ := want["text"].(string)
+		if gotText != wantText {
+			return false
+		}
+	}
+	return true
 }
 
 // hasOfficialSystemPrefix 文本是否以官方块 0（固定前缀）开头。
