@@ -84,12 +84,22 @@ func TestEnvironmentBlockTracksProfile(t *testing.T) {
 	}
 }
 
+// useLegacySystemProfile 固定伪装版本到 3.16.3：本文件的期望值描述 legacy 文案形状，
+// 3.17.1 档案的形状与逐字节断言在 system_profile_test.go。
+func useLegacySystemProfile(t *testing.T) {
+	t.Helper()
+	old := config.ZcodeClientVersion
+	t.Cleanup(func() { config.ZcodeClientVersion = old })
+	config.ZcodeClientVersion = "3.16.3"
+}
+
 // TestSystemBlocksShape 块结构与顺序：CLI Prefix → Agent Identity（→ # Environment）。
 // 顺序与官方的分段排序一致（system+stable 先于 system+dynamic），否则前缀缓存命中会变差。
 //
 // 默认只返回前两块静态段：# Environment 由 config.UpstreamInjectEnvironment 控制；
 // 推理回退路径始终由 BuildFallbackSystem 生成三块（见 start_plan_p0a_test.go）。
 func TestSystemBlocksShape(t *testing.T) {
+	useLegacySystemProfile(t)
 	oldInject := config.UpstreamInjectEnvironment
 	t.Cleanup(func() { config.UpstreamInjectEnvironment = oldInject })
 
@@ -168,6 +178,7 @@ func TestEnvironmentBlockOmittedByDefault(t *testing.T) {
 // 调用方（gateway/body.go）会把它并入请求体并可能就地 append，
 // 共享切片会让一个请求污染后续所有请求。
 func TestSystemBlocksReturnFreshSlice(t *testing.T) {
+	useLegacySystemProfile(t)
 	first := ZcodeSystemBlocks()
 	first[0] = map[string]any{"type": "text", "text": "污染"}
 

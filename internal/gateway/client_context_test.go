@@ -31,7 +31,7 @@ func TestJWTKeepsCallerSystemOverHTTP(t *testing.T) {
 		{"empty_blocks", []any{}, []any{}},
 		{"foreign_blocks_with_extensions", foreignBlocks, upstream.BuildFallbackSystem(map[string]any{"system": foreignBlocks}, config.ZcodeClientProfile())},
 		{"complete_client_context", []any{
-			map[string]any{"type": "text", "text": "You are ZCode, an interactive coding agent", "cache_control": map[string]any{"type": "ephemeral"}},
+			map[string]any{"type": "text", "text": upstream.OfficialSystemPrefix(), "cache_control": map[string]any{"type": "ephemeral"}},
 			map[string]any{"type": "text", "text": "这是客户端提供的扩展身份与交互规则。"},
 			map[string]any{"type": "text", "text": "# Environment\nPrimary working directory: /client/work"},
 		}, nil},

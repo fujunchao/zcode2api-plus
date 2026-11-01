@@ -175,8 +175,9 @@ func useLegacyClientContext(t *testing.T) {
 // 首段自带官方前缀的调用者（官方系客户端）已拥有完整上下文：原样保留，
 // 不改写其指令、缓存策略、顺序或扩展字段。
 func TestNormalizeBodyOfficialSystemIsIdempotent(t *testing.T) {
-	const payload = `{"model":"GLM-5.3","system":[
-		{"type":"text","text":"You are ZCode, an interactive coding agent","cache_control":{"type":"ephemeral","ttl":"1h"}},
+	// 首段前缀取自当前伪装版本：默认值随客户端升级变化，硬编码旧文案会在升级时误报。
+	payload := `{"model":"GLM-5.3","system":[
+		{"type":"text","text":"` + upstream.OfficialSystemPrefix() + `","cache_control":{"type":"ephemeral","ttl":"1h"}},
 		{"type":"text","text":"重复但有意保留"},
 		{"type":"text","text":"重复但有意保留","caller_metadata":"保留"}
 	],"messages":[{"role":"user","content":"问题"}]}`
@@ -267,7 +268,7 @@ func TestNormalizeBodyForeignStringSystemGetsOfficialPrefix(t *testing.T) {
 		t.Fatalf("第三方文本必须保留在 block 2: %v", system[len(system)-1])
 	}
 	firstText, _ := system[0].(map[string]any)["text"].(string)
-	if !strings.HasPrefix(firstText, "You are ZCode, an interactive coding agent") {
+	if !strings.HasPrefix(firstText, upstream.OfficialSystemPrefix()) {
 		t.Fatalf("首段必须是官方固定前缀: %q", firstText)
 	}
 }
@@ -307,7 +308,7 @@ func TestNormalizeBodyInjectsCurrentDateOnlyOnFallback(t *testing.T) {
 		t.Fatalf("重复规范化不得重复插入 currentDate: %d", len(content))
 	}
 
-	official := "You are ZCode, an interactive coding agent\n调用者完整上下文"
+	official := upstream.OfficialSystemPrefix() + "\n调用者完整上下文"
 	preserved := map[string]any{
 		"system":   official,
 		"messages": []any{map[string]any{"role": "user", "content": "你好"}},

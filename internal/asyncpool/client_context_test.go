@@ -99,7 +99,7 @@ func TestAsyncClientContextReachesActualUpstream(t *testing.T) {
 			t.Fatalf("异步出站 system 应为三块且客户端原文并入 block 2: %v", actual.body["system"])
 		}
 		first, _ := system[0].(map[string]any)
-		if text, _ := first["text"].(string); !strings.HasPrefix(text, "You are ZCode, an interactive coding agent") {
+		if text, _ := first["text"].(string); !strings.HasPrefix(text, upstream.OfficialSystemPrefix()) {
 			t.Fatalf("首段必须是官方固定前缀: %v", first)
 		}
 		if last, _ := system[len(system)-1].(map[string]any); !strings.Contains(last["text"].(string), clientSystem) {

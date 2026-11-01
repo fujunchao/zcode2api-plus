@@ -16,6 +16,7 @@ import (
 	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 	"zcode2api/internal/model"
+	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
 )
 
@@ -71,7 +72,7 @@ func TestMetadataIsolationAsyncRetries(t *testing.T) {
 			t.Cleanup(up.Close)
 			config.UpstreamZai = up.URL
 			// 官方前缀形态的调用者指令：preserve 分支原样保留，内容视图与入口一致。
-			body := map[string]any{"model": "GLM-5.3", "stream": true, "system": "You are ZCode, an interactive coding agent synthetic-client-instructions", "messages": []any{map[string]any{"role": "user", "content": "hi"}},
+			body := map[string]any{"model": "GLM-5.3", "stream": true, "system": upstream.OfficialSystemPrefix() + " synthetic-client-instructions", "messages": []any{map[string]any{"role": "user", "content": "hi"}},
 				"metadata": map[string]any{"user_id": `{"device_id":"client","session_id":"synthetic-session"}`, "trace_hint": "keep"}}
 			gateway.NormalizeBody(body, false)
 			before, _ := marshalJSON(body)
