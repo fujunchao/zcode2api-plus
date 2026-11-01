@@ -171,9 +171,48 @@ SDn(e=!0){return["# Harness"," - Text you output outside of tool use …", …]}
 
 ---
 
-## 7. 未验证与风险
+## 7. 探针实验与修正（2026-11-01 追记）
 
-1. **未做在线实验**：H1 的最终确认需要 E1（单账号探针）；本文的因果链是「静态差异 + 已证机制 + 时间相关性」的合成，不是受控实验结论。
+`v2.11.5-go` 引入 `zcode2api probe`（只读账号库、单账号、单请求），做了一组 A/B：
+
+| # | 版本 / 文案 | 出口 | 响应 |
+|---|---|---|---|
+| E0 | 3.16.3 / 3.16.x 档案 | proxy 146.190.80.158:9090 | **200**，正文 `OK`，`input_tokens=1684` |
+| E1 | 3.17.1 / 3.17.1 档案（首段已对齐 `You are ZCode, an interactive agent`，sha16 `7779642e…`） | 同上 | **405 / 3012**，547ms |
+
+E0/E1 同账号（`duhyod-13a388b1`）、同出口、同极简 body（`stream:false`、无 tools），
+只改「版本 + system 文案」⇒ **账号未被标记，差异确实来自 3.17.1 侧**；但也说明
+**H1（只差首段与身份段文字）不成立**：对齐首段后仍然 3012。
+
+### 7.1 新发现：身份段有两个变体
+
+3.17.1 的 `ContextBuilder.build()` 按「是否配置 Output Style」选择身份段：
+
+```js
+n = config.outputStyle?.prompt.trim() ? config.outputStyle : undefined
+t.push(wDn(n, midConversationSystem))   // wDn(e,t) => e ? pBa : dBa
+```
+
+- `pBa`：「You are an interactive agent that helps users according to their "Output Style"…」
+- `dBa`：「You are an agent working with the user toward their goals, using your own judgment along the way.」
+
+E1 用的是 `pBa`；桌面端默认（未配 Output Style）实际走 `dBa` ⇒ 身份段不匹配，
+这与 3012 完全一致。`v2.11.6-go` 已把档案重建为 `dBa` 变体（identity 1317 字符）。
+注意 3.15.3 里没有 `dBa` 这段文字（当时恒用 `pBa`），所以这是 3.17.x 的新行为。
+
+### 7.2 仍未排除
+
+- 若 `v2.11.6-go` 的 `dBa` 版本仍是 3012，则剩下两种可能：请求体字段差异
+  （tools / `output_config` / `context_management`）或上游尚未放行 3.17.1；
+  两者都只能靠官方客户端真实抓包定案（`probe --system-file` 可直接复现抓包文案）。
+- `x-zcode-session-features` 已静态排除：仅在会话记录过特性（tool_search/workflow 等）时发送，
+  一条 “hi” 的默认会话本来就不发。
+
+---
+
+## 8. 未验证与风险
+
+1. **已做在线实验（见 §7）**：E0=200 / E1=405 证明「只对齐首段」不足；H1 修正为「身份段变体（dBa）+ 文本」假设，待 v2.11.6-go 的探针复验。
 2. **3.17.1 桌面上下文段是否变化未知**：我们只能静态重建 CLI 身份段，桌面段（`# ZCode Desktop Context`）来自服务端下发，需真实抓包确认。
 3. **H1b（新头）未排除**：若 E1 失败，需按 E4 补头复测。
-4. **其它部署可能已受影响**：v2.11.4-go 默认即 3.17.1，建议尽快热修（§4.4）。
+4. **其它部署可能已受影响**：v2.11.4-go 默认即 3.17.1，v2.11.5-go 已把默认回退到 3.16.3，部署新版本即可解除。

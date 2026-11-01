@@ -59,6 +59,13 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 升级不改变任何接口、配置项与数据结构：用户无需操作；想固定或回退时设置
 `ZCODE_CLIENT_VERSION`（Compose 需在 `environment:` 显式引用该变量才会进容器）。
 
+`v2.11.6-go` **修正 3.17.1 文案的身份段变体**：探针对照实验（同账号/同出口/同请求体）
+证明「只对齐 system 首段」不够——3.17.1 默认会话走 `dBa` 变体
+（`You are an agent working with the user toward their goals…`），而非 `pBa`
+（带 Output Style 时才用）。本版把 3.17.1 档案重建为 `dBa`，并给 `probe` 增加
+`--system-file`（无需发版即可验证抓包文案）。默认版本仍为 3.16.3。
+详见 [发布说明](docs/releases/v2.11.6-go.md)。
+
 `v2.11.5-go` **回退默认客户端声明到 3.16.3**（3.17.1 需显式开启）：3.17.1 改了官方
 system 提示词首段（`You are ZCode, an interactive coding agent` → `You are ZCode, an interactive agent`，
 身份段首行与 Harness 缩进也变了），而上游从 system 第 0 字节校验到身份段末尾、并按

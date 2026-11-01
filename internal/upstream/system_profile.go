@@ -26,8 +26,13 @@ type ZcodeSystemProfileSummary struct {
 
 // ZcodeSystemSummary 取当前档案的 system 指纹（含 block 0 原文，便于人工核对）。
 func ZcodeSystemSummary() ZcodeSystemProfileSummary {
-	summary := ZcodeSystemProfileSummary{Profile: string(config.ZcodeSystemProfileKey())}
-	blocks := ZcodeSystemBlocks()
+	return ZcodeSystemSummaryFromBlocks(ZcodeSystemBlocks(), string(config.ZcodeSystemProfileKey()))
+}
+
+// ZcodeSystemSummaryFromBlocks 按给定 blocks 计算指纹，供 probe --system-file 的自定义
+// 文案复用同一套算法——人工还原时看到的指纹，必须与线上出站请求口径一致。
+func ZcodeSystemSummaryFromBlocks(blocks []any, profile string) ZcodeSystemProfileSummary {
+	summary := ZcodeSystemProfileSummary{Profile: profile}
 	summary.Blocks = len(blocks)
 	if len(blocks) == 0 {
 		return summary

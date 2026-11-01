@@ -40,10 +40,11 @@ import (
 const probeResponseLimit = 4096
 
 type probeOptions struct {
-	Model     string
-	Message   string
-	MaxTokens int
-	Timeout   time.Duration
+	Model      string
+	Message    string
+	MaxTokens  int
+	Timeout    time.Duration
+	SystemFile string
 }
 
 type probeCandidate struct {
@@ -62,6 +63,7 @@ type probeReport struct {
 	SystemFirstSHA    string `json:"system_first_sha16"`
 	SystemIdentitySHA string `json:"system_identity_sha16"`
 	SystemBlocks      int    `json:"system_blocks"`
+	SystemSource      string `json:"system_source"`
 	Account           string `json:"account"`
 	AccountName       string `json:"account_name"`
 	DeviceMidSrc      string `json:"device_mid_source"`
@@ -79,15 +81,16 @@ type probeReport struct {
 func runProbe(args []string) int {
 	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
 	var (
-		dbPath    = fs.String("db", config.DBPath, "账号库路径（默认 ZCODE_DATA_DIR/accounts.db）")
-		account   = fs.String("account", "", "账号 id 或 name；留空则挑最久未使用的一个")
-		listOnly  = fs.Bool("list", false, "只列出候选账号，不发请求")
-		clientVer = fs.String("client-version", "", "覆盖伪装版本（默认取 ZCODE_CLIENT_VERSION）")
-		modelName = fs.String("model", "glm-5.3", "探针模型")
-		message   = fs.String("message", "只回复 OK", "探针消息")
-		maxTokens = fs.Int("max-tokens", 16, "max_tokens")
-		timeout   = fs.Duration("timeout", 90*time.Second, "单请求超时")
-		dryRun    = fs.Bool("dry-run", false, "只打印将要发送的指纹，不发请求")
+		dbPath     = fs.String("db", config.DBPath, "账号库路径（默认 ZCODE_DATA_DIR/accounts.db）")
+		account    = fs.String("account", "", "账号 id 或 name；留空则挑最久未使用的一个")
+		listOnly   = fs.Bool("list", false, "只列出候选账号，不发请求")
+		clientVer  = fs.String("client-version", "", "覆盖伪装版本（默认取 ZCODE_CLIENT_VERSION）")
+		modelName  = fs.String("model", "glm-5.3", "探针模型")
+		message    = fs.String("message", "只回复 OK", "探针消息")
+		maxTokens  = fs.Int("max-tokens", 16, "max_tokens")
+		timeout    = fs.Duration("timeout", 90*time.Second, "单请求超时")
+		dryRun     = fs.Bool("dry-run", false, "只打印将要发送的指纹，不发请求")
+		systemFile = fs.String("system-file", "", "用自定义 JSON（{blocks:[…]}）覆盖 system，用于逐字节还原实验")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -96,6 +99,14 @@ func runProbe(args []string) int {
 		applyProbeClientVersion(v)
 	}
 	summary := upstream.ZcodeSystemSummary()
+	if file := strings.TrimSpace(*systemFile); file != "" {
+		blocks, loadErr := loadProbeSystemFile(file)
+		if loadErr != nil {
+			fmt.Fprintln(os.Stderr, "读取 system 文件失败: "+loadErr.Error())
+			return 1
+		}
+		summary = upstream.ZcodeSystemSummaryFromBlocks(blocks, "custom")
+	}
 
 	candidates, err := loadProbeCandidates(*dbPath)
 	if err != nil {
@@ -126,6 +137,7 @@ func runProbe(args []string) int {
 	}
 	report := probeSend(picked, summary, probeOptions{
 		Model: *modelName, Message: *message, MaxTokens: *maxTokens, Timeout: *timeout,
+		SystemFile: strings.TrimSpace(*systemFile),
 	})
 	exitCode := 1
 	if report.OK {
@@ -232,6 +244,40 @@ func queryProbeAccounts(dsn string) ([]probeCandidate, error) {
 	return out, nil
 }
 
+// loadProbeSystemFile 读取自定义 system 文案文件（{"blocks":[…]}）。
+//
+// 用途：拿到官方客户端的真实抓包后，不必重新发版就能逐字节复现它的 system；
+// 也方便做「只改一处」的对照实验。block 0 的 cache_control 与内嵌档案一样被剥掉，
+// 保证「文件模式」与「内建档案模式」的出站形态一致。
+func loadProbeSystemFile(path string) ([]any, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Blocks []any `json:"blocks"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	if len(payload.Blocks) == 0 {
+		return nil, fmt.Errorf("system 文件缺少 blocks（%s）", path)
+	}
+	blocks := make([]any, 0, len(payload.Blocks))
+	for i, item := range payload.Blocks {
+		block, ok := item.(map[string]any)
+		if !ok {
+			blocks = append(blocks, item)
+			continue
+		}
+		if i == 0 {
+			delete(block, "cache_control")
+		}
+		blocks = append(blocks, block)
+	}
+	return blocks, nil
+}
+
 // probeEligible 只留「启用的 JWT 账号且当前可正常使用」的候选。
 func probeEligible(acc *model.Account) bool {
 	if acc == nil || !acc.Enabled || acc.ArchivedAt != nil || acc.ModelProbeOnly {
@@ -270,6 +316,7 @@ func probeSend(picked *probeCandidate, summary upstream.ZcodeSystemProfileSummar
 		SystemFirstSHA:    summary.FirstSHA16,
 		SystemIdentitySHA: summary.IdentitySHA16,
 		SystemBlocks:      summary.Blocks,
+		SystemSource:      "builtin",
 		Account:           picked.ID,
 		AccountName:       picked.Name,
 		Model:             opt.Model,
@@ -288,6 +335,17 @@ func probeSend(picked *probeCandidate, summary upstream.ZcodeSystemProfileSummar
 			}},
 		},
 	}, true)
+	if opt.SystemFile != "" {
+		// 自定义文案：整块替换 system，其余（metadata、头、端点）与线上一致，
+		// 这样一次实验只改一个变量。
+		blocks, loadErr := loadProbeSystemFile(opt.SystemFile)
+		if loadErr != nil {
+			report.Error = "读取 system 文件失败: " + loadErr.Error()
+			return report
+		}
+		body["system"] = blocks
+		report.SystemSource = "file:" + opt.SystemFile
+	}
 	attr := upstream.NewAttribution(nil, "")
 	deviceMid, deviceSrc := probeDeviceMid(picked.acc)
 	report.DeviceMidSrc = deviceSrc

@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"strings"
 	"testing"
 
 	"zcode2api/internal/config"
@@ -14,13 +15,24 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 		config.ZcodeClientVersion, config.UserAgent = oldVersion, oldUA
 	})
 
+	// identityHead 是身份段首行：3.17.1 在没有 Output Style 时走 dBa 变体
+	// （"You are an agent working with the user…"），配错变体会被上游判 3012。
 	cases := []struct {
-		version string
-		profile string
-		prefix  string
+		version      string
+		profile      string
+		prefix       string
+		identityHead string
 	}{
-		{"3.16.3", "3.16.x", "You are ZCode, an interactive coding agent"},
-		{"3.17.1", "3.17.1", "You are ZCode, an interactive agent"},
+		{
+			"3.16.3", "3.16.x",
+			"You are ZCode, an interactive coding agent",
+			"You are an interactive ZCode agent that helps users with software engineering tasks.",
+		},
+		{
+			"3.17.1", "3.17.1",
+			"You are ZCode, an interactive agent",
+			"You are an agent working with the user toward their goals",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.version, func(t *testing.T) {
@@ -47,12 +59,29 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 			if len(blocks) < 2 {
 				t.Fatalf("system 块数 = %d, 期望 ≥2", len(blocks))
 			}
+			if head := identityHeadOf(blocks); !strings.HasPrefix(head, tc.identityHead) {
+				t.Fatalf("身份段首行 = %q, 期望以 %q 开头", head, tc.identityHead)
+			}
 			first, _ := blocks[0].(map[string]any)
 			if _, ok := first["cache_control"]; ok {
 				t.Fatal("block 0 不应带 cache_control")
 			}
 		})
 	}
+}
+
+// identityHeadOf 取 block 1 里身份段的第一行（去掉前导空行）。
+func identityHeadOf(blocks []any) string {
+	if len(blocks) < 2 {
+		return ""
+	}
+	second, _ := blocks[1].(map[string]any)
+	body, _ := second["text"].(string)
+	lines := strings.Split(strings.TrimPrefix(body, "\n"), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	return lines[0]
 }
 
 // 两个档案必须真的不同：相同就意味着档案没生效（embed 或选择器写错）。
