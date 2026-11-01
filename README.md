@@ -59,6 +59,12 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 升级不改变任何接口、配置项与数据结构：用户无需操作；想固定或回退时设置
 `ZCODE_CLIENT_VERSION`（Compose 需在 `environment:` 显式引用该变量才会进容器）。
 
+`v2.11.7-go` **按真实抓包逐字节修正 3.17.1 身份段**：官方客户端 model-io 显示身份段为
+1231 字符（sha16 `4058874023c7541f`），而静态提取把 Harness 里一个未展开的模板字面量
+（`${e?"…":"…"}`）也写了进去，多了 88 字符——上游按 `app_version` 校验
+「第 0 字节到身份段末尾」，差一个字节即 3012。本版改用抓包原文，并用测试锁死长度与指纹。
+详见 [发布说明](docs/releases/v2.11.7-go.md)。
+
 `v2.11.6-go` **修正 3.17.1 文案的身份段变体**：探针对照实验（同账号/同出口/同请求体）
 证明「只对齐 system 首段」不够——3.17.1 默认会话走 `dBa` 变体
 （`You are an agent working with the user toward their goals…`），而非 `pBa`

@@ -18,20 +18,26 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 	// identityHead 是身份段首行：3.17.1 在没有 Output Style 时走 dBa 变体
 	// （"You are an agent working with the user…"），配错变体会被上游判 3012。
 	cases := []struct {
-		version      string
-		profile      string
-		prefix       string
-		identityHead string
+		version       string
+		profile       string
+		prefix        string
+		identityHead  string
+		identityChars int
+		identitySHA16 string
 	}{
 		{
 			"3.16.3", "3.16.x",
 			"You are ZCode, an interactive coding agent",
 			"You are an interactive ZCode agent that helps users with software engineering tasks.",
+			1213, "fb4777a371fac341",
 		},
 		{
+			// 身份段字节数直接锁死：2026-11-01 的真实抓包显示上游按 app_version 校验
+			// 「system 第 0 字节到身份段末尾」，差 88 字节（模板字面量没展开）就会被判 3012。
 			"3.17.1", "3.17.1",
 			"You are ZCode, an interactive agent",
 			"You are an agent working with the user toward their goals",
+			1231, "4058874023c7541f",
 		},
 	}
 	for _, tc := range cases {
@@ -51,6 +57,12 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 			}
 			if summary.IdentityChars == 0 || summary.IdentitySHA16 == "" {
 				t.Fatalf("身份段指纹缺失: %+v", summary)
+			}
+			if summary.IdentityChars != tc.identityChars {
+				t.Fatalf("身份段长度 = %d, 期望 %d（多/少一个字节都会 3012）", summary.IdentityChars, tc.identityChars)
+			}
+			if summary.IdentitySHA16 != tc.identitySHA16 {
+				t.Fatalf("身份段 sha16 = %s, 期望 %s", summary.IdentitySHA16, tc.identitySHA16)
 			}
 			if got := OfficialSystemPrefix(); got != tc.prefix {
 				t.Fatalf("OfficialSystemPrefix = %q, 期望 %q", got, tc.prefix)

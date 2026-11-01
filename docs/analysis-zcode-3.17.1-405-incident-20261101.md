@@ -200,7 +200,26 @@ E1 用的是 `pBa`；桌面端默认（未配 Output Style）实际走 `dBa` ⇒
 这与 3012 完全一致。`v2.11.6-go` 已把档案重建为 `dBa` 变体（identity 1317 字符）。
 注意 3.15.3 里没有 `dBa` 这段文字（当时恒用 `pBa`），所以这是 3.17.x 的新行为。
 
-### 7.2 仍未排除
+### 7.2 真实抓包与逐字节修正（2026-11-01）
+
+官方 3.17.1 客户端（新账号，可正常对话）留下 `model-io-sess_e42884da….jsonl`，取其中一条真实请求：
+
+| 项 | 真实值 | 我方 v2.11.6-go | 判定 |
+|---|---|---|---|
+| block 0 | 35 字符 `You are ZCode, an interactive agent` | 相同 | 一致 |
+| 身份段 | 1231 字符，sha16 `4058874023c7541f` | 1317 字符 | 多 88 字符 |
+| system 块数 | 3（35 / 3119 / 3794） | 2 | 差异（含用户私有路径，不可逐字节校验） |
+
+88 字符来源：Harness 第 9 条项目符号在源码里是模板字面量
+`${e?"…mid-conversation system turns…":"…<system-reminder> tags…"}`，
+静态提取未展开、把 `${…}` 原样写入档案；真实桌面会话 `e=true` 只发前半句。
+按文档化机制（校验范围＝第 0 字节到身份段末尾），这就是 3012 的直接原因。
+
+真实请求其余画像：`user-agent: ZCode/3.17.1`（无 ai-sdk 后缀）、`x-zcode-agent: glm`、
+`x-zcode-query-source: main_turn`、**无 `x-device-mid`**；体含 `output_config{effort:max}`、
+`thinking{type:enabled}`、`tool_choice{type:auto}`、`tools 106`、`max_tokens 128000`。
+
+### 7.3 仍未排除
 
 - 若 `v2.11.6-go` 的 `dBa` 版本仍是 3012，则剩下两种可能：请求体字段差异
   （tools / `output_config` / `context_management`）或上游尚未放行 3.17.1；

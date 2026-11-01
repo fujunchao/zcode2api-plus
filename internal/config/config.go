@@ -506,7 +506,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.11.6-go"
+	AppVersion = "2.11.7-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。
