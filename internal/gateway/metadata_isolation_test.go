@@ -48,7 +48,7 @@ func TestMetadataIsolationSyncRetries(t *testing.T) {
 			body := msgBody()
 			// 官方前缀形态的调用者指令：preserve 分支原样保留（第三方前缀的
 			// 合并回退见 body_test 的 ForeignSystem 回归用例）。
-			body["system"] = "You are ZCode, an interactive coding agent synthetic-client-instructions"
+			body["system"] = upstream.OfficialSystemPrefix() + " synthetic-client-instructions"
 			body["metadata"] = map[string]any{"user_id": `{"device_id":"client","account_uuid":"client","session_id":"synthetic-session"}`, "trace_hint": "keep", "extension": map[string]any{"flag": true}}
 			NormalizeBody(body, false)
 			before, _ := marshalJSON(body)

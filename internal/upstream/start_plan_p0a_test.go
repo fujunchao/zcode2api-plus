@@ -42,6 +42,15 @@ func loadStartPlanGolden(t *testing.T) startPlanGoldenShape {
 	return golden
 }
 
+// useLegacyGoldenProfile 固定 3.16.3：golden 夹具（block 字符数/字节数）按 legacy 文案采集，
+// 升级默认版本不改变夹具语义。
+func useLegacyGoldenProfile(t *testing.T) {
+	t.Helper()
+	old := config.ZcodeClientVersion
+	t.Cleanup(func() { config.ZcodeClientVersion = old })
+	config.ZcodeClientVersion = "3.16.3"
+}
+
 func goldenProfile(g startPlanGoldenShape) config.ZcodeProfile {
 	return config.ZcodeProfile{
 		BarePlatform: g.Profile.BarePlatform,
@@ -53,6 +62,7 @@ func goldenProfile(g startPlanGoldenShape) config.ZcodeProfile {
 }
 
 func TestStartPlanFallbackSystemGoldenShape(t *testing.T) {
+	useLegacyGoldenProfile(t)
 	golden := loadStartPlanGolden(t)
 	blocks := BuildFallbackSystem(nil, goldenProfile(golden))
 	if len(blocks) != golden.Blocks {
@@ -93,6 +103,7 @@ func TestStartPlanFallbackSystemGoldenShape(t *testing.T) {
 }
 
 func TestBuildFallbackSystemMergesThirdPartyTextIntoBlockTwo(t *testing.T) {
+	useLegacyGoldenProfile(t)
 	golden := loadStartPlanGolden(t)
 	profile := goldenProfile(golden)
 	for _, tc := range []struct {

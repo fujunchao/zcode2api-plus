@@ -108,7 +108,7 @@ func TestNormalizeBodySystemInjection(t *testing.T) {
 func TestNormalizeBodyKnownSystemBlocksAreIdempotent(t *testing.T) {
 	useLegacyClientContext(t)
 	blocks := upstream.ZcodeFallbackSystemBlocks()
-	const prefix = "You are ZCode, an interactive coding agent"
+	prefix := upstream.OfficialSystemPrefix()
 	// 当前 profile 的精确标准块去重；缓存/扩展不同的调用者块继续保留。
 	known := blocks[0]
 	user := map[string]any{"type": "text", "text": "保留调用者的原始指令"}
