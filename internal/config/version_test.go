@@ -26,11 +26,11 @@ func TestClientVersionShape(t *testing.T) {
 	}
 }
 
-// 默认声明必须是「已核验 system 文案配对」的版本，而不是本机最新安装版本：
-// 3.17.1 改了官方 system 首段，文案档案尚未经 probe 验证，故默认仍留在 3.16.3
-// （见 docs/analysis-zcode-3.17.1-405-incident-20261101.md）。显式环境覆盖不受此限。
+// 默认声明必须是「已核验 system 文案配对」的版本：3.17.1 的档案已用官方抓包逐字节
+// 校准（identity 1235 B / sha16 4058874023c7541f），单账号探针 200 通过，故为默认。
+// 回退到 3.16.3 走环境变量，本断言只守默认值。
 func TestDefaultClientVersionHasVerifiedPromptPair(t *testing.T) {
-	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.16.3" {
+	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.17.1" {
 		t.Fatalf("默认客户端声明未同步: %q", ZcodeClientVersion)
 	}
 }
