@@ -304,6 +304,12 @@
   修复见 `v2.11.5-go`（默认回退 + `zcode_system_3171.json` + `probe` 探针）。
 - 根因与取证：[analysis-zcode-3.17.1-405-incident-20261101.md](analysis-zcode-3.17.1-405-incident-20261101.md)；
   探针操作：[runbook-zcode-3.17.1-probe-20261101.md](runbook-zcode-3.17.1-probe-20261101.md)。
+	- **v2.11.5-go 已发布（2026-11-01）**：commit `c961ede`、tag `v2.11.5-go`（tag object `f58e58f…`）、
+	  release run [41263374145](https://github.com/fujunchao/zcode2api-plus/actions/runs/41263374145)：
+	  validate 全绿、build 5/5、image 成功；Release 非 draft（5 个附件）；
+	  镜像 `2.11.5-go` 与 `latest` 同 digest `sha256:e1d015e2…`；
+	  产物抽查：内嵌 `2.11.5-go` 1 处、`2.11.4-go` 0 处、`3.16.3`（默认）1 处、`3.17.1`（文案档案）2 处。
+	- **待办**：部署 v2.11.5-go 后按 runbook 跑 `zcode2api probe`，把 JSON 贴回，据 200/405 决定 3.17.1 是否放量。
 
 ---
 
