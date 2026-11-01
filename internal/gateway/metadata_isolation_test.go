@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -49,7 +50,7 @@ func TestMetadataIsolationSyncRetries(t *testing.T) {
 			body := msgBody()
 			// 官方前缀形态的调用者指令：preserve 分支原样保留（第三方前缀的
 			// 合并回退见 body_test 的 ForeignSystem 回归用例）。
-			body["system"] = upstream.OfficialSystemPrefix() + " synthetic-client-instructions"
+			body["system"] = upstream.ZcodeSystemBlocks()
 			body["metadata"] = map[string]any{"user_id": `{"device_id":"client","account_uuid":"client","session_id":"synthetic-session"}`, "trace_hint": "keep", "extension": map[string]any{"flag": true}}
 			NormalizeBody(body, false)
 			before, _ := marshalJSON(body)
@@ -90,7 +91,7 @@ func TestMetadataIsolationSyncRetries(t *testing.T) {
 				if identity["device_id"] != acc.DeviceMidOr(config.DeviceMid()) || identity["session_id"] != "synthetic-session" || identity["session_id"] != call.Header.Get("X-Session-Id") || identity["account_uuid"] != "" {
 					t.Fatalf("隔离修复不能改变实际账号/会话身份：%v", identity)
 				}
-				if meta["trace_hint"] != "keep" || call.Body["system"] != body["system"] {
+				if meta["trace_hint"] != "keep" || !reflect.DeepEqual(call.Body["system"], body["system"]) {
 					t.Fatal("客户端扩展字段和指令不得被改写")
 				}
 			}
