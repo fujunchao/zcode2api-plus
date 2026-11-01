@@ -29,15 +29,16 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 			"3.16.3", "3.16.x",
 			"You are ZCode, an interactive coding agent",
 			"You are an interactive ZCode agent that helps users with software engineering tasks.",
-			1213, "fb4777a371fac341",
+			1217, "fb4777a371fac341",
 		},
 		{
-			// 身份段字节数直接锁死：2026-11-01 的真实抓包显示上游按 app_version 校验
+			// 身份段**字节数**直接锁死（Go 的 len(string) 就是上游口径，含多字节字符）：
+			// 2026-11-01 的真实抓包显示上游按 app_version 校验
 			// 「system 第 0 字节到身份段末尾」，差 88 字节（模板字面量没展开）就会被判 3012。
 			"3.17.1", "3.17.1",
 			"You are ZCode, an interactive agent",
 			"You are an agent working with the user toward their goals",
-			1231, "4058874023c7541f",
+			1235, "4058874023c7541f",
 		},
 	}
 	for _, tc := range cases {
