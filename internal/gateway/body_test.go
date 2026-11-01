@@ -322,18 +322,35 @@ func TestNormalizeBodyInjectsCurrentDateOnlyOnFallback(t *testing.T) {
 		t.Fatalf("重复规范化不得重复插入 currentDate: %d", len(content))
 	}
 
-	official := upstream.OfficialSystemPrefix() + "\n调用者完整上下文"
+	// 保留路径只认「块形态且首段+身份段与档案一致」；字符串形态没有身份段，
+	// 一律重建并把原文并入 dynamic 块（2026-11-01 第二条泄漏路径）。
+	official := upstream.ZcodeSystemBlocks()
 	preserved := map[string]any{
 		"system":   official,
 		"messages": []any{map[string]any{"role": "user", "content": "你好"}},
 	}
 	NormalizeBody(preserved, true)
-	if preserved["system"] != official {
+	if !reflect.DeepEqual(preserved["system"], official) {
 		t.Fatal("调用者官方 system 必须原样保留")
 	}
 	preservedContent, _ := preserved["messages"].([]any)[0].(map[string]any)["content"].([]any)
 	if len(preservedContent) != 1 || preservedContent[0].(map[string]any)["text"] != "你好" {
 		t.Fatal("调用者官方 system 路径不得注入 currentDate（content 只应桥接原文块）")
+	}
+
+	// 字符串形态：必须重建 canonical，且原文保留在 dynamic 块。
+	strBody := map[string]any{
+		"system":   upstream.OfficialSystemPrefix() + "\n调用者完整上下文",
+		"messages": []any{map[string]any{"role": "user", "content": "你好"}},
+	}
+	NormalizeBody(strBody, true)
+	strBlocks, _ := strBody["system"].([]any)
+	if len(strBlocks) < 2 {
+		t.Fatalf("字符串形态 system 必须重建为多块，实际 %d", len(strBlocks))
+	}
+	lastText, _ := strBlocks[len(strBlocks)-1].(map[string]any)["text"].(string)
+	if !strings.Contains(lastText, "调用者完整上下文") {
+		t.Fatal("字符串形态的调用者原文必须并入 dynamic 块")
 	}
 }
 
