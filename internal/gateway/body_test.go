@@ -175,14 +175,28 @@ func useLegacyClientContext(t *testing.T) {
 // 首段自带官方前缀的调用者（官方系客户端）已拥有完整上下文：原样保留，
 // 不改写其指令、缓存策略、顺序或扩展字段。
 func TestNormalizeBodyOfficialSystemIsIdempotent(t *testing.T) {
-	// 首段前缀取自当前伪装版本：默认值随客户端升级变化，硬编码旧文案会在升级时误报。
-	payload := `{"model":"GLM-5.3","system":[
-		{"type":"text","text":"` + upstream.OfficialSystemPrefix() + `","cache_control":{"type":"ephemeral","ttl":"1h"}},
-		{"type":"text","text":"重复但有意保留"},
-		{"type":"text","text":"重复但有意保留","caller_metadata":"保留"}
-	],"messages":[{"role":"user","content":"问题"}]}`
+	// 调用者自带完整官方上下文 = 首段 + 身份段都与本版本档案逐字节一致
+	// （只对上前缀不算：3.16.x 与 3.17.1 的块 0 只差几个字，2026-11-01 因此误判放过 3012）。
+	blocks := upstream.ZcodeSystemBlocks()
+	prefix := blocks[0].(map[string]any)["text"].(string)
+	identity := blocks[1].(map[string]any)["text"].(string)
+	payload := map[string]any{
+		"model": "GLM-5.3",
+		"system": []any{
+			map[string]any{"type": "text", "text": prefix, "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+			map[string]any{"type": "text", "text": identity},
+			map[string]any{"type": "text", "text": "重复但有意保留"},
+			map[string]any{"type": "text", "text": "重复但有意保留", "caller_metadata": "保留"},
+		},
+		"messages": []any{map[string]any{"role": "user", "content": "问题"}},
+	}
+	// 通过 JSON 往返模拟下游重新提交同一请求，不依赖 Go 对象的指针身份。
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var body map[string]any
-	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatal(err)
 	}
 	originalSystem, _ := json.Marshal(body["system"])

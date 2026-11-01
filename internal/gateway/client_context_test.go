@@ -30,9 +30,10 @@ func TestJWTKeepsCallerSystemOverHTTP(t *testing.T) {
 		{"empty_text", "", ""},
 		{"empty_blocks", []any{}, []any{}},
 		{"foreign_blocks_with_extensions", foreignBlocks, upstream.BuildFallbackSystem(map[string]any{"system": foreignBlocks}, config.ZcodeClientProfile())},
+		// 官方系客户端：首段与身份段都与当前档案一致，才原样保留（余下扩展块不动）。
 		{"complete_client_context", []any{
 			map[string]any{"type": "text", "text": upstream.OfficialSystemPrefix(), "cache_control": map[string]any{"type": "ephemeral"}},
-			map[string]any{"type": "text", "text": "这是客户端提供的扩展身份与交互规则。"},
+			map[string]any{"type": "text", "text": upstream.ZcodeSystemBlocks()[1].(map[string]any)["text"].(string)},
 			map[string]any{"type": "text", "text": "# Environment\nPrimary working directory: /client/work"},
 		}, nil},
 	} {
