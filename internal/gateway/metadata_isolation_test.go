@@ -12,6 +12,7 @@ import (
 	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
+	"zcode2api/internal/upstream"
 	"zcode2api/internal/web"
 )
 
