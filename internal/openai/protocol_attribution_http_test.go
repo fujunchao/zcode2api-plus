@@ -222,8 +222,15 @@ func assertProtocolSystem(t *testing.T, path, kind string, input map[string]any,
 		if blocks == nil || len(blocks) != 0 {
 			t.Fatal("兼容协议的显式空指令不能被当作缺省")
 		}
-	} else if len(blocks) != 1 || blocks[0].(map[string]any)["text"] != upstream.OfficialSystemPrefix()+"\n调用者完整 GUI 上下文：仅使用客户端提供的工具。" {
-		t.Fatal("兼容转换不能替换调用者完整 GUI 上下文")
+	} else if kind == "caller" {
+		// 兼容协议把调用者字符串落成单块 system；块形态下只有「首段 + 身份段都与当前档案一致」
+		// 才可原样透传（2026-11-01 事故），这里缺身份段 ⇒ 必须重建 canonical，并把原文并入 block 2。
+		want := upstream.BuildFallbackSystem(map[string]any{
+			"system": upstream.OfficialSystemPrefix() + "\n调用者完整 GUI 上下文：仅使用客户端提供的工具。",
+		}, config.ZcodeClientProfile())
+		if !reflect.DeepEqual(blocks, want) {
+			t.Fatal("兼容转换不能丢弃调用者完整 GUI 上下文（应并入 block 2）")
+		}
 	}
 }
 
