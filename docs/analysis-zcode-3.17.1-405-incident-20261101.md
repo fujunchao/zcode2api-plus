@@ -235,7 +235,42 @@ E1 用的是 `pBa`；桌面端默认（未配 Output Style）实际走 `dBa` ⇒
 system 第 3 块（含 `C:\Users\<用户>\…\memory/` 等私有路径）不参与校验——
 否则官方客户端在不同用户之间也无法通过。
 
-### 7.4 仍未排除
+### 7.4 切默认后的两条泄漏路径（2026-11-01 傍晚）
+
+把默认值切到 3.17.1（`v2.11.8-go`）后，生产再次出现 3012。日志显示问题不在档案本身，
+而在**「保留客户端 system」的判据**：`official_prefix_match=true` 但 `official_identity_match=false`，
+网关仍判定「官方客户端」并原样转发。
+
+| 路径 | 现场特征 | 为什么会漏 | 修复版本 |
+|---|---|---|---|
+| 块形态 | `system_form=blocks`、`system_source=input`、3 块 | 只比对块 0 前缀；3.16.x（42B）与 3.17.1（35B）前缀相近，切默认后恰好撞上 | v2.11.9-go |
+| 字符串形态 | `system_form=string`、`system_text_bytes=[66]` | 字符串分支同样只看前缀；字符串形态**无法携带身份段** | v2.11.10-go |
+
+为什么升到 3.17.1 才炸：默认 3.16.3 时调用者块 0（35B）与 42B 前缀**不匹配** → 走重建 → 200；
+切到 3.17.1 后块 0 恰好匹配 → 走保留 → 身份段不匹配 → 3012。
+
+### 7.5 最终判据与终验（2026-11-01 18:16）
+
+`ShouldPreserveCallerSystem` 的最终语义：
+
+| system 形态 | 行为 |
+|---|---|
+| 缺省 / nil 且有消息内 system | 保留（MCS 语义不变） |
+| 字符串：`""` | 保留（调用者声明无指令） |
+| 字符串：其它 | **重建**：三块 canonical，原文并入 dynamic 块 |
+| blocks：空切片 | 保留 |
+| blocks：块 0 与块 1 都等于当前档案 | 保留（调用者追加的块不动） |
+| blocks：其它 | **重建**：同上 |
+
+生产终验（`v2.11.10-go`，两条请求均 200，3012 计数 0）：
+
+```text
+system_source=legacy_merge system_form=blocks system_blocks=3
+system_text_bytes=[35,2335,5291]
+official_prefix_match=true official_identity_match=true
+```
+
+### 7.6 仍未排除
 
 - 若 `v2.11.6-go` 的 `dBa` 版本仍是 3012，则剩下两种可能：请求体字段差异
   （tools / `output_config` / `context_management`）或上游尚未放行 3.17.1；

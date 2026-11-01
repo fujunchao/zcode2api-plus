@@ -54,6 +54,22 @@ docker exec -e ZCODE_CLIENT_VERSION=<新版本> <容器> zcode2api probe --accou
 判定：`200` 且 `business_code` 为空 ⇒ 通过；`405 / 3012` ⇒ 身份段仍不一致，
 回到第 2 步比对 `system_identity_sha16` 与抓包 sha16。
 
+**⚠️ 探针覆盖不到 preserve 分支**：`probe` 走的是 builtin 档案，不经过「保留客户端 system」。
+升版本后必须再打两条**真实请求**，覆盖两种泄漏形态：
+
+```bash
+# (a) 普通请求（无 system）→ 期望 system_source=gateway_fallback
+curl -s -X POST http://127.0.0.1:3000/v1/messages -H "Authorization: Bearer $KEY" \
+  -d '{"model":"glm-5.3","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}'
+
+# (b) 字符串形态（官方前缀 + 自定义）→ 期望 system_source=legacy_merge，不是 input
+curl -s -X POST http://127.0.0.1:3000/v1/messages -H "Authorization: Bearer $KEY" \
+  -d '{"model":"glm-5.3","max_tokens":16,"system":"You are ZCode, an interactive agent\\n\\ncustom","messages":[{"role":"user","content":"ping"}]}'
+
+# 两条都应 200，且日志里 official_identity_match=true、3012 计数为 0
+docker compose logs --since 3m zcode2api | grep 'system_source='
+```
+
 ## 5. 灰度与回滚
 
 1. 只把「一个实例/部署」的 `ZCODE_CLIENT_VERSION` 改成新版本并重启；
