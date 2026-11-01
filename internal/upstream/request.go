@@ -21,6 +21,14 @@ import (
 //go:embed zcode_system.json
 var zcodeSystemJSON []byte
 
+// 3.17.1 起的官方文案（CLI Prefix 去掉 "coding"、身份段首行改写、Harness 缩进变化）。
+// 档案必须与 config.ZcodeClientVersion 成对选择：上游从 system 第 0 字节校验到
+// 身份段末尾，只升版本不换文案会被判 405/3012
+// （见 docs/analysis-zcode-3.17.1-405-incident-20261101.md）。
+//
+//go:embed zcode_system_3171.json
+var zcodeSystem3171JSON []byte
+
 type zcodeDynamicSections struct {
 	BeforeEnvironment string `json:"beforeEnvironment"`
 	AfterEnvironment  string `json:"afterEnvironment"`
@@ -32,10 +40,46 @@ type zcodeSystemFile struct {
 }
 
 var (
-	zcodeOnce         sync.Once
+	zcodeMu           sync.Mutex
+	zcodeCacheProfile config.ZcodeSystemProfile
+	zcodeCacheValid   bool
 	zcodeStaticBlocks []any
 	zcodeDynamic      zcodeDynamicSections
 )
+
+// zcodeProfileSource 按档案取内嵌文案：3.17.1 走独立档案，其余沿用 legacy。
+func zcodeProfileSource(profile config.ZcodeSystemProfile) []byte {
+	if profile == config.ZcodeSystemProfile3171 {
+		return zcodeSystem3171JSON
+	}
+	return zcodeSystemJSON
+}
+
+// zcodeProfileData 解析并缓存「当前伪装版本对应的文案档案」。
+//
+// 缓存必须按档案键控：probe 子命令与测试会临时改 config.ZcodeClientVersion，
+// 换了档案还复用旧文案，就会重演 3.17.1 事故（版本与文案各说各话）。
+func zcodeProfileData() ([]any, zcodeDynamicSections) {
+	profile := config.ZcodeSystemProfileKey()
+	zcodeMu.Lock()
+	defer zcodeMu.Unlock()
+	if zcodeCacheValid && zcodeCacheProfile == profile {
+		return zcodeStaticBlocks, zcodeDynamic
+	}
+	var parsed zcodeSystemFile
+	if err := json.Unmarshal(zcodeProfileSource(profile), &parsed); err != nil || len(parsed.Blocks) == 0 {
+		parsed = zcodeSystemFile{Blocks: []any{}}
+	}
+	zcodeStaticBlocks, zcodeDynamic = parsed.Blocks, parsed.DynamicSections
+	zcodeCacheProfile, zcodeCacheValid = profile, true
+	return zcodeStaticBlocks, zcodeDynamic
+}
+
+// zcodeDynamicConfig 返回当前档案的 dynamic 段模板（# Environment 前后两段）。
+func zcodeDynamicConfig() zcodeDynamicSections {
+	_, dynamic := zcodeProfileData()
+	return dynamic
+}
 
 // ZcodeSystemBlocks 返回 ZCode 官方系统提示词的静态块（JSON 解析失败时为空，对齐 Python 版）。
 // 用于 JWT 缺省上下文、回退合并与官方前缀判定；调用者自带官方前缀（或显式空值 /
@@ -60,18 +104,9 @@ func ZcodeSystemBlocks() []any {
 // 块 0（CLI Prefix）不带 cache_control，块 1（稳定身份段）保留 ephemeral。
 // 所有档案一致，不再只对 electron 删除。
 func copyZcodeStaticBlocks() []any {
-	zcodeOnce.Do(func() {
-		var parsed zcodeSystemFile
-		if err := json.Unmarshal(zcodeSystemJSON, &parsed); err != nil {
-			zcodeStaticBlocks = []any{}
-			zcodeDynamic = zcodeDynamicSections{}
-			return
-		}
-		zcodeStaticBlocks = parsed.Blocks
-		zcodeDynamic = parsed.DynamicSections
-	})
-	blocks := make([]any, 0, len(zcodeStaticBlocks))
-	for i, raw := range zcodeStaticBlocks {
+	staticBlocks, _ := zcodeProfileData()
+	blocks := make([]any, 0, len(staticBlocks))
+	for i, raw := range staticBlocks {
 		block, ok := raw.(map[string]any)
 		if !ok {
 			blocks = append(blocks, raw)

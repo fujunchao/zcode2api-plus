@@ -40,6 +40,7 @@ const cliUsage = `ZCode2api (Go)
   zcode2api set-admin-key <key>        设置后台密码
   zcode2api export [file]              导出账号
   zcode2api import <file>              导入账号
+  zcode2api probe [--list] [--account X]  单账号单请求探针（验证版本↔文案配对）
 `
 
 // runCLI 命令分发；返回进程退出码。cmd 为空串表示无参数。
@@ -83,6 +84,8 @@ func runCLI(cmd string, rest []string, serveFn func() int) int {
 	case "import":
 		cmdImport(rest)
 		return 0
+	case "probe":
+		return runProbe(rest)
 	}
 	fmt.Println(web.Red + "未知命令: " + cmd + web.Reset)
 	fmt.Print(cliUsage)

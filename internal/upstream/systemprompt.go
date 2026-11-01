@@ -124,9 +124,10 @@ func BuildFallbackSystem(body map[string]any, profile config.ZcodeProfile) []any
 // fallbackDynamicText 按官方顺序拼接 dynamic 段：
 // 两个换行 + beforeEnvironment + 两个换行 + Environment + 两个换行 + afterEnvironment。
 func fallbackDynamicText(profile config.ZcodeProfile) string {
-	return "\n\n" + zcodeDynamic.BeforeEnvironment +
+	dynamic := zcodeDynamicConfig()
+	return "\n\n" + dynamic.BeforeEnvironment +
 		"\n\n" + environmentTextFor(profile) +
-		"\n\n" + zcodeDynamic.AfterEnvironment
+		"\n\n" + dynamic.AfterEnvironment
 }
 
 // callerSystemText 把第三方 system 压成一段文本，供并入 dynamic 块。

@@ -26,9 +26,11 @@ func TestClientVersionShape(t *testing.T) {
 	}
 }
 
-// 默认声明必须与本次核验的桌面补丁版本一致；显式环境覆盖仍由既有配置入口接管。
-func TestDefaultClientVersionMatchesInstalledClient(t *testing.T) {
-	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.17.1" {
+// 默认声明必须是「已核验 system 文案配对」的版本，而不是本机最新安装版本：
+// 3.17.1 改了官方 system 首段，文案档案尚未经 probe 验证，故默认仍留在 3.16.3
+// （见 docs/analysis-zcode-3.17.1-405-incident-20261101.md）。显式环境覆盖不受此限。
+func TestDefaultClientVersionHasVerifiedPromptPair(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.16.3" {
 		t.Fatalf("默认客户端声明未同步: %q", ZcodeClientVersion)
 	}
 }

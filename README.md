@@ -53,10 +53,19 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 同步、异步及 OpenAI 兼容模型请求均跳过验证码，不依赖浏览器或人工回填；
 **套餐领取仍保留验证码**，因此自动领取场景不要关闭浏览器求解开关。
 该策略使用验证码配置缓存（默认 1 小时，失败保留 last-good），字段缺失或配置获取失败时保留原验证要求。
-默认客户端版本已同步至 `3.17.1`；若部署显式设置了 `ZCODE_CLIENT_VERSION` 或
-`UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。版本特定的内部状态与回滚要求见下方发布说明。
+默认客户端版本为 `3.16.3`（3.17.1 改了官方 system 首段、需配独立文案档案，尚未通过探针验证）；
+若部署显式设置了 `ZCODE_CLIENT_VERSION` 或 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。
+版本特定的内部状态与回滚要求见下方发布说明。
 升级不改变任何接口、配置项与数据结构：用户无需操作；想固定或回退时设置
 `ZCODE_CLIENT_VERSION`（Compose 需在 `environment:` 显式引用该变量才会进容器）。
+
+`v2.11.5-go` **回退默认客户端声明到 3.16.3**（3.17.1 需显式开启）：3.17.1 改了官方
+system 提示词首段（`You are ZCode, an interactive coding agent` → `You are ZCode, an interactive agent`，
+身份段首行与 Harness 缩进也变了），而上游从 system 第 0 字节校验到身份段末尾、并按
+`app_version` 期望对应文案——只升版本号会全量 405/3012
+（[根因分析](docs/analysis-zcode-3.17.1-405-incident-20261101.md)）。本版默认回落 3.16.3，
+新增 3.17.1 文案档案与 `zcode2api probe` 单账号探针；3.17.1 待探针验证通过后再改默认。
+详见 [发布说明](docs/releases/v2.11.5-go.md)。
 
 `v2.11.4-go` 同步 **ZCode 3.17.1 客户端声明**（模型请求协议未变）：默认伪装版本
 `3.16.3 → 3.17.1`，UA / `X-ZCode-App-Version` / `app_version` 随常量派生；伪装头集合、
