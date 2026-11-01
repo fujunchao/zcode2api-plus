@@ -219,7 +219,23 @@ E1 用的是 `pBa`；桌面端默认（未配 Output Style）实际走 `dBa` ⇒
 `x-zcode-query-source: main_turn`、**无 `x-device-mid`**；体含 `output_config{effort:max}`、
 `thinking{type:enabled}`、`tool_choice{type:auto}`、`tools 106`、`max_tokens 128000`。
 
-### 7.3 仍未排除
+### 7.3 验证通过（2026-11-01 13:56）
+
+`v2.11.7-go` 探针（同账号、单请求）返回 **200 OK**，正文 `OK`，`input_tokens=1688`，
+`system_identity_sha16=4058874023c7541f` 与官方抓包**逐字节相同**，`elapsed_ms=2265`。
+
+| 实验 | 版本 / 文案 | identity sha16 | 响应 |
+|---|---|---|---|
+| E0 | 3.16.3 / 3.16.x | fb4777a371fac341 | 200 |
+| E1 | 3.17.1 / pBa 变体 | a01e1fb2c2ea0bea | 405 / 3012 |
+| E2 | 3.17.1 / dBa 变体（模板字面量未展开） | 20f3146ce6a0256d | 405 / 3012 |
+| E3 | 3.17.1 / dBa + 抓包原文 | **4058874023c7541f** | **200** |
+
+⇒ **上游只按「第 0 字节 → 身份段末尾」逐字节校验；差 88 字节即 3012。**
+system 第 3 块（含 `C:\Users\<用户>\…\memory/` 等私有路径）不参与校验——
+否则官方客户端在不同用户之间也无法通过。
+
+### 7.4 仍未排除
 
 - 若 `v2.11.6-go` 的 `dBa` 版本仍是 3012，则剩下两种可能：请求体字段差异
   （tools / `output_config` / `context_management`）或上游尚未放行 3.17.1；
