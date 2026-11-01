@@ -33,7 +33,9 @@ func TestShouldPreserveCallerSystemRequiresIdentityMatch(t *testing.T) {
 		{"官方两块 + 调用者追加块", map[string]any{"system": withExtra}, true},
 		{"前缀对但身份段不同", map[string]any{"system": mismatched}, false},
 		{"首段是第三方文本", map[string]any{"system": []any{map[string]any{"type": "text", "text": "You are Claude Code"}}}, false},
-		{"字符串形态仍按前缀", map[string]any{"system": prefix + " 调用者补充"}, true},
+		// 字符串形态没有身份段：除显式空值外一律重建（2026-11-01 第二条泄漏路径）。
+		{"字符串形态：官方前缀 + 自定义指令", map[string]any{"system": prefix + " 调用者补充"}, false},
+		{"字符串形态：仅官方前缀", map[string]any{"system": prefix}, false},
 		{"空 system 且无消息内 system", map[string]any{"system": ""}, true},
 	}
 	for _, tc := range cases {

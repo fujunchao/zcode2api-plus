@@ -38,10 +38,10 @@ func ShouldPreserveCallerSystem(body map[string]any) bool {
 	case nil:
 		return HasSystemMessages(body)
 	case string:
-		if value == "" {
-			return true
-		}
-		return hasOfficialSystemPrefix(value)
+		// 字符串形态无法携带身份段：除「显式空值＝调用者声明无指令」外一律重建。
+		// 只比对前缀会把「官方前缀 + 自定义指令」原样送出，缺身份段必被上游判 3012
+		// （2026-11-01 事故的第二条泄漏路径：system_form=string）。
+		return value == ""
 	case []any:
 		if len(value) == 0 {
 			return true
@@ -54,7 +54,6 @@ func ShouldPreserveCallerSystem(body map[string]any) bool {
 		return false
 	}
 }
-
 
 // callerBlocksMatchOfficial 判断块形态的 system 是否与当前档案的「首段 + 身份段」逐字节一致。
 //
@@ -81,12 +80,6 @@ func callerBlocksMatchOfficial(blocks []any) bool {
 		}
 	}
 	return true
-}
-
-// hasOfficialSystemPrefix 文本是否以官方块 0（固定前缀）开头。
-func hasOfficialSystemPrefix(text string) bool {
-	prefix := OfficialSystemPrefix()
-	return prefix != "" && strings.HasPrefix(text, prefix)
 }
 
 // OfficialSystemPrefix 官方 system 首段（块 0）的固定文本；zcode_system.json 解析

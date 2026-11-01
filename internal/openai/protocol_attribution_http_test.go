@@ -213,8 +213,16 @@ func assertProtocolSystem(t *testing.T, path, kind string, input map[string]any,
 		return
 	}
 	if path == "/v1/messages" || path == "/async/v1/messages" {
+		if kind == "caller" {
+			// 字符串形态没有身份段：必须重建 canonical，调用者原文并入 dynamic 块。
+			want := upstream.BuildFallbackSystem(map[string]any{"system": input["system"]}, config.ZcodeClientProfile())
+			if !reflect.DeepEqual(system, want) {
+				t.Fatal("字符串形态的调用者 system 必须重建为 canonical，原文并入 dynamic 块")
+			}
+			return
+		}
 		if !reflect.DeepEqual(system, input["system"]) {
-			t.Fatal("调用者官方/显式空 system 应完全保真")
+			t.Fatal("显式空 system 应完全保真")
 		}
 		return
 	}
