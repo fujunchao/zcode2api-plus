@@ -19,11 +19,11 @@ jobs:
   validate:
     # 本地相对路径复用保证 CI 定义与待发布代码来自同一提交。
     # 任一验证任务失败或取消，下面的发布任务均不会执行。
-    # validate_only：跳过前端/镜像/交叉编译——紧随其后的 build、image 两个 job 会真正
-    # 编译五个平台并构建镜像，重复一遍只是让发版多等 2 分钟。
+    #
+    # 这里**不**传 validate_only：实测（2026-11-02，v2.11.11）跳过前端/镜像/交叉编译对
+    # 墙钟 0 收益——它们在并行分支上，关键路径是 test-repeat；少跑三个 job 只会削弱门禁。
+    # 发版变快来自 test 已拆成三个并行 job，不是靠跳 job。
     uses: ./.github/workflows/ci.yml
-    with:
-      validate_only: true
 
   build:
     needs: validate
