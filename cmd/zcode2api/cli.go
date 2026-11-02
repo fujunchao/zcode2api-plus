@@ -342,7 +342,13 @@ func cmdStatus() {
 	fmt.Println(web.Cyan + "\n--- zcode2api-plus (Go) 状态 ---" + web.Reset)
 	fmt.Printf("数据库      : %s\n", web.Blue+config.DBPath+web.Reset)
 	fmt.Printf("默认端口    : %s\n", web.Blue+strconv.Itoa(config.Port)+web.Reset)
-	st := openStore()
+	// 只读打开优先：服务常驻时持有 SQLite 独占锁，用可写入口会被直接挡住，
+	// 而 status 只需要「密钥是否已设置」「有多少账号」这类只读信息。
+	// 首次安装（库还没建）才回退到可写入口，顺带完成建库。
+	st, err := store.NewReadOnly()
+	if err != nil {
+		st = openStore()
+	}
 	defer func() { _ = st.Close() }()
 	if st.AdminKey() != "" {
 		fmt.Println("后台密码    : 已设置")

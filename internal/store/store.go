@@ -149,6 +149,108 @@ func New() (*Store, error) {
 	return s, nil
 }
 
+// NewReadOnly 以只读方式打开数据库并加载「status 需要的最小快照」。
+//
+// 为什么要它：服务常驻时会持有 SQLite 独占锁并保持 WAL 连接，CLI 用 NewExclusive
+// 打开会直接失败（"数据库正在被其他服务或 CLI 使用"）——而「有多少账号、密钥是否
+// 已设置」这种只读问题不该被主进程挡住。
+//
+// 与 New 的差别：不建表、不迁移、不写任何字段（只读连接上写会直接报错），因此
+// 它也不会补全新字段——迁移仍然只由 serve 进程负责。
+func NewReadOnly() (*Store, error) {
+	db, err := openDBReadOnly(config.DBPath)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{
+		Requests:           requeststats.New(),
+		db:                 db,
+		accounts:           map[string][]*model.Account{model.ProviderZai: {}},
+		settings:           map[string]string{},
+		initializations:    map[string]*InitializationTask{},
+		initializationRuns: map[string]string{},
+		rotation:           map[string]int{},
+		lineTruncStrikes:   map[string]int{},
+		lineTruncTotals:    map[string]int{},
+		strictJournalPath:  config.DBPath + ".strict-proxy.json",
+	}
+	if err := s.loadReadOnly(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// openDBReadOnly 只读打开：不建目录、不改 journal 模式，避免在只读卷上失败。
+func openDBReadOnly(path string) (*sql.DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// loadReadOnly 只读加载 status 需要的两组数据：后台/网关密钥与账号快照。
+//
+// 迁移、初始化、建表全部跳过——那些都会写库，只读连接上必然失败；status 只需要
+// 「密钥是否已设置」和「账号数量/可用数」，不值得为它冒写入风险。
+func (s *Store) loadReadOnly() error {
+	settings := map[string]string{
+		"admin_key":              "",
+		"gateway_key":            "",
+		"quota_refresh_interval": strconv.Itoa(config.QuotaRefreshInterval),
+	}
+	rows, err := s.db.Query(fmt.Sprintf("SELECT key, value FROM %s WHERE key IN ('admin_key', 'gateway_key')", metaTable))
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			rows.Close()
+			return err
+		}
+		settings[k] = v
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	s.settings = settings
+	s.publishSettings()
+
+	accounts := map[string][]*model.Account{model.ProviderZai: {}}
+	accountRows, err := s.db.Query(fmt.Sprintf("SELECT data FROM %s ORDER BY created_at ASC", accountsTable))
+	if err != nil {
+		return err
+	}
+	defer accountRows.Close()
+	for accountRows.Next() {
+		var data string
+		if err := accountRows.Scan(&data); err != nil {
+			return err
+		}
+		acc, err := model.FromJSON([]byte(data))
+		if err != nil {
+			continue // 坏行跳过（与 load 一致）
+		}
+		if _, ok := accounts[acc.Provider]; ok {
+			accounts[acc.Provider] = append(accounts[acc.Provider], acc)
+		}
+	}
+	s.accounts = accounts
+	return accountRows.Err()
+}
+
 // Close 关闭数据库连接。
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {

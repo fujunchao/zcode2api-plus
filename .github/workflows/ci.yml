@@ -16,7 +16,14 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    # go-rewrite 只接受「来自已绿分支的 ff 合并」，树与分支完全一致，重复跑一遍 CI 纯属浪费；
+    # 发布门禁由 release.yml 的 validate（复用本文件）保证，不靠这条 push 触发。
+    branches: ["**", "!go-rewrite"]
+    # 纯文档提交不可能影响构建产物，跳过整条流水线；发布仍走 release.yml 的全量 validate。
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "temp/**"
   pull_request:
   workflow_call:
     inputs:
@@ -25,6 +32,11 @@ on:
         type: string
         required: false
         default: "linux/amd64"
+      validate_only:
+        description: "只跑必要校验（跳过前端/镜像/交叉编译）；release.yml 的构建阶段会真正编译各平台"
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       # 手动触发时可指定多个平台，用来验证 release.yml 的多架构路径（含 QEMU 下的
@@ -34,6 +46,11 @@ on:
         type: string
         required: false
         default: "linux/amd64"
+      validate_only:
+        description: "只跑必要校验（跳过前端/镜像/交叉编译）"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -55,6 +72,8 @@ jobs:
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
 
   frontend:
+    # validate_only：发布流水线的 validate 阶段跳过——紧随其后的 build/image 会真正编译各平台。
+    if: ${{ !inputs.validate_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,6 +100,7 @@ jobs:
           git diff --exit-code -- dist
           test -z "$(git ls-files --others --exclude-standard -- dist)"
 
+  # 常规测试 job：编译 + 静态检查 + 全量单测（-race 与重复性回归已拆到并行 job）。
   test:
     runs-on: ubuntu-latest
     steps:
@@ -99,6 +119,38 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+  # 竞态检查独立 job：与常规测试并行，把原 test job 的墙钟从约 7.5 分钟压到约 4 分钟。
+  # 失败时能一眼看出是数据竞争而非普通断言失败；-count=1 关掉测试结果缓存，
+  # 竞态是时序相关的，缓存下来的 PASS 不能当作「这次真的跑过检测器」。
+  test-race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
+      # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
+      # 「这次真的跑过检测器」。编译缓存仍然生效，代价只是重跑一次测试。
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+
+  # 重复性回归（-count=10/20）独立 job：都是确定性的重复验证，与上面两个 job 无依赖；
+  # 拆开只为并行，步骤内容一字未改，失败仍按步骤名定位。
+  test-repeat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
       # 未支持的卡/订阅上下文必须早拒绝，合法头、换号和异步行为保持；仅用合成数据。
       - name: Test account context boundary regression (repeat)
@@ -148,12 +200,6 @@ jobs:
       # 恢复探测使用合成凭据、受控时钟、隔离 SQLite 和本地 HTTP，不访问真实套餐。
       - name: Test API key quota recovery regression (repeat)
         run: go test ./internal/store ./internal/gateway ./internal/openai -run 'TestQuotaProbe|TestAPIKeyQuota' -count=20 -timeout=180s
-
-      # 竞态检查单独一步：失败时能一眼看出是数据竞争而非普通断言失败。
-      # -count=1 关掉测试结果缓存：竞态是时序相关的，缓存下来的 PASS 不能当作
-      # 「这次真的跑过检测器」。编译缓存仍然生效，代价只是重跑一次测试。
-      - name: Test (race)
-        run: go test -race -count=1 ./...
 
       - name: Repeat model probe contracts
         run: go test ./internal/modelprobe ./internal/adminapi ./internal/store ./internal/gateway ./internal/asyncpool -run '^TestModelProbe' -count=10 -timeout=240s
@@ -234,6 +280,8 @@ jobs:
 
   # 平台矩阵下只做编译：确认可交叉编译（与 release.yml 的目标一致），不重复跑测试
   cross-build:
+    # validate_only：发布流水线的 validate 阶段跳过——紧随其后的 build/image 会真正编译各平台。
+    if: ${{ !inputs.validate_only }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -261,6 +309,8 @@ jobs:
   # 镜像构建守门员：本地不一定装了 Docker（本仓库开发者机器就没有），
   # 所以 Dockerfile 的正确性只能靠这里保证。只构建不推送，推送上 GHCR 在 release.yml。
   docker:
+    # validate_only：发布流水线的 validate 阶段跳过——紧随其后的 build/image 会真正编译各平台。
+    if: ${{ !inputs.validate_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
