@@ -484,8 +484,11 @@ var (
 	// （事故见 docs/analysis-zcode-3.17.1-405-incident-20261101.md）。
 	// 2026-11-01 晚：3.17.1 档案已用官方抓包逐字节校准（identity 1235 B / sha16
 	// 4058874023c7541f），单账号探针 200 通过，故恢复 3.17.1 为默认。
-	// 回退：ZCODE_CLIENT_VERSION=3.16.3（改环境变量重启即可，无需换镜像）。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.17.1")
+	// 2026-11-03 同步 3.17.2：CLI system 文案与 3.17.1 逐字节相同（block0 35 B /
+	// sha16 7779642e…，身份段 1235 B / 4058874023c7541f），来源头/端点/UA/模型目录
+	// 均未变，复用 3171 档案（映射见 zcode_system_profile.go）。
+	// 回退：ZCODE_CLIENT_VERSION=3.17.1（改环境变量重启即可，无需换镜像）。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.17.2")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
