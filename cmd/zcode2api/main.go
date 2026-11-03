@@ -206,6 +206,13 @@ func printBanner(st *store.Store) {
 		fmt.Sprintf("%s后台管理%s  %s%s/admin/login%s", web.Dim, web.Reset, web.Cyan, base, web.Reset),
 		fmt.Sprintf("%s对话端点%s  %s%s/v1/messages%s", web.Dim, web.Reset, web.Cyan, base, web.Reset),
 	}
+	// 版本与 system 文案必须成对：默认值走精确映射表，未命中时显式告警，
+	// 避免「新版本号 + 旧文案」静默出站（3.17.1 事故形态，见 docs/analysis-zcode-3.17.1-405-incident-20261101.md）。
+	if _, exact := config.ZcodeSystemProfileForExact(config.ZcodeClientVersion); !exact {
+		lines = append(lines, fmt.Sprintf(
+			"%s⚠ 客户端版本 %s 没有精确 system 文案档案，已回落 legacy；与上游校验口径不符会 405/3012%s",
+			web.Yellow, config.ZcodeClientVersion, web.Reset))
+	}
 	if st.GeneratedAdminKey != "" {
 		lines = append(lines, fmt.Sprintf(
 			"%s初始后台密码%s  %s%s%s %s（请登录后尽快在「设置」页修改）%s",

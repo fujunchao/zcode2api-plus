@@ -40,6 +40,14 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 			"You are an agent working with the user toward their goals",
 			1235, "4058874023c7541f",
 		},
+		{
+			// 3.17.2 的 CLI 文案与 3.17.1 逐字节相同（2026-11-03 逆向核验：同一份档案），
+			// 两行必须同时通过：只改版本不补映射、或档案被改坏，都会在这里变红。
+			"3.17.2", "3.17.1",
+			"You are ZCode, an interactive agent",
+			"You are an agent working with the user toward their goals",
+			1235, "4058874023c7541f",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.version, func(t *testing.T) {
