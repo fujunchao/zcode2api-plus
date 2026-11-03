@@ -34,6 +34,18 @@ python temp/incident-20261031/extract_model_io.py --roots "<rollout 目录>"
 静态提取会把 `${…}` 原样抄进去 → 多几十字节 → 全量 3012。
 **一律以抓包原文为准**，不要用源码字符串直接拼。
 
+### 2.1 档案文件完整性校验（哈希口径）
+
+档案 JSON 的 sha256 与**取文件的方式**有关，别拿错基准：
+
+| 口径 | 大小 | 说明 |
+|---|---|---|
+| Git blob / `raw.githubusercontent.com`（LF） | 7,728 B | **校验用这个**（Linux 检出、`curl` 下载都是它） |
+| Windows 工作区检出（`core.autocrlf=true` → CRLF） | 7,749 B | 仅换行符不同，解析结果一致 |
+
+3.17.1 档案的 blob 口径 sha256 = `df76f852d50cdd279638b5f3f64b7090168bb70b8f6fe0e9d9064fbdbf829620`。
+判定是否「档案没坏」最终仍以 `probe --dry-run` 的两项指纹为准（block0 长度/sha16 + 身份段字节数/sha16），哈希只用来防传输损坏。
+
 ## 3. 生成档案
 
 档案结构：`{"blocks":[{"type":"text","text":...},…],"dynamicSections":{…}}`；

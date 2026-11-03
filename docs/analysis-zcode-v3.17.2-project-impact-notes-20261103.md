@@ -166,3 +166,40 @@
 4. 任何一步出现 405 / 3012：回退 ZCODE_CLIENT_VERSION=3.17.1 并重启（compose 需 -e），不需要换镜像。
 
 说明：按 AGENTS.md，本地不跑 go test；改动推分支后由 GitHub Actions 验证，用 gh run watch 看结果。
+
+---
+
+## 十一、实测验证（2026-11-03，单账号探针，已闭环）
+
+> 环境：生产容器 `ghcr.io/fujunchao/zcode2api-plus:v2.11.10-go`（3.17.1 默认、**不含**本分支改动），用路径 A 做等价验证：
+> `probe --client-version 3.17.2 --system-file <3171 档案>`——版本头换成 3.17.2、system 用 3.17.2 应发的那份文案，等价于合并后的出站形态。
+
+| 判定项 | 实测 | 期望 | 结论 |
+|---|---|---|---|
+| dry-run `client_version` | 3.17.2 | 3.17.2 | ✅ |
+| dry-run `system.first_chars` / `first_sha16` | 35 / `7779642ea44a4696` | 35 / `7779642ea44a4696` | ✅ |
+| dry-run `system.identity_chars` / `identity_sha16` | 1235 / `4058874023c7541f` | 1235 / `4058874023c7541f` | ✅ |
+| 真请求 `http_status` / `ok` | 200 / true | 200 / true | ✅ |
+| 真请求 `business_code` | 无 | 无 | ✅ 无 405 / 3012 |
+| 真请求 `system_source` | `file:/tmp/zcode_3171.json` | 指定档案 | ✅ |
+| 真请求耗时 / 出口 | ≈3.9 s / socks5 代理 | — | 正常 |
+
+⇒ **上游接受「声明 3.17.2 + 3.17.1 校准文案」，升级门禁通过**；这与静态逆向的结论（两版 CLI 文案逐字节相同）一致。
+
+### 11.1 档案完整性校验的哈希口径（本轮踩过的坑）
+
+`internal/upstream/zcode_system_3171.json` 有两个不同的 sha256，取决于取文件的方式：
+
+| 口径 | 大小 | sha256 |
+|---|---|---|
+| **Git blob / raw.githubusercontent（LF）** | **7,728 B** | **`df76f852d50cdd279638b5f3f64b7090168bb70b8f6fe0e9d9064fbdbf829620`** |
+| Windows 工作区检出（`core.autocrlf=true`→CRLF） | 7,749 B | `4db29a33dc6f04c43538a9cea06917b431541008230f84cd037bd38d58a6f740` |
+
+两者差异只在换行符（+21 个 CR），解析出的 blocks 完全相同：block0 35 B / `7779642e…`，身份段 1235 B / `4058874023c7541f`。
+**校验完整性一律用 git blob / raw 口径**（Linux 检出与 `curl` 下载都是这个口径）；拿 Windows 工作区文件的哈希当基准会误判。
+
+### 11.2 探针覆盖不到的部分（仍需上线后补）
+
+- 探针走的是 `--system-file` 直给，**绕过**了 `ZcodeSystemProfileFor` 的档案选择，因此它证明不了映射代码（映射由 `TestZcodeSystemProfileFor` / `TestDefaultClientVersionHasExactSystemProfile` 在 CI 守）。
+- 也不覆盖「保留客户端 system」的两条 preserve 路径；上线后按 `docs/runbook-zcode-prompt-parity.md` §4 各打一条真实请求（无 system / 字符串 system），期望 `system_source=gateway_fallback` 与 `legacy_merge`、`official_identity_match=true`、3012 计数 0。
+
