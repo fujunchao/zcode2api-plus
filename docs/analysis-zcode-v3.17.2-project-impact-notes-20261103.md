@@ -122,6 +122,7 @@
 1. **档案 block1 缺 276 B（既有偏差）**：两份档案都缺 Desktop Context 里的 "### Interactive views" 及后两行；3.15.3/3.17.2 的 CLI 都会输出这 3 行。位于身份段之后，**不参与上游校验**；只有做「缓存前缀对齐」时才值得补（补时按「无 Gen UI 目录」分支取文案）。
 2. **x-zcode-session-features**：7 值枚举未变；仍建议**不发**（发错值比不发风险大，且一条默认会话本来就不发）。
 3. **host↔CLI 的 MCP 身份头 workspace 路由**：ACP（stdio JSON-RPC）层的 -32602 门禁，网关不参与，仅记录。
+4. **Compose 版本覆盖（2026-11-05 复核补齐）**：根目录 `docker-compose.yml` 原先未透传 `ZCODE_CLIENT_VERSION`，因此只把 `3.17.1` 写进 `.env` 不会改变容器内的默认版本；模板现已按同名值透传并默认 `3.17.2`，默认值仍与已核验的 system 文案档案成对。
 
 ---
 

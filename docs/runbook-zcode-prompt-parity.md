@@ -86,7 +86,7 @@ docker compose logs --since 3m zcode2api | grep 'system_source='
 
 1. 只把「一个实例/部署」的 `ZCODE_CLIENT_VERSION` 改成新版本并重启；
 2. 观察 24h：出现 `3012` / `unusual activity` / `405` 立即回滚；
-3. 回滚＝把变量改回旧版本并重启，不需要换镜像。
+3. 回滚＝把变量改回旧版本并重启，不需要换镜像。根目录 Compose 已透传 `.env` 中的 `ZCODE_CLIENT_VERSION`；也可用 `docker compose run --rm -e ZCODE_CLIENT_VERSION=<版本> ...` 仅覆盖单次运行。
 
 ## 6. 反面教材（本次真实教训）
 

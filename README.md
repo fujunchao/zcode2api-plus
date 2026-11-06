@@ -57,7 +57,7 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 若部署显式设置了 `ZCODE_CLIENT_VERSION` 或 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。
 版本特定的内部状态与回滚要求见下方发布说明。
 升级不改变任何接口、配置项与数据结构：用户无需操作；想固定或回退时设置
-`ZCODE_CLIENT_VERSION`（Compose 需在 `environment:` 显式引用该变量才会进容器）。
+`ZCODE_CLIENT_VERSION`（根目录 `docker-compose.yml` 已按 `.env` 同名值透传；未设置时使用当前已核验的 `3.17.2`）。
 
 `v2.11.12-go` **同步 ZCode 3.17.2 客户端声明**：3.17.2 的 CLI system 文案与 3.17.1 逐字节相同
 （block0 35 B / sha16 `7779642ea44a4696`，身份段 1235 B / sha16 `4058874023c7541f`），伪装来源头、
