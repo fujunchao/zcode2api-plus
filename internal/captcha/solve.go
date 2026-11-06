@@ -224,6 +224,18 @@ type RodWorker struct {
 	// pageDirty 上次求解失败/中止后置位：SDK 弹层状态已污染，下次 Solve 前重载页面。
 	// 成功路径复用同一页面，避免每次重新加载 224KB SDK（对齐 worker_main）。
 	pageDirty bool
+
+	// 寿命上限（0 表示不限）：命中后由池在两次求解之间回收重建。
+	//
+	// 为什么需要：成功路径刻意复用同一页面（省 224KB SDK 重载），代价是页面
+	// 状态只增不减。真机实测同一只 renderer 跑 3 天、约 2700 次 initAliyunCaptcha
+	// 后，RSS 从 174MB 线性涨到 1509MB、CPU 从 3.4% 涨到 30.7%，而同期真实
+	// 消费为 0。上游 Python 版没有这道闸门（浏览器活到进程退出）。
+	createdAt time.Time
+	solves    int64
+	maxAge    time.Duration
+	maxSolves int
+	maxRSS    int64 // 字节
 }
 
 // NewRodWorkerFactory 构造绑定验证码配置的真实求解工厂。
@@ -249,7 +261,12 @@ func newRodWorker(ctx context.Context, bin string, cfg Config) (*RodWorker, erro
 	if err := b.Connect(); err != nil {
 		// 连接都没建立，不对这个浏览器对象调 Close()：它尚无可用会话，rod 的
 		// Browser.Close 会试图在未连接的对象上操作（上游把这一处判定为 nil panic）。
-		// 此处的资源清理由 launcher 负责——它会杀掉刚启动的进程并删除临时目录。
+		//
+		// 必须先 Kill 再 Cleanup：Cleanup 的实现是 <-l.exit（等进程自己退出）
+		// 再删目录，它不杀进程。此处浏览器进程已经起来了，直接 Cleanup 会永久
+		// 阻塞，factory 永不返回 → 槽位卡死 → 启动超时；每次重试都留下一只
+		// 杀不掉的浏览器和一个卡住的 goroutine。
+		l.Kill()
 		l.Cleanup()
 		return nil, fmt.Errorf("浏览器连接失败: %w", err)
 	}
@@ -266,6 +283,10 @@ func newRodWorker(ctx context.Context, bin string, cfg Config) (*RodWorker, erro
 		cfg:          cfg,
 		solveTimeout: time.Duration(config.CaptchaSolveTimeout) * time.Second,
 		sdkLoadTTL:   sdkLoadTimeout,
+		createdAt:    time.Now(),
+		maxAge:       time.Duration(config.CaptchaBrowserMaxAgeSec) * time.Second,
+		maxSolves:    config.CaptchaBrowserMaxSolves,
+		maxRSS:       int64(config.CaptchaBrowserMaxRSSMB) * 1024 * 1024,
 	}, nil
 }
 
@@ -277,20 +298,27 @@ func loadSDKPage(ctx context.Context, b *rod.Browser, cfg Config) (*rod.Page, er
 	if err != nil {
 		return nil, err
 	}
-	page = page.Context(ctx)
+	// 页面绑定「不可取消」的 ctx：这个 page 会活到 worker 回收，而传进来的
+	// ctx 是池的启动超时 ctx（factory 返回后立刻 cancel）。若直接绑定它，
+	// 之后 Close/reload 用的就是这个已取消的 ctx——rod 的 cdp.Call 在 ctx
+	// 已结束时直接返回 ctx.Err()，页面关不掉、旧 target 可能留在浏览器里。
+	//
+	// 求解超时语义不受影响：Solve 里每次都用 page.Context(reqCtx) 派生副本。
+	page = page.Context(context.WithoutCancel(ctx))
 	if err := page.SetDocumentContent(buildCaptchaHTML(aliyunCaptchaSDKEscaped, captchaConfigJSON(cfg))); err != nil {
 		_ = page.Close()
 		return nil, err
 	}
 	deadline := time.Now().Add(sdkLoadTimeout)
 	for {
+		// 页面不再绑启动 ctx，取消必须在这里显式检查（否则池 Stop 时要等满 20s）。
+		if err := ctx.Err(); err != nil {
+			_ = page.Close()
+			return nil, err
+		}
 		res, err := page.Evaluate(rod.Eval(sdkReadyJS))
 		if err == nil && res != nil && !res.Value.Nil() && res.Value.Bool() {
 			return page, nil
-		}
-		if err != nil && ctx.Err() != nil {
-			_ = page.Close()
-			return nil, ctx.Err()
 		}
 		if time.Now().After(deadline) {
 			_ = page.Close()
@@ -302,6 +330,8 @@ func loadSDKPage(ctx context.Context, b *rod.Browser, cfg Config) (*rod.Page, er
 
 // Solve 在已加载的真实 Chromium 页面中生成一次 verify_param（对齐 _solve_once）。
 func (w *RodWorker) Solve(ctx context.Context) (string, error) {
+	// 计数用于 WorkerRecycler 的求解次数上限；失败也计入（页面已被折腾过）。
+	w.solves++
 	if w.pageDirty {
 		if err := w.reload(ctx); err != nil {
 			return "", err
@@ -384,6 +414,62 @@ func (w *RodWorker) reload(ctx context.Context) error {
 	}
 	w.page = page
 	return nil
+}
+
+// RecycleReason 实现 WorkerRecycler：任一寿命阈值命中就返回原因。
+//
+// 判定顺序按「先便宜后昂贵」：时间与计数是纯内存比较，RSS 需要读 /proc。
+func (w *RodWorker) RecycleReason(now time.Time) string {
+	if w.maxAge > 0 {
+		if age := now.Sub(w.createdAt); age >= w.maxAge {
+			return fmt.Sprintf("存活 %s ≥ 上限 %s", age.Truncate(time.Second), w.maxAge)
+		}
+	}
+	if w.maxSolves > 0 && w.solves >= int64(w.maxSolves) {
+		return fmt.Sprintf("已求解 %d 次 ≥ 上限 %d", w.solves, w.maxSolves)
+	}
+	if w.maxRSS > 0 && w.launcher != nil {
+		if rss, ok := processRSSBytes(w.launcher.PID()); ok && rss >= w.maxRSS {
+			return fmt.Sprintf("进程 RSS %dMB ≥ 上限 %dMB", rss/1024/1024, w.maxRSS/1024/1024)
+		}
+	}
+	return ""
+}
+
+// Kill 实现 WorkerKiller：看门狗超时后强制终止浏览器进程组。
+func (w *RodWorker) Kill() {
+	if w.launcher != nil {
+		w.launcher.Kill()
+	}
+}
+
+// processRSSBytes 读取进程常驻内存；读不到（非 Linux / 进程已退出）返回 false。
+//
+// 注意这是浏览器父进程的 RSS，不是 --type=renderer 子进程——真正吃内存的是
+// renderer。父进程 RSS 只作为兜底信号（阈值给宽），主判据是存活时长与求解次数。
+func processRSSBytes(pid int) (int64, bool) {
+	if pid <= 0 {
+		return 0, false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0, false
+		}
+		kb, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return kb * 1024, true
+	}
+	return 0, false
 }
 
 // Close 释放浏览器与会话资源。

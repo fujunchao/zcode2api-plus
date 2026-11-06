@@ -98,6 +98,27 @@ var (
 	CaptchaBrowserShutdownTimeout = max(1, envInt("ZCODE_CAPTCHA_BROWSER_SHUTDOWN_TIMEOUT", 10))
 	CaptchaBrowserFailureCooldown = max(1, envInt("ZCODE_CAPTCHA_BROWSER_FAILURE_COOLDOWN", 60))
 
+	// 浏览器 worker 寿命上限：命中任一阈值即在两次求解之间回收重建（0=不限）。
+	//
+	// 为什么需要：成功路径刻意复用同一页面（省 224KB SDK 重载），页面状态只增
+	// 不减。真机实测单只 renderer 跑 3 天后 RSS 174M→1509M（+17.5MB/h）、CPU
+	// 3.4%→30.7%。6 小时的上限把内存压到约 280MB、CPU 压到个位数，代价是每
+	// 6 小时一次冷启动（实测 7.6s，发生在两次求解之间，不影响在途请求）。
+	CaptchaBrowserMaxAgeSec = max(0, envInt("ZCODE_CAPTCHA_BROWSER_MAX_AGE_SECONDS", 21_600))
+	CaptchaBrowserMaxSolves = max(0, envInt("ZCODE_CAPTCHA_BROWSER_MAX_SOLVES", 5_000))
+	// 父进程 RSS 兜底阈值；renderer 子进程才是内存大头，故给宽，只挡明显异常。
+	CaptchaBrowserMaxRSSMB = max(0, envInt("ZCODE_CAPTCHA_BROWSER_MAX_RSS_MB", 1_500))
+
+	// 池级空闲停池：无在途求解且超过该时长没被使用，就释放整个浏览器池，
+	// 下次需要时冷启动（实测 7.6s）。0 = 关闭，退回「常驻到进程退出」。
+	//
+	// 默认取 30 分钟而不是 15 分钟：每次重启都是一次设备指纹轮换
+	// （solve.go 每次启动随机 --fingerprint 种子 + 新建临时 user-data-dir），
+	// 阈值过小会让上游按设备做的风控更容易触发。
+	CaptchaBrowserIdleStopSec = max(0, envInt("ZCODE_CAPTCHA_BROWSER_IDLE_STOP_SECONDS", 1_800))
+	// 两次停池之间的最小间隔，避免「停→被补货拉起→再停」的抖动。
+	CaptchaBrowserMinStopIntervalSec = max(0, envInt("ZCODE_CAPTCHA_BROWSER_MIN_STOP_INTERVAL_SECONDS", 1_800))
+
 	// 预求解 token 池（P0-B）。池按 sceneId|region|prefix 分桶，token 一次性、
 	// TTL 到期即丢弃；池空时最多 1–2 路并发求解竞速。关闭后退回逐请求求解。
 	CaptchaPoolEnabled       = envBool("ZCODE_CAPTCHA_POOL_ENABLED", true)

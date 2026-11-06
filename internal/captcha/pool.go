@@ -40,6 +40,26 @@ type Worker interface {
 // 返回错误等价 Python worker 未能进入 READY。
 type WorkerFactory func(ctx context.Context) (Worker, error)
 
+// WorkerRecycler 可选能力：worker 自评是否该在两次求解之间回收重建。
+//
+// 做成可选接口而不是扩 Worker，是为了不打扰既有测试替身；只有真实浏览器
+// worker 需要寿命上限。上游 Python 版没有这道闸门，浏览器一旦拉起就活到
+// 进程退出——真机实测单只 renderer 三天从 174MB 涨到 1509MB、CPU 从 3.4%
+// 涨到 30.7%，且成功路径从不重载页面（solve.go 的 pageDirty 只在失败时置位）。
+type WorkerRecycler interface {
+	// RecycleReason 返回非空原因表示该回收；空串表示继续复用。
+	RecycleReason(now time.Time) string
+}
+
+// WorkerKiller 可选能力：强制终止底层浏览器进程。
+//
+// 仅用于 closeWorker 的看门狗超时兜底：rod 的 Launcher.Cleanup 会阻塞在
+// <-l.exit 等待进程自己退出，浏览器假死时 Close 永不返回，不补一刀就会
+// 留下杀不掉的孤儿浏览器（池随后重建一只，内存直接翻倍）。
+type WorkerKiller interface {
+	Kill()
+}
+
 // 池相关错误语义（对齐 Python 版的 CaptchaBrowserError 子类）。
 var (
 	// ErrPoolNotStarted 池尚未启动（或已关闭后再次调用）。
@@ -494,6 +514,17 @@ func (p *Pool) serveLoop(g *generation, w Worker, id int) bool {
 				web.Warn("captcha_browser", fmt.Sprintf("worker %d 求解失败: %s", id, redact(err.Error())))
 			}
 		}
+
+		// 寿命回收：只在两次求解之间判定，不打断在途请求；命中即重建。
+		// 放在错误分支之后，是为了让「致命退出」优先按自己的语义处理。
+		if rec, ok := w.(WorkerRecycler); ok {
+			if reason := rec.RecycleReason(p.now()); reason != "" {
+				p.countRestart()
+				web.Ok("captcha_browser", fmt.Sprintf("worker %d 达到回收阈值（%s），重建", id, reason))
+				p.closeWorker(w)
+				return false
+			}
+		}
 	}
 }
 
@@ -537,8 +568,12 @@ func (p *Pool) sleepRestart(g *generation) bool {
 	}
 }
 
-// closeWorker 异步关闭 worker；Close 阻塞超过看门狗时限即放弃等待
-// （残留浏览器进程由 leakless/进程退出兜底）。
+// closeWorker 异步关闭 worker；Close 阻塞超过看门狗时限则强制终止进程。
+//
+// 为什么必须补 Kill：rod 的 Launcher.Cleanup 实现是「先 <-l.exit 等进程退出，
+// 再删临时目录」，它本身不杀进程；而浏览器假死时 browser.Close 也可能长时间
+// 不返回。旧实现超时后只打一条日志就放弃，于是那只浏览器在进程内永生，池
+// 一秒后又拉起新的一只——两只各占数百 MB，是 OOM 的直接触发器形态。
 func (p *Pool) closeWorker(w Worker) {
 	go func() {
 		done := make(chan struct{})
@@ -551,7 +586,10 @@ func (p *Pool) closeWorker(w Worker) {
 		select {
 		case <-done:
 		case <-time.After(p.closeWatchdog):
-			web.Warn("captcha_browser", "worker 关闭超时，放弃等待")
+			web.Warn("captcha_browser", "worker 关闭超时，强制终止浏览器进程")
+			if k, ok := w.(WorkerKiller); ok {
+				k.Kill()
+			}
 		}
 	}()
 }
