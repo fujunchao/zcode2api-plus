@@ -249,6 +249,27 @@ func newTokenPool(solver Solver, opts tokenPoolOptions, now func() time.Time) *t
 	return p
 }
 
+// Warm 预热：池空时后台解一条 token 入桶（不消费）。
+//
+// 与 refillOnce 的区别：Warm 不受 idleStop 约束，它是「已知马上要用」的显式
+// 信号（定时领取前 2 分钟调用）。刻意不更新 lastTake——预热不是真实流量，
+// 不该重置空闲判定，否则空闲停补会被预热本身反复推翻。
+func (p *tokenPool) Warm() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || !p.active || p.solver == nil {
+		return
+	}
+	p.pruneLocked(p.now())
+	if len(p.buckets[p.key]) > 0 || p.inflight[p.key] > 0 {
+		return // 已有库存或在途求解：无需重复预热
+	}
+	p.launchMintsLocked(p.cfg, p.key, 1)
+}
+
 // SetSolver 更新求解器（Manager 先 Enable 后 SetSolver 的兼容路径）。
 func (p *tokenPool) SetSolver(s Solver) {
 	if p == nil {

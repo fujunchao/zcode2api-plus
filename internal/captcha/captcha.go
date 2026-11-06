@@ -124,6 +124,30 @@ func (m *Manager) EnableTokenPool(enabled bool) {
 	}
 }
 
+// Warm 预热一条验证码 token 入桶（不消费、不阻塞）。
+//
+// 用于「已知即将需要验证码」的场景：定时领取前提前 2 分钟调用，领取真正
+// 开始时 token 已就绪，第一个账号不必吃约 7.6s 的浏览器冷启动。
+//
+// 幂等：池里已有库存或在途求解时什么都不做。token 池未启用时是空操作
+// （逐请求求解路径本身就会拉起浏览器，没有「预热」可做）。
+func (m *Manager) Warm(ctx context.Context) error {
+	if m == nil || !config.CaptchaBrowserEnabled {
+		return nil
+	}
+	cfg := m.FetchConfig(ctx)
+	if !cfg.Enabled {
+		return nil
+	}
+	m.mu.Lock()
+	pool := m.pool
+	m.mu.Unlock()
+	if pool != nil {
+		pool.Warm()
+	}
+	return nil
+}
+
 // BrowserStatus 转发浏览器求解器的运行态。
 //
 // 求解器是接口（测试注入假实现），只有真实 *BrowserSolver 才有状态可报；

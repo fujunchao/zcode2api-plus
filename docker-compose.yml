@@ -33,8 +33,12 @@ services:
     #   2 CPU / 2 GB 内存起步；每个额外 Chromium worker 约再预留 0.5–1 GB。
     #   compose 非 swarm 模式可写：deploy.resources.limits.cpus: "2"、
     #   memory: 2g；或 docker run --cpus=2 --memory=2g。
-    # 空闲 15 分钟后 token 池停止「主动补货」（后台不再求解，CPU 随之回落）；
-    # 真实请求仍会按需触发一次求解，不受影响。浏览器进程本身常驻，进程退出才回收。
+    # 空闲行为（三层，全部可配）：
+    #   1. 空闲 15 分钟：token 池停止「主动补货」，后台不再求解，CPU 回落；
+    #      真实请求仍会按需触发一次求解，不受影响。
+    #   2. worker 寿命闸门：存活 6h / 求解 5000 次 / 父进程 1500MB 任一命中即重建，
+    #      把「常驻越久内存越大」压回 300MB 量级（真机实测 3 天可涨到 1.5GB）。
+    #   3. 空闲 30 分钟：整个浏览器池释放，下次需要时冷启动约 8 秒。
     ports:
       # 直连访问（浏览器直接开 http://<主机>:3000）就保持原样。
       # 若前面挂了 Nginx / Caddy 等反向代理，请改成只绑回环：
@@ -63,6 +67,16 @@ services:
       # Chromium worker 数；建议 2 起步（默认代码值为 1，compose 默认给 2）。
       # 每个 worker 是一个常驻 Chromium，CPU/内存按 worker 数线性增长。
       ZCODE_CAPTCHA_BROWSER_WORKERS: ${ZCODE_CAPTCHA_BROWSER_WORKERS:-2}
+      # worker 寿命上限（任一命中即在两次求解之间重建）；0 表示不限制。
+      # 成功路径刻意复用同一页面，页面状态只增不减，必须靠这道闸门兜住。
+      ZCODE_CAPTCHA_BROWSER_MAX_AGE_SECONDS: ${ZCODE_CAPTCHA_BROWSER_MAX_AGE_SECONDS:-21600}
+      ZCODE_CAPTCHA_BROWSER_MAX_SOLVES: ${ZCODE_CAPTCHA_BROWSER_MAX_SOLVES:-5000}
+      ZCODE_CAPTCHA_BROWSER_MAX_RSS_MB: ${ZCODE_CAPTCHA_BROWSER_MAX_RSS_MB:-1500}
+      # 池级空闲停池：连续 30 分钟没有求解就释放整个浏览器，下次冷启动约 8 秒；
+      # 0 表示关闭（退回「常驻到进程退出」）。每次重启都是一次设备指纹轮换
+      # （每次启动随机 --fingerprint 种子 + 新建临时 user-data-dir），阈值不宜过小。
+      ZCODE_CAPTCHA_BROWSER_IDLE_STOP_SECONDS: ${ZCODE_CAPTCHA_BROWSER_IDLE_STOP_SECONDS:-1800}
+      ZCODE_CAPTCHA_BROWSER_MIN_STOP_INTERVAL_SECONDS: ${ZCODE_CAPTCHA_BROWSER_MIN_STOP_INTERVAL_SECONDS:-1800}
       # 后台自动刷新额度的间隔（秒），0 关闭
       ZCODE_QUOTA_REFRESH_INTERVAL: ${ZCODE_QUOTA_REFRESH_INTERVAL:-60}
       # 限流冷却时长（秒）

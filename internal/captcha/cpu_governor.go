@@ -88,15 +88,102 @@ func (g *cpuGovernor) Factor() float64 {
 	}
 }
 
-// readCPUSample 读取 CPU 累计计数：Linux /proc/stat 优先，其余平台用
-// runtime/metrics 的进程 CPU 时间折算为「进程 CPU / (墙钟 × NumCPU)」。
+// readCPUSample 读取 CPU 累计计数，口径按优先级：
+//
+//  1. cgroup v2 的 cpu.stat —— 容器部署的正确口径：只统计本容器用掉的 CPU，
+//     分母是 cgroup 的 CPU 配额（cpu.max），不是整机核心数。
+//  2. /proc/stat —— 非容器 Linux 的整机口径。
+//  3. runtime/metrics 的进程 CPU 时间 —— 其余平台。
+//
+// 为什么必须改：旧实现只读 /proc/stat，那是整机口径。容器里跑 109% CPU 时，
+// 在 4 核宿主上只算 27%，永远碰不到 70%/85% 阈值，governor 形同虚设
+// （真机实测见 findings/browser-lifecycle-audit-20261106.md §5.3）。
 func readCPUSample() (cpuSample, bool) {
 	if runtime.GOOS == "linux" {
+		if sample, ok := readCgroupCPUSample(); ok {
+			return sample, true
+		}
 		if sample, ok := readProcStatSample(); ok {
 			return sample, true
 		}
 	}
 	return readProcessCPUSample()
+}
+
+// cgroup v2 采样路径；测试可覆写为临时文件。
+var (
+	cgroupCPUStatPath = "/sys/fs/cgroup/cpu.stat"
+	cgroupCPUMaxPath  = "/sys/fs/cgroup/cpu.max"
+)
+
+// cgroupCPUStart 进程启动时刻，用于把累计用量折算成「墙钟 × 配额」。
+var cgroupCPUStart = time.Now()
+
+// readCgroupCPUSample 用 cgroup v2 的累计 CPU 用量作 busy，以
+// 「墙钟 × CPU 配额」作 total，得到容器口径的 0–100% 占用率。
+//
+// cgroup v1（无 cpu.stat）或读不到时返回 false，交由上层退回 /proc/stat。
+func readCgroupCPUSample() (cpuSample, bool) {
+	usage, ok := readCgroupUsageUsec()
+	if !ok {
+		return cpuSample{}, false
+	}
+	milliCores := cgroupCPUQuotaMilliCores()
+	elapsed := time.Since(cgroupCPUStart).Microseconds()
+	if milliCores <= 0 || elapsed <= 0 {
+		return cpuSample{}, false
+	}
+	// total 与 busy 同为微秒量级；total = 墙钟微秒 × 配额（千分之一核）。
+	total := uint64(elapsed) * uint64(milliCores) / 1000
+	if total == 0 {
+		return cpuSample{}, false
+	}
+	return cpuSample{Busy: usage, Total: total}, true
+}
+
+// readCgroupUsageUsec 读 cpu.stat 的 usage_usec（cgroup v2 累计 CPU 微秒）。
+func readCgroupUsageUsec() (uint64, bool) {
+	data, err := os.ReadFile(cgroupCPUStatPath)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "usage_usec" {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return v, true
+	}
+	return 0, false
+}
+
+// cgroupCPUQuotaMilliCores 读 cpu.max 的配额，返回「千分之一核」。
+//
+// 格式："<quota> <period>" 或 "max <period>"。max 表示不限，此时用
+// runtime.NumCPU() 作为分母（等价于整机可用核数）。
+func cgroupCPUQuotaMilliCores() int64 {
+	fallback := int64(runtime.NumCPU()) * 1000
+	data, err := os.ReadFile(cgroupCPUMaxPath)
+	if err != nil {
+		return fallback
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 || fields[0] == "max" {
+		return fallback
+	}
+	quota, err1 := strconv.ParseInt(fields[0], 10, 64)
+	period, err2 := strconv.ParseInt(fields[1], 10, 64)
+	if err1 != nil || err2 != nil || quota <= 0 || period <= 0 {
+		return fallback
+	}
+	if cores := quota * 1000 / period; cores > 0 {
+		return cores
+	}
+	return fallback
 }
 
 // readProcStatSample 解析 /proc/stat 第一行（聚合 cpu 行）。

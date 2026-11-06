@@ -474,10 +474,18 @@ Restart=on-failure
 > 0.5–1 GB。Docker 部署建議 `ZCODE_CAPTCHA_BROWSER_WORKERS=2` 起步，依
 > `captcha_pool_size` / `empty_take` / CPU 指標調整。
 >
-> 空閒行為：連續 15 分鐘沒有取用 token 後，token 池會**停止主動補貨**（後台不再
-> 求解，CPU 隨之回落）；此時 `/admin/api/monitor` 的 `captcha.idle_stopped` 為
-> `true`、`captcha.pool_size` 會隨 TTL 自然掉到 0，屬正常狀態，不是補貨失敗。
-> 真實請求仍會按需觸發一次求解。瀏覽器進程本身常駐（懶啟動），只在進程退出時回收。
+> 資源回收（三層，全部可配，都可設 0 關閉）：
+>
+> 1. **空閒停補**：連續 15 分鐘沒有取用 token 後，token 池停止主動補貨（後台不再
+>    求解，CPU 隨之回落）；此時 `/admin/api/monitor` 的 `captcha.idle_stopped` 為
+>    `true`、`captcha.pool_size` 會隨 TTL 自然掉到 0，屬正常狀態，不是補貨失敗。
+>    真實請求仍會按需觸發一次求解。
+> 2. **worker 壽命閘門**：單個 worker 存活 6h / 求解 5000 次 / 父進程 RSS 1500MB
+>    任一命中即在兩次求解之間重建。成功路徑刻意複用同一頁面（省 224KB SDK 重載），
+>    頁面狀態只增不減——真機實測同一隻 renderer 跑 3 天，RSS 從 174MB 線性漲到
+>    1509MB、CPU 從 3.4% 漲到 30.7%，這道閘門把它壓回 300MB 量級。
+> 3. **池級空閒停池**：連續 30 分鐘沒有求解就釋放整個瀏覽器，下次需要時冷啟動
+>    （實測 7.6s）。定時領取會在開始前 2 分鐘自動預熱，抵消這次冷啟動。
 
 ## 配置（環境變量）
 
@@ -489,6 +497,11 @@ Restart=on-failure
 | `ZCODE_DATA_DIR` | `./data` | 賬號庫、密鑰、全局設備指紋（每賬號指紋存於賬號庫） |
 | `ZCODE_CAPTCHA_BROWSER` | false | 啟用 rod 瀏覽器池自動求解 |
 | `ZCODE_CAPTCHA_BROWSER_WORKERS` | 1 | Chromium worker 數；Docker 建議 2 起步（需 2 CPU / 2 GB 起） |
+| `ZCODE_CAPTCHA_BROWSER_MAX_AGE_SECONDS` | 21600 | worker 存活上限（秒），到點在兩次求解之間重建；0=不限 |
+| `ZCODE_CAPTCHA_BROWSER_MAX_SOLVES` | 5000 | worker 求解次數上限，到點重建；0=不限 |
+| `ZCODE_CAPTCHA_BROWSER_MAX_RSS_MB` | 1500 | worker 父進程 RSS 兜底閾值；0=不判 |
+| `ZCODE_CAPTCHA_BROWSER_IDLE_STOP_SECONDS` | 1800 | 池級空閒停池（秒）；0=常駐到進程退出 |
+| `ZCODE_CAPTCHA_BROWSER_MIN_STOP_INTERVAL_SECONDS` | 1800 | 兩次停池的最小間隔（秒），防抖 |
 | `ZCODE_CAPTCHA_POOL_ENABLED` | true | 預求解 token 池；false 退回逐請求求解 |
 | `ZCODE_CAPTCHA_POOL_TTL_MS` | 95000 | 池內 token TTL（毫秒）；一次性、取走即刪除 |
 | `ZCODE_CAPTCHA_POOL_MIN` / `MAX` | 2 / 6 | refill 目標水位與上限 |

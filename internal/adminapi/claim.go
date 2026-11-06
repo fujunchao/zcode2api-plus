@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -305,6 +306,13 @@ const claimSlotWait = 30 * time.Second
 // claimBatchGap 批量内相邻账号的间隔，避免把上游打得太密。
 const claimBatchGap = time.Second
 
+// claimPreWarmLead 定时领取前的验证码预热提前量。
+//
+// 浏览器冷启动实测 7.6s（11-03 03:27:47 拉配置 → 03:27:54 池就绪），
+// 提前 2 分钟足够覆盖冷启动与首条 token 失败后的一次重试，又不会让浏览器
+// 白白多活太久（领取结束后它还会按空闲策略自行回收）。
+const claimPreWarmLead = 120 * time.Second
+
 // ClaimScheduler 每日定时领取：到设置页指定的时间点（本地时区）对池内全部
 // JWT 账号领取一次。受「每日定時領取」开关约束；尊重账号的 claim.next_at
 // ——那是上游自己给的节奏，刚领过的账号会被跳过。
@@ -318,6 +326,7 @@ type ClaimScheduler struct {
 
 	lastFiredMu sync.Mutex
 	lastFired   string // 已触发过的日期（YYYY-MM-DD），防同一天重复触发
+	lastWarmed  string // 已预热过的时刻（YYYY-MM-DD HH:MM），防同一分钟重复预热
 	now         func() time.Time
 }
 
@@ -352,6 +361,50 @@ func shouldFireClaim(now time.Time, lastFired, target string, enabled bool) bool
 	return now.Format("15:04") == target
 }
 
+// claimPreWarmMinute 计算预热时刻（HH:MM）；跨日自动回绕。
+//
+// 用固定日期做算术，避免 00:0x 这类目标时刻减去提前量后跨到前一天。
+func claimPreWarmMinute(target string, lead time.Duration) (string, bool) {
+	parts := strings.Split(target, ":")
+	if len(parts) != 2 {
+		return "", false
+	}
+	hour, err1 := strconv.Atoi(parts[0])
+	minute, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return "", false
+	}
+	base := time.Date(2000, 1, 1, hour, minute, 0, 0, time.UTC)
+	return base.Add(-lead).Format("15:04"), true
+}
+
+// maybePreWarm 在定时领取前 claimPreWarmLead 预热一条验证码 token。
+//
+// 收益：领取批量的第一个账号不必吃浏览器冷启动（实测 7.6s），也不会因为
+// 冷启动叠加求解超时而把该账号记成失败。同一分钟只预热一次。
+func (s *ClaimScheduler) maybePreWarm(now time.Time) {
+	target := s.h.Store.ClaimScheduleTime()
+	if !s.h.Store.ClaimScheduleEnabled() || !store.ValidClaimScheduleTime(target) {
+		return
+	}
+	warmAt, ok := claimPreWarmMinute(target, claimPreWarmLead)
+	if !ok || now.Format("15:04") != warmAt {
+		return
+	}
+	stamp := now.Format("2006-01-02 15:04")
+	s.lastFiredMu.Lock()
+	if s.lastWarmed == stamp {
+		s.lastFiredMu.Unlock()
+		return
+	}
+	s.lastWarmed = stamp
+	s.lastFiredMu.Unlock()
+	if s.h.Captcha != nil {
+		_ = s.h.Captcha.Warm(s.ctx)
+		web.Ok("claim", "定时领取前预热验证码 token（提前 "+claimPreWarmLead.String()+"）")
+	}
+}
+
 // loop 调度循环：每 claimScheduleTick 醒一次，实时读设置（改完即生效），
 // 到点触发一次批量并用日期去重。
 func (s *ClaimScheduler) loop() {
@@ -380,6 +433,9 @@ func (s *ClaimScheduler) loop() {
 				}()
 				s.h.runScheduledClaimsContext(s.ctx, now)
 			}()
+		} else {
+			// 非触发时刻：检查是否该为即将到来的领取预热验证码 token。
+			s.maybePreWarm(now)
 		}
 		select {
 		case <-s.stop:
@@ -399,6 +455,11 @@ func (h *Handler) runScheduledClaims(now time.Time) {
 }
 
 func (h *Handler) runScheduledClaimsContext(ctx context.Context, now time.Time) {
+	// 兜底预热：正常路径已由 maybePreWarm 提前 2 分钟触发；这里再补一次，
+	// 覆盖「进程刚启动、错过了预热 tick」的情况（Warm 幂等，已热则无操作）。
+	if h.Captcha != nil {
+		_ = h.Captcha.Warm(ctx)
+	}
 	accounts := h.jwtAccounts(nil)
 	if len(accounts) == 0 {
 		web.Ok("claim", "定时领取：池内无 JWT 账号，跳过")

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"zcode2api/internal/config"
@@ -37,6 +38,27 @@ type BrowserSolver struct {
 	//（每个都是真进程、启动还要等就绪），同时仍然不持锁做启动。
 	starting    chan struct{}
 	startingKey string
+
+	// ── 空闲停池（P2）────────────────────────────────────────────────────
+	//
+	// 浏览器常驻是上游继承来的形态，代价是内存只增不减：真机实测单只
+	// renderer 跑 3 天从 174MB 涨到 1509MB、CPU 从 3.4% 涨到 30.7%，而同期
+	// 真实验证码消费为 0。这里在「无在途求解且最后一次使用超过 idleStop」
+	// 时释放整个池，下次需要时由 acquirePool 冷启动（实测 7.6s）。
+	//
+	// lastUse 在 acquirePool 里随 inFlight++ 一起更新（持锁），因此池在
+	// 使用期间不可能被判定为空闲——这条不变量替代了额外的重试逻辑。
+	lastUse    time.Time
+	lastStop   time.Time
+	idleStop   time.Duration
+	minStopGap time.Duration
+	idleTick   time.Duration
+
+	idleOnce      sync.Once
+	idleCloseOnce sync.Once
+	idleRunning   atomic.Bool
+	idleStopCh    chan struct{}
+	idleDone      chan struct{}
 
 	// now 可注入时钟（测试用）。
 	now func() time.Time
@@ -99,12 +121,78 @@ func (s *BrowserSolver) Status() BrowserStatus {
 
 // NewBrowserSolver 创建浏览器求解器；池在首次 Solve 时惰性启动。
 func NewBrowserSolver() *BrowserSolver {
-	return &BrowserSolver{
-		now: time.Now,
+	idleStop := time.Duration(config.CaptchaBrowserIdleStopSec) * time.Second
+	idleTick := 60 * time.Second
+	if idleStop > 0 && idleStop/4 < idleTick {
+		idleTick = idleStop / 4
+	}
+	if idleTick < time.Second {
+		idleTick = time.Second
+	}
+	s := &BrowserSolver{
+		now:        time.Now,
+		idleStop:   idleStop,
+		minStopGap: time.Duration(config.CaptchaBrowserMinStopIntervalSec) * time.Second,
+		idleTick:   idleTick,
+		idleStopCh: make(chan struct{}),
+		idleDone:   make(chan struct{}),
 		newPool: func(cfg Config) *Pool {
 			return NewPool(NewRodWorkerFactory(cfg), config.CaptchaBrowserWorkers)
 		},
 	}
+	s.lastUse = s.now()
+	return s
+}
+
+// startIdleLoop 在第一次成功启动池后拉起空闲巡检（幂等）。
+func (s *BrowserSolver) startIdleLoop() {
+	if s == nil || s.idleStop <= 0 {
+		return // 0 = 关闭空闲停池，保持常驻
+	}
+	s.idleOnce.Do(func() {
+		s.idleRunning.Store(true)
+		go s.idleLoop()
+	})
+}
+
+func (s *BrowserSolver) idleLoop() {
+	defer close(s.idleDone)
+	ticker := time.NewTicker(s.idleTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.idleStopCh:
+			return
+		case <-ticker.C:
+			s.stopIdlePool()
+		}
+	}
+}
+
+// stopIdlePool 在池空闲超时且无在途求解时释放整个池。
+//
+// 之所以安全：inFlight 在 acquirePool 里持锁自增，本函数持锁读它，
+// 因此「拿到池指针」与「池被停掉」不会同时发生。
+func (s *BrowserSolver) stopIdlePool() {
+	s.mu.Lock()
+	if s.closed || s.pool == nil || s.inFlight > 0 {
+		s.mu.Unlock()
+		return
+	}
+	now := s.now()
+	if now.Sub(s.lastUse) < s.idleStop || now.Sub(s.lastStop) < s.minStopGap {
+		s.mu.Unlock()
+		return
+	}
+	pool := s.pool
+	s.pool = nil
+	s.poolKey = ""
+	s.lastStop = now
+	s.mu.Unlock()
+
+	web.Ok("captcha", fmt.Sprintf(
+		"浏览器池空闲超时（>%s），已释放 Chromium；下次需要时冷启动", s.idleStop))
+	pool.Stop()
 }
 
 // SetPoolFactory 注入池构造函数（测试用）。
@@ -179,6 +267,8 @@ func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string)
 		}
 		if s.pool != nil && s.poolKey == key && s.pool.IsStarted() {
 			s.inFlight++
+			// 与 inFlight++ 同锁更新：池在使用期间不可能被判为空闲。
+			s.lastUse = s.now()
 			release := s.releaseAfterUse()
 			s.mu.Unlock()
 			return s.pool, release, nil
@@ -232,9 +322,11 @@ func (s *BrowserSolver) acquirePool(ctx context.Context, cfg Config, key string)
 		s.pool = pool
 		s.poolKey = key
 		s.inFlight++
+		s.lastUse = s.now()
 		release := s.releaseAfterUse()
 		s.mu.Unlock()
 
+		s.startIdleLoop()
 		web.Ok("captcha", fmt.Sprintf("真实浏览器验证码池已就绪（%d 个 worker）", config.CaptchaBrowserWorkers))
 		return pool, release, nil
 	}
@@ -292,6 +384,16 @@ func (s *BrowserSolver) Close() error {
 	// 求解器上；后续 Solve 也直接短路，不再拉起新浏览器。
 	s.closed = true
 	s.mu.Unlock()
+
+	// 先停巡检，再关池：反过来会让巡检在 Stop 之后又看到 nil 池（无害），
+	// 但等待 goroutine 退出更干净，避免测试里泄漏。
+	s.idleCloseOnce.Do(func() { close(s.idleStopCh) })
+	if s.idleRunning.Load() {
+		select {
+		case <-s.idleDone:
+		case <-time.After(5 * time.Second):
+		}
+	}
 
 	if pool != nil {
 		pool.Stop()
