@@ -3,6 +3,7 @@
 package adminapi
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"zcode2api/internal/captcha"
 	"zcode2api/internal/config"
 )
 
@@ -23,13 +25,13 @@ func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 	if cpuCount < 1 {
 		cpuCount = 1
 	}
-	browserStatus, browserDetail := "standby", "按需啟用"
-	if config.CaptchaBrowserEnabled {
-		browserStatus, browserDetail = "online", "Chromium"
-	}
+	browserStatus, browserDetail := browserServiceState(h.Captcha)
 	var captchaPool any = map[string]any{}
+	var browserInfo any = map[string]any{}
 	if h.Captcha != nil {
 		captchaPool = h.Captcha.TokenPoolStats()
+		// 浏览器池真实运行态：与 token 池指标分开报，避免「配置开着就等于在线」。
+		browserInfo = h.Captcha.BrowserStatus()
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -43,7 +45,8 @@ func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 		"requests": requests,
 		// 验证码 token 池指标：pool_size/take/empty_take/mint/mint_fail/wait p50/p95。
 		// 只输出计数与耗时，不含 token 原文。
-		"captcha": captchaPool,
+		"captcha":         captchaPool,
+		"captcha_browser": browserInfo,
 		"accounts": map[string]any{
 			"total":     stats["total"],
 			"active":    stats["active"],
@@ -58,6 +61,34 @@ func (h *Handler) handleMonitor(w http.ResponseWriter, r *http.Request) {
 			{"name": "驗證瀏覽器", "status": browserStatus, "detail": browserDetail},
 		},
 	})
+}
+
+// browserServiceState 把浏览器池的真实运行态翻译成监控页展示值。
+//
+// 旧实现只看配置开关 config.CaptchaBrowserEnabled：开关开着就报 online。
+// 服务器实测证明这是假信号——重启后浏览器尚未拉起（懒启动）、进程根本不存在，
+// 控制台依然显示「驗證瀏覽器 online」。
+func browserServiceState(cm *captcha.Manager) (status, detail string) {
+	if !config.CaptchaBrowserEnabled {
+		return "standby", "按需啟用"
+	}
+	if cm == nil {
+		return "unknown", "管理器未就緒"
+	}
+	st := cm.BrowserStatus()
+	switch st.State {
+	case "online":
+		return "online", fmt.Sprintf("Chromium · %d worker · 求解 %d 次 · 重建 %d 次",
+			st.Workers, st.Solves, st.Restarts)
+	case "starting":
+		return "starting", "Chromium 啟動中"
+	case "cooling":
+		return "cooling", "啟動失敗，冷卻中"
+	case "closed":
+		return "offline", "已關閉"
+	default:
+		return "standby", "按需啟用（尚未拉起）"
+	}
 }
 
 func (h *Handler) handleUsage(w http.ResponseWriter, r *http.Request) {

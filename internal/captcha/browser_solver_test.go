@@ -397,3 +397,72 @@ func (w *blockingWorker) Solve(ctx context.Context) (string, error) {
 }
 
 func (w *blockingWorker) Close() error { return nil }
+
+// TestBrowserSolverStatusReflectsRealState 监控状态必须反映真实运行态，
+// 而不是「配置开关开着就报 online」。
+//
+// 旧实现（internal/adminapi/monitor.go）只看 config.CaptchaBrowserEnabled，
+// 服务器实测出现过「浏览器进程根本不存在，控制台仍显示 online」的假信号。
+func TestBrowserSolverStatusReflectsRealState(t *testing.T) {
+	setBrowserEnabled(t, true)
+	m := NewManager()
+	m.SetConfigProvider(func(context.Context) (Config, error) { return DefaultConfig, nil })
+	s := NewBrowserSolver()
+	s.SetPoolFactory(func(Config) *Pool {
+		f := &scriptFactory{}
+		return newStartedFakePool(t, f.create, 1)
+	})
+	m.SetSolver(s)
+
+	// 懒启动：还没有任何请求时池不存在，必须报 standby。
+	if got := s.Status(); got.State != "standby" {
+		t.Fatalf("未使用时状态应为 standby，实际 %q", got.State)
+	}
+	if _, err := m.GetVerifyParam(context.Background()); err != nil {
+		t.Fatalf("首次求解失败: %v", err)
+	}
+	st := s.Status()
+	if st.State != "online" || st.Workers != 1 || st.Solves == 0 {
+		t.Fatalf("求解后应报 online 并带计数: %+v", st)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if got := s.Status(); got.State != "closed" {
+		t.Fatalf("关闭后状态应为 closed，实际 %q", got.State)
+	}
+}
+
+// TestBrowserSolverStatusCoolingAfterStartupFailure 启动失败进入冷却时，
+// 状态必须是 cooling；此时浏览器没有起来，报 online 会掩盖故障。
+func TestBrowserSolverStatusCoolingAfterStartupFailure(t *testing.T) {
+	setBrowserEnabled(t, true)
+	m := NewManager()
+	m.SetConfigProvider(func(context.Context) (Config, error) { return DefaultConfig, nil })
+	s := NewBrowserSolver()
+	s.SetPoolFactory(func(Config) *Pool {
+		return NewPool(func(context.Context) (Worker, error) {
+			return nil, errors.New("boom")
+		}, 1)
+	})
+	m.SetSolver(s)
+	if _, err := m.GetVerifyParam(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("启动失败应回退人工回填: %v", err)
+	}
+	if got := s.Status(); got.State != "cooling" {
+		t.Fatalf("启动失败后状态应为 cooling，实际 %q", got.State)
+	}
+}
+
+// TestManagerBrowserStatusWithoutSolver 未注入求解器（纯 API Key 部署）
+// 时状态是 disabled，不能把 nil 解引用成崩溃。
+func TestManagerBrowserStatusWithoutSolver(t *testing.T) {
+	m := NewManager()
+	if got := m.BrowserStatus(); got.State != "disabled" {
+		t.Fatalf("无求解器时应为 disabled，实际 %q", got.State)
+	}
+	var nilManager *Manager
+	if got := nilManager.BrowserStatus(); got.State != "disabled" {
+		t.Fatalf("nil 管理器应为 disabled，实际 %q", got.State)
+	}
+}

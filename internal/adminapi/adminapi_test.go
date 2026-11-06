@@ -550,6 +550,18 @@ func TestMonitorAndUsage(t *testing.T) {
 	if _, ok := captchaStats["wait_p95_ms"]; !ok {
 		t.Fatalf("监控缺少 captcha.wait_p95_ms: %v", captchaStats)
 	}
+	// 深度空闲标记：空闲停补后 pool_size 会自然掉到 0，必须能与「补货失败」区分。
+	if _, ok := captchaStats["idle_stopped"]; !ok {
+		t.Fatalf("监控缺少 captcha.idle_stopped: %v", captchaStats)
+	}
+	// 浏览器池真实状态独立上报，不能只靠 services 里的字符串。
+	browserInfo, ok := body["captcha_browser"].(map[string]any)
+	if !ok {
+		t.Fatalf("监控缺少 captcha_browser: %v", body["captcha_browser"])
+	}
+	if _, ok := browserInfo["state"]; !ok {
+		t.Fatalf("captcha_browser 缺少 state: %v", browserInfo)
+	}
 	if got := body["uptime_sec"].(float64); got < 0 {
 		t.Fatalf("uptime 应非负: %v", got)
 	}

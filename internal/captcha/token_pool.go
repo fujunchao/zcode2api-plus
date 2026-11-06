@@ -85,6 +85,9 @@ type TokenPoolStats struct {
 	IdleSeconds     float64 `json:"idle_seconds"`
 	CPUPercent      float64 `json:"cpu_percent"`
 	WaitSampleCount int     `json:"wait_sample_count"`
+	// IdleStopped 深度空闲已停止主动补货：此时 pool_size 会随 TTL 自然掉到 0，
+	// target 仍显示 1（按需唤醒的下限），不要把它误读成「补货失败」。
+	IdleStopped bool `json:"idle_stopped"`
 }
 
 // poolToken 一条预解 token；参数不出日志、不落盘。
@@ -192,7 +195,10 @@ type tokenPool struct {
 	lastTake  time.Time
 	lastEmpty time.Time
 	lastDecay time.Time
-	idleLog   bool
+	// 空闲状态日志标志：缩容与深空闲分别独立，否则深空闲那条永远打不出来
+	// （缩容已把标志置位）。恢复补货时两者一起复位。
+	idleShrinkLogged bool
+	idleStopLogged   bool
 
 	waitSamples []int64 // Take 的等待毫秒数，容量有界
 
@@ -200,6 +206,12 @@ type tokenPool struct {
 	emptyTakeTotal int64
 	mintTotal      int64
 	mintFailTotal  int64
+
+	// mint 汇总日志：成功 mint 原本静默，长跑时无从判断池是否在空转。
+	// 这里按固定窗口累计增量，只在有增量时打一条，避免刷屏。
+	mintLogAt   time.Time
+	mintLogMint int64
+	mintLogFail int64
 
 	governor *cpuGovernor
 }
@@ -286,7 +298,8 @@ func (p *tokenPool) SetConfig(cfg Config, verified bool) {
 		p.buckets = make(map[string][]poolToken)
 		p.issued = make(map[string]time.Time)
 		p.target = p.opts.min
-		p.idleLog = false
+		p.idleShrinkLogged = false
+		p.idleStopLogged = false
 		p.lastTake = now
 		p.lastDecay = now
 		p.mintFailStreak = 0
@@ -671,19 +684,22 @@ func (p *tokenPool) refillOnce(now time.Time) {
 	case idle > p.opts.idleStop:
 		target = 1
 		deepIdle = true
-		if !p.idleLog {
-			p.idleLog = true
-			web.Ok("captcha", "token 池空闲停补（保留 1 条 token 唤醒）")
+		if !p.idleStopLogged {
+			p.idleStopLogged = true
+			// 深空闲必然已经过缩容，一并置位，避免恢复时重复打「缩容」。
+			p.idleShrinkLogged = true
+			web.Ok("captcha", "token 池深度空闲：停止主动补货（真实请求仍按需求解）")
 		}
 	case idle > p.opts.idleShrink:
 		target = 1
-		if !p.idleLog {
-			p.idleLog = true
+		if !p.idleShrinkLogged {
+			p.idleShrinkLogged = true
 			web.Ok("captcha", "token 池空闲缩容至 1")
 		}
 	default:
-		if p.idleLog {
-			p.idleLog = false
+		if p.idleShrinkLogged || p.idleStopLogged {
+			p.idleShrinkLogged = false
+			p.idleStopLogged = false
 			web.Ok("captcha", "token 池恢复补货")
 		}
 	}
@@ -702,7 +718,17 @@ func (p *tokenPool) refillOnce(now time.Time) {
 	size := len(p.buckets[p.key])
 	inflight := p.inflight[p.key]
 	need := target - size - inflight
-	if deepIdle && size >= 1 {
+	if deepIdle {
+		// 深度空闲：无条件停止主动补货，与桶里是否还留着 token 无关。
+		//
+		// 旧实现要求 size >= 1 才归零，而 CaptchaPoolTTL(默认 95s) 远小于
+		// idleStop(默认 900s)：桶里那条 token 必然先过期，过期后 need 又变正数，
+		// 于是空闲期仍以「每 TTL 一次」的节奏永续拉起浏览器求解。服务器实测
+		// 3 天≈2700 次求解、真实消费 0 次，渲染进程 RSS 从 174MB 线性涨到 1509MB、
+		// CPU 从 3.4% 涨到 30.7%（见 docs/plan-captcha-browser-lifecycle-20261106.md）。
+		//
+		// 唤醒路径不受影响：真实请求走 Take → 池空 → 注册 waiter →
+		// ensureMintsLocked 同步求解，与本函数无关。
 		need = 0
 	}
 	if need > 0 {
@@ -717,7 +743,42 @@ func (p *tokenPool) refillOnce(now time.Time) {
 		}
 		p.lastDecay = now
 	}
+	p.maybeLogMintSummaryLocked(now)
 	p.mu.Unlock()
+}
+
+// mintSummaryEvery 补解汇总日志的最小间隔。
+//
+// 成功 mint 原本完全静默：服务器上 3 天日志里 captcha 相关只有「池已启动」与
+// 「空闲缩容」各一条，而同期浏览器实际被驱动了约 2700 次。没有这条汇总，
+// 「池在空转」这件事在日志里是看不见的。
+const mintSummaryEvery = 10 * time.Minute
+
+// maybeLogMintSummaryLocked 按固定窗口输出一条补解汇总；窗口内零增量则静默。
+// 调用方持锁。
+func (p *tokenPool) maybeLogMintSummaryLocked(now time.Time) {
+	if p.mintLogAt.IsZero() {
+		p.mintLogAt = now
+		p.mintLogMint = p.mintTotal
+		p.mintLogFail = p.mintFailTotal
+		return
+	}
+	if now.Sub(p.mintLogAt) < mintSummaryEvery {
+		return
+	}
+	started := p.mintTotal - p.mintLogMint
+	failed := p.mintFailTotal - p.mintLogFail
+	p.mintLogAt = now
+	p.mintLogMint = p.mintTotal
+	p.mintLogFail = p.mintFailTotal
+	if started == 0 && failed == 0 {
+		// 窗口内一次求解都没有：空闲停补生效后就应该是这个状态，无需刷屏。
+		return
+	}
+	web.Ok("captcha", fmt.Sprintf(
+		"补解汇总：本窗口发起 %d 次、失败 %d 次；累计发起 %d 次、失败 %d 次；池 %d 条、目标 %d、空闲 %.0fs",
+		started, failed, p.mintTotal, p.mintFailTotal,
+		len(p.buckets[p.key]), p.target, now.Sub(p.lastTake).Seconds()))
 }
 
 // Stats 返回当前池指标快照。
@@ -741,6 +802,7 @@ func (p *tokenPool) Stats() TokenPoolStats {
 	}
 	return TokenPoolStats{
 		Enabled:         !p.closed && p.active,
+		IdleStopped:     !p.closed && p.active && idle > p.opts.idleStop.Seconds(),
 		PoolSize:        len(p.buckets[p.key]),
 		TakeTotal:       p.takeTotal,
 		EmptyTakeTotal:  p.emptyTakeTotal,

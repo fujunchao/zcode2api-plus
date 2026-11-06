@@ -275,13 +275,19 @@ func TestTokenPoolCloseStopsRefill(t *testing.T) {
 	}
 }
 
+// TestTokenPoolIdleShrinkAndStop 空闲缩容与深度空闲停补。
+//
+// ttl 必须用生产默认量级（95s），不能用 1h：CaptchaPoolTTL 远小于 idleStop
+// 正是旧缺陷的成因——桶里那条 token 必然先过期，过期后水位又变正数，
+// 于是「深空闲」期间仍按每 TTL 一次的节奏永续补货。用 1h 的 ttl 会让
+// 那条 token 活到断言时刻，把缺陷掩盖掉（本用例最初就是这么漏过去的）。
 func TestTokenPoolIdleShrinkAndStop(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	solver := &fakeTokenSolver{}
 	opts := testPoolOptions()
 	opts.min = 2
 	opts.max = 2
-	opts.ttl = time.Hour
+	opts.ttl = 95 * time.Second
 	opts.idleShrink = 120 * time.Second
 	opts.idleStop = 900 * time.Second
 	p := newTokenPool(solver, opts, func() time.Time { return now })
@@ -298,11 +304,65 @@ func TestTokenPoolIdleShrinkAndStop(t *testing.T) {
 
 	callsBefore, _ := solver.snapshot()
 	now = now.Add(20 * time.Minute)
+	// 先确认桶里那条已按 TTL 过期：旧实现正是在这里开始无限补货。
+	if size := p.Stats().PoolSize; size != 0 {
+		t.Fatalf("深空闲时库存应已按 TTL 过期，实际 %d 条", size)
+	}
 	p.refillOnce(now)
 	time.Sleep(20 * time.Millisecond)
 	callsAfter, _ := solver.snapshot()
 	if callsAfter != callsBefore {
 		t.Fatalf("深度空闲不应继续补货：%d -> %d", callsBefore, callsAfter)
+	}
+	// 多推几个 TTL 周期，确保不是「刚好这一轮没补」。
+	for i := 0; i < 3; i++ {
+		now = now.Add(95 * time.Second)
+		p.refillOnce(now)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if callsLater, _ := solver.snapshot(); callsLater != callsBefore {
+		t.Fatalf("深度空闲跨多个 TTL 仍不应补货：%d -> %d", callsBefore, callsLater)
+	}
+	if !p.Stats().IdleStopped {
+		t.Fatalf("Stats 应报告 idle_stopped=true")
+	}
+}
+
+// TestTokenPoolDeepIdleStillServesTake 深度空闲只停「主动补货」，
+// 真实请求的按需求解必须仍然可用——否则等于把验证码功能关掉。
+func TestTokenPoolDeepIdleStillServesTake(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	solver := &fakeTokenSolver{}
+	opts := testPoolOptions()
+	opts.min = 1
+	opts.max = 1
+	opts.ttl = 95 * time.Second
+	opts.idleShrink = 120 * time.Second
+	opts.idleStop = 900 * time.Second
+	opts.emptySolve = 1
+	p := newTokenPool(solver, opts, func() time.Time { return now })
+	t.Cleanup(func() { _ = p.Close() })
+	cfg := solveCfg("cn")
+	p.SetConfig(cfg, true)
+
+	// 推进到深度空闲：主动补货已停，桶为空。
+	now = now.Add(30 * time.Minute)
+	p.refillOnce(now)
+	time.Sleep(20 * time.Millisecond)
+	if size := p.Stats().PoolSize; size != 0 {
+		t.Fatalf("深空闲后不应有库存，实际 %d 条", size)
+	}
+	if calls, _ := solver.snapshot(); calls != 0 {
+		t.Fatalf("深空闲不应触发求解，实际 %d 次", calls)
+	}
+
+	// 真实请求：Take 必须触发同步求解并拿到 token。
+	tok, err := p.Take(context.Background(), cfg)
+	if err != nil || tok == nil || tok.VerifyParam == "" {
+		t.Fatalf("深空闲下 Take 应仍能按需求解: %+v %v", tok, err)
+	}
+	if !tok.TakeStats.EmptyTake {
+		t.Fatalf("池空取用应标记 empty_take: %+v", tok.TakeStats)
 	}
 }
 

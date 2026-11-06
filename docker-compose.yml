@@ -33,7 +33,8 @@ services:
     #   2 CPU / 2 GB 内存起步；每个额外 Chromium worker 约再预留 0.5–1 GB。
     #   compose 非 swarm 模式可写：deploy.resources.limits.cpus: "2"、
     #   memory: 2g；或 docker run --cpus=2 --memory=2g。
-    # 空闲 15 分钟后 token 池会缩到 1 条并停止预解，CPU 自动回落。
+    # 空闲 15 分钟后 token 池停止「主动补货」（后台不再求解，CPU 随之回落）；
+    # 真实请求仍会按需触发一次求解，不受影响。浏览器进程本身常驻，进程退出才回收。
     ports:
       # 直连访问（浏览器直接开 http://<主机>:3000）就保持原样。
       # 若前面挂了 Nginx / Caddy 等反向代理，请改成只绑回环：

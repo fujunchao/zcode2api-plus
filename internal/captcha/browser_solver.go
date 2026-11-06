@@ -44,6 +44,59 @@ type BrowserSolver struct {
 	newPool func(cfg Config) *Pool
 }
 
+// BrowserStatus 浏览器池的对外运行态快照（供后台监控展示真实状态）。
+//
+// 之所以需要它：控制台原先只看配置开关就报「驗證瀏覽器 online」，而配置开启
+// 但浏览器尚未拉起（懒启动）或已经失败退避时，那个 online 是假信号。
+type BrowserStatus struct {
+	// State 取值：disabled（未启用）/ standby（按需，未拉起）/ starting（启动中）
+	// / online（有就绪 worker）/ cooling（启动失败退避中）/ closed（已关闭）。
+	State string `json:"state"`
+	// Workers 池的槽位数；0 表示池未运行。
+	Workers int `json:"workers"`
+	// InFlight 正在锁外执行的求解数。
+	InFlight int `json:"in_flight"`
+	// Restarts worker 替换次数（超时判死/致命退出/寿命回收）。
+	Restarts int64 `json:"worker_restarts"`
+	// Solves 累计派发到 worker 的求解次数。
+	Solves int64 `json:"solves"`
+}
+
+// Status 返回当前运行态快照；不加锁地读少数字段，允许轻微陈旧。
+func (s *BrowserSolver) Status() BrowserStatus {
+	if s == nil {
+		return BrowserStatus{State: "disabled"}
+	}
+	s.mu.Lock()
+	closed := s.closed
+	starting := s.starting != nil
+	cooling := s.now().Before(s.failureUntil)
+	inFlight := s.inFlight
+	pool := s.pool
+	s.mu.Unlock()
+
+	if closed {
+		return BrowserStatus{State: "closed"}
+	}
+	if starting {
+		return BrowserStatus{State: "starting"}
+	}
+	if cooling {
+		return BrowserStatus{State: "cooling"}
+	}
+	if pool != nil && pool.IsStarted() {
+		stats := pool.StatsSnapshot()
+		return BrowserStatus{
+			State:    "online",
+			Workers:  stats.Started,
+			InFlight: inFlight,
+			Restarts: stats.WorkerRestarts,
+			Solves:   stats.Requests,
+		}
+	}
+	return BrowserStatus{State: "standby"}
+}
+
 // NewBrowserSolver 创建浏览器求解器；池在首次 Solve 时惰性启动。
 func NewBrowserSolver() *BrowserSolver {
 	return &BrowserSolver{

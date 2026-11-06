@@ -472,8 +472,12 @@ Restart=on-failure
 >
 > 資源建議：容器至少 **2 CPU / 2 GB 記憶體**起；每個 Chromium worker 約再預留
 > 0.5–1 GB。Docker 部署建議 `ZCODE_CAPTCHA_BROWSER_WORKERS=2` 起步，依
-> `captcha_pool_size` / `empty_take` / CPU 指標調整；空閒 15 分鐘後 token 池會
-> 縮到 1 條並停止預解。
+> `captcha_pool_size` / `empty_take` / CPU 指標調整。
+>
+> 空閒行為：連續 15 分鐘沒有取用 token 後，token 池會**停止主動補貨**（後台不再
+> 求解，CPU 隨之回落）；此時 `/admin/api/monitor` 的 `captcha.idle_stopped` 為
+> `true`、`captcha.pool_size` 會隨 TTL 自然掉到 0，屬正常狀態，不是補貨失敗。
+> 真實請求仍會按需觸發一次求解。瀏覽器進程本身常駐（懶啟動），只在進程退出時回收。
 
 ## 配置（環境變量）
 

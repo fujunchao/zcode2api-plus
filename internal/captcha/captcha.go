@@ -124,6 +124,23 @@ func (m *Manager) EnableTokenPool(enabled bool) {
 	}
 }
 
+// BrowserStatus 转发浏览器求解器的运行态。
+//
+// 求解器是接口（测试注入假实现），只有真实 *BrowserSolver 才有状态可报；
+// 其余情况返回 disabled，监控页据此显示「按需启用」。
+func (m *Manager) BrowserStatus() BrowserStatus {
+	if m == nil {
+		return BrowserStatus{State: "disabled"}
+	}
+	m.mu.Lock()
+	solver := m.solver
+	m.mu.Unlock()
+	if bs, ok := solver.(*BrowserSolver); ok {
+		return bs.Status()
+	}
+	return BrowserStatus{State: "disabled"}
+}
+
 // TokenPoolStats 返回 token 池指标；未启用时返回零值。
 func (m *Manager) TokenPoolStats() TokenPoolStats {
 	if m == nil {
