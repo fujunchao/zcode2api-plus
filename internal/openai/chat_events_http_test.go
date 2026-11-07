@@ -68,7 +68,10 @@ func TestChatStreamReportsUpstreamFailure(t *testing.T) {
 		body := compatRequest("chat")
 		body["stream"] = true
 		status, raw := postCompat(t, f, "chat", body)
-		if status != http.StatusOK || !strings.Contains(raw, `"type":"upstream_stream_error"`) || strings.Contains(raw, "data: [DONE]") {
+		// 2026-11-07 起断流错误类型跟随 ZCODE_TRUNCATE_TERMINAL，默认 overloaded_error
+		// （OpenAI 生态普遍按可重试处理）；关键不变量是「显式报错」且「不伪装成 [DONE]」。
+		if status != http.StatusOK || !strings.Contains(raw, `"error"`) ||
+			!strings.Contains(raw, `"type":"overloaded_error"`) || strings.Contains(raw, "data: [DONE]") {
 			t.Fatalf("异常串流须显式报错且不能伪装正常结束: %d %s", status, raw)
 		}
 	}

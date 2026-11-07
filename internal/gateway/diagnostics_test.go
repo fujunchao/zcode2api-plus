@@ -328,6 +328,9 @@ func TestStreamTruncateCountAccumulatesAcrossSuccess(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		fl := w.(http.Flusher)
 		_, _ = io.WriteString(w, sseStart)
+		// 先给一个内容增量：预缓冲只在「已产出内容」之后才允许进入断流终态路径，
+		// 没有内容就断会被当作「客户端未收到任何字节」换号重打（见 truncate_terminal_test.go）。
+		_, _ = io.WriteString(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}`+"\n\n")
 		fl.Flush()
 		if n >= 3 {
 			// 第三次：正常收尾（交出终值）。

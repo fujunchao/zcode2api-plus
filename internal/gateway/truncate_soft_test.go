@@ -17,6 +17,11 @@ func TestUpstreamTruncateCountsAsLineSoftFailure(t *testing.T) {
 	t.Cleanup(func() { config.ProxySoftTruncate = old })
 
 	f := newFixture(t)
+	// 本用例只验证「断流计入软失败」，与 line-guard 熔断（默认 2 连击即摘线路）解耦：
+	// 摘线会把软失败画像一并清理，混在一起断言就会随阈值默认值变化而红。
+	if err := f.st.SetSetting(store.LineTruncateStrikesKey, "0"); err != nil {
+		t.Fatal(err)
+	}
 	acc, err := f.st.AddAccount(model.ProviderZai, "trunc", "sk-trunc")
 	if err != nil {
 		t.Fatal(err)
