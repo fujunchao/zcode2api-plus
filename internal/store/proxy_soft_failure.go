@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -75,6 +76,8 @@ type ProxySoftFailure struct {
 	// 典型形状，成功清零会让它永远达不到阈值。
 	Truncates           int   `json:"truncates,omitempty"`
 	TruncateWindowStart int64 `json:"truncate_window_start,omitempty"`
+	// TruncateTimes 保存窗口内每次断流的时间戳；旧版本只有计数和起点，首次更新时兼容迁移。
+	TruncateTimes []int64 `json:"truncate_times,omitempty"`
 }
 
 type proxySoftState struct {
@@ -86,7 +89,7 @@ type ProxySoftDecision struct {
 	Action  string
 	Until   time.Time
 	Strikes int
-	// Trigger 本次处置的判据：probation / consecutive / rate；空串表示只记账。
+	// Trigger 本次处置的判据：truncate_strikes / probation / consecutive / rate；空串表示只记账。
 	Trigger string
 }
 
@@ -114,6 +117,7 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 	nowMs := now.UnixMilli()
 	windowMs := config.ProxySoftWindow.Milliseconds()
 	ent, exists := s.proxySoft.Entries[e.identity]
+	previous := ent
 	if !exists {
 		ent = ProxySoftFailure{Identity: e.identity, WindowStart: nowMs}
 	}
@@ -155,13 +159,36 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 	}
 	// 断流专用计数：独立窗口、不因成功清零。闸门关闭（阈值 0）时不计数——
 	// 没有消费者，留着只会让状态无谓增长。
+	truncateChanged := false
 	if !ok && signal == ProxySignalUpstreamTruncate && config.ProxySoftTruncateStrikes > 0 {
 		truncWindowMs := config.ProxySoftTruncateWindow.Milliseconds()
-		if ent.TruncateWindowStart == 0 || nowMs-ent.TruncateWindowStart >= truncWindowMs {
-			ent.TruncateWindowStart = nowMs
-			ent.Truncates = 0
+		// 兼容 v2.13.4：旧状态只记录总数与窗口起点，无法恢复每次时间，
+		// 将已有计数视为发生在起点，避免升级后立即丢掉已观察到的断流。
+		if len(ent.TruncateTimes) == 0 && ent.Truncates > 0 && ent.TruncateWindowStart > 0 {
+			ent.TruncateTimes = make([]int64, ent.Truncates)
+			for i := range ent.TruncateTimes {
+				ent.TruncateTimes[i] = ent.TruncateWindowStart
+			}
 		}
-		ent.Truncates++
+		// 使用最近已观察到的时间作为窗口右边界，兼容并发收尾的时间戳乱序。
+		windowEnd := nowMs
+		for _, at := range ent.TruncateTimes {
+			windowEnd = max(windowEnd, at)
+		}
+		kept := make([]int64, 0, len(ent.TruncateTimes)+1)
+		for _, at := range ent.TruncateTimes {
+			if windowEnd-at <= truncWindowMs {
+				kept = append(kept, at)
+			}
+		}
+		if windowEnd-nowMs <= truncWindowMs {
+			kept = append(kept, nowMs)
+		}
+		slices.Sort(kept)
+		ent.TruncateTimes = kept
+		ent.Truncates = len(ent.TruncateTimes)
+		ent.TruncateWindowStart = ent.TruncateTimes[0]
+		truncateChanged = true
 	}
 	ent.LastAt = nowMs
 	if signal != "" {
@@ -212,11 +239,17 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 		ent.QuarantineUntil = out.Until.UnixMilli()
 	}
 	s.proxySoft.Entries[e.identity] = ent
+	// 首次断流立即落库；随后成功对连续/观察期状态的复位也要保存，否则重启会复活旧失败。
+	// 只保存发生状态转换的成功，不把稳定线路的每次成功都变成数据库写入。
+	recovered := ok && ent.Truncates > 0 &&
+		(previous.Consecutive > 0 || previous.Probation != ent.Probation || previous.Strikes != ent.Strikes)
+	if out.Action != "" || truncateChanged || recovered || s.proxySoftDirty {
+		if err := s.commitProxySoftLocked(now); err != nil {
+			web.Warn("proxy-soft", "软失败状态落库失败: "+err.Error())
+		}
+	}
 	if out.Action == "" {
 		return out
-	}
-	if err := s.commitProxySoftLocked(now); err != nil {
-		web.Warn("proxy-soft", "软失败状态落库失败: "+err.Error())
 	}
 	// 隔离与续期都复用既有网络复核队列：软失败本身不是删除证据，
 	// 但值得让巡检用新鲜探测再确认一次（探测失败才会进入现有的删除链）。
@@ -316,6 +349,7 @@ func (s *Store) ProxySoftFailures() []ProxySoftFailure {
 	defer s.mu.Unlock()
 	out := make([]ProxySoftFailure, 0, len(s.proxySoft.Entries))
 	for _, ent := range s.proxySoft.Entries {
+		ent.TruncateTimes = slices.Clone(ent.TruncateTimes)
 		out = append(out, ent)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -328,6 +362,7 @@ func (s *Store) ProxySoftFailures() []ProxySoftFailure {
 }
 
 func (s *Store) commitProxySoftLocked(now time.Time) error {
+	s.proxySoftDirty = true
 	s.pruneProxySoftLocked(now)
 	raw, err := json.Marshal(s.proxySoft)
 	if err != nil {
@@ -336,6 +371,9 @@ func (s *Store) commitProxySoftLocked(now time.Time) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.ExecContext(ctx, "INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", proxySoftFailureKey, string(raw))
+	if err == nil {
+		s.proxySoftDirty = false
+	}
 	return err
 }
 

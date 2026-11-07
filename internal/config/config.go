@@ -228,12 +228,12 @@ var (
 	// 且它**不因成功清零**——坏线的典型形状正是「夹着成功」。见
 	// docs/plan-line-truncate-rate-gate-20261107.md。
 	ProxySoftTruncateStrikes = max(0, envInt("ZCODE_PROXY_SOFT_TRUNCATE_STRIKES", 2))
-	// ProxySoftTruncateWindow 断流闸门的统计窗口。
+	// ProxySoftTruncateWindow 断流闸门的滚动统计窗口，按每次断流时间独立过期。
 	//
 	// 取 60 分钟而不是 30：2026-11-07 同一条线的两次断流相隔 45 分钟，30 分钟窗口刚好漏掉。
 	ProxySoftTruncateWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_TRUNCATE_WINDOW_SECONDS", 3600))) * time.Second
 	// TruncateRetryAvoidTTL 重试感知选线：某份内容刚在哪些线路上断流后，同一内容的
-	// 重试请求在此时长内绕开这些线路（0=关闭）。
+	// 重试请求在各条线路最近一次断流后的此时长内绕开它（0=关闭）。
 	//
 	// 客户端（ZCode）重试时**原样重放请求体**，因此内容指纹天然命中；一条线路常挂多个
 	// 账号，只有整线避让才能挡住「换号却还是同一条线」。见
@@ -633,7 +633,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.13.4-go"
+	AppVersion = "2.13.5-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

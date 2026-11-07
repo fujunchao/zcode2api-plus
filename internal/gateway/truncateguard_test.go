@@ -19,7 +19,7 @@ func TestTruncateRetryGuard(t *testing.T) {
 	if got := g.Avoid("key-2", now); len(got) != 0 {
 		t.Fatalf("不同内容不应互相影响：%v", got)
 	}
-	// TTL 过期后不再避让（窗口内的重试只发生在断流后几秒）。
+	// TTL 过期后不再避让。
 	if got := g.Avoid("key-1", now.Add(3*time.Minute)); len(got) != 0 {
 		t.Fatalf("TTL 过期后不应避让：%v", got)
 	}

@@ -20,8 +20,8 @@ const truncateRetryMaxEntries = 256
 
 // truncateRetryEntry 一份内容在最近窗口内断流过的线路集合。
 type truncateRetryEntry struct {
-	at    time.Time
-	lines map[string]struct{}
+	// 每条线路独立计时：同一内容在不同线路上连续失败时，后一次失败不能被首次失败的 TTL 覆盖。
+	lines map[string]time.Time
 }
 
 // TruncateRetryGuard 按内容指纹记录断流线路。
@@ -34,7 +34,7 @@ type TruncateRetryGuard struct {
 	now     func() time.Time
 }
 
-// NewTruncateRetryGuard 创建防护表；ttl <= 0 或 now 为空时返回 nil（调用方判空跳过）。
+// NewTruncateRetryGuard 创建防护表；ttl <= 0 时返回 nil，未注入时钟时使用 time.Now。
 func NewTruncateRetryGuard(ttl time.Duration, now func() time.Time) *TruncateRetryGuard {
 	if ttl <= 0 {
 		return nil
@@ -55,24 +55,30 @@ func (g *TruncateRetryGuard) Note(key, line string, now time.Time) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if len(g.entries) >= truncateRetryMaxEntries {
+	ent, ok := g.entries[key]
+	if !ok && len(g.entries) >= truncateRetryMaxEntries {
 		g.entries = map[string]truncateRetryEntry{}
 	}
-	ent, ok := g.entries[key]
-	if !ok || now.Sub(ent.at) > g.ttl {
-		ent = truncateRetryEntry{at: now, lines: map[string]struct{}{}}
+	if !ok {
+		ent = truncateRetryEntry{lines: map[string]time.Time{}}
 	}
-	// 窗口内后续断流不延长 TTL：重试只发生在断流之后的几秒内，
-	// 延长只会让「同一内容稍后再发一次」也被带着避让，反而缩小可用线路。
-	if _, exists := ent.lines[line]; !exists {
-		ent.lines[line] = struct{}{}
+	// 先清理这份内容已过期的线路；仍有效的线路保留独立时间戳。
+	for identity, at := range ent.lines {
+		if now.Sub(at) > g.ttl {
+			delete(ent.lines, identity)
+		}
+	}
+	// 同一线路再次断流从本次断流重新计时；不同线路各自拥有完整 TTL。
+	// 并发收尾可能以较旧的时间稍后入锁，旧事件不能覆盖较新的断流时间。
+	if at, exists := ent.lines[line]; !exists || now.After(at) {
+		ent.lines[line] = now
 	}
 	g.entries[key] = ent
 }
 
 // Avoid 返回该内容在 TTL 内断流过的线路 identity；无记录或已过期返回 nil。
 //
-// 只读不删：过期条目在下一次 Note 或 Cleanup 时清理，避免读路径写放大。
+// 逐线路清理过期记录；内容下的全部线路都过期时，才删除内容条目。
 func (g *TruncateRetryGuard) Avoid(key string, now time.Time) []string {
 	if g == nil || key == "" {
 		return nil
@@ -86,14 +92,19 @@ func (g *TruncateRetryGuard) Avoid(key string, now time.Time) []string {
 	if !ok {
 		return nil
 	}
-	if now.Sub(ent.at) > g.ttl {
+	out := make([]string, 0, len(ent.lines))
+	for line, at := range ent.lines {
+		if now.Sub(at) > g.ttl {
+			delete(ent.lines, line)
+			continue
+		}
+		out = append(out, line)
+	}
+	if len(ent.lines) == 0 {
 		delete(g.entries, key)
 		return nil
 	}
-	out := make([]string, 0, len(ent.lines))
-	for line := range ent.lines {
-		out = append(out, line)
-	}
+	g.entries[key] = ent
 	return out
 }
 
@@ -109,9 +120,16 @@ func (g *TruncateRetryGuard) Cleanup(now time.Time) int {
 	defer g.mu.Unlock()
 	removed := 0
 	for key, ent := range g.entries {
-		if now.Sub(ent.at) > g.ttl {
+		for line, at := range ent.lines {
+			if now.Sub(at) > g.ttl {
+				delete(ent.lines, line)
+			}
+		}
+		if len(ent.lines) == 0 {
 			delete(g.entries, key)
 			removed++
+		} else {
+			g.entries[key] = ent
 		}
 	}
 	return removed

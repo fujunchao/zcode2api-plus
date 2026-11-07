@@ -89,6 +89,7 @@ type Store struct {
 	modelProbe            modelProbeState
 	proxyFailureRechecks  map[string]proxyFailureRecheck // 运行期异常通知，不是删除证据；重启不续用。
 	proxySoft             proxySoftState                 // 软失败统计与隔离状态，保存于内部 meta，不进入设置快照。
+	proxySoftDirty        bool                           // 保存失败时保留脏标记，下次记录或关闭时重试。
 	line405               line405State                   // 线路级 405 画像与隔离，保存于内部 meta，不进入设置快照。
 	proxyUplink           proxyUplinkState               // 线路实测上行带宽（EWMA），选路门槛用，保存在内部 meta。
 	proxyUplinkCommitAt   int64                          // 上行带宽状态上次落盘时间（unix ms），仅用于落盘节流。
@@ -260,6 +261,9 @@ func (s *Store) Close() error {
 		s.strictClosed = true
 		if s.modelProbe.accountsDirty {
 			s.closeErr = s.persistProbeStateLocked()
+		}
+		if s.proxySoftDirty {
+			s.closeErr = errors.Join(s.closeErr, s.commitProxySoftLocked(time.Now()))
 		}
 		if s.strictRetryCancel != nil {
 			s.strictRetryCancel()

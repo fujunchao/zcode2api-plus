@@ -211,6 +211,10 @@ jobs:
       - name: Repeat release review regression
         run: go test ./internal/store ./internal/gateway ./internal/openai -run '^(TestNetworkUplinkSave|TestSelectUplinkUnknownBeforeSlow|TestPrebufferPreservesEarlyUpstreamError|TestGracefulToolCompletionGuard)' -count=10 -timeout=180s
 
+      # C1/C2 使用受控时间与隔离数据库，覆盖窗口边界、重启持久化及逐线路有效期。
+      - name: Repeat truncate window regression
+        run: go test ./internal/store ./internal/gateway -run '^(TestProxySoftTruncate|TestTruncateRetryGuard|TestRetryRequestAvoidsTruncatedLine)' -count=10 -timeout=180s
+
   # 真实客户端只连接 httptest，不读取账号、不访问真实模型；SDK 依赖安装在临时目录。
   sdk-compat:
     runs-on: ubuntu-latest
