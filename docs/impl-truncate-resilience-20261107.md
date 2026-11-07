@@ -136,3 +136,35 @@ content_block_stop（关闭当前块）→ 新开一个 text 块写可见提示 
 - [ ] 405/3012 风控、验证码、额度、计费、断流熔断口径不变；
 - [ ] `ZCODE_TRUNCATE_TERMINAL=legacy` 能一键回到 v2.13.0 行为；
 - [ ] §A 的线上改动可见（线路已删、设置 2/600、归档文件存在）。
+---
+
+## 执行记录（2026-11-07 完成）
+
+| 阶段 | 状态 | 证据 |
+|---|---|---|
+| A P0 线上止血 | ✅ | 坏线路已删（11→10，无账号失绑）、熔断参数 2/600 生效、日志归档 cron 已建并实跑；见 @@docs/ops-p0-20261107.md@@ |
+| B P1 终态语义 | ✅ v2.13.1 | 四策略 + 单测；默认 retryable |
+| C P2 预缓冲换号 | ✅ v2.13.1 | 未出内容断流换号重打；全部失败 502 |
+| D P3 graceful | ✅ v2.13.1 | 无未闭合 tool_use 才补帧，否则降级 |
+| E 演练通道 | ✅ v2.13.2 | 请求头（直连）+ 请求体 metadata（经 new-api）两种触发 |
+| F 发布 | ✅ v2.13.1 / v2.13.2 | CI 全绿 → tag → Release 附件 5 平台 + GHCR 镜像 → 生产已部署 2.13.2-go |
+
+### 关键实测（决定了 v2.13.2 的存在）
+
+1. 直连 zcode2api 的演练帧：`{"type":"error","error":{"type":"overloaded_error","code":"overloaded_error","message":"[1312][…]"}}`
+2. **经 new-api 回读**：`{"type":"error","error":{"type":"overloaded_error","message":"[1312][…]"}}` ——
+   `code` 被丢弃，`type` 与 `message` 保留；同时实测 **自定义请求头也不透传**（`X-Zcode-Drill` 丢失）。
+3. 结论：可重试语义必须写进 `message`（ZCode 取码兜底 = message 的 `^(\d{4})` 前缀），
+   v2.13.1 只写 `code` 在真实链路上不生效 → v2.13.2 双通道修复。
+
+### 生产部署状态（2026-11-07 19:53 BJ）
+
+- 容器 `zcode2api`：`ghcr.io/fujunchao/zcode2api-plus:2.13.2-go`，healthy，`/meta → 2.13.2-go`；
+- env：`ZCODE_TRUNCATE_TERMINAL=retryable`、`ZCODE_TRUNCATE_PREBUFFER_MS=12000`、`ZCODE_DRILL_KEY` 已置空（演练关闭）；
+- 冒烟：经 new-api 的正常流式请求完整（message_start → ping → content_block_* → stop），预缓冲未影响正常流。
+
+### 仍需观察的一件事
+
+下一次真实断流时，ZCode 的 `~/.zcode/cli/log/zcode-<日期>.jsonl` 应出现
+`model_retry_scheduled` / `attempt=2`，且**不再**出现 `turn.failed`。
+若仍出现 `turn.failed`，说明该客户端版本对错误分类的口径又有变化，需要按 v2.13.2 同样的方法重新逆向。
