@@ -844,9 +844,17 @@ func (p *Pool) attemptUpstreamOnce(
 	resp, err := client.Do(httpReq)
 	finishAttempt(resp, err)
 	watchdog.Headers(resp)
-	if uplink != nil && diag != nil {
-		diag.UpKBps = uplink.RateKBps()
-		if uplink.Aborted() {
+	// 与 sync 路径同一处理：实测带宽先写线路状态（供选路层跨请求使用），
+	// 再挂到本请求诊断上。两条路径必须共用同一份带宽数据，否则 sync/async 的
+	// 选路会依据不同的线路画像分叉。
+	if uplink != nil {
+		if kbps := uplink.RateKBps(); kbps > 0 {
+			p.Store.RecordProxyUplink(egress, kbps, time.Now())
+			if diag != nil {
+				diag.UpKBps = kbps
+			}
+		}
+		if diag != nil && uplink.Aborted() {
 			diag.UplinkAborts++
 		}
 	}

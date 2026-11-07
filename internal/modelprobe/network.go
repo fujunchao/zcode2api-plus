@@ -96,12 +96,15 @@ func (m *Manager) checkNetwork(ctx context.Context, p store.ProxyProfile, policy
 	return withDeepProbe(ctx, p, report, deep)
 }
 
-// withDeepProbe 只在巡检 first 阶段跑隧道裸写。
+// withDeepProbe 跑隧道裸写（4MiB，且按 steady_kbps 判定）。
 //
-// 为什么不在 second / direct / preflight 跑：
-//   - second 只是对失败线路复核可达性，first 的隧道结果已经入库；
+// 为什么 second 轮在 enforce 下也要跑：first 因隧道不达标而 OK=false 时，如果
+// second 只跑浅探针，浅探针 OK 就会把状态判成 recovered——慢线路因此永远退不掉。
+// 这正是 2026-11 之前「开了 enforce 也没用」的直接原因。
+//
+// 为什么不在 direct / preflight 跑：
 //   - direct 没有代理 URL，隧道无意义；
-//   - preflight 每个模型探测租约都会跑，在那里写 1MiB 会把流量与特征放大到每次租约。
+//   - preflight 每个模型探测租约都会跑，在那里写 4MiB 会把流量放大到每次租约。
 //
 // shadow 只记录、不改 OK；enforce 才把隧道失败并入判定。
 func withDeepProbe(ctx context.Context, p store.ProxyProfile, report networkprobe.Report, deep bool) networkprobe.Report {
@@ -109,13 +112,15 @@ func withDeepProbe(ctx context.Context, p store.ProxyProfile, report networkprob
 	if !deep || mode == "off" || p.URL == "" {
 		return report
 	}
-	t := networkprobe.CheckTunnelWrite(ctx, p.URL, config.DeepTarget, config.DeepBytes, config.DeepBudget, config.DeepMinBytes, config.DeepMinKbps)
+	t := networkprobe.CheckTunnelWrite(ctx, p.URL, config.DeepTarget, config.DeepBytes, config.DeepSkipBytes, config.DeepBudget, config.DeepMinBytes, config.DeepMinKbps)
 	report.Tunnel = &t
 	if mode == "enforce" {
 		report.OK = report.OK && t.OK
 	}
-	web.Warn("proxy-deep", fmt.Sprintf("id=%s mode=%s ok=%t bytes=%d ms=%d kbps=%d target=%s early_stop=%t",
-		p.ID, mode, t.OK, t.Bytes, t.MS, t.Kbps, config.DeepTarget, t.EarlyStop))
+	// steady_kbps 是判定依据（已跳过内核缓冲吸收窗口）；kbps 是全程平均，保留用于对比——
+	// 两者差距越大，说明这条线「突发很快、持续很差」，正是要抓的形态。
+	web.Warn("proxy-deep", fmt.Sprintf("id=%s mode=%s ok=%t bytes=%d ms=%d kbps=%d steady_kbps=%d skip_bytes=%d target=%s early_stop=%t",
+		p.ID, mode, t.OK, t.Bytes, t.MS, t.Kbps, t.SteadyKBps, config.DeepSkipBytes, config.DeepTarget, t.EarlyStop))
 	return report
 }
 
@@ -307,7 +312,10 @@ func (m *Manager) RunNetworkDue(parent context.Context) (worked bool, err error)
 			}
 		}
 	}
-	second := m.networkBatch(ctx, append(slices.Clone(bad), controls...), p, r.targets, false)
+	// enforce 下确认轮必须同样跑隧道测速，否则 first 的隧道失败会被浅探针「洗白」
+	// 成 recovered（见 withDeepProbe 上方注释）。shadow 模式仍只跑 first，控制流量。
+	secondDeep := config.DeepProbeMode() == "enforce"
+	second := m.networkBatch(ctx, append(slices.Clone(bad), controls...), p, r.targets, secondDeep)
 	var direct *networkprobe.Report
 	needsDirect := false
 	for _, b := range bad {

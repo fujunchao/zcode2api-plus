@@ -64,7 +64,12 @@ func (d *ReqDiag) BeginUpstreamAttempt(acc *model.Account, egress store.ProxyEgr
 		// 新字段始终追加，不挪动原有日志字段；开始与结果使用同一份请求快照。
 		// elapsed_ms 让「超时到底生效没有」可直接验证：死线路此前每次 60–80 秒，
 		// 收紧拨号/握手后应落到 25–35 秒。
-		web.Attempt(d.ReqID, fmt.Sprintf("event=%s %s status=%d err_kind=%s elapsed_ms=%d%s%s%s ts=%s", event, base, status, kind, d.Now().Sub(started).Milliseconds(), summary, extra, responseHeaderSummary(resp), diagnosticTime(d.Now())))
+		elapsed := d.Now().Sub(started)
+		// 累加所有出站尝试的墙钟：诊断行的 firstbyte 只等于**最后一次**尝试，
+		// 而用户实际等待接近这个累计值（实测 r(frt_total, 用户感知)=0.9945，
+		// r(firstbyte, 用户感知)=0.5774）。有重试时两者会差出几十秒。
+		d.AttemptsElapsed += elapsed
+		web.Attempt(d.ReqID, fmt.Sprintf("event=%s %s status=%d err_kind=%s elapsed_ms=%d%s%s%s ts=%s", event, base, status, kind, elapsed.Milliseconds(), summary, extra, responseHeaderSummary(resp), diagnosticTime(d.Now())))
 	}
 }
 

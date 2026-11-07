@@ -186,6 +186,14 @@ var (
 var (
 	// ProxySoftQuarantine 软失败隔离总开关；false 时只记录不隔离。
 	ProxySoftQuarantine = envBool("ZCODE_PROXY_SOFT_QUARANTINE", true)
+	// SelectUplinkBand 选路时是否按「绑定线路上行带宽」分档收窄候选；false 关闭该层。
+	//
+	// 数据来自真实请求的实测 up_kbps（EWMA），不是探针 kbps——后者写的是 TLS 端口，
+	// 边缘 10ms 内 400 并重置，bytes/ms 变成「缓冲容量 + 对端关闭时间」，实测同一条线
+	// 高估 5.2x/10.8x、也低估 5.4x，方向都不确定。
+	//
+	// 关闭后行为与改造前逐字一致：selectAccount 的其余层级不受影响。
+	SelectUplinkBand = envBool("ZCODE_SELECT_UPLINK_BAND", true)
 	// ProxySoftTruncate 上游中途断流是否计入线路软失败；false 时只走 line-guard 熔断。
 	//
 	// 断流对客户端可见且无法重试：连接失败可以换线重试，断流不能。默认计入，
@@ -248,9 +256,19 @@ var (
 	// DeepTarget 只接受 host:port，不接受 URL——避免把凭据写进配置。
 	DeepTarget = env("ZCODE_PROXY_DEEP_TARGET", "zcode.z.ai:443")
 	// DeepBytes 单次写入量。
-	DeepBytes = int64(max(65536, envInt("ZCODE_PROXY_DEEP_BYTES", 1048576)))
-	// DeepBudget 单次预算。
-	DeepBudget = time.Duration(max(1000, envInt("ZCODE_PROXY_DEEP_BUDGET_MS", 12000))) * time.Millisecond
+	//
+	// 4MiB 的来历：所有线路前 ~128KB 会瞬间写进内核缓冲（0.2-0.3s），之后才断崖
+	// 跌到真实链路速率；1MiB 载荷仍有约 1/8 落在缓冲窗口内，全程平均被抬高。
+	// 载荷加大到 4MiB 后缓冲占比降到 ~3%，配合 DeepSkipBytes 才测得准链路。
+	DeepBytes = int64(max(262144, envInt("ZCODE_PROXY_DEEP_BYTES", 4194304)))
+	// DeepSkipBytes 稳态速率的统计起点；覆盖内核缓冲的吸收窗口。0 = 不做稳态统计。
+	//
+	// 实测依据：对「探针报 165KB/s、真实稳态 32KB/s」这类线路，跳过前 128KB 后
+	// 探针值与独立实测一致（同量级）；不跳则高估 5-11 倍，方向还不固定
+	// （也会低估 5 倍以上）。tunnel.steady_kbps 就是按这个起点算的。
+	DeepSkipBytes = int64(max(0, envInt("ZCODE_PROXY_DEEP_SKIP_BYTES", 131072)))
+	// DeepBudget 单次预算。4MiB 在 150KB/s 的线上需要 27s，12s 会一律撞预算。
+	DeepBudget = time.Duration(max(1000, envInt("ZCODE_PROXY_DEEP_BUDGET_MS", 30000))) * time.Millisecond
 	// DeepMinBytes 早停判定下限：写满这个量且够快，就认为链路没问题。
 	//
 	// 256KB → 128KB 的依据不是「曲线平缓」，而是 96KB 与 128KB 对真实成功线路的
@@ -258,10 +276,11 @@ var (
 	// 早停是「对端主动关闭」（写错误），与「缓冲区吃满后阻塞」不同：后者会撞满预算，
 	// 被 `ms < budget*2/3` 挡掉，所以放宽下限不会把传不动的线放进来。
 	//
-	// ⚠️ 不要单独下调 DeepBytes 来省流量：满写分支不受 kbps/ms 约束，1MiB/12s 就是
-	// 85KB/s 的隐式速率底线（正好等于 DeepMinKbps）。降 size 会让「突发后卡死」的
-	// 线在卡死前停止写入、被判 OK——2026-10-20 日志里有 78 条这样的样本。
-	DeepMinBytes = int64(max(1024, envInt("ZCODE_PROXY_DEEP_MIN_BYTES", 131072)))
+	// ⚠️ 下调 DeepBytes 不再能绕过速率判据：2026-11 起「写满」只是 OK 的必要条件，
+	// 还要 steady_kbps ≥ DeepMinKbps（此前 1MiB/12s 恰好等于 85KB/s，速率是隐式的，
+	// 降 size 就会失守）。尽管如此，仍需保证 DeepBytes >> DeepSkipBytes，否则稳态
+	// 区间太短、采样噪声会主导结果。
+	DeepMinBytes = int64(max(1024, envInt("ZCODE_PROXY_DEEP_MIN_BYTES", 524288)))
 	// DeepMinKbps 速率下限（KB/s）：实测「慢但能用」约 68，故障线路 20 量级。
 	DeepMinKbps = int64(max(1, envInt("ZCODE_PROXY_DEEP_MIN_KBPS", 85)))
 )
@@ -532,7 +551,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.12.0-go"
+	AppVersion = "2.13.0-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

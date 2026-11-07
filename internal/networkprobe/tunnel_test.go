@@ -97,7 +97,7 @@ func targetServer(t *testing.T, mode string, limit int64) string {
 func TestCheckTunnelWriteFull(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "drain", 0)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 256<<10, 2*time.Second, 64<<10, 85)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 256<<10, 0, 2*time.Second, 64<<10, 85)
 	if !rep.OK || rep.Bytes != 256<<10 {
 		t.Fatalf("写满应当 OK：%+v", rep)
 	}
@@ -110,7 +110,7 @@ func TestCheckTunnelWriteFull(t *testing.T) {
 func TestCheckTunnelWriteEarlyStopIsOK(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "early", 128<<10)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 4<<20, 2*time.Second, 64<<10, 1)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 4<<20, 0, 2*time.Second, 64<<10, 1)
 	if !rep.OK || !rep.EarlyStop {
 		t.Fatalf("对端早关且够快应判 OK：%+v", rep)
 	}
@@ -122,7 +122,7 @@ func TestCheckTunnelWriteStallFails(t *testing.T) {
 	target := targetServer(t, "stall", 0)
 	start := time.Now()
 	// 64MB 远大于两端内核缓冲之和：缓冲被填满后写必然阻塞到 deadline。
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 300*time.Millisecond, 64<<10, 85)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 0, 300*time.Millisecond, 64<<10, 85)
 	if rep.OK {
 		t.Fatalf("写不动必须判失败：%+v", rep)
 	}
@@ -133,7 +133,7 @@ func TestCheckTunnelWriteStallFails(t *testing.T) {
 
 func TestCheckTunnelWriteDialFailure(t *testing.T) {
 	// 代理端口不通：应立即失败，不写字节。
-	rep := CheckTunnelWrite(context.Background(), "http://127.0.0.1:1", "127.0.0.1:443", 1024, time.Second, 512, 85)
+	rep := CheckTunnelWrite(context.Background(), "http://127.0.0.1:1", "127.0.0.1:443", 1024, 0, time.Second, 512, 85)
 	if rep.OK || rep.Bytes != 0 || rep.Error == "" {
 		t.Fatalf("建连失败应直接判失败：%+v", rep)
 	}
@@ -147,7 +147,7 @@ func TestCheckTunnelWriteDialFailure(t *testing.T) {
 func TestDeepMinBytesCoversEarlyCloseAt150KB(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "early", 150<<10)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 2*time.Second, 128<<10, 85)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 0, 2*time.Second, 128<<10, 85)
 	if !rep.OK || !rep.EarlyStop {
 		t.Fatalf("150KB 早停 + 128KB 下限应判 OK：%+v", rep)
 	}
@@ -163,7 +163,7 @@ func TestDeepMinBytesCoversEarlyCloseAt150KB(t *testing.T) {
 func TestDeepMinBytesRejectsEarlyCloseBelowFloor(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "early", 150<<10)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 2*time.Second, 4<<20, 85)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 0, 2*time.Second, 4<<20, 85)
 	if rep.OK {
 		t.Fatalf("写入量低于下限不应判 OK：%+v", rep)
 	}
@@ -176,7 +176,7 @@ func TestDeepBytesStallAfterPartialWriteFails(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "early_stall", 300<<10)
 	start := time.Now()
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 300*time.Millisecond, 128<<10, 85)
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 64<<20, 0, 300*time.Millisecond, 128<<10, 85)
 	if rep.OK {
 		t.Fatalf("突发后卡死必须判失败：%+v", rep)
 	}

@@ -10,6 +10,7 @@ import (
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/networkprobe"
+	"zcode2api/internal/web"
 )
 
 type NetworkHealthRecord struct {
@@ -110,6 +111,68 @@ func (s *Store) networkHealthSummaryLocked(now time.Time) (NetworkHealthSummary,
 	return out, nil
 }
 
+// syncUplinkFromRecordsLocked 把网络巡检的隧道测速结果写进上行带宽状态。
+//
+// 只采纳 steady_kbps>0 的样本：全程平均（kbps）会被前 128KB 的内核缓冲抬高，
+// 实测同一条线高估 5-11 倍，用它做选路会把坏线当快线。
+// 调用方须持有 s.mu。
+func (s *Store) syncUplinkFromRecordsLocked(records []NetworkHealthRecord, now time.Time) {
+	if len(records) == 0 {
+		return
+	}
+	if s.proxyUplink.Entries == nil {
+		s.proxyUplink.Entries = map[string]ProxyUplink{}
+	}
+	changed := false
+	for _, rec := range records {
+		profile, ok := s.probeProfileLocked(rec.ProfileID)
+		if !ok || profile.URL == "" {
+			continue
+		}
+		identity := strictProxyIdentity(profile.URL)
+		if identity == "" {
+			continue
+		}
+		kbps := tunnelSteadyKBps(rec.First)
+		if kbps <= 0 && rec.Second != nil {
+			kbps = tunnelSteadyKBps(*rec.Second)
+		}
+		if kbps <= 0 {
+			continue
+		}
+		ent, exists := s.proxyUplink.Entries[identity]
+		if !exists {
+			ent = ProxyUplink{Identity: identity}
+		}
+		ent.ProfileID, ent.Generation = profile.ID, profile.Generation
+		// 探针样本与真实请求样本混进同一个 EWMA：两者口径不同但同向，
+		// 且真实样本会持续覆盖，权重交给调用频次自然决定。
+		if ent.Sample <= 0 {
+			ent.KBps = kbps
+		} else {
+			ent.KBps = ent.KBps*(1-proxyUplinkAlpha) + kbps*proxyUplinkAlpha
+		}
+		ent.Sample++
+		ent.LastAt = now.UnixMilli()
+		s.proxyUplink.Entries[identity] = ent
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	if err := s.commitProxyUplinkLocked(); err != nil {
+		web.Warn("proxy-uplink", "巡检上行带宽落库失败: "+err.Error())
+	}
+}
+
+// tunnelSteadyKBps 取一次探测的稳态上行速率；没有隧道结果时返回 0。
+func tunnelSteadyKBps(rep networkprobe.Report) float64 {
+	if rep.Tunnel == nil || rep.Tunnel.SteadyKBps <= 0 {
+		return 0
+	}
+	return float64(rep.Tunnel.SteadyKBps)
+}
+
 func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHealthRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -140,6 +203,16 @@ func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHe
 			return err
 		}
 	}
+	// 把本次探测的实测上行带宽同步进选路状态。
+	//
+	// 探针自 2026-11 起按 steady_kbps 判定（跳过内核缓冲吸收窗口），与真实请求的
+	// up_kbps 采样口径一致，可以直接作为初值。这样新导入的线路在**首次巡检之后**
+	// 就有带宽画像，不必等两次真实请求才定档——而订阅每 15 分钟就导入一批新线，
+	// 等真实请求往往意味着用户先踩一次慢线。
+	//
+	// 后续真实请求的采样会继续用 EWMA 修正它（探针测的是到 Cloudflare 的速率，
+	// 真实请求测的是到 zcode.z.ai 的速率，两者不完全等价，真实采样权重应当更高）。
+	s.syncUplinkFromRecordsLocked(records, time.Now())
 	if _, err = tx.Exec("DELETE FROM proxy_network_health WHERE rowid NOT IN (SELECT rowid FROM proxy_network_health ORDER BY rowid DESC LIMIT 10000)"); err != nil {
 		return err
 	}

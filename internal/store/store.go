@@ -90,6 +90,8 @@ type Store struct {
 	proxyFailureRechecks  map[string]proxyFailureRecheck // 运行期异常通知，不是删除证据；重启不续用。
 	proxySoft             proxySoftState                 // 软失败统计与隔离状态，保存于内部 meta，不进入设置快照。
 	line405               line405State                   // 线路级 405 画像与隔离，保存于内部 meta，不进入设置快照。
+	proxyUplink           proxyUplinkState               // 线路实测上行带宽（EWMA），选路门槛用，保存在内部 meta。
+	proxyUplinkCommitAt   int64                          // 上行带宽状态上次落盘时间（unix ms），仅用于落盘节流。
 	proxyRelaxLoggedAt    int64                          // 选线放宽日志限频（unix ms），仅用于避免日志刷屏。
 	proxyProtectLogged    map[string]int64               // 「最近成功免删」日志限频（profile ID → 上次输出 ms），仅内存。
 	line405RelaxLoggedAt  int64                          // 线路 405 隔离放宽日志限频（unix ms）。
@@ -414,6 +416,13 @@ func (s *Store) load() error {
 	}
 	delete(settings, proxySoftFailureKey)
 	s.pruneProxySoftLocked(time.Now())
+	if raw := settings[proxyUplinkKey]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &s.proxyUplink); err != nil {
+			return fmt.Errorf("读取代理上行带宽状态失败: %w", err)
+		}
+	}
+	delete(settings, proxyUplinkKey)
+	s.pruneProxyUplinkLocked(time.Now())
 	if raw := settings[line405Key]; raw != "" {
 		if err := json.Unmarshal([]byte(raw), &s.line405); err != nil {
 			return fmt.Errorf("读取线路 405 状态失败: %w", err)
@@ -2008,6 +2017,44 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 		pool = promo
 	} else {
 		pool = regular
+	}
+	// 上行带宽门槛：只保留「绑定线路上行带宽」处于最高档的账号。
+	//
+	// 为什么插在这里：前面几层（资格/模型/到期/promo）是硬语义，不能为了带宽跳过；
+	// 后面是「额度优先」，它会把候选收窄成一组，放在它之前才能看到全局。
+	//
+	// 为什么是门槛而不是排序：与上面的到期门槛同构——按带宽排序再取前 N 个会把流量
+	// 压到少数账号（zcode-pool 的 take(4) 就是热点来源）。这里只收窄候选，组内仍由
+	// 下方游标轮询，保持负载均衡。
+	//
+	// 为什么分档而不是逐值比较：EWMA 会小幅浮动，逐值比较会让「最优组」每小时换一次
+	// 人，反而引入抖动。分档把档内差异吸收掉。
+	//
+	// 数据来源是真实请求的实测 up_kbps，不是探针 kbps——后者方向都不确定
+	// （详见 proxy_uplink.go 的包级注释）。
+	if config.SelectUplinkBand {
+		if snapshot := s.proxyUplinkSnapshotLocked(); len(snapshot) > 0 {
+			best := 0
+			for _, a := range pool {
+				if band := uplinkBandOfIdentity(snapshot, s.boundLineIdentityLocked(a)); band > best {
+					best = band
+				}
+			}
+			// best==0 表示全池都没有可用样本：保持原状，不因「还没测到」而收窄。
+			if best > 0 {
+				kept := make([]*model.Account, 0, len(pool))
+				for _, a := range pool {
+					if uplinkBandOfIdentity(snapshot, s.boundLineIdentityLocked(a)) == best {
+						kept = append(kept, a)
+					}
+				}
+				// 兜底：收窄后为空则回落到收窄前。宁可派一条慢线，
+				// 也不能因为带宽判不出而返回 no_available_account。
+				if len(kept) > 0 {
+					pool = kept
+				}
+			}
+		}
 	}
 	// 额度优先：只保留剩余额度最多的那一组，再由下面的游标在组内轮转。
 	//

@@ -72,9 +72,16 @@ type ReqDiag struct {
 
 	UpstreamStart time.Time // 上游请求发出时刻（首字节与耗时的基准）
 	FirstByte     time.Duration
-	MaxGap        time.Duration
-	Bytes         int64 // 从上游读到的总字节数
-	lastRead      time.Time
+	// AttemptsElapsed 本请求所有出站尝试的累计墙钟（Σ 每次 client.Do 的耗时）。
+	//
+	// 与 FirstByte 的区别：FirstByte 只等于**最后一次**尝试，而用户实际等待接近
+	// 这个累计值。实测 r(frt_total, 用户感知首字)=0.9945，而 r(firstbyte, 用户感知)
+	// 只有 0.5774——有重试时日志里 firstbyte=1474ms 对应的真实等待可达 121 秒。
+	// 没有它，看日志的人会把「重试放大」误判成「一切正常」。
+	AttemptsElapsed time.Duration
+	MaxGap          time.Duration
+	Bytes           int64 // 从上游读到的总字节数
+	lastRead        time.Time
 
 	// UpKBps 最后一次尝试的实测上行速率（KB/s）；0 = 未采样或未启用上行闸门。
 	// UplinkAborts 本请求被上行速率闸门淘汰的尝试次数：>0 说明问题在出口带宽，
@@ -262,6 +269,9 @@ func (d *ReqDiag) Format() string {
 	// 验证码热路径字段同样追加在行尾；0 表示池热命中，必须原样打印。
 	msg += fmt.Sprintf(" captcha_wait_ms=%d captcha_pool_size=%d captcha_empty_take=%d captcha_mint_fail=%d",
 		d.CaptchaWait.Milliseconds(), d.CaptchaPoolSize, d.CaptchaEmptyTake, d.CaptchaMintFail)
+	// frt_total 是「用户实际等待的首字时长」的日志口径（Σ 所有尝试）。
+	// 单次尝试时它约等于 firstbyte；有重试时 firstbyte 会严重低估，必须看这个。
+	msg += fmt.Sprintf(" frt_total=%s", dashDur(d.AttemptsElapsed))
 	return msg
 }
 

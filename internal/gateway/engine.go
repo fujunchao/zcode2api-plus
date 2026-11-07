@@ -524,9 +524,19 @@ func (e *Engine) tryAccount(
 		resp, err := client.Do(httpReq)
 		finishAttempt(resp, err)
 		watchdog.Headers(resp)
-		if uplink != nil && diag != nil {
-			diag.UpKBps = uplink.RateKBps()
-			if uplink.Aborted() {
+		// 先把实测带宽写进线路状态，再挂到诊断上：选路层靠它跨请求记住「哪条线快」，
+		// 而 diag 只服务本请求、且可能为 nil。
+		//
+		// 只在 kbps>0 时写：0 表示本次未采到样本（请求体低于上行闸门门槛，或上传
+		// 快到来不及计时），当成 0KB/s 记账会把快线误判成慢线。
+		if uplink != nil {
+			if kbps := uplink.RateKBps(); kbps > 0 {
+				e.Store.RecordProxyUplink(egress, kbps, e.now())
+				if diag != nil {
+					diag.UpKBps = kbps
+				}
+			}
+			if diag != nil && uplink.Aborted() {
 				diag.UplinkAborts++
 			}
 		}
