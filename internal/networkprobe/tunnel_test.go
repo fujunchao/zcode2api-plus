@@ -107,12 +107,21 @@ func TestCheckTunnelWriteFull(t *testing.T) {
 }
 
 // 对端读够就关：只要够快、写的量够，就算链路没问题。
+//
+// 这里不断言 EarlyStop：4MiB 在 CI 上可能整体进入内核发送缓冲、循环正常跑完
+// （Bytes 写满 size，EarlyStop=false），是否早停取决于缓冲大小与对端关闭的时序，
+// 原本就是竞态。早停分支的**判定逻辑**由 TestJudgeTunnelOKEarlyStop 用确定性
+// 构造覆盖；本用例守的是集成路径不要把早停/写满误判成故障。
 func TestCheckTunnelWriteEarlyStopIsOK(t *testing.T) {
 	proxyURL := startConnectProxy(t)
 	target := targetServer(t, "early", 128<<10)
-	rep := CheckTunnelWrite(context.Background(), proxyURL, target, 4<<20, 0, 2*time.Second, 64<<10, 1)
-	if !rep.OK || !rep.EarlyStop {
+	const size = 4 << 20
+	rep := CheckTunnelWrite(context.Background(), proxyURL, target, size, 0, 2*time.Second, 64<<10, 1)
+	if !rep.OK {
 		t.Fatalf("对端早关且够快应判 OK：%+v", rep)
+	}
+	if !rep.EarlyStop && rep.Bytes < size {
+		t.Fatalf("既未早停也未写满，属于异常：%+v", rep)
 	}
 }
 
