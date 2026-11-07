@@ -409,6 +409,15 @@ func (g *prebufferGate) stopTimerLocked() {
 	}
 }
 
+// close 在交付函数退出前停表并关闭闸门；已启动但尚未取得锁的回调也不得再写响应。
+func (g *prebufferGate) close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopTimerLocked()
+	g.abandoned = true
+	g.pending = nil
+}
+
 func (g *prebufferGate) commitLocked() error {
 	if g.committed || g.abandoned {
 		return g.writeErr

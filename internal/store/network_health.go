@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"sort"
 	"strconv"
@@ -10,7 +11,6 @@ import (
 
 	"zcode2api/internal/config"
 	"zcode2api/internal/networkprobe"
-	"zcode2api/internal/web"
 )
 
 type NetworkHealthRecord struct {
@@ -115,10 +115,10 @@ func (s *Store) networkHealthSummaryLocked(now time.Time) (NetworkHealthSummary,
 //
 // 只采纳 steady_kbps>0 的样本：全程平均（kbps）会被前 128KB 的内核缓冲抬高，
 // 实测同一条线高估 5-11 倍，用它做选路会把坏线当快线。
-// 调用方须持有 s.mu。
-func (s *Store) syncUplinkFromRecordsLocked(records []NetworkHealthRecord, now time.Time) {
+// 仅更新内存并返回是否变化；调用方须持有 s.mu，负责在同一事务内保存并处理回滚。
+func (s *Store) syncUplinkFromRecordsLocked(records []NetworkHealthRecord, now time.Time) bool {
 	if len(records) == 0 {
-		return
+		return false
 	}
 	if s.proxyUplink.Entries == nil {
 		s.proxyUplink.Entries = map[string]ProxyUplink{}
@@ -126,43 +126,48 @@ func (s *Store) syncUplinkFromRecordsLocked(records []NetworkHealthRecord, now t
 	changed := false
 	for _, rec := range records {
 		profile, ok := s.probeProfileLocked(rec.ProfileID)
-		if !ok || profile.URL == "" {
+		if !ok || profile.URL == "" || profile.Generation != rec.Generation || rec.Removed {
 			continue
 		}
 		identity := strictProxyIdentity(profile.URL)
 		if identity == "" {
 			continue
 		}
-		kbps := tunnelSteadyKBps(rec.First)
-		if kbps <= 0 && rec.Second != nil {
-			kbps = tunnelSteadyKBps(*rec.Second)
-		}
-		if kbps <= 0 {
-			continue
-		}
 		ent, exists := s.proxyUplink.Entries[identity]
 		if !exists {
 			ent = ProxyUplink{Identity: identity}
 		}
-		ent.ProfileID, ent.Generation = profile.ID, profile.Generation
-		// 探针样本与真实请求样本混进同一个 EWMA：两者口径不同但同向，
-		// 且真实样本会持续覆盖，权重交给调用频次自然决定。
-		if ent.Sample <= 0 {
-			ent.KBps = kbps
-		} else {
-			ent.KBps = ent.KBps*(1-proxyUplinkAlpha) + kbps*proxyUplinkAlpha
+		if ent.ProbeRound != rec.RoundID || ent.ProfileID != profile.ID || ent.Generation != profile.Generation {
+			ent.ProbeRound, ent.ProbeStages = rec.RoundID, 0
 		}
-		ent.Sample++
-		ent.LastAt = now.UnixMilli()
-		s.proxyUplink.Entries[identity] = ent
-		changed = true
+		ent.ProfileID, ent.Generation = profile.ID, profile.Generation
+		updated := false
+		addSample := func(report networkprobe.Report, stage uint8) {
+			kbps := tunnelSteadyKBps(report)
+			if kbps <= 0 || ent.ProbeStages&stage != 0 {
+				return
+			}
+			if ent.Sample <= 0 {
+				ent.KBps = kbps
+			} else {
+				ent.KBps = ent.KBps*(1-proxyUplinkAlpha) + kbps*proxyUplinkAlpha
+			}
+			ent.Sample++
+			ent.LastAt = now.UnixMilli()
+			ent.ProbeStages |= stage
+			updated = true
+		}
+		// 首次与复核是两个独立测量；处置后再次保存不能重新计数。
+		addSample(rec.First, 1)
+		if rec.Second != nil {
+			addSample(*rec.Second, 2)
+		}
+		if updated {
+			s.proxyUplink.Entries[identity] = ent
+			changed = true
+		}
 	}
-	if !changed {
-		return
-	}
-	if err := s.commitProxyUplinkLocked(); err != nil {
-		web.Warn("proxy-uplink", "巡检上行带宽落库失败: "+err.Error())
-	}
+	return changed
 }
 
 // tunnelSteadyKBps 取一次探测的稳态上行速率；没有隧道结果时返回 0。
@@ -189,12 +194,6 @@ func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHe
 			r.State = "changed"
 			r.RecheckAt = 0
 		}
-		// 结果落库是冷启动门禁的唯一正常解除出口：从取走到落库之间线路必须继续被挡住。
-		// 轮次被取消时不会走到这里，由 Fresh 门禁的有效期兜底放行。
-		if hint, ok := s.proxyFailureRechecks[r.ProfileID]; ok {
-			hint.InFlight, hint.InFlightAt, hint.Fresh = false, time.Time{}, false
-			s.proxyFailureRechecks[r.ProfileID] = hint
-		}
 		raw, err := json.Marshal(r)
 		if err != nil {
 			return err
@@ -203,20 +202,46 @@ func (s *Store) SaveNetworkHealth(policy ModelProbeSettings, records []NetworkHe
 			return err
 		}
 	}
-	// 把本次探测的实测上行带宽同步进选路状态。
-	//
-	// 探针自 2026-11 起按 steady_kbps 判定（跳过内核缓冲吸收窗口），与真实请求的
-	// up_kbps 采样口径一致，可以直接作为初值。这样新导入的线路在**首次巡检之后**
-	// 就有带宽画像，不必等两次真实请求才定档——而订阅每 15 分钟就导入一批新线，
-	// 等真实请求往往意味着用户先踩一次慢线。
-	//
-	// 后续真实请求的采样会继续用 EWMA 修正它（探针测的是到 Cloudflare 的速率，
-	// 真实请求测的是到 zcode.z.ai 的速率，两者不完全等价，真实采样权重应当更高）。
-	s.syncUplinkFromRecordsLocked(records, time.Now())
+	// 唯一数据库连接已由 tx 占用，带宽必须通过同一事务写入。
+	// 用副本更新内存；任意写入或提交失败都恢复旧状态，避免失败重试被误判为重复样本。
+	previousUplink := s.proxyUplink
+	s.proxyUplink.Entries = maps.Clone(previousUplink.Entries)
+	committed := false
+	defer func() {
+		if !committed {
+			s.proxyUplink = previousUplink
+		}
+	}()
+	now := time.Now()
+	changed := s.syncUplinkFromRecordsLocked(records, now)
+	if changed {
+		s.pruneProxyUplinkLocked(now)
+		raw, err := json.Marshal(s.proxyUplink)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)", proxyUplinkKey, string(raw)); err != nil {
+			return err
+		}
+	}
 	if _, err = tx.Exec("DELETE FROM proxy_network_health WHERE rowid NOT IN (SELECT rowid FROM proxy_network_health ORDER BY rowid DESC LIMIT 10000)"); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	if changed {
+		s.proxyUplinkCommitAt = now.UnixMilli()
+	}
+	// 只有事务完整落库后才解除冷启动门禁；失败或取消仍由有效期兜底。
+	for _, r := range records {
+		if hint, ok := s.proxyFailureRechecks[r.ProfileID]; ok {
+			hint.InFlight, hint.InFlightAt, hint.Fresh = false, time.Time{}, false
+			s.proxyFailureRechecks[r.ProfileID] = hint
+		}
+	}
+	return nil
 }
 
 func (s *Store) ClearInterruptedNetworkHealth() error {

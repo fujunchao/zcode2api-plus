@@ -78,6 +78,7 @@ type chatStreamTool struct {
 	index   float64
 	initial string
 	hasArgs bool
+	closed  bool
 }
 
 // dispatch 分发一个已解析的上游事件。
@@ -102,7 +103,14 @@ func (e *sseEncoder) dispatch(event, data string) error {
 		return e.onContentBlockDelta(payload)
 	case "content_block_stop":
 		index, _ := payload["index"].(float64)
-		return e.flushToolInput(e.tools[int(index)])
+		tool := e.tools[int(index)]
+		if err := e.flushToolInput(tool); err != nil {
+			return err
+		}
+		if tool != nil {
+			tool.closed = true
+		}
+		return nil
 	case "message_delta":
 		return e.onMessageDelta(payload)
 	case "message_stop":
@@ -291,7 +299,7 @@ func (e *sseEncoder) fail(cause error) error {
 	case config.TruncateTerminalGraceful:
 		// 收敛成正常结束：finish chunk + [DONE]，客户端不会把本轮判成失败。
 		// 流还没开始时没有可收敛的消息（客户端连 chunk id 都没见过）→ 退回错误 chunk。
-		if e.id == "" {
+		if !e.canFinishGracefully() {
 			break
 		}
 		e.finished = true
@@ -314,6 +322,19 @@ func (e *sseEncoder) fail(cause error) error {
 		return err
 	}
 	return cause
+}
+
+// canFinishGracefully 检查全部工具，交错输出时不能只看最后一个块。
+func (e *sseEncoder) canFinishGracefully() bool {
+	if e.id == "" {
+		return false
+	}
+	for _, tool := range e.toolOrder {
+		if !tool.closed {
+			return false
+		}
+	}
+	return true
 }
 
 // emit 序列化并写出一个 chunk 事件。

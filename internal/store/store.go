@@ -2036,15 +2036,15 @@ func (s *Store) selectAccount(provider string, skipIDs map[string]bool, modelNam
 		if snapshot := s.proxyUplinkSnapshotLocked(); len(snapshot) > 0 {
 			best := 0
 			for _, a := range pool {
-				if band := uplinkBandOfIdentity(snapshot, s.boundLineIdentityLocked(a)); band > best {
+				if band := uplinkRankOfIdentity(snapshot, s.boundLineIdentityLocked(a)); band > best {
 					best = band
 				}
 			}
-			// best==0 表示全池都没有可用样本：保持原状，不因「还没测到」而收窄。
+			// 未知档排在已知中速线之后、慢线之前；全未知时同档保留全部候选。
 			if best > 0 {
 				kept := make([]*model.Account, 0, len(pool))
 				for _, a := range pool {
-					if uplinkBandOfIdentity(snapshot, s.boundLineIdentityLocked(a)) == best {
+					if uplinkRankOfIdentity(snapshot, s.boundLineIdentityLocked(a)) == best {
 						kept = append(kept, a)
 					}
 				}

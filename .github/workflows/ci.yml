@@ -207,6 +207,10 @@ jobs:
       - name: Repeat unified proxy health contracts
         run: go test ./internal/modelprobe ./internal/adminapi -run 'TestUnified|TestProxyHealth' -count=10 -timeout=240s
 
+      # 发布审核回归走真实事务、HTTP 端点及虚拟时钟，保护采样去重与流式收尾。
+      - name: Repeat release review regression
+        run: go test ./internal/store ./internal/gateway ./internal/openai -run '^(TestNetworkUplinkSave|TestSelectUplinkUnknownBeforeSlow|TestPrebufferPreservesEarlyUpstreamError|TestGracefulToolCompletionGuard)' -count=10 -timeout=180s
+
   # 真实客户端只连接 httptest，不读取账号、不访问真实模型；SDK 依赖安装在临时目录。
   sdk-compat:
     runs-on: ubuntu-latest

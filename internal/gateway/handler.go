@@ -109,6 +109,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 func passthroughDeliver(w http.ResponseWriter, d Delivery) error {
 	isSSE := strings.Contains(d.ContentType, "text/event-stream")
 	gate := newPrebufferGate(w, d.StatusCode, d.ContentType, config.TruncatePrebufferBytes)
+	defer gate.close()
 
 	prebuffer := isSSE && prebufferBudget() > 0
 	if !prebuffer {
@@ -152,8 +153,11 @@ func passthroughDeliver(w http.ResponseWriter, d Delivery) error {
 				return err
 			}
 			tail.finish()
-			// 上游自己的 error 事件已经原样转发给客户端：再追加一条「中断」既重复又失实。
+			// 上游业务错误可能仍在预缓冲中：先原样交付，不追加传输中断帧。
 			if IsUpstreamErrorEvent(err) {
+				if cerr := gate.commit(); cerr != nil {
+					return cerr
+				}
 				return err
 			}
 			if gate.claimUndelivered() {

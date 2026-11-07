@@ -60,6 +60,9 @@ type ProxyUplink struct {
 	// Sample 累计样本数；小于 proxyUplinkMinSample 时只记账、不参与选路。
 	Sample int   `json:"sample"`
 	LastAt int64 `json:"last_at"`
+	// 同一巡检轮会多次保存；阶段位分别记录首次探测与复核，随带宽一起持久化。
+	ProbeRound  string `json:"probe_round,omitempty"`
+	ProbeStages uint8  `json:"probe_stages,omitempty"`
 }
 
 type proxyUplinkState struct {
@@ -208,17 +211,15 @@ func (s *Store) pruneProxyUplinkLocked(now time.Time) {
 	}
 }
 
-// uplinkBandOfIdentity 取某条线路的档位；无样本返回 0。
-//
-// 快照已按 proxyUplinkMinSample 过滤过，进到这里的值都够可信，
-// 所以这里只需要按门槛分档，不再重复判样本数。
-func uplinkBandOfIdentity(snapshot map[string]float64, identity string) int {
-	if identity == "" {
-		return 0
+// uplinkRankOfIdentity 只用于选路排序：快(4) > 中(3) > 未知(2) > 慢(1)。
+// 快照已过滤不足两个样本的线路；未知线路不能被已知慢线永久排除。
+func uplinkRankOfIdentity(snapshot map[string]float64, identity string) int {
+	band := UplinkBand(snapshot[identity], proxyUplinkMinSample)
+	if band == 0 {
+		return 2
 	}
-	kbps, ok := snapshot[identity]
-	if !ok {
-		return 0
+	if band == 1 {
+		return 1
 	}
-	return UplinkBand(kbps, proxyUplinkMinSample)
+	return band + 1
 }

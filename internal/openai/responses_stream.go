@@ -64,6 +64,7 @@ type responsesBlock struct {
 	text        strings.Builder
 	initialArgs string
 	hasArgs     bool
+	closed      bool
 }
 
 type responsesEncoder struct {
@@ -127,6 +128,11 @@ func (e *responsesEncoder) dispatch(event, data string) error {
 		}
 	case "content_block_delta":
 		return e.onContentBlockDelta(payload)
+	case "content_block_stop":
+		index, _ := payload["index"].(float64)
+		if b := e.blocks[int(index)]; b != nil {
+			b.closed = true
+		}
 	case "message_delta":
 		if usage, ok := payload["usage"].(map[string]any); ok {
 			// 与 Chat/网关一致，保留多次 delta 的累计用量，而不是只看最后一段。
@@ -362,9 +368,12 @@ func (e *responsesEncoder) fail(cause error) error {
 			return err
 		}
 	}
-	if config.TruncateTerminal == config.TruncateTerminalGraceful {
-		e.finished = true
-		return e.emit("response.completed", map[string]any{"response": e.responseEnvelope("completed")})
+	if config.TruncateTerminal == config.TruncateTerminalGraceful && e.canFinishGracefully() {
+		// 复用正常收尾，补齐每个输出项目的 done 事件；仍返回原始错误供引擎记账。
+		if err := e.onMessageStop(); err != nil {
+			return err
+		}
+		return cause
 	}
 	for _, b := range e.items {
 		b.item["status"] = "incomplete"
@@ -380,6 +389,15 @@ func (e *responsesEncoder) fail(cause error) error {
 		return err
 	}
 	return cause
+}
+
+func (e *responsesEncoder) canFinishGracefully() bool {
+	for _, b := range e.items {
+		if b.kind == "tool_use" && !b.closed {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *responsesEncoder) responseEnvelope(status string) map[string]any {
