@@ -101,6 +101,10 @@ type ReqDiag struct {
 	CaptchaEmptyTake int
 	CaptchaMintFail  int
 
+	// contentKey 完整内容指纹（模型 + 内容），仅供重试感知选线在收尾时归档断流线路；
+	// 诊断行输出仍只出现 InputRef 摘要。
+	contentKey string
+
 	startedAt time.Time
 	total     time.Duration
 	clock     func() time.Time
@@ -128,12 +132,24 @@ func NewReqDiag(reqID, modelName string, stream bool, body map[string]any, clock
 }
 
 // SetContentKey 仅提取现有重放键的内容摘要，不改变键或记录/续期保护窗口。
+//
+// 完整键另存一份供重试感知选线使用（收尾时按它归档「断流线路」，见 truncateguard.go）；
+// 不写入诊断行输出，日志里仍只出现摘要。
 func (d *ReqDiag) SetContentKey(key string) {
 	if d != nil {
 		if _, ref, ok := strings.Cut(key, "|"); ok {
 			d.InputRef = ref
 		}
+		d.contentKey = key
 	}
+}
+
+// ContentKey 返回本次请求的完整内容指纹（模型 + 内容）；未设置时为空串。
+func (d *ReqDiag) ContentKey() string {
+	if d == nil {
+		return ""
+	}
+	return d.contentKey
 }
 
 // Now 取当前时刻（走注入的时钟）。

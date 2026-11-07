@@ -222,6 +222,23 @@ var (
 	// ProxySoftConsecutiveWindow 连续计数有效期：超过则重新从 1 计。
 	// 防止「早上失败一次、傍晚失败一次」这种跨越半天的孤立失败被当成连续。
 	ProxySoftConsecutiveWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_CONSECUTIVE_WINDOW_SECONDS", 7200))) * time.Second
+	// ProxySoftTruncateStrikes 断流专用闸门：同一线路在窗口内**累计** N 次上游断流即隔离
+	// （默认 2，0=关闭）。与上面的失败率判据分开的理由：断流会让客户端整轮重跑，代价比
+	// transport_timeout 高一个数量级（后者在请求内就能换线），不应共用「3 次失败」的门槛；
+	// 且它**不因成功清零**——坏线的典型形状正是「夹着成功」。见
+	// docs/plan-line-truncate-rate-gate-20261107.md。
+	ProxySoftTruncateStrikes = max(0, envInt("ZCODE_PROXY_SOFT_TRUNCATE_STRIKES", 2))
+	// ProxySoftTruncateWindow 断流闸门的统计窗口。
+	//
+	// 取 60 分钟而不是 30：2026-11-07 同一条线的两次断流相隔 45 分钟，30 分钟窗口刚好漏掉。
+	ProxySoftTruncateWindow = time.Duration(max(60, envInt("ZCODE_PROXY_SOFT_TRUNCATE_WINDOW_SECONDS", 3600))) * time.Second
+	// TruncateRetryAvoidTTL 重试感知选线：某份内容刚在哪些线路上断流后，同一内容的
+	// 重试请求在此时长内绕开这些线路（0=关闭）。
+	//
+	// 客户端（ZCode）重试时**原样重放请求体**，因此内容指纹天然命中；一条线路常挂多个
+	// 账号，只有整线避让才能挡住「换号却还是同一条线」。见
+	// docs/plan-line-truncate-rate-gate-20261107.md。
+	TruncateRetryAvoidTTL = time.Duration(max(0, envInt("ZCODE_TRUNCATE_RETRY_AVOID_SECONDS", 120))) * time.Second
 	// ProxyFreshGateSeconds 新导入线路的冷启动门禁时长；超时未出结果即放行。
 	ProxyFreshGateSeconds = max(0, envInt("ZCODE_PROXY_FRESH_GATE_SECONDS", 120))
 	// ProxyProtectRecentHours 巡检自动删除前的「最近成功」保护窗口（小时）；0 关闭。
@@ -616,7 +633,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.13.3-go"
+	AppVersion = "2.13.4-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

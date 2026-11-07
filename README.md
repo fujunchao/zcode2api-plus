@@ -519,6 +519,9 @@ Restart=on-failure
 | `ZCODE_ASYNC_ENABLED` | — | 掛載 /async/v1/messages 空閒池 |
 | `ZCODE_LINE_TRUNCATE_STRIKES` | 2 | 同一線路連續 N 次上游側斷流即移除線路並改派綁定賬號（0=關閉；後台可在線改） |
 | `ZCODE_LINE_TRUNCATE_AVOID_SECONDS` | 600 | 斷流後該賬號選號回避秒數（僅選號層軟過濾，不是冷卻；0=關閉） |
+| `ZCODE_PROXY_SOFT_TRUNCATE_STRIKES` | 2 | 斷流專用閘門：同一線路 60 分鐘內**累計** N 次上游斷流即隔離（0=關閉；與失敗率判據分開，斷流代價高一級） |
+| `ZCODE_PROXY_SOFT_TRUNCATE_WINDOW_SECONDS` | 3600 | 上述斷流閘門的統計窗口 |
+| `ZCODE_TRUNCATE_RETRY_AVOID_SECONDS` | 120 | 重試感知選線：同一份內容斷流後，重試請求在此期間整線避讓（0=關閉） |
 | `ZCODE_TRUNCATE_TERMINAL` | retryable | 上游中途斷流時給客戶端的終態：`retryable`（SSE error + overloaded_error，客戶端自動重試）/ `graceful`（補協議正常結束，內容截斷）/ `abort`（直接斷連）/ `legacy`（舊 api_error，不可重試，回滾用） |
 | `ZCODE_TRUNCATE_GRACEFUL_NOTICE` | （上游连接中断…） | graceful 模式追加的可見提示；空=不追加 |
 | `ZCODE_TRUNCATE_PREBUFFER_MS` | 12000 | 首個內容增量前的預緩衝預算（毫秒）：期內斷流會換號重打且對客戶端不可見；0=關閉 |

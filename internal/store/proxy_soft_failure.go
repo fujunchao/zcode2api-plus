@@ -68,6 +68,13 @@ type ProxySoftFailure struct {
 	// 成功一次即清零；超过有效期重新从 1 计，避免把隔了半天的两次孤立失败当成连续。
 	Consecutive      int   `json:"consecutive,omitempty"`
 	ConsecutiveSince int64 `json:"consecutive_since,omitempty"`
+	// Truncates / TruncateWindowStart 是**断流专用**计数：只统计 upstream_truncate，
+	// 不因成功清零，窗口与 Attempts/Failures 独立。理由见
+	// docs/plan-line-truncate-rate-gate-20261107.md：断流的代价是「客户端整轮重跑」，
+	// 与 transport_timeout 不同级，不能共用同一份失败阈值；而「夹着成功」正是坏线的
+	// 典型形状，成功清零会让它永远达不到阈值。
+	Truncates           int   `json:"truncates,omitempty"`
+	TruncateWindowStart int64 `json:"truncate_window_start,omitempty"`
 }
 
 type proxySoftState struct {
@@ -146,6 +153,15 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 			ent.Probation, ent.Strikes = false, 0
 		}
 	}
+	// 断流专用计数：独立窗口、不因成功清零。
+	if !ok && signal == ProxySignalUpstreamTruncate {
+		truncWindowMs := config.ProxySoftTruncateWindow.Milliseconds()
+		if ent.TruncateWindowStart == 0 || nowMs-ent.TruncateWindowStart >= truncWindowMs {
+			ent.TruncateWindowStart = nowMs
+			ent.Truncates = 0
+		}
+		ent.Truncates++
+	}
 	ent.LastAt = nowMs
 	if signal != "" {
 		ent.LastSignal = signal
@@ -163,10 +179,18 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 	// 判据 C：窗口失败率兜底，防止「成功一次清零」把高频坏线洗白。
 	rateHit := !ok && ent.Attempts >= config.ProxySoftMinAttempts && ent.Failures >= config.ProxySoftMinFailures &&
 		ent.Failures*100 >= config.ProxySoftMinRatePercent*ent.Attempts
+	// 判据 D：断流专用闸门。一次断流已经让用户损失一整次生成，同一条线一小时内第二次
+	// 就是「没吸取教训」；它不看失败率分母，因为断流的发生率本来就很低，
+	// 分母只会把真凶稀释掉（与判据 C 的分工见 config 注释）。
+	truncateHit := !ok && config.ProxySoftTruncateStrikes > 0 && signal == ProxySignalUpstreamTruncate &&
+		ent.Truncates >= config.ProxySoftTruncateStrikes &&
+		ent.TruncateWindowStart > 0 && nowMs-ent.TruncateWindowStart <= config.ProxySoftTruncateWindow.Milliseconds()
 	trigger := ""
 	switch {
-	case allowQuarantine && !quarantined && (probationHit || consecutiveHit || rateHit):
+	case allowQuarantine && !quarantined && (truncateHit || probationHit || consecutiveHit || rateHit):
 		switch {
+		case truncateHit:
+			trigger = "truncate_strikes"
 		case probationHit:
 			trigger = "probation"
 		case consecutiveHit:
@@ -210,8 +234,8 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 		triggerText = "-"
 	}
 	web.Warn("proxy-soft", fmt.Sprintf(
-		"id=%s signal=%s failures=%d attempts=%d rate=%d%% consecutive=%d probation=%d trigger=%s action=%s until=%s strikes=%d reassigned=%d no_alt=%d",
-		ent.ProfileID, ent.LastSignal, ent.Failures, ent.Attempts, proxySoftRatePercent(ent), ent.Consecutive,
+		"id=%s signal=%s failures=%d attempts=%d rate=%d%% consecutive=%d truncates=%d probation=%d trigger=%s action=%s until=%s strikes=%d reassigned=%d no_alt=%d",
+		ent.ProfileID, ent.LastSignal, ent.Failures, ent.Attempts, proxySoftRatePercent(ent), ent.Consecutive, ent.Truncates,
 		probationFlag, triggerText, out.Action,
 		out.Until.Format(time.RFC3339), ent.Strikes, reassigned, noAlt))
 	return out

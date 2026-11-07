@@ -65,6 +65,9 @@ type Engine struct {
 	// nil = 禁用（ReplayGuardTTL <= 0）。跨请求共享正是它的意义：上一个请求刚把
 	// 两个账号喂给特征 body，下一个相同 body 的请求必须立即被挡住。
 	replay *ReplayGuard
+	// truncateRetry 重试感知选线：按「内容指纹+模型」记住最近断流过的线路，TTL 内的
+	// 同内容重试请求整线避让。nil = 禁用（TruncateRetryAvoidTTL <= 0）。见 truncateguard.go。
+	truncateRetry *TruncateRetryGuard
 
 	now func() time.Time
 }
@@ -92,6 +95,7 @@ func NewEngine(st *store.Store, cm *captcha.Manager, client *http.Client) *Engin
 	if ReplayGuardTTL > 0 {
 		e.replay = NewReplayGuard(time.Duration(ReplayGuardTTL)*time.Second, e.now)
 	}
+	e.truncateRetry = NewTruncateRetryGuard(config.TruncateRetryAvoidTTL, e.now)
 	return e
 }
 
@@ -248,6 +252,15 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	// 上面的账号。"换号"因此变成"换线"——否则 24 个账号共享一条慢线时，换谁都是再
 	// 等一个同样的预算。
 	avoid := map[string]bool{}
+	// 重试感知：同一份内容刚刚在哪些线路上被掐断，本次整线避让（见 truncateguard.go）。
+	// 客户端重试原样重放请求体，因此内容指纹天然命中；一条线常挂多个账号，只靠账号级
+	// 回避挡不住「换了账号还是同一条线」。
+	if lines := e.truncateRetry.Avoid(contentKey, e.now()); len(lines) > 0 {
+		for _, line := range lines {
+			avoid[line] = true
+		}
+		web.Warn(reqID, fmt.Sprintf("同内容重试：避让最近断流的 %d 条线路", len(lines)))
+	}
 	// 408/524 换线预算按请求计数（跨账号共享）：否则每个账号都会各拿一份预算，
 	// 两个账号就会各重试一次，预算形同虚设。
 	timeoutRetries := 0
@@ -1086,6 +1099,11 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 		upstreamEvent := IsUpstreamErrorEvent(err)
 		if !isClientGone(ctx) && !upstreamEvent {
 			diag.TruncTotal = RecordUpstreamTruncate(e.Store, acc, e.now(), attemptEgress...)
+			// 同内容重试要能绕开这条线：记下「这份内容 + 这条线路」，
+			// 客户端几秒后的重试会整线避让（见 truncateguard.go）。
+			if len(attemptEgress) > 0 && attemptEgress[0].Mode == "proxy" {
+				e.truncateRetry.Note(diag.ContentKey(), attemptEgress[0].Identity(), e.now())
+			}
 			e.fireRefresh(acc)
 		}
 		label := "流传输中断"
