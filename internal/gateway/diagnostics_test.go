@@ -488,6 +488,7 @@ func TestDiagNewFieldsAppendedAtTail(t *testing.T) {
 		"roles_user", "roles_assistant", "roles_system", "roles_developer", "roles_tool", "roles_other", "tools",
 		"tool_use_blocks", "tool_result_blocks", "mcs_declared", "up_kbps", "uplink_abort",
 		"captcha_wait_ms", "captcha_pool_size", "captcha_empty_take", "captcha_mint_fail",
+		"frt_total",
 	} {
 		key := " " + field + "="
 		index := strings.Index(line, key)
@@ -496,7 +497,8 @@ func TestDiagNewFieldsAppendedAtTail(t *testing.T) {
 		}
 		last = index
 	}
-	if !strings.HasSuffix(line, " mcs_declared=false up_kbps=- uplink_abort=0 captcha_wait_ms=0 captcha_pool_size=0 captcha_empty_take=0 captcha_mint_fail=0") {
+	// frt_total 是最后追加的字段，值是毫秒数（本用例有真实出站），不是 "-"。
+	if !regexp.MustCompile(` mcs_declared=false up_kbps=- uplink_abort=0 captcha_wait_ms=0 captcha_pool_size=0 captcha_empty_take=0 captcha_mint_fail=0 frt_total=\d+ms$`).MatchString(line) {
 		t.Fatalf("最终追加字段或实际能力声明不符：%s", line)
 	}
 }
