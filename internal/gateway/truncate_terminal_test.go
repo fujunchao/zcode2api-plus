@@ -57,15 +57,21 @@ func TestTruncateTerminalPolicies(t *testing.T) {
 		{
 			name:   "retryable_可重试错误帧",
 			policy: config.TruncateTerminalRetryable,
-			// ZCode 的 provider 错误码读取链命中 overloaded_error 才会自动重试。
-			want:    []string{"event: error", `"type":"overloaded_error"`, `"code":"overloaded_error"`},
+			// 双通道缺一不可：code 供直连命中码表；[1312][ 前缀供 new-api 重建后仍能穿透
+			// （实测 new-api 只保留 type 与 message，附加字段会被丢弃）。
+			want: []string{
+				"event: error",
+				`"type":"overloaded_error"`,
+				`"code":"overloaded_error"`,
+				`"message":"[1312][`,
+			},
 			notWant: []string{`"type":"api_error"`},
 		},
 		{
 			name:    "legacy_回滚形态",
 			policy:  config.TruncateTerminalLegacy,
 			want:    []string{"event: error", `"type":"api_error"`, "上游流式响应中断"},
-			notWant: []string{"overloaded_error"},
+			notWant: []string{"overloaded_error", "[1312]"},
 		},
 		{
 			name:   "graceful_补齐协议正常结束",

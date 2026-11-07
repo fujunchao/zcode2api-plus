@@ -205,15 +205,22 @@ func (t *sseTail) gracefulFrames() ([]string, bool) {
 
 // terminalErrorFrame 生成断流的错误帧。
 //
-// retryable（默认）：type 与 code 都写 overloaded_error。ZCode 的 provider 错误码读取
-// 链是 o.code → error.code → error_code → code，命中其 I4e 映射表后得到
-// reason=ProviderOverloaded / retryable=true ⇒ 自动重试（最多 11 次）。
+// retryable（默认）：可重试语义必须**同时**用两条通道承载，缺一不可：
+//
+//  1. error.type / error.code = overloaded_error：直连客户端时命中其码表
+//     （overloaded_error → ProviderOverloaded / retryable=true）；
+//  2. message 前缀 "[1312]["：**new-api 会把 SSE error 帧按 {type,message} 重建**，
+//     实测（2026-11-07，v2.13.1 演练）附加的 code 被整体丢弃，只剩 type 与 message。
+//     而 ZCode 的 providerCode 解析链最后一步正是「从 message 里取 ^\[(\d{4})\] 前缀」
+//     （1312 → ProviderOverloaded / retryable=true），所以码必须写进 message 才能穿透。
+//
+// 两条通道任意一条生效都能让客户端自动重试；都失效时退回 legacy 的不可重试行为。
 // legacy：保持改造前的 api_error（不可重试），仅用于回滚。
 func terminalErrorFrame(cause error) string {
 	message := "上游流式响应中断: " + cause.Error()
 	errorType, errorCode := "api_error", ""
 	if config.TruncateTerminal != config.TruncateTerminalLegacy {
-		message = "上游流式响应中断（已转交客户端重试）: " + cause.Error()
+		message = "[1312][上游流式响应中断（已转交客户端重试）: " + cause.Error() + "]"
 		errorType, errorCode = "overloaded_error", "overloaded_error"
 	}
 	errorObj := map[string]any{"type": errorType, "message": message}
