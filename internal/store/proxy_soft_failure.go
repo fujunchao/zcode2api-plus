@@ -153,8 +153,9 @@ func (s *Store) RecordProxySoftOutcome(e ProxyEgress, signal string, status int,
 			ent.Probation, ent.Strikes = false, 0
 		}
 	}
-	// 断流专用计数：独立窗口、不因成功清零。
-	if !ok && signal == ProxySignalUpstreamTruncate {
+	// 断流专用计数：独立窗口、不因成功清零。闸门关闭（阈值 0）时不计数——
+	// 没有消费者，留着只会让状态无谓增长。
+	if !ok && signal == ProxySignalUpstreamTruncate && config.ProxySoftTruncateStrikes > 0 {
 		truncWindowMs := config.ProxySoftTruncateWindow.Milliseconds()
 		if ent.TruncateWindowStart == 0 || nowMs-ent.TruncateWindowStart >= truncWindowMs {
 			ent.TruncateWindowStart = nowMs
