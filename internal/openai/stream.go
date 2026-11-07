@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 )
 
@@ -274,14 +275,43 @@ func (e *sseEncoder) flushToolInput(tool *chatStreamTool) error {
 	return e.emitToolArguments(tool, tool.initial)
 }
 
+// fail 通过终止 chunk 交付失败，同时返回错误，避免引擎把中断串流累计为完整交付。
+//
+// 终止形态跟随 config.TruncateTerminal（与 /v1/messages 同一套语义，见
+// internal/gateway/truncate.go）：OpenAI 生态的客户端只看状态码/错误类型，
+// overloaded_error 是它们普遍会重试的那一类。
 func (e *sseEncoder) fail(cause error) error {
-	if !e.finished {
+	if e.finished {
+		return cause
+	}
+	switch config.TruncateTerminal {
+	case config.TruncateTerminalAbort:
 		e.finished = true
-		if err := e.emit(map[string]any{"error": map[string]any{
-			"message": cause.Error(), "type": "upstream_stream_error", "code": "server_error",
-		}}); err != nil {
+		return &gateway.AbortedDeliveryError{Err: cause}
+	case config.TruncateTerminalGraceful:
+		// 收敛成正常结束：finish chunk + [DONE]，客户端不会把本轮判成失败。
+		// 流还没开始时没有可收敛的消息（客户端连 chunk id 都没见过）→ 退回错误 chunk。
+		if e.id == "" {
+			break
+		}
+		e.finished = true
+		if err := e.emit(chunk(e.id, e.model, map[string]any{}, "stop")); err != nil {
 			return err
 		}
+		if err := e.write("data: [DONE]\n\n"); err != nil {
+			return err
+		}
+		return cause
+	}
+	e.finished = true
+	errorType, errorCode := "upstream_stream_error", "server_error"
+	if config.TruncateTerminal != config.TruncateTerminalLegacy {
+		errorType, errorCode = "overloaded_error", "overloaded_error"
+	}
+	if err := e.emit(map[string]any{"error": map[string]any{
+		"message": cause.Error(), "type": errorType, "code": errorCode,
+	}}); err != nil {
+		return err
 	}
 	return cause
 }

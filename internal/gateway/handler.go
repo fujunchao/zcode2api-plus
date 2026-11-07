@@ -4,13 +4,16 @@
 package gateway
 
 import (
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"zcode2api/internal/auth"
+	"zcode2api/internal/config"
 )
 
 // Handler 网关 HTTP 层。
@@ -39,6 +42,13 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 演练通道：只在 ZCODE_DRILL_KEY 非空且密钥命中时生效，不接触账号池与上游。
+	// 用途是验证「new-api → 客户端」真实链路上的终态字节形态（见方案 §4）。
+	if mode, ok := drillMode(r, body); ok {
+		serveDrill(w, mode)
+		return
+	}
+
 	// 入口整形一次（不含 system 注入；每账号副本内注入，见 engine.tryAccount）
 	NormalizeBody(body, false)
 
@@ -57,6 +67,11 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return passthroughDeliver(w, d)
 	})
 	if result.Delivered {
+		// abort 策略：不补帧、也不让 chunked 正常收尾，直接断开连接。客户端看到的是
+		// 传输层中断（可重试），而不是「服务端业务错误」（不可重试）。
+		if result.AbortConnection {
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 	WriteRunResult(w, result)
@@ -85,43 +100,169 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // passthroughDeliver 字节级透传上游响应；SSE 每 chunk flush。
+//
+// 分两段：
+//   - 预缓冲期（仅 SSE 且预算 > 0）：首个内容增量之前不提交响应头，这段期间的失败
+//     可以换号重打，客户端一个字节都没收到（NothingDeliveredError）；
+//   - 提交之后：逐块透传，失败按 config.TruncateTerminal 补终态（可重试错误 /
+//     优雅收尾 / 直接断连），而不是一律写不可重试的 api_error。
 func passthroughDeliver(w http.ResponseWriter, d Delivery) error {
-	w.Header().Set("Content-Type", d.ContentType)
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(d.StatusCode)
+	isSSE := strings.Contains(d.ContentType, "text/event-stream")
+	gate := newPrebufferGate(w, d.StatusCode, d.ContentType, config.TruncatePrebufferBytes)
 
-	flusher, _ := w.(http.Flusher)
+	prebuffer := isSSE && prebufferBudget() > 0
+	if !prebuffer {
+		if err := gate.commit(); err != nil {
+			return err
+		}
+	}
+	gate.startTimer(prebufferBudget())
+
+	tail := &sseTail{}
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := d.Body.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return werr
+			if isSSE {
+				tail.feed(buf[:n])
 			}
-			if flusher != nil {
-				flusher.Flush()
+			if prebuffer {
+				shouldCommit, perr := gate.push(buf[:n])
+				if perr != nil {
+					return perr
+				}
+				// 出现真正的内容就立刻提交：预缓冲不能拖慢首字。
+				if shouldCommit || tail.contentSeen() {
+					if cerr := gate.commit(); cerr != nil {
+						return cerr
+					}
+				}
+			} else if werr := gate.write(buf[:n]); werr != nil {
+				return werr
 			}
 		}
 		if err == io.EOF {
-			return nil
+			if isSSE {
+				tail.finish()
+			}
+			return gate.commit()
 		}
 		if err != nil {
-			// 上游自己的 error 事件已原样转发给客户端，再追加一条「中断」既重复又失实。
-			if strings.Contains(d.ContentType, "text/event-stream") && !IsUpstreamErrorEvent(err) {
-				// HTTP 200 已发出，只能用 SSE 错误事件通知客户端；额外空行隔开
-				// 上游可能残留的半行。写客户端失败仍由上面的 w.Write 分支直接返回。
-				data, _ := marshalJSON(map[string]any{
-					"type":  "error",
-					"error": map[string]any{"type": "api_error", "message": "上游流式响应中断: " + err.Error()},
-				})
-				if _, werr := fmt.Fprintf(w, "\n\nevent: error\ndata: %s\n\n", data); werr != nil {
-					return werr
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
+			if !isSSE {
+				return err
 			}
+			tail.finish()
+			// 上游自己的 error 事件已经原样转发给客户端：再追加一条「中断」既重复又失实。
+			if IsUpstreamErrorEvent(err) {
+				return err
+			}
+			if gate.claimUndelivered() {
+				// 客户端一个字节都没收到：交给引擎换号重打。
+				return &NothingDeliveredError{Err: err}
+			}
+			return writeTruncateTerminal(func(frame string) error {
+				return gate.write([]byte(frame))
+			}, tail, err)
+		}
+	}
+}
+
+// ── 演练通道 ────────────────────────────────────────────────────────────────
+
+// drillMode 解析演练请求；返回模式与是否命中。
+//
+// 只有 config.DrillKey 非空时才可能命中，密钥比对走常量时间比较。支持两种传递方式：
+// 请求头 X-Zcode-Drill（可配 X-Zcode-Drill-Mode 选 ok/truncate），或请求体
+// metadata.zcode_drill（new-api 只透传部分请求头时用体兜底）。
+func drillMode(r *http.Request, body map[string]any) (string, bool) {
+	key := strings.TrimSpace(config.DrillKey)
+	if key == "" {
+		return "", false
+	}
+	token := strings.TrimSpace(r.Header.Get("X-Zcode-Drill"))
+	mode := strings.TrimSpace(r.Header.Get("X-Zcode-Drill-Mode"))
+	if token == "" && body != nil {
+		if meta, ok := body["metadata"].(map[string]any); ok {
+			token, _ = meta["zcode_drill"].(string)
+			if m, _ := meta["zcode_drill_mode"].(string); m != "" {
+				mode = m
+			}
+		}
+	}
+	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(key)) != 1 {
+		return "", false
+	}
+	if mode != "ok" {
+		mode = "truncate"
+	}
+	return mode, true
+}
+
+// serveDrill 产出一段可控的 SSE：3 个文本增量后按当前策略收尾（ok 模式正常结束）。
+//
+// 刻意走与真实流量完全相同的终态函数，才能验证「客户端到底会看到什么」。
+func serveDrill(w http.ResponseWriter, mode string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	write := func(frame string) error {
+		if _, err := io.WriteString(w, frame); err != nil {
 			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+
+	tail := &sseTail{}
+	frames := []string{
+		sseFrame("message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": "msg_drill", "type": "message", "role": "assistant", "model": "drill",
+				"content": []any{}, "stop_reason": nil,
+				"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+			},
+		}),
+		sseFrame("content_block_start", map[string]any{
+			"type": "content_block_start", "index": 0,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}),
+		sseFrame("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": "演练：这一段来自网关演练通道。"},
+		}),
+	}
+	for _, frame := range frames {
+		if err := write(frame); err != nil {
+			return
+		}
+		tail.feed([]byte(frame))
+	}
+
+	if mode == "ok" {
+		for _, frame := range []string{
+			sseFrame("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}),
+			sseFrame("message_delta", map[string]any{
+				"type":  "message_delta",
+				"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+				"usage": map[string]any{"output_tokens": 12},
+			}),
+			sseFrame("message_stop", map[string]any{"type": "message_stop"}),
+		} {
+			if err := write(frame); err != nil {
+				return
+			}
+		}
+		return
+	}
+
+	if err := writeTruncateTerminal(write, tail, errors.New("drill: unexpected EOF")); err != nil {
+		var aborted *AbortedDeliveryError
+		if errors.As(err, &aborted) {
+			panic(http.ErrAbortHandler)
 		}
 	}
 }

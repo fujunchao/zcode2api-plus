@@ -137,10 +137,13 @@ func defaultUpstreamClient() *http.Client {
 // runResult 循环结束状态：Delivered=true 表示已通过 deliver 交付上游 200
 // （handler 不得再写响应）；否则 Status/Body 是要回给客户端的错误 JSON。
 type runResult struct {
-	Delivered  bool
-	Status     int
-	Body       any
-	RetryAfter time.Duration
+	Delivered bool
+	Status    int
+	Body      any
+	// AbortConnection 表示交付已开始、但按 abort 策略需要直接断开连接
+	// （不让 chunked 正常收尾）。HTTP 层据此 panic(http.ErrAbortHandler)。
+	AbortConnection bool
+	RetryAfter      time.Duration
 }
 
 // attemptResult 单次账号尝试的出路：retrySame（同账号再试一次）、
@@ -153,6 +156,9 @@ type attemptResult struct {
 	avoid          string // 本次失败的线路 identity；换号时加入请求级回避集合。
 	timeoutRetry   bool   // 本次失败消耗了一次 408/524 换线预算（计数在请求级）。
 	uplinkSlow     bool   // 本次失败被上行速率闸门判定「传不完」（线路带宽问题）。
+	// streamEarlyTruncate 表示上游在「产出任何内容之前」就断了，客户端一个字节都
+	// 没收到：这次尝试对客户端不可见，可以换号重打（见 truncate.go 的预缓冲说明）。
+	streamEarlyTruncate bool
 }
 
 // attemptBudget 单账号内的三类重试预算，各自独立计数。
@@ -248,6 +254,10 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	// 上行速率闸门淘汰次数：用于终态判定——全部尝试都因「传不完」被淘汰时，
 	// 如实返回「线路带宽不足」，而不是伪装成 524 或 no_available_account。
 	uplinkSlow := 0
+	// 未交付断流次数：上游在「产出内容之前」就断了，客户端一个字节都没收到。
+	// 这类尝试对客户端不可见，正常情况下会被换号重打掩盖掉；只有全部尝试都这样
+	// 才需要给客户端一个 5xx（客户端按 statusCode>=500 判定可重试）。
+	earlyTruncate := 0
 	probeTried := false
 	for range MaxAccountAttempts {
 		if !deadlineAt.IsZero() && !e.now().Before(deadlineAt) {
@@ -295,6 +305,9 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 		if res.uplinkSlow {
 			uplinkSlow++
 		}
+		if res.streamEarlyTruncate {
+			earlyTruncate++
+		}
 		if res.switchAccount {
 			if res.avoid != "" {
 				avoid[res.avoid] = true
@@ -311,6 +324,14 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 			uplinkSlow, dashBytes(diag.BodyBytes)))
 		return withRetryAdvice(errResult(http.StatusServiceUnavailable, "upstream_uplink_too_slow",
 			"当前可用代理线路的上行带宽不足以传完本次请求，请稍后重试或减小上下文"), 30*time.Second)
+	}
+
+	// 全部尝试都在「产出内容之前」被上游掐断：客户端还没收到任何字节，可以安全地
+	// 用一个 5xx 结束（客户端按 statusCode>=500 判定可重试），而不是 200 + 错误帧。
+	if earlyTruncate > 0 {
+		web.ReqErr(reqID, fmt.Sprintf("上游在产出内容前中断（已换号重试 %d 次，客户端未收到任何字节）", earlyTruncate))
+		return errResult(http.StatusBadGateway, "upstream_stream_interrupted",
+			"上游在产出内容前中断，请重试")
 	}
 
 	// 选不出号 ≠ 「账号没绑定模型/额度用完」：冷却、风控、停用、整号耗尽都会走到
@@ -1010,7 +1031,18 @@ func (e *Engine) deliverStream(ctx context.Context, reqID string, acc *model.Acc
 		Body:        &teeReader{r: resp.Body, c: usage, diag: diag, now: e.now},
 	})
 	_ = resp.Body.Close()
-	return e.finishDelivery(ctx, reqID, acc, usage, err, diag)
+	res := e.finishDelivery(ctx, reqID, acc, usage, err, diag)
+	var undelivered *NothingDeliveredError
+	if errors.As(err, &undelivered) {
+		// 客户端一个字节都没收到：这次尝试完全不可见，换号重打。
+		// 记账与诊断已在 finishDelivery 里完成（断流计数、账号回避、[#] 行）。
+		out := attemptResult{switchAccount: true, streamEarlyTruncate: true}
+		if egress, ok := ProxyAttemptEgress(ctx); ok {
+			out.avoid = egress.Identity()
+		}
+		return out
+	}
+	return res
 }
 
 // finishDelivery 交付收尾：累计 usage 并写日志。
@@ -1065,6 +1097,12 @@ func (e *Engine) finishDelivery(ctx context.Context, reqID string, acc *model.Ac
 			web.ReqErr(reqID, fmt.Sprintf("%s，上游 usage 已完整，仍计入 %d tok: %v", label, got.Output, err))
 		} else {
 			web.ReqErr(reqID, fmt.Sprintf("%s: %v", label, err))
+		}
+		// abort 策略：交付已开始但要求直接断开连接（不补帧）。记账照旧，
+		// 只是把「怎么收尾」交给 HTTP 层用 panic(http.ErrAbortHandler) 完成。
+		var aborted *AbortedDeliveryError
+		if errors.As(err, &aborted) {
+			return attemptResult{final: runResult{Delivered: true, AbortConnection: true}}
 		}
 		return attemptResult{final: runResult{Delivered: true}}
 	}

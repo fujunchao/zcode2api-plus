@@ -61,6 +61,11 @@ func (u *cutUp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fl := w.(http.Flusher)
 	_, _ = io.WriteString(w, sseStart)
 	fl.Flush()
+	// 先给一个内容增量：预缓冲只在「已产出内容」之后才进入断流终态路径，
+	// 没有内容的断流现在会被当作「对客户端不可见」换号重打（见 truncate_terminal_test.go）。
+	// 本文件的用例关注的是断流的线路级记账，不是收尾形态，所以保持「已交付 + 中途掐断」。
+	_, _ = io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n")
+	fl.Flush()
 	time.Sleep(5 * time.Millisecond)
 	if abort {
 		// 中途掐断：chunked 编码不收尾 ⇒ 客户端读到 unexpected EOF。

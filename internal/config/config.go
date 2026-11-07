@@ -364,10 +364,75 @@ var (
 // 同一约定：环境变量只是默认值，后台「系統設定」写入后以落库值为准。
 var (
 	// LineTruncateStrikes 触发线路熔断的连续断流次数；0 = 关闭熔断。
-	LineTruncateStrikes = envInt("ZCODE_LINE_TRUNCATE_STRIKES", 3)
+	//
+	// 2026-11-07 复盘（docs/plan-truncate-resilience-20261107.md）：默认 3 连击对
+	// 「25% 概率掐断、中间还夹着成功」的坏线路几乎不触发——每次成功都会把连击清零，
+	// 于是一条坏线能反复掐断一整天。放宽到 2 连击，配合 600s 回避，坏线在第二次
+	// 断流后就会被摘掉；代价是偶发抖动的健康线路更容易被误摘（它会在巡检/导入里
+	// 自动回来）。
+	LineTruncateStrikes = envInt("ZCODE_LINE_TRUNCATE_STRIKES", 2)
 	// LineTruncateAvoidSeconds 断流后账号选号回避时长（秒）；0 = 关闭回避。
-	LineTruncateAvoidSeconds = envInt("ZCODE_LINE_TRUNCATE_AVOID_SECONDS", 60)
+	//
+	// 60s 只够躲开客户端立刻到达的那一次重试；客户端重试预算可达 11 次、退避到分钟级，
+	// 10 分钟才覆盖得住（同一个账号被同一条坏线连续掐断两次的样本见 11-07 fcd8cd）。
+	LineTruncateAvoidSeconds = envInt("ZCODE_LINE_TRUNCATE_AVOID_SECONDS", 600)
 )
+
+// ── 上游断流的终态语义 ──────────────────────────────────────────────────────
+// 上游在 SSE 响应体中途被掐断（unexpected EOF）时，HTTP 200 与已写出的字节都已
+// 无法回滚，网关只能补一个「终态」告诉客户端这轮没跑完。**补什么决定客户端怎么
+// 反应**：2026-11-07 复盘发现 ZCode 把 api_error 判成不可重试（reason=unknown /
+// retryable=false），直接把整轮 turn 判死，而它本来有 11 次重试预算。
+//
+// 四种形态（见 docs/plan-truncate-resilience-20261107.md）：
+//
+//	retryable = event: error + error.type/code=overloaded_error：客户端认作可重试并自动重试
+//	graceful  = 补齐 content_block_stop / message_delta / message_stop：本轮正常结束（内容截断）
+//	abort     = 不补帧，直接断开连接：客户端按传输错误重试
+//	legacy    = 现状 api_error（不可重试），仅用于回滚
+//
+// graceful 只在「没有未闭合 tool_use 块」时生效，否则自动降级为 retryable——把
+// 半截工具调用当成功交付，比报错更危险。
+const (
+	TruncateTerminalLegacy    = "legacy"
+	TruncateTerminalRetryable = "retryable"
+	TruncateTerminalGraceful  = "graceful"
+	TruncateTerminalAbort     = "abort"
+)
+
+var (
+	// TruncateTerminal 断流终态形态；非法值按 retryable 处理（注释见常量组）。
+	TruncateTerminal = normalizeTruncateTerminal(env("ZCODE_TRUNCATE_TERMINAL", TruncateTerminalRetryable))
+	// TruncateGracefulNotice graceful 模式追加的可见提示（空 = 不追加）。
+	TruncateGracefulNotice = env("ZCODE_TRUNCATE_GRACEFUL_NOTICE", "（上游连接中断，本次回答被截断）")
+	// TruncatePrebufferBudget 流式响应在「第一个内容增量」之前的缓冲预算。
+	//
+	// 这段时间里客户端还没收到任何内容，失败可以换号重打而对客户端完全透明
+	// （2026-11-07 fcd8cd：200 + 322B 之后静默 49s 才断，客户端白等一场）。
+	// 0 = 关闭（立刻提交响应头，退回逐块透传）。
+	TruncatePrebufferBudget = time.Duration(max(0, envInt("ZCODE_TRUNCATE_PREBUFFER_MS", 12000))) * time.Millisecond
+	// TruncatePrebufferBytes 预缓冲上限：超过即提交响应头，避免把大首包全压在内存里。
+	TruncatePrebufferBytes = max(4096, envInt("ZCODE_TRUNCATE_PREBUFFER_BYTES", 64<<10))
+	// DrillKey 演练通道密钥：非空且请求头 X-Zcode-Drill 命中时，网关产出一段可控的
+	// SSE（不接触账号池），用于验证「new-api → 客户端」真实链路上的终态字节形态。
+	// 空 = 关闭。见 docs/plan-truncate-resilience-20261107.md §4。
+	DrillKey = env("ZCODE_DRILL_KEY", "")
+)
+
+// normalizeTruncateTerminal 收敛配置值；未知值退回 retryable 而不是 legacy——
+// 写错配置时应当继续保护用户，而不是悄悄退化成会打断工作的旧行为。
+func normalizeTruncateTerminal(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case TruncateTerminalLegacy:
+		return TruncateTerminalLegacy
+	case TruncateTerminalGraceful:
+		return TruncateTerminalGraceful
+	case TruncateTerminalAbort:
+		return TruncateTerminalAbort
+	default:
+		return TruncateTerminalRetryable
+	}
+}
 
 // ── 上游端点 ────────────────────────────────────────────────────────────────
 var (
@@ -551,7 +616,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.13.0-go"
+	AppVersion = "2.13.1-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

@@ -20,11 +20,13 @@ func TestLineTruncateSettingsAPI(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("GET settings: %d", status)
 	}
-	if got := data["line_truncate_strikes"]; got != float64(3) {
-		t.Fatalf("熔断阈值默认应为 3，实际 %v", got)
+	// 2026-11-07 起默认 2 连击 / 600s 回避：3 连击对「25% 概率掐断、中间夹着成功」的
+	// 坏线路几乎不触发（每次成功都会把连击清零），60s 回避也只够躲开客户端第一次重试。
+	if got := data["line_truncate_strikes"]; got != float64(2) {
+		t.Fatalf("熔断阈值默认应为 2，实际 %v", got)
 	}
-	if got := data["line_truncate_avoid_seconds"]; got != float64(60) {
-		t.Fatalf("回避时长默认应为 60，实际 %v", got)
+	if got := data["line_truncate_avoid_seconds"]; got != float64(600) {
+		t.Fatalf("回避时长默认应为 600，实际 %v", got)
 	}
 
 	status, _ = do(t, mux, st, http.MethodPut, "/admin/api/settings", map[string]any{

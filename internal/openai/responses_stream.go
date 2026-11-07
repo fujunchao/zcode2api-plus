@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"zcode2api/internal/config"
 	"zcode2api/internal/gateway"
 )
 
@@ -345,21 +346,36 @@ func (e *responsesEncoder) onMessageStop() error {
 }
 
 // fail 通过终止事件交付失败，同时返回错误，避免引擎把中断串流累计为完整交付。
+//
+// 终止形态跟随 config.TruncateTerminal：abort 直接断连；graceful 收敛成
+// response.completed（本轮正常结束，内容截断）；其余按可重试错误类型上报。
 func (e *responsesEncoder) fail(cause error) error {
 	if e.finished {
 		return cause
+	}
+	if config.TruncateTerminal == config.TruncateTerminalAbort {
+		e.finished = true
+		return &gateway.AbortedDeliveryError{Err: cause}
 	}
 	if e.respID == "" {
 		if err := e.onMessageStart(nil); err != nil {
 			return err
 		}
 	}
+	if config.TruncateTerminal == config.TruncateTerminalGraceful {
+		e.finished = true
+		return e.emit("response.completed", map[string]any{"response": e.responseEnvelope("completed")})
+	}
 	for _, b := range e.items {
 		b.item["status"] = "incomplete"
 	}
 	e.finished = true
 	response := e.responseEnvelope("failed")
-	response["error"] = map[string]any{"code": "server_error", "message": cause.Error()}
+	errorCode := "server_error"
+	if config.TruncateTerminal != config.TruncateTerminalLegacy {
+		errorCode = "overloaded_error"
+	}
+	response["error"] = map[string]any{"code": errorCode, "message": cause.Error()}
 	if err := e.emit("response.failed", map[string]any{"response": response}); err != nil {
 		return err
 	}

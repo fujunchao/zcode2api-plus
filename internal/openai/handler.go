@@ -74,6 +74,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			return deliverJSON(w, d)
 		})
 	if result.Delivered {
+		// abort 策略：不让 chunked 正常收尾，直接断开（客户端按传输错误重试）。
+		if result.AbortConnection {
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 	// 引擎错误体已是 {"error":{message,type,code}} 形态，OpenAI 客户端兼容

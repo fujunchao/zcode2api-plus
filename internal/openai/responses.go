@@ -454,6 +454,10 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return deliverResponsesJSON(w, d, parallelTools)
 		})
 	if result.Delivered {
+		// abort 策略：不让 chunked 正常收尾，直接断开（客户端按传输错误重试）。
+		if result.AbortConnection {
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 	gateway.WriteRunResult(w, result)
