@@ -49,8 +49,15 @@ func TestClaimRiskClassification(t *testing.T) {
 				if tc.name == "上游冷却时间" && out["next_at"] != float64(1700007200) {
 					t.Fatalf("风控分类不得丢失上游冷却时间: %v", out)
 				}
-				if out["risk_control"] != true || out["http_status"] != tc.status || len(billing.requests) != 1 {
-					t.Fatalf("风控信号应透传且不在原线路重试: %v calls=%d", out, len(billing.requests))
+				// 只数领取请求：显式 plan_id 之前还会补一次 campaign 反查（营销触达）。
+				claimCalls := 0
+				for _, call := range billing.requests {
+					if lastSegment(call.Path) == "claim" {
+						claimCalls++
+					}
+				}
+				if out["risk_control"] != true || out["http_status"] != tc.status || claimCalls != 1 {
+					t.Fatalf("风控信号应透传且不在原线路重试: %v calls=%d", out, claimCalls)
 				}
 			}
 		})

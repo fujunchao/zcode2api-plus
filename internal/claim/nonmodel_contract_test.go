@@ -88,10 +88,22 @@ func TestClaimNonmodelHTTPContract(t *testing.T) {
 					if _, err := svc.Claim(acc, "synthetic-plan"); err != nil {
 						t.Fatal(err)
 					}
-					r = <-seen
+					// 显式 plan_id 会先补一次 campaign 反查（营销触达 GET）：只认领取请求，
+					// 不依赖它排在第几个——顺序是实现细节，契约是「必须发出带验证码的 POST」。
+					var claimReq *http.Request
+					for i := 0; i < 4 && claimReq == nil; i++ {
+						candidate := <-seen
+						if candidate.Method == http.MethodPost && strings.HasSuffix(candidate.URL.Path, "/billing/claim") {
+							claimReq = candidate
+						}
+					}
+					if claimReq == nil {
+						t.Fatal("没有观察到 /billing/claim 请求")
+					}
+					r = claimReq
 					assertNonmodelClaimHeaders(t, r.Header, acc)
-					if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/billing/claim") || r.Header.Get(captchaHeader) != "synthetic-captcha" || r.Header.Get(captchaRegionHeader) != "synthetic-region" {
-						t.Fatal("领取不能丢失方法、目标或验证码契约")
+					if r.Header.Get(captchaHeader) != "synthetic-captcha" || r.Header.Get(captchaRegionHeader) != "synthetic-region" {
+						t.Fatal("领取不能丢失验证码契约")
 					}
 				}
 			})

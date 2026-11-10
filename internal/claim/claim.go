@@ -451,14 +451,18 @@ func (s *Service) ClaimablePlans(acc *model.Account) ([]map[string]any, error) {
 	// preview 恒空是当前上游的常态（18 个账号抽样全无 data），把常态误报成错误
 	// 会让「刷新资格」与自动领取整条链路变成失败态。营销触达不可用时留一条日志，
 	// 免得把「端点挂了」看成「没有活动」。
-	if marketingErr != nil {
-		web.Warn("claim", fmt.Sprintf("账号 %s 营销触达不可用，按「无套餐」处理: %v", acc.Name, marketingErr))
-	}
 	// 空投递与「版本/凭据漂移」在上游是同一个响应（见 MarketingNoDeliveryHint），
 	// 这条日志是区分「活动没投放」与「伪装身份漂移」的唯一线索；放在这里可以让
 	// 领取、自动领取与后台「刷新资格」三条调用路径都留下痕迹。
-	web.Warn("claim", fmt.Sprintf("账号 %s 营销触达与 billing/preview 均无套餐（%s）",
-		acc.Name, MarketingNoDeliveryHint(acc)))
+	//
+	// 级别：营销触达本身不可用才是 Warn；「两边都没有套餐」是上游常态（活动结束、
+	// 账号已领过），用 Ok，否则后台刷新一次会刷出一屏告警。
+	hint := MarketingNoDeliveryHint(acc)
+	if marketingErr != nil {
+		web.Warn("claim", fmt.Sprintf("账号 %s 营销触达不可用，按「无套餐」处理: %v（%s）", acc.Name, marketingErr, hint))
+	} else {
+		web.Ok("claim", fmt.Sprintf("账号 %s 当前没有可领套餐（%s）", acc.Name, hint))
+	}
 	return fallback, nil
 }
 
@@ -634,8 +638,8 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 		return outcomes
 	}
 	if len(plans) == 0 {
-		web.Ok("claim", fmt.Sprintf("账号 %s 上游无投放套餐，跳过领取（%s）",
-			acc.Name, MarketingNoDeliveryHint(acc)))
+		// 诊断细节（app_version / 凭据）由 ClaimablePlans 统一输出，这里只报动作结果。
+		web.Ok("claim", fmt.Sprintf("账号 %s 上游无投放套餐，跳过领取", acc.Name))
 		return outcomes
 	}
 
