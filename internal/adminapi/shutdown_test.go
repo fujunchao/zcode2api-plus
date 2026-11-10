@@ -4,10 +4,12 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 	"zcode2api/internal/auth"
 	"zcode2api/internal/captcha"
+	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/quota"
@@ -16,8 +18,10 @@ import (
 func TestClaimSchedulerStopCancelsRequest(t *testing.T) {
 	st := newClaimStore(t)
 	entered, release := make(chan struct{}), make(chan struct{})
+	// 套餐发现有两跳（营销触达 + 回退 preview），用 Once 保证只关一次信号通道。
+	var once sync.Once
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(entered)
+		once.Do(func() { close(entered) })
 		select {
 		case <-r.Context().Done():
 		case <-release:
@@ -25,9 +29,9 @@ func TestClaimSchedulerStopCancelsRequest(t *testing.T) {
 	}))
 	defer up.Close()
 	defer close(release)
-	old := config.ZcodeBillingBase
-	config.ZcodeBillingBase = up.URL
-	defer func() { config.ZcodeBillingBase = old }()
+	old, oldMarketing := config.ZcodeBillingBase, claim.MarketingBaseURL
+	config.ZcodeBillingBase, claim.MarketingBaseURL = up.URL, up.URL
+	defer func() { config.ZcodeBillingBase, claim.MarketingBaseURL = old, oldMarketing }()
 	a, _ := st.AddAccount(model.ProviderZai, "test", "test.e30.sig")
 	_ = st.SetSetting("claim_schedule_enabled", "true")
 	_ = st.SetSetting("claim_schedule_time", time.Now().Format("15:04"))

@@ -55,6 +55,14 @@ func newAccountQuotaFixture(t *testing.T, before, after string) *newAccountFixtu
 		claimBody: `{"code":0,"data":{}}`}
 	handler := func(line string) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+			// 营销触达是套餐发现的第一跳（2026-11-10 起 billing/preview 已停投）。
+			// 这里声明「无活动」，并且**不记录**进 f.requests：既有断言看的是
+			// billing 端点序列，把营销触达记进去会把顺序断言变成噪声。
+			if strings.HasSuffix(r.URL.Path, "/marketing/touch") {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"code":0,"data":{"deliveries":[]}}`))
+				return
+			}
 			account := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			plan := ""
 			if strings.HasSuffix(r.URL.Path, "/billing/claim") {
@@ -106,6 +114,10 @@ func newAccountQuotaFixture(t *testing.T, before, after string) *newAccountFixtu
 	oldBase, oldReport := config.ZcodeBillingBase, claim.EventReportURL
 	config.ZcodeBillingBase, claim.EventReportURL = bad.URL, bad.URL+"/event/report"
 	t.Cleanup(func() { config.ZcodeBillingBase, claim.EventReportURL = oldBase, oldReport })
+	oldMarketing := claim.MarketingBaseURL
+	// 账号绑了代理，请求经代理投递，这个 host 只提供形态，永不真正解析。
+	claim.MarketingBaseURL = "http://marketing.example.test/api/v1"
+	t.Cleanup(func() { claim.MarketingBaseURL = oldMarketing })
 	var err error
 	if f.bad, err = st.AddProxyProfile("初始代理", bad.URL, true); err != nil {
 		t.Fatal(err)

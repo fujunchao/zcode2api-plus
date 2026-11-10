@@ -3,10 +3,12 @@ package adminapi
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 	"zcode2api/internal/captcha"
+	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 )
@@ -15,14 +17,20 @@ func TestAutoClaimChecksLatestAccountHealth(t *testing.T) {
 	st := newClaimStore(t)
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
+		// 营销触达是套餐发现的第一跳：它不计入「领取相关的 billing 请求数」，
+		// 本用例关心的是「这个账号有没有真的发起领取」。
+		if !strings.Contains(r.URL.Path, "/billing/") {
+			_, _ = w.Write([]byte("{\"code\":0,\"data\":{\"deliveries\":[]}}"))
+			return
+		}
+		calls.Add(1)
 		_, _ = w.Write([]byte("{\"code\":0,\"data\":{\"plans\":[]}}"))
 	}))
 	defer upstream.Close()
-	old := config.ZcodeBillingBase
-	config.ZcodeBillingBase = upstream.URL
-	defer func() { config.ZcodeBillingBase = old }()
+	old, oldMarketing := config.ZcodeBillingBase, claim.MarketingBaseURL
+	config.ZcodeBillingBase, claim.MarketingBaseURL = upstream.URL, upstream.URL
+	defer func() { config.ZcodeBillingBase, claim.MarketingBaseURL = old, oldMarketing }()
 	h := &Handler{Store: st, Captcha: captcha.NewManager()}
 	for _, state := range []string{"cooling", "disabled", "invalid", "archived", "claim-cooling", "exhausted", "cooling-expired"} {
 		t.Run(state, func(t *testing.T) {

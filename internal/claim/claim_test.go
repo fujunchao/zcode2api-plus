@@ -150,11 +150,18 @@ func TestClaimSuccessWith3007Retry(t *testing.T) {
 	if result["plan_id"] != "p1" {
 		t.Fatalf("结果不符: %v", result)
 	}
-	if len(up.requests) != 2 { // 显式 plan_id 无需 preview：2 次 claim
-		t.Fatalf("应 2 次上游请求: %d", len(up.requests))
+	// 显式 plan_id 无需 preview：2 次 claim（外加 1 次回执用的 campaign 反查，不计入这里）。
+	var claimCalls []upstreamCall
+	for _, call := range up.requests {
+		if lastSegment(call.Path) == "claim" {
+			claimCalls = append(claimCalls, call)
+		}
+	}
+	if len(claimCalls) != 2 {
+		t.Fatalf("应 2 次领取请求: %d", len(claimCalls))
 	}
 	// 最后一次 claim 应带换新后的验证码与区域头
-	claimCall := up.requests[len(up.requests)-1]
+	claimCall := claimCalls[len(claimCalls)-1]
 	if claimCall.Headers.Get(captchaHeader) != "second" {
 		t.Fatalf("换码重试应携带新验证码: %q", claimCall.Headers.Get(captchaHeader))
 	}

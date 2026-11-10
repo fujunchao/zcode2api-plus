@@ -1,6 +1,10 @@
-// 套餐领取（Z.AI billing/preview + billing/claim），对应 Python 版 app/claim.py。
-// 链路：GET /billing/preview → data.plans[]；POST /billing/claim（body
-// {"plan_id"}）需验证码头 X-Aliyun-Captcha-Verify-Param（+可选 Region 头）。
+// 套餐领取（营销触达发现套餐 + billing/claim 领取），对应 Python 版 app/claim.py。
+//
+// 链路：GET /marketing/touch → deliveries[].…buttons[].action{type:"claim_zcode_plan"}
+// 的 args.plan_id（见 marketing.go；2026-11-10 起上游的唯一投放渠道），
+// 回退 GET /billing/preview → data.plans[]；POST /billing/claim（body {"plan_id"}）
+// 需验证码头 X-Aliyun-Captcha-Verify-Param（+可选 Region 头）；成功后回执
+// POST /marketing/touch/action。
 // 业务码沿用 zcode-switch 映射；3007 换码重试一次。请求经 clientFor 走账号代理。
 package claim
 
@@ -169,27 +173,7 @@ func ParsePlan(raw map[string]any) map[string]any {
 	}
 	var grants []any
 	if entitlements, ok := raw["entitlements"].([]any); ok {
-		for _, item := range entitlements {
-			ent, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if meter, _ := ent["meter"].(string); meter != "model_usage" {
-				continue
-			}
-			if unit, _ := ent["unit_type"].(string); unit != "token" {
-				continue
-			}
-			name := orFirst(ent, "show_name", "showName")
-			if name == "" {
-				continue
-			}
-			grants = append(grants, map[string]any{
-				"name":   name,
-				"units":  asFloat(firstNonNil(ent["grant_units"], ent["grantUnits"])),
-				"period": orDefault(orFirst(ent, "period"), "one_time"),
-			})
-		}
+		grants = planGrants(entitlements)
 	}
 	return map[string]any{
 		"plan_id":     planID,
@@ -198,6 +182,36 @@ func ParsePlan(raw map[string]any) map[string]any {
 		"priority":    asFloat(firstNonNil(raw["priority"])),
 		"grants":      grants,
 	}
+}
+
+// planGrants 把 entitlements 里的 model_usage / token 授权转成展示用 grants。
+//
+// billing/preview 的套餐体与营销触达 delivery 里携带的 zcode_plan 是同一形态，
+// 两处共用这一份过滤：只修一条链路会让「活动套餐显示了但没有权益」。
+func planGrants(entitlements []any) []any {
+	var grants []any
+	for _, item := range entitlements {
+		ent, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if meter, _ := ent["meter"].(string); meter != "model_usage" {
+			continue
+		}
+		if unit, _ := ent["unit_type"].(string); unit != "token" {
+			continue
+		}
+		name := orFirst(ent, "show_name", "showName")
+		if name == "" {
+			continue
+		}
+		grants = append(grants, map[string]any{
+			"name":   name,
+			"units":  asFloat(firstNonNil(ent["grant_units"], ent["grantUnits"])),
+			"period": orDefault(orFirst(ent, "period"), "one_time"),
+		})
+	}
+	return grants
 }
 
 // JWTUserID JWT payload 的 user_id（官方客户端事件上报以 user_id 标识用户）。
@@ -405,7 +419,46 @@ func (s *Service) ReportActivationEvents(acc *model.Account) string {
 }
 
 // PreviewPlans 拉取账号当前可领取套餐，按优先级降序。
+//
+// 2026-11-10 现场核实：billing/preview 已不再投放套餐（恒 code 0 且没有 data），
+// 真实入口是营销触达。为让「刷新资格」与自动领取都看到同一份套餐，这里统一走
+// ClaimablePlans；billing/preview 只作为回退保留（见 docs/analysis-claim-marketing-touch-20261110.md）。
 func (s *Service) PreviewPlans(acc *model.Account) ([]map[string]any, error) {
+	return s.ClaimablePlans(acc)
+}
+
+// ClaimablePlans 可领套餐的单一发现点：营销触达优先，回退 billing/preview。
+//
+// 两条路径的来源都是上游自己算好的「本账号当前能领什么」：
+//   - 营销触达 delivery 的 claim_zcode_plan 动作（现在的唯一投放渠道）；
+//   - billing/preview 的 data.plans（旧渠道，上游已停投，留作格式回退）。
+func (s *Service) ClaimablePlans(acc *model.Account) ([]map[string]any, error) {
+	plans, marketingErr := s.marketingPlansView(acc)
+	if len(plans) > 0 {
+		return plans, nil
+	}
+	fallback, billingErr := s.previewBillingPlans(acc)
+	if len(fallback) > 0 {
+		return fallback, nil
+	}
+	// 回退路径一旦报错（业务码 / 风控 / 线路不可达），一律以它为准：它信息量更大，
+	// 也是既有代理护栏（proxyguard 按 endpointUnreachable / riskControl 改派或淘汰
+	// 线路）唯一依赖的信号。
+	if billingErr != nil {
+		return nil, billingErr
+	}
+	// 两边都返回「空」：按「当前没有可领套餐」处理，不升级成错误——
+	// preview 恒空是当前上游的常态（18 个账号抽样全无 data），把常态误报成错误
+	// 会让「刷新资格」与自动领取整条链路变成失败态。营销触达不可用时留一条日志，
+	// 免得把「端点挂了」看成「没有活动」。
+	if marketingErr != nil {
+		web.Warn("claim", fmt.Sprintf("账号 %s 营销触达不可用，按「无套餐」处理: %v", acc.Name, marketingErr))
+	}
+	return fallback, nil
+}
+
+// previewBillingPlans 旧的 billing/preview 发现路径（保留作回退）。
+func (s *Service) previewBillingPlans(acc *model.Account) ([]map[string]any, error) {
 	headers := authHeaders(acc)
 	body, err := s.billingRequest(acc, http.MethodGet,
 		"/billing/preview?app_version="+config.ZcodeClientVersion+"&platform="+config.ZcodeQueryPlatform(),
@@ -448,13 +501,27 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 
 	planName := ""
 	grants := []any{}
+	campaignID := ""
 	if planID == "" {
-		plans, err := s.PreviewPlans(acc)
+		plans, err := s.ClaimablePlans(acc)
 		if err != nil {
 			return nil, err
 		}
 		if len(plans) == 0 {
-			return nil, &ClaimError{msg: "沒有待領取的套餐"}
+			// 无投递 = 本次查询没看到活动（未投放或本活动已领过）。
+			//
+			// 刻意**不带 1005 之类的业务码**：1005/1003/3007 会让
+			// adminapi.claimCooldownUntil 落长冷却（默认 1 小时），而营销触达的
+			// 「0 条」是瞬态——2026-11-10 实测同一账号间隔十几分钟就从 0 条变 1 条
+			// （docs/analysis-claim-marketing-touch-20261110.md §7）。一次瞬态空响应
+			// 把一个本来可领的账号锁一小时，正是本次要修的那个 bug 的镜像。
+			// 留短冷却（claim_retry_cooldown）让下一轮/手动点击自然重试。
+			//
+			// 顺带留一条诊断：空投递与「版本/凭据漂移」在上游响应里长得一模一样
+			// （见 MarketingNoDeliveryHint），没有这条日志就只能看到「所有账号都没活动」。
+			web.Warn("claim", fmt.Sprintf("账号 %s 营销触达与 billing/preview 均无套餐（%s）",
+				acc.Name, MarketingNoDeliveryHint(acc)))
+			return nil, &ClaimError{msg: "該賬號當前沒有可領取的活動套餐"}
 		}
 		best := plans[0]
 		planID, _ = best["plan_id"].(string)
@@ -465,6 +532,7 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 		if g, ok := best["grants"].([]any); ok {
 			grants = g
 		}
+		campaignID, _ = best["campaign_id"].(string)
 	}
 
 	var lastErr error
@@ -485,12 +553,21 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 		code := BusinessCode(body)
 		_, endsAt := parsePlanWindow(body)
 		if code == 0 {
+			if campaignID == "" {
+				// 显式 plan_id 的路径没走过发现阶段：补一次反查（失败只影响归因）。
+				campaignID = s.campaignForPlan(acc, planID)
+			}
 			out := map[string]any{"plan_id": planID, "plan_name": planName, "grants": grants}
 			if endsAt != nil {
 				// 上游自己算好的下次可领时间，供调用方落盘与倒计时展示。
 				// 缺省时不写该键，避免 *float64(nil) 这类形态混进 outcome。
 				out["next_at"] = *endsAt
 			}
+			if campaignID != "" {
+				out["campaign_id"] = campaignID
+			}
+			// 官方在动作成功之后才回执营销触达；回报失败只 warn，不影响领取结论。
+			s.ReportMarketingClaim(acc, campaignID)
 			return out, nil
 		}
 		if code == 3007 && attempt == 1 {
@@ -544,7 +621,8 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 		return outcomes
 	}
 	if len(plans) == 0 {
-		web.Ok("claim", fmt.Sprintf("账号 %s 上游无投放套餐，跳过领取", acc.Name))
+		web.Ok("claim", fmt.Sprintf("账号 %s 上游无投放套餐，跳过领取（%s）",
+			acc.Name, MarketingNoDeliveryHint(acc)))
 		return outcomes
 	}
 

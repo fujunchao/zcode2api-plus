@@ -24,23 +24,48 @@ func TestClaimNonmodelHTTPContract(t *testing.T) {
 				apiKey := "synthetic-api-key"
 				device := "synthetic-device"
 				acc.APIKey, acc.VirtualDeviceMid = &apiKey, &device
-				seen := make(chan *http.Request, 2)
+				seen := make(chan *http.Request, 4)
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					_, _ = io.Copy(io.Discard, r.Body)
 					seen <- r.Clone(context.Background())
 					_, _ = io.WriteString(w, `{"code":0,"data":{"plans":[]}}`)
 				}))
 				t.Cleanup(server.Close)
-				oldBase := config.ZcodeBillingBase
+				oldBase, oldMarketing := config.ZcodeBillingBase, MarketingBaseURL
 				config.ZcodeBillingBase = server.URL
+				MarketingBaseURL = server.URL
 				if proxied {
 					config.ZcodeBillingBase = "http://billing.example.test/api/v1/zcode-plan"
+					// 营销触达与 billing 同源但不同前缀：代理同样要看到自己的绝对 URL。
+					MarketingBaseURL = "http://marketing.example.test/api/v1"
 					acc.ProxyURL = &server.URL
 				}
-				t.Cleanup(func() { config.ZcodeBillingBase = oldBase })
+				t.Cleanup(func() { config.ZcodeBillingBase, MarketingBaseURL = oldBase, oldMarketing })
 				svc := NewService(nil)
 				if _, err := svc.PreviewPlans(acc); err != nil {
 					t.Fatal(err)
+				}
+				// 套餐发现的第一跳是营销触达：只带四项身份头，不带 billing 来源头与 Content-Type。
+				marketing := <-seen
+				if marketing.Method != http.MethodGet || !strings.HasSuffix(marketing.URL.Path, marketingTouchPath) {
+					t.Fatalf("营销触达目标错误: %s %s", marketing.Method, marketing.URL.Path)
+				}
+				if marketing.URL.Query().Get("seq") == "" {
+					t.Fatal("营销触达必须带自增 seq")
+				}
+				if got := marketing.Header.Get("X-ZCode-App-Version"); got != config.ZcodeClientVersion {
+					t.Fatalf("营销触达版本头未取自常量: %q", got)
+				}
+				if got := marketing.Header.Get("X-Device-Mid"); got != device {
+					t.Fatalf("营销触达设备指纹不符: %q", got)
+				}
+				if got := marketing.Header.Get("Content-Type"); got != "" {
+					t.Fatalf("营销触达 GET 不得带 Content-Type: %q", got)
+				}
+				for _, key := range []string{"X-Title", "X-Platform", "X-Os-Category", "HTTP-Referer"} {
+					if got := marketing.Header.Get(key); got != "" {
+						t.Fatalf("营销触达不得混入 billing 来源头 %s=%q", key, got)
+					}
 				}
 				r := <-seen
 				if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/billing/preview") {

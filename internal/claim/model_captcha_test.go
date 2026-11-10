@@ -43,10 +43,16 @@ func TestModelCaptchaSkipDoesNotDisableClaim(t *testing.T) {
 			if manual {
 				wantTokens = []string{"claim-manual"}
 			}
-			if len(up.requests) != len(wantTokens) {
-				t.Fatalf("领取请求数不符: %d", len(up.requests))
+			var claimCalls []upstreamCall
+			for _, call := range up.requests {
+				if lastSegment(call.Path) == "claim" {
+					claimCalls = append(claimCalls, call)
+				}
 			}
-			for i, call := range up.requests {
+			if len(claimCalls) != len(wantTokens) {
+				t.Fatalf("领取请求数不符: %d", len(claimCalls))
+			}
+			for i, call := range claimCalls {
 				if call.Headers.Get(captchaHeader) != wantTokens[i] || call.Headers.Get(captchaRegionHeader) != "cn" {
 					t.Fatalf("领取必须保留验证码和区域: request=%d headers=%v", i, call.Headers)
 				}

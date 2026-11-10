@@ -11,14 +11,16 @@ import (
 	"zcode2api/internal/config"
 )
 
-// queryRecorder 代理 fakeBilling，额外记录每次请求的完整 query。
+// queryRecorder 代理 fakeBilling，额外记录每次请求的完整 query 与请求头。
 type queryRecorder struct {
 	inner   *fakeBilling
 	queries []url.Values
+	headers []http.Header
 }
 
 func (q *queryRecorder) Do(r *http.Request) (*http.Response, error) {
 	q.queries = append(q.queries, r.URL.Query())
+	q.headers = append(q.headers, r.Header.Clone())
 	return q.inner.Do(r)
 }
 
@@ -54,13 +56,24 @@ func TestClientVersionSingleSource(t *testing.T) {
 	if _, err := svc.PreviewPlans(acc); err != nil {
 		t.Fatalf("preview 不应报错: %v", err)
 	}
-	if len(rec.queries) != 1 {
-		t.Fatalf("应恰好 1 次 preview 请求，实得 %d", len(rec.queries))
+	// 套餐发现是两跳：营销触达（现在的主渠道）+ billing/preview（回退）。
+	// 两跳都必须带上伪装版本，缺任何一处都会让活动投放在上游静默变空。
+	if len(rec.queries) != 2 {
+		t.Fatalf("应恰好 2 次发现请求（营销触达 + preview），实得 %d", len(rec.queries))
 	}
-	if got := rec.queries[0].Get("app_version"); got != sentinel {
+	if rec.queries[0].Get("seq") == "" {
+		t.Fatalf("第一跳应是营销触达（带 seq）: %v", rec.queries[0])
+	}
+	if rec.queries[0].Get("app_version") != "" {
+		t.Fatalf("营销触达不带 app_version 查询参数（版本走请求头）: %v", rec.queries[0])
+	}
+	if got := rec.headers[0].Get("X-ZCode-App-Version"); got != sentinel {
+		t.Fatalf("营销触达的版本头未取自常量: %q", got)
+	}
+	if got := rec.queries[1].Get("app_version"); got != sentinel {
 		t.Fatalf("preview 的 app_version 未取自常量: %q", got)
 	}
-	if got := rec.queries[0].Get("platform"); got != config.ZcodeQueryPlatform() {
+	if got := rec.queries[1].Get("platform"); got != config.ZcodeQueryPlatform() {
 		t.Fatalf("preview 的 platform 不符: %q", got)
 	}
 }

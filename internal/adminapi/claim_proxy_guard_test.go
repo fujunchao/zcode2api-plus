@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"zcode2api/internal/captcha"
+	"zcode2api/internal/claim"
 	"zcode2api/internal/config"
 	"zcode2api/internal/model"
 	"zcode2api/internal/quota"
@@ -30,6 +31,11 @@ func newClaimGuardFixture(t *testing.T, balanceStatus int, balanceBody string) *
 	handler := func(calls *atomic.Int32, blocked bool) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
+			if strings.HasSuffix(r.URL.Path, "/marketing/touch") {
+				// 套餐发现的第一跳：声明「无活动」，且不计入领取/取额计数。
+				_, _ = w.Write([]byte(`{"code":0,"data":{"deliveries":[]}}`))
+				return
+			}
 			if strings.HasSuffix(r.URL.Path, "/billing/balance") {
 				w.WriteHeader(balanceStatus)
 				_, _ = w.Write([]byte(balanceBody))
@@ -52,9 +58,11 @@ func newClaimGuardFixture(t *testing.T, balanceStatus int, balanceBody string) *
 	t.Cleanup(up.Close)
 	other := httptest.NewServer(handler(&f.newClaims, false))
 	t.Cleanup(other.Close)
-	oldBase := config.ZcodeBillingBase
+	oldBase, oldMarketing := config.ZcodeBillingBase, claim.MarketingBaseURL
 	config.ZcodeBillingBase = up.URL
-	t.Cleanup(func() { config.ZcodeBillingBase = oldBase })
+	// 账号绑了代理，请求经代理投递，这个 host 只提供形态，永不真正解析。
+	claim.MarketingBaseURL = "http://marketing.example.test/api/v1"
+	t.Cleanup(func() { config.ZcodeBillingBase, claim.MarketingBaseURL = oldBase, oldMarketing })
 	f.bad, _ = st.AddProxyProfile("bad", up.URL, true)
 	f.good, _ = st.AddProxyProfile("good", other.URL, true)
 	a, _ := st.AddAccount(model.ProviderZai, "new-account", "header.payload.signature")

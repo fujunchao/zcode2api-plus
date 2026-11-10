@@ -24,6 +24,10 @@ func TestClaimRedirectDoesNotForwardAccountCredentials(t *testing.T) {
 	old := config.ZcodeBillingBase
 	config.ZcodeBillingBase = origin.URL
 	t.Cleanup(func() { config.ZcodeBillingBase = old })
+	// 营销触达是套餐发现的第一跳，同样必须钉在本机 mock 上（否则用例会真打上游）。
+	oldMarketing := MarketingBaseURL
+	MarketingBaseURL = origin.URL
+	t.Cleanup(func() { MarketingBaseURL = oldMarketing })
 	_, err := NewService(nil).PreviewPlans(acc)
 	if err == nil || forwarded.Load() != 0 {
 		t.Fatal("3xx 不能冒充成功或把账号认证发送到重定向目标")
