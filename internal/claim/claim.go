@@ -454,6 +454,11 @@ func (s *Service) ClaimablePlans(acc *model.Account) ([]map[string]any, error) {
 	if marketingErr != nil {
 		web.Warn("claim", fmt.Sprintf("账号 %s 营销触达不可用，按「无套餐」处理: %v", acc.Name, marketingErr))
 	}
+	// 空投递与「版本/凭据漂移」在上游是同一个响应（见 MarketingNoDeliveryHint），
+	// 这条日志是区分「活动没投放」与「伪装身份漂移」的唯一线索；放在这里可以让
+	// 领取、自动领取与后台「刷新资格」三条调用路径都留下痕迹。
+	web.Warn("claim", fmt.Sprintf("账号 %s 营销触达与 billing/preview 均无套餐（%s）",
+		acc.Name, MarketingNoDeliveryHint(acc)))
 	return fallback, nil
 }
 
@@ -494,14 +499,26 @@ func (s *Service) previewBillingPlans(acc *model.Account) ([]map[string]any, err
 
 // Claim 领取套餐。planID 为空时自动选优先级最高的可领套餐。
 // 返回 {plan_id, plan_name, grants}；3007（验证码失败）自动换码重试一次。
+//
+// 发现阶段已经拿到 campaign_id 的调用方请用 ClaimWithCampaign：领取成功后上游
+// 立刻撤下该投递，事后反查必然落空（见 ClaimWithCampaign 注释）。
 func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, error) {
+	return s.ClaimWithCampaign(acc, planID, "")
+}
+
+// ClaimWithCampaign 带 campaign 上下文的领取（发现阶段已知时传入）。
+//
+// 为什么必须由调用方传：账号一旦领到该活动，上游就不再投递这条 delivery
+// （2026-11-10 实测：领到活动的账号 marketing/touch 返回 0 条，未领的 1 条）。
+// 因此「领取成功后再反查 campaign_id」必然拿不到——回执会静默丢失，还白花一次
+// 上游请求；campaign_id 只能在领取**之前**取得。
+func (s *Service) ClaimWithCampaign(acc *model.Account, planID, campaignID string) (map[string]any, error) {
 	if acc.Mode != "jwt" || acc.JWTToken == nil || *acc.JWTToken == "" {
 		return nil, &ClaimError{msg: "僅 Coding Plan (JWT) 賬號支持領取"}
 	}
 
 	planName := ""
 	grants := []any{}
-	campaignID := ""
 	if planID == "" {
 		plans, err := s.ClaimablePlans(acc)
 		if err != nil {
@@ -516,11 +533,7 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 			// （docs/analysis-claim-marketing-touch-20261110.md §7）。一次瞬态空响应
 			// 把一个本来可领的账号锁一小时，正是本次要修的那个 bug 的镜像。
 			// 留短冷却（claim_retry_cooldown）让下一轮/手动点击自然重试。
-			//
-			// 顺带留一条诊断：空投递与「版本/凭据漂移」在上游响应里长得一模一样
-			// （见 MarketingNoDeliveryHint），没有这条日志就只能看到「所有账号都没活动」。
-			web.Warn("claim", fmt.Sprintf("账号 %s 营销触达与 billing/preview 均无套餐（%s）",
-				acc.Name, MarketingNoDeliveryHint(acc)))
+			// 诊断日志由 ClaimablePlans 统一输出（「刷新资格」等调用方也覆盖到）。
 			return nil, &ClaimError{msg: "該賬號當前沒有可領取的活動套餐"}
 		}
 		best := plans[0]
@@ -533,6 +546,10 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 			grants = g
 		}
 		campaignID, _ = best["campaign_id"].(string)
+	} else if campaignID == "" {
+		// 显式 plan_id 且调用方没带 campaign：只能补一次反查，且必须在**领取之前**——
+		// 领取成功后上游就撤下这条投递，那时再查必然落空（回执会静默丢失）。
+		campaignID = s.campaignForPlan(acc, planID)
 	}
 
 	var lastErr error
@@ -553,10 +570,6 @@ func (s *Service) Claim(acc *model.Account, planID string) (map[string]any, erro
 		code := BusinessCode(body)
 		_, endsAt := parsePlanWindow(body)
 		if code == 0 {
-			if campaignID == "" {
-				// 显式 plan_id 的路径没走过发现阶段：补一次反查（失败只影响归因）。
-				campaignID = s.campaignForPlan(acc, planID)
-			}
 			out := map[string]any{"plan_id": planID, "plan_name": planName, "grants": grants}
 			if endsAt != nil {
 				// 上游自己算好的下次可领时间，供调用方落盘与倒计时展示。
@@ -631,7 +644,9 @@ func (s *Service) AutoClaimAllPlans(acc *model.Account) []map[string]any {
 			break
 		}
 		planID, _ := plan["plan_id"].(string)
-		result, err := s.Claim(acc, planID)
+		// campaign_id 只能在发现阶段取：领取成功后上游即撤下该投递，事后再查必然落空。
+		campaignID, _ := plan["campaign_id"].(string)
+		result, err := s.ClaimWithCampaign(acc, planID, campaignID)
 		if err != nil {
 			outcomes = append(outcomes, FailureOutcome(acc, planID, err))
 			web.Warn("claim", fmt.Sprintf("账号 %s 自动领取 %s 失败: %v", acc.Name, planID, err))

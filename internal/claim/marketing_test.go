@@ -79,7 +79,7 @@ const bannerDelivery = `{"code":0,"msg":"","data":{"server_time":1794312332,"lan
 const popupDelivery = `{"code":0,"data":{"deliveries":[{"campaign_id":"cmp-popup","resource_position":"popup","priority":10,
 "popup":{"buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"plan-popup"}}}],
 "hero":{"args":{"zcode_plan":{"plan_id":"plan-popup","name":"弹窗套餐","priority":7,
-"entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token","grant_units":1000,"period":"one_time"}]}}}}]}}`
+"entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token","grant_units":1000,"period":"one_time"}]}}}}}]}}`
 
 func newMarketingService(t *testing.T, up *marketingFake) *Service {
 	t.Helper()
@@ -429,6 +429,49 @@ func TestAutoClaimAllPlansUsesMarketingDelivery(t *testing.T) {
 	}
 	if len(up.actions) != 1 {
 		t.Fatalf("自动领取成功后应回执一次: %d", len(up.actions))
+	}
+	if len(up.touches) != 1 {
+		// 上游在领到活动后就不再投递：任何「领取成功后再反查 campaign_id」的实现
+		// 都会在这里多出一次必然落空的查询，回执也就丢了。
+		t.Fatalf("发现阶段之后不得再查营销触达: %d", len(up.touches))
+	}
+}
+
+// TestMarketingClaimDoesNotRequeryAfterClaim 固化上游真实语义：
+// 账号领到该活动后投递立刻消失。若实现改成「领取成功后再反查 campaign_id」，
+// 第二次查询会返回 0 条 → 回执丢失 → 本用例变红。
+func TestMarketingClaimDoesNotRequeryAfterClaim(t *testing.T) {
+	acc := newTestAccount(t)
+	claimed := false
+	up := &marketingFake{
+		inner: &fakeBilling{responses: map[string]func(upstreamCall) (int, string){
+			"/billing/preview": func(upstreamCall) (int, string) { return 200, deadPreview },
+			"/billing/claim": func(upstreamCall) (int, string) {
+				claimed = true
+				return 200, `{"code":0,"data":{"plan":{"ends_at":1794358800}}}`
+			},
+		}},
+	}
+	up.touch = func(upstreamCall) (int, string) {
+		if claimed {
+			// 领完之后上游不再投递这条 delivery。
+			return 200, `{"code":0,"data":{"deliveries":[]}}`
+		}
+		return 200, bannerDelivery
+	}
+	out := newMarketingService(t, up).AutoClaimAllPlans(acc)
+	if len(out) != 1 || out[0]["ok"] != true {
+		t.Fatalf("自动领取应成功: %v", out)
+	}
+	if out[0]["campaign_id"] != "2101141259813175296" {
+		t.Fatalf("结果必须带上发现阶段的 campaign_id: %v", out[0])
+	}
+	if len(up.actions) != 1 {
+		t.Fatalf("领取成功后必须恰好回执一次（不能因反查落空而丢回执）: %d", len(up.actions))
+	}
+	var actionBody map[string]string
+	if err := json.Unmarshal(up.actions[0].Body, &actionBody); err != nil || actionBody["campaign_id"] != "2101141259813175296" {
+		t.Fatalf("回执体不符: %s", up.actions[0].Body)
 	}
 }
 

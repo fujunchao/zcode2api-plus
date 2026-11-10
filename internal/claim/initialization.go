@@ -59,7 +59,9 @@ func (s *Service) RunInitialization(acc *model.Account) (out InitializationOutco
 			return out
 		}
 		id, _ := plan["plan_id"].(string)
-		result, err := s.Claim(acc, id)
+		// 与 AutoClaimAllPlans 同口径：campaign_id 必须来自发现阶段（领后投递即撤下）。
+		campaignID, _ := plan["campaign_id"].(string)
+		result, err := s.ClaimWithCampaign(acc, id, campaignID)
 		if err != nil {
 			failure := initializationFailure(err)
 			failure.Succeeded = out.Succeeded
