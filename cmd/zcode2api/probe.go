@@ -62,6 +62,7 @@ type probeReport struct {
 	SystemFirst       string `json:"system_first_text"`
 	SystemFirstSHA    string `json:"system_first_sha16"`
 	SystemIdentitySHA string `json:"system_identity_sha16"`
+	SystemDynamicSHA  string `json:"system_dynamic_sha16,omitempty"`
 	SystemBlocks      int    `json:"system_blocks"`
 	SystemSource      string `json:"system_source"`
 	Account           string `json:"account"`
@@ -315,6 +316,7 @@ func probeSend(picked *probeCandidate, summary upstream.ZcodeSystemProfileSummar
 		SystemFirst:       summary.FirstText,
 		SystemFirstSHA:    summary.FirstSHA16,
 		SystemIdentitySHA: summary.IdentitySHA16,
+		SystemDynamicSHA:  summary.DynamicSHA16,
 		SystemBlocks:      summary.Blocks,
 		SystemSource:      "builtin",
 		Account:           picked.ID,

@@ -218,6 +218,9 @@ func Test3180ProfileCacheIsolation(t *testing.T) {
 	if current.Profile != "3.18.0" || current.IdentityChars != 1233 {
 		t.Fatalf("切换到 3.18.0 后档案未重新解析: %+v", current)
 	}
+	if current.DynamicChars != 1595 || current.DynamicSHA16 != "26a2daa8c8381086" {
+		t.Fatalf("3.18.0 第三块指纹不符: %+v", current)
+	}
 	if legacy.Profile != "3.17.1" || legacy.IdentityChars != 1235 {
 		t.Fatalf("3.17.2 档案基线不符: %+v", legacy)
 	}

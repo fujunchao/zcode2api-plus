@@ -22,6 +22,10 @@ type ZcodeSystemProfileSummary struct {
 	FirstSHA16    string `json:"first_sha16"`
 	IdentityChars int    `json:"identity_chars"`
 	IdentitySHA16 string `json:"identity_sha16"`
+	// DynamicChars / DynamicSHA16 第三块（3.18.0 的 Dynamic Behavior +
+	// Context Management + Total Tokens）的指纹；旧档案默认只有两块时为空。
+	DynamicChars int    `json:"dynamic_chars,omitempty"`
+	DynamicSHA16 string `json:"dynamic_sha16,omitempty"`
 }
 
 // ZcodeSystemSummary 取当前档案的 system 指纹（含 block 0 原文，便于人工核对）。
@@ -51,6 +55,12 @@ func ZcodeSystemSummaryFromBlocks(blocks []any, profile string) ZcodeSystemProfi
 		}
 		summary.IdentityChars = len(identity)
 		summary.IdentitySHA16 = shortSHA16(identity)
+	}
+	if len(blocks) > 2 {
+		third, _ := blocks[2].(map[string]any)
+		dynamic, _ := third["text"].(string)
+		summary.DynamicChars = len(dynamic)
+		summary.DynamicSHA16 = shortSHA16(dynamic)
 	}
 	return summary
 }
