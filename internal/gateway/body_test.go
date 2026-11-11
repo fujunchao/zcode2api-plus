@@ -379,3 +379,75 @@ func TestNormalizeBodyOfficialThreeBlockSystemPreserved(t *testing.T) {
 		t.Fatal("保留官方 system 时不得注入 currentDate（content 只应桥接原文块）")
 	}
 }
+
+// TestNormalizeBody3180EnvironmentIsUserReminder 3.18.0 的 Environment 不进 system，
+// 而是首轮 user 的 system-reminder；顺序为 环境 → currentDate → 用户正文。
+func TestNormalizeBody3180EnvironmentIsUserReminder(t *testing.T) {
+	oldVersion, oldPreserve := config.ZcodeClientVersion, config.PreserveClientContext
+	config.ZcodeClientVersion = "3.18.0"
+	config.PreserveClientContext = true
+	t.Cleanup(func() {
+		config.ZcodeClientVersion, config.PreserveClientContext = oldVersion, oldPreserve
+	})
+
+	body := map[string]any{
+		"model":    "GLM-5.3",
+		"messages": []any{map[string]any{"role": "user", "content": "问题"}},
+	}
+	NormalizeBody(body, true)
+
+	system, ok := body["system"].([]any)
+	if !ok || len(system) != 3 {
+		t.Fatalf("3.18.0 system 应为三块，实际 %#v", body["system"])
+	}
+	for i, raw := range system {
+		block, _ := raw.(map[string]any)
+		if text, _ := block["text"].(string); strings.Contains(text, "# Environment") {
+			t.Fatalf("3.18.0 第 %d 块 system 不得含 # Environment", i)
+		}
+	}
+
+	messages := body["messages"].([]any)
+	content, ok := messages[0].(map[string]any)["content"].([]any)
+	if !ok || len(content) != 3 {
+		t.Fatalf("首条 user 应含 环境/currentDate/正文 三块，实际 %#v", messages[0])
+	}
+	first, _ := content[0].(map[string]any)["text"].(string)
+	if !strings.HasPrefix(first, "<system-reminder>\n# Environment\n") {
+		t.Fatalf("环境提醒应位于首条 user 最前面: %q", first[:min(80, len(first))])
+	}
+	second, _ := content[1].(map[string]any)["text"].(string)
+	if !strings.Contains(second, "# currentDate") {
+		t.Fatalf("currentDate 应排在环境之后: %q", second[:min(80, len(second))])
+	}
+	if text, _ := content[2].(map[string]any)["text"].(string); text != "问题" {
+		t.Fatalf("用户正文被改写: %q", text)
+	}
+}
+
+// TestNormalizeBody3180OfficialSystemPreserved 调用者自带官方三块时原样保留，
+// 不重复注入环境或 currentDate。
+func TestNormalizeBody3180OfficialSystemPreserved(t *testing.T) {
+	oldVersion := config.ZcodeClientVersion
+	config.ZcodeClientVersion = "3.18.0"
+	t.Cleanup(func() { config.ZcodeClientVersion = oldVersion })
+
+	official := upstream.ZcodeSystemBlocks()
+	before, err := json.Marshal(official)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{
+		"system":   official,
+		"messages": []any{map[string]any{"role": "user", "content": "客户端原文"}},
+	}
+	NormalizeBody(body, true)
+	after, err := json.Marshal(body["system"])
+	if err != nil || string(after) != string(before) {
+		t.Fatal("调用者官方 3.18.0 system 必须原样保留")
+	}
+	content, _ := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("保留官方 system 时不得注入环境/currentDate，实际 %d 块", len(content))
+	}
+}

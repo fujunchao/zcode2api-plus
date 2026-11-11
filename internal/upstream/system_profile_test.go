@@ -48,6 +48,14 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 			"You are an agent working with the user toward their goals",
 			1235, "4058874023c7541f",
 		},
+		{
+			// 3.18.0（2026-11-11 逆向核验）：身份段不再接 Desktop Context 与两个连接换行，
+			// 边界就是正文本身 1,233 B；block2 另起一块 1,595 B。
+			"3.18.0", "3.18.0",
+			"You are ZCode, an interactive agent",
+			"You are an agent working with the user toward their goals",
+			1233, "aac4ba4cc7b555b3",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.version, func(t *testing.T) {

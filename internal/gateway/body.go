@@ -68,6 +68,10 @@ func NormalizeBody(body map[string]any, needsZcodeSystem bool) map[string]any {
 			// 文本并入 block 2，不再追加第 4 块；currentDate 只在这一路径合并进首条 user。
 			body["system"] = upstream.BuildFallbackSystem(body, config.ZcodeClientProfile())
 			upstream.InjectContextPrefix(body, time.Now(), upstream.ClientTimezoneLocation())
+			// 3.18.0 的 Environment/Desktop Context 不在 system 里，而是首轮 user 的
+			// <system-reminder>；先注入 currentDate 再前插环境，最终顺序为
+			// 环境 → currentDate → 用户正文。
+			upstream.InjectEnvironmentReminder(body, config.ZcodeClientProfile())
 		default:
 			// 其余类型保持原样（对齐 Python 版的 elif 链）
 		}

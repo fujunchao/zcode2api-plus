@@ -101,6 +101,11 @@ func appendEnvironmentBlock(static []any) []any {
 // profile 必须由调用方传入：Environment 与请求头同源，不能在这里另读一次
 // 全局档案，否则测试/请求构造期间改配置会出现头体不一致。
 func BuildFallbackSystem(body map[string]any, profile config.ZcodeProfile) []any {
+	// 3.18.0 起 Environment/Desktop Context 不再属于 system，档案本身就是三块静态文案；
+	// 环境由 InjectEnvironmentReminder 作为 user 提醒注入。3.17.x 及更早保持原路径。
+	if config.ZcodeSystemProfileKey().UsesUserReminderEnvironment() {
+		return buildFallbackSystem3180(body)
+	}
 	blocks := copyZcodeStaticBlocks()
 	dynamic := fallbackDynamicText(profile)
 	generated := slices.Clone(blocks)
@@ -119,6 +124,175 @@ func BuildFallbackSystem(body map[string]any, profile config.ZcodeProfile) []any
 		"text":          dynamic,
 		"cache_control": map[string]any{"type": "ephemeral"},
 	})
+}
+
+// buildFallbackSystem3180 3.18.0 的回退 system：三块全部来自档案，不生成 Environment。
+//
+// 调用者第三方 system 文本仍并入 block2 末尾，保持“最多三块”的既有约束；调用者
+// 自带官方前两块时 NormalizeBody 会先走保留分支，不会到这里。
+func buildFallbackSystem3180(body map[string]any) []any {
+	blocks := copyZcodeStaticBlocks()
+	if len(blocks) == 0 || body == nil {
+		return blocks
+	}
+	extra := callerSystemText(body["system"], blocks)
+	if extra == "" {
+		return blocks
+	}
+	last, ok := blocks[len(blocks)-1].(map[string]any)
+	if !ok {
+		return blocks
+	}
+	clone := maps.Clone(last)
+	text, _ := clone["text"].(string)
+	clone["text"] = text + "\n\n" + extra
+	blocks[len(blocks)-1] = clone
+	return blocks
+}
+
+// environmentUntrustedDataLine 3.17.2/3.18.0 环境段末尾的固定安全提示。
+// 逐字节取自 3.18.0 随包 CLI 的 buildEnvironmentContent；不要改写措辞或标点。
+const environmentUntrustedDataLine = "Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run."
+
+// environmentReminderTextFor3180 3.18.0 的完整环境通知正文。
+//
+// 与 environmentTextFor（legacy 档案的 system 段）刻意分开：新版的格式是
+// “environment: ” 尾随空格、字段行行首空格、末尾固定安全提示，并在桌面会话下
+// 追加 # ZCode Desktop Context。逐字节对齐 3.18.0 CLI 的 buildEnvironmentContent。
+func environmentReminderTextFor3180(p config.ZcodeProfile) string {
+	lines := []string{
+		"# Environment",
+		"You have been invoked in the following environment: ",
+		" - Primary working directory: " + p.CWD,
+		" - Is a git repository: " + envInfoGitRepositoryLine,
+		" - Platform: " + p.EnvPlatform(),
+		" - Shell: " + p.Shell,
+		" - OS Version: " + p.EnvOSVersion(),
+		" - " + environmentUntrustedDataLine,
+	}
+	text := strings.Join(lines, "\n")
+	if desktop := zcodeDesktopContext(); desktop != "" {
+		text += "\n\n" + desktop
+	}
+	return text
+}
+
+// InjectEnvironmentReminder 把 3.18.0 的环境/桌面上下文作为首轮 user 提醒注入。
+//
+// 官方客户端把它作为 meta_user 附件持久化到会话历史，后续轮次只发环境变化；
+// 网关是无状态的，调用方历史也不含网关注入的附件，因此采用可解释的近似：
+//   - 只在回退重建 system 的路径调用（调用者自带官方 system 时不重复注入）；
+//   - 历史里已经有环境提醒则跳过（幂等）；
+//   - 历史里出现 assistant 或工具块则视为续轮，跳过（假设首轮已注入）；
+//   - 只注入首条 user，放在 content 最前面，顺序为 环境 → currentDate → 用户正文。
+//
+// 环境三元组在网关上固定，不存在“环境变化”，因此不实现 # Environment update。
+func InjectEnvironmentReminder(body map[string]any, profile config.ZcodeProfile) {
+	if !config.ZcodeSystemProfileKey().UsesUserReminderEnvironment() {
+		return
+	}
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		return
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if ok && contentHasEnvironmentReminder(msg["content"]) {
+			return
+		}
+	}
+	if historyIsContinuation(messages) {
+		return
+	}
+	text := environmentReminderTextFor3180(profile)
+	if text == "" {
+		return
+	}
+	reminder := map[string]any{
+		"type": "text",
+		"text": "<system-reminder>\n" + text + "\n</system-reminder>",
+	}
+	for index, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok || msg["role"] != "user" {
+			continue
+		}
+		if contentHasToolBlock(msg["content"]) {
+			// Anthropic 要求 tool_result 位于 user content 首位；首条 user 就是工具结果时
+			// 不硬插提醒，避免把合法请求改成非法形状。
+			return
+		}
+		clone := maps.Clone(msg)
+		switch content := msg["content"].(type) {
+		case string:
+			clone["content"] = []any{
+				reminder,
+				map[string]any{"type": "text", "text": content},
+			}
+		case []any:
+			merged := make([]any, 0, len(content)+1)
+			merged = append(merged, reminder)
+			merged = append(merged, content...)
+			clone["content"] = merged
+		default:
+			return
+		}
+		next := slices.Clone(messages)
+		next[index] = clone
+		body["messages"] = next
+		return
+	}
+}
+
+func contentHasEnvironmentReminder(content any) bool {
+	check := func(text string) bool {
+		return strings.Contains(text, "<system-reminder>") && strings.Contains(text, "# Environment")
+	}
+	switch value := content.(type) {
+	case string:
+		return check(value)
+	case []any:
+		for _, raw := range value {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, _ := block["text"].(string); check(text) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func historyIsContinuation(messages []any) bool {
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if msg["role"] == "assistant" || contentHasToolBlock(msg["content"]) {
+			return true
+		}
+	}
+	return false
+}
+
+func contentHasToolBlock(content any) bool {
+	switch value := content.(type) {
+	case []any:
+		for _, raw := range value {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "tool_use", "tool_result", "server_tool_use", "mcp_tool_use", "mcp_tool_result":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // fallbackDynamicText 按官方顺序拼接 dynamic 段：

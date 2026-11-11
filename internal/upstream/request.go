@@ -29,6 +29,12 @@ var zcodeSystemJSON []byte
 //go:embed zcode_system_3171.json
 var zcodeSystem3171JSON []byte
 
+// 3.18.0 的官方文案：三块静态 system（block1 不再带 Desktop Context 与连接换行），
+// 并附桌面上下文原文供“用户环境提醒”装配。档案必须与 ZCODE_CLIENT_VERSION 成对选择。
+//
+//go:embed zcode_system_3180.json
+var zcodeSystem3180JSON []byte
+
 type zcodeDynamicSections struct {
 	BeforeEnvironment string `json:"beforeEnvironment"`
 	AfterEnvironment  string `json:"afterEnvironment"`
@@ -37,19 +43,26 @@ type zcodeDynamicSections struct {
 type zcodeSystemFile struct {
 	Blocks          []any                `json:"blocks"`
 	DynamicSections zcodeDynamicSections `json:"dynamicSections"`
+	// DesktopContext 3.18.0 档案里的 # ZCode Desktop Context 原文（无可视化目录分支）。
+	// 旧档案把该段直接拼在 block1 末尾，故为空；3.18.0 改由用户环境提醒拼接。
+	DesktopContext string `json:"desktopContext"`
 }
 
 var (
-	zcodeMu           sync.Mutex
-	zcodeCacheProfile config.ZcodeSystemProfile
-	zcodeCacheValid   bool
-	zcodeStaticBlocks []any
-	zcodeDynamic      zcodeDynamicSections
+	zcodeMu                 sync.Mutex
+	zcodeCacheProfile       config.ZcodeSystemProfile
+	zcodeCacheValid         bool
+	zcodeStaticBlocks       []any
+	zcodeDynamic            zcodeDynamicSections
+	zcodeDesktopContextText string
 )
 
-// zcodeProfileSource 按档案取内嵌文案：3.17.1 走独立档案，其余沿用 legacy。
+// zcodeProfileSource 按档案取内嵌文案：3.18.0 / 3.17.1 走独立档案，其余沿用 legacy。
 func zcodeProfileSource(profile config.ZcodeSystemProfile) []byte {
-	if profile == config.ZcodeSystemProfile3171 {
+	switch profile {
+	case config.ZcodeSystemProfile3180:
+		return zcodeSystem3180JSON
+	case config.ZcodeSystemProfile3171:
 		return zcodeSystem3171JSON
 	}
 	return zcodeSystemJSON
@@ -60,19 +73,33 @@ func zcodeProfileSource(profile config.ZcodeSystemProfile) []byte {
 // 缓存必须按档案键控：probe 子命令与测试会临时改 config.ZcodeClientVersion，
 // 换了档案还复用旧文案，就会重演 3.17.1 事故（版本与文案各说各话）。
 func zcodeProfileData() ([]any, zcodeDynamicSections) {
+	blocks, dynamic, _ := zcodeProfileDataAll()
+	return blocks, dynamic
+}
+
+// zcodeProfileDataAll 同 zcodeProfileData，并返回当前档案的桌面上下文原文。
+// 三个返回值必须在同一把锁内取，避免请求构造期间切档案时拿到混合内容。
+func zcodeProfileDataAll() ([]any, zcodeDynamicSections, string) {
 	profile := config.ZcodeSystemProfileKey()
 	zcodeMu.Lock()
 	defer zcodeMu.Unlock()
 	if zcodeCacheValid && zcodeCacheProfile == profile {
-		return zcodeStaticBlocks, zcodeDynamic
+		return zcodeStaticBlocks, zcodeDynamic, zcodeDesktopContextText
 	}
 	var parsed zcodeSystemFile
 	if err := json.Unmarshal(zcodeProfileSource(profile), &parsed); err != nil || len(parsed.Blocks) == 0 {
 		parsed = zcodeSystemFile{Blocks: []any{}}
 	}
 	zcodeStaticBlocks, zcodeDynamic = parsed.Blocks, parsed.DynamicSections
+	zcodeDesktopContextText = parsed.DesktopContext
 	zcodeCacheProfile, zcodeCacheValid = profile, true
-	return zcodeStaticBlocks, zcodeDynamic
+	return zcodeStaticBlocks, zcodeDynamic, zcodeDesktopContextText
+}
+
+// zcodeDesktopContext 当前档案附带的桌面上下文原文；旧档案为空。
+func zcodeDesktopContext() string {
+	_, _, desktop := zcodeProfileDataAll()
+	return desktop
 }
 
 // zcodeDynamicConfig 返回当前档案的 dynamic 段模板（# Environment 前后两段）。
@@ -94,7 +121,9 @@ func zcodeDynamicConfig() zcodeDynamicSections {
 // 所有请求（见 TestSystemBlocksReturnFreshSlice）。
 func ZcodeSystemBlocks() []any {
 	blocks := copyZcodeStaticBlocks()
-	if config.UpstreamInjectEnvironment {
+	// 3.18.0 起 Environment/Desktop Context 改走普通 user 的 system-reminder，
+	// 不再拼进 system。旧开关只服务 legacy/3171 档案，避免 3180 被追加成第 4 块。
+	if config.UpstreamInjectEnvironment && !config.ZcodeSystemProfileKey().UsesUserReminderEnvironment() {
 		return appendEnvironmentBlock(blocks)
 	}
 	return blocks
