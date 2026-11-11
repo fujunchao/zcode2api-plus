@@ -28,8 +28,8 @@ func TestModelCaptchaPolicyFromHTTP(t *testing.T) {
 	}{
 		{"模型跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":true}}}}`, true},
 		{"全局禁用", 200, `{"data":{"configs":{"captcha":{"enabled":false,"skip_model_request":false}}}}`, true},
-		// 3.18.0 要求 enabled 是显式布尔：缺失即视为配置不完整，回退 DefaultConfig（不跳过）。
-		{"缺少显式 enabled", 200, `{"data":{"configs":{"captcha":{"skip_model_request":true}}}}`, false},
+		// 客户端把 enabled 当作可选布尔：缺失按启用处理，skip_model_request=true 时合法且跳过。
+		{"缺少显式 enabled 但 skip=true", 200, `{"data":{"configs":{"captcha":{"skip_model_request":true}}}}`, true},
 		{"显式不跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":false}}}}`, false},
 		{"旧版无字段", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc"}}}}`, false},
 		// 显式 null / 字符串都不是显式布尔：整条配置被判无效并回退 DefaultConfig（仍不跳过）。

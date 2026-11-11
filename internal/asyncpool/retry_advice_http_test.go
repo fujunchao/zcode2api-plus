@@ -201,7 +201,7 @@ func firstContent(body map[string]any) string {
 		for _, block := range v {
 			bm, _ := block.(map[string]any)
 			s, ok := bm["text"].(string)
-			if ok && !strings.Contains(s, "# currentDate") {
+			if ok && !strings.Contains(s, "# currentDate") && !strings.Contains(s, "# Environment") {
 				return s
 			}
 		}

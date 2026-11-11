@@ -304,16 +304,22 @@ func TestNormalizeBodyInjectsCurrentDateOnlyOnFallback(t *testing.T) {
 	NormalizeBody(body, true)
 	messages := body["messages"].([]any)
 	content, ok := messages[0].(map[string]any)["content"].([]any)
-	if !ok || len(content) != 2 {
-		t.Fatalf("fallback 首条 user 应合并 currentDate + 原文: %v", messages[0])
+	if !ok || len(content) != 3 {
+		t.Fatalf("fallback 首条 user 应为 环境 + currentDate + 原文: %v", messages[0])
 	}
-	if text, _ := content[0].(map[string]any)["text"].(string); !strings.Contains(text, "# currentDate") || !strings.Contains(text, "Today's date is 20") {
+	if env, _ := content[0].(map[string]any)["text"].(string); !strings.Contains(env, "# Environment") {
+		t.Fatalf("环境提醒应位于首条 user 最前面: %q", env)
+	}
+	if text, _ := content[1].(map[string]any)["text"].(string); !strings.Contains(text, "# currentDate") || !strings.Contains(text, "Today's date is 20") {
 		t.Fatalf("currentDate 应按官方 system-reminder 形态生成: %q", text)
+	}
+	if text, _ := content[2].(map[string]any)["text"].(string); text != "你好" {
+		t.Fatalf("用户正文应保持在最后: %q", text)
 	}
 	NormalizeBody(body, true)
 	content = body["messages"].([]any)[0].(map[string]any)["content"].([]any)
-	if len(content) != 2 {
-		t.Fatalf("重复规范化不得重复插入 currentDate: %d", len(content))
+	if len(content) != 3 {
+		t.Fatalf("重复规范化不得重复插入环境或 currentDate: %d", len(content))
 	}
 
 	// 保留路径只认「块形态且首段+身份段与档案一致」；字符串形态没有身份段，
