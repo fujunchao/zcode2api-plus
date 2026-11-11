@@ -68,6 +68,7 @@ type sseEncoder struct {
 	model        string
 	tools        map[int]*chatStreamTool // Anthropic block index → 独立工具状态
 	toolOrder    []*chatStreamTool
+	unprojected  unprojectedBlocks // 只占位、不投影的块（MCP / 内建服务端工具）
 	finished     bool
 	inputUsage   map[string]any // message_start 的 usage（input 系）
 	outputUsage  map[string]any // message_delta 的 usage（output）
@@ -79,6 +80,45 @@ type chatStreamTool struct {
 	initial string
 	hasArgs bool
 	closed  bool
+}
+
+// ── 不进入 OpenAI 投影的上游块 ────────────────────────────────────────────────
+
+// unprojectedBlocks 记录上游流里出现、但 OpenAI 两种对外形态都无法表达的内容块：
+// Anthropic block index → 块类型。
+//
+// 覆盖 MCP 工具（mcp_tool_use / mcp_tool_result）与内建服务端工具
+// （server_tool_use 及其各类结果块）。它们由上游自己执行：网关既不能把它们变成
+// 客户端要执行的 tool_calls，也没有 OpenAI 侧的工具结果形态可以回传，所以只登记占位：
+//   - 同 index 的 input_json_delta 被安全丢弃，不再被误判成「工具参数引用了未声明的
+//     内容块」而中断整条本可正常收尾的流；
+//   - 不占用 tool_calls / output_item 的序号，正文与普通函数工具的索引保持不变。
+type unprojectedBlocks map[int]string
+
+// add 登记一个占位块。
+func (m *unprojectedBlocks) add(index int, blockType string) {
+	if *m == nil {
+		*m = map[int]string{}
+	}
+	(*m)[index] = blockType
+}
+
+// has 报告该 index 是否已登记为不投影的占位块。
+func (m unprojectedBlocks) has(index int) bool {
+	_, ok := m[index]
+	return ok
+}
+
+// isUnprojectedBlockType 判断块类型是否属于「不进入 OpenAI 投影」的一类。
+func isUnprojectedBlockType(blockType string) bool {
+	switch blockType {
+	case "mcp_tool_use", "server_tool_use", "mcp_tool_result":
+		return true
+	}
+	// 兜底：上游按 xxx_tool_use / xxx_tool_result 命名的新增服务端执行块
+	// （web_search_tool_result、code_execution_tool_result 等）。tool_use /
+	// tool_result 自身比后缀少一个下划线，不会被误吞。
+	return strings.HasSuffix(blockType, "_tool_use") || strings.HasSuffix(blockType, "_tool_result")
 }
 
 // dispatch 分发一个已解析的上游事件。
@@ -143,9 +183,18 @@ func (e *sseEncoder) onContentBlockStart(payload map[string]any) error {
 	if block == nil {
 		return nil
 	}
-	switch block["type"] {
+	kind, _ := block["type"].(string)
+	index, hasIndex := payload["index"].(float64)
+	if isUnprojectedBlockType(kind) {
+		// 只登记占位：投影成 tool_calls 会让客户端去执行一个上游已经执行过的工具。
+		// 缺 index 的畸形事件不登记，否则会把 index 0 上真正的函数工具参数一起吞掉。
+		if hasIndex {
+			e.unprojected.add(int(index), kind)
+		}
+		return nil
+	}
+	switch kind {
 	case "text", "thinking":
-		kind, _ := block["type"].(string)
 		text, _ := block[kind].(string)
 		if text == "" {
 			return nil
@@ -159,7 +208,6 @@ func (e *sseEncoder) onContentBlockStart(payload map[string]any) error {
 	default:
 		return nil
 	}
-	index, _ := payload["index"].(float64)
 	toolIndex := float64(len(e.toolOrder))
 	if e.tools == nil {
 		e.tools = map[int]*chatStreamTool{}
@@ -201,6 +249,11 @@ func (e *sseEncoder) onContentBlockDelta(payload map[string]any) error {
 		return e.emit(chunk(e.id, e.model, map[string]any{"content": text}, nil))
 	case "input_json_delta":
 		index, _ := payload["index"].(float64)
+		if e.unprojected.has(int(index)) {
+			// 占位块的参数属于 MCP / 内建服务端工具：上游已执行，网关不代跑，
+			// 丢弃增量即可；判成协议错误会白白中断后面仍可交付的正文。
+			return nil
+		}
 		tool := e.tools[int(index)]
 		if tool == nil {
 			return fmt.Errorf("上游工具参数引用了未声明的内容块 %d", int(index))

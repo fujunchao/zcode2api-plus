@@ -82,6 +82,7 @@ type responsesEncoder struct {
 	blocks        map[int]*responsesBlock
 	items         []*responsesBlock
 	counts        map[string]int
+	unprojected   unprojectedBlocks // 只占位、不投影的块（MCP / 内建服务端工具）
 }
 
 func (e *responsesEncoder) emit(name string, payload map[string]any) error {
@@ -112,10 +113,19 @@ func (e *responsesEncoder) dispatch(event, data string) error {
 	case "content_block_start":
 		block, _ := payload["content_block"].(map[string]any)
 		kind, _ := block["type"].(string)
+		index, hasIndex := payload["index"].(float64)
+		if isUnprojectedBlockType(kind) {
+			// 与 Chat 侧同一语义：只登记占位，绝不生成 function_call 项目——
+			// 客户端会照着它去执行一个上游已经执行过的 MCP / 内建工具。
+			// 缺 index 的畸形事件不登记，避免吞掉 index 0 上真正的函数工具参数。
+			if hasIndex {
+				e.unprojected.add(int(index), kind)
+			}
+			return nil
+		}
 		if kind != "text" && kind != "thinking" && kind != "tool_use" {
 			return nil
 		}
-		index, _ := payload["index"].(float64)
 		b, err := e.openBlock(int(index), kind, block)
 		if err != nil {
 			return err
@@ -253,6 +263,12 @@ func (e *responsesEncoder) onContentBlockDelta(payload map[string]any) error {
 	case "thinking_delta":
 		kind, text = "thinking", stringOf(delta["thinking"])
 	case "input_json_delta":
+		index, _ := payload["index"].(float64)
+		if e.unprojected.has(int(index)) {
+			// 占位块的参数属于 MCP / 内建服务端工具：上游已执行，这里只丢弃增量，
+			// 不能判成「未声明的工具块」而中断整条仍可正常收尾的流。
+			return nil
+		}
 		kind, text = "tool_use", stringOf(delta["partial_json"])
 	default:
 		return nil // signature_delta / redacted_thinking 不对客户端暴露

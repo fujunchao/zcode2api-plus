@@ -8,6 +8,7 @@
 package captcha
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -256,6 +257,13 @@ func (m *Manager) FetchConfig(ctx context.Context) Config {
 	return cfg
 }
 
+// fetchConfigHTTP 拉取并校验上游验证码配置。
+//
+// 校验语义对齐 ZCode 3.18.0 客户端 readValidatedRequestVerificationConfig：
+// 先验证业务 envelope 的 code/success，再验证 captcha 对象、显式布尔字段，
+// 以及主动验证码场景（enabled=true）必需的 prefix/region/sceneId。
+// 任一处不合规都返回错误，由 FetchConfig 继续使用 last-good（或回退
+// DefaultConfig），避免残缺配置被当作成功值写入缓存、覆盖此前有效配置。
 func fetchConfigHTTP(ctx context.Context) (Config, error) {
 	endpoint, err := url.Parse(configURL)
 	if err != nil {
@@ -286,32 +294,168 @@ func fetchConfigHTTP(ctx context.Context) (Config, error) {
 		return Config{}, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	var payload struct {
-		Data struct {
+		Code    json.RawMessage `json:"code"`
+		Success json.RawMessage `json:"success"`
+		Data    struct {
 			Configs struct {
-				Captcha *struct {
-					Enabled          *bool  `json:"enabled"`
-					Prefix           string `json:"prefix"`
-					Region           string `json:"region"`
-					SceneID          string `json:"sceneId"`
-					SkipModelRequest bool   `json:"skip_model_request"`
-				} `json:"captcha"`
+				// RawMessage 才能区分「缺失」「显式 null」「类型错误」；
+				// 强类型指针把 null 与缺失都变成零值，无法对齐 3.18.0 的严格语义。
+				Captcha json.RawMessage `json:"captcha"`
 			} `json:"configs"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return Config{}, err
 	}
-	c := payload.Data.Configs.Captcha
-	if c == nil {
-		return Config{}, errors.New("上游配置缺少 captcha 对象")
+	if err := validateEnvelope(payload.Code, payload.Success); err != nil {
+		return Config{}, err
 	}
-	return Config{
-		Enabled:          c.Enabled == nil || *c.Enabled, // 对齐 Python：仅显式 false 才禁用
-		Prefix:           strings.TrimSpace(c.Prefix),
-		Region:           strings.TrimSpace(c.Region),
-		SceneID:          strings.TrimSpace(c.SceneID),
-		SkipModelRequest: c.SkipModelRequest,
-	}, nil
+	raw := bytes.TrimSpace(payload.Data.Configs.Captcha)
+	switch {
+	case len(raw) == 0:
+		return Config{}, errors.New("上游配置缺少 captcha 对象")
+	case bytes.Equal(raw, []byte("null")):
+		return Config{}, errors.New("上游配置 captcha 为 null，必须为对象")
+	case raw[0] != '{':
+		return Config{}, fmt.Errorf("上游配置 captcha 不是对象: %s", payloadSnippet(raw))
+	}
+	var c struct {
+		Enabled          json.RawMessage `json:"enabled"`
+		Prefix           json.RawMessage `json:"prefix"`
+		Region           json.RawMessage `json:"region"`
+		SceneID          json.RawMessage `json:"sceneId"`
+		SkipModelRequest json.RawMessage `json:"skip_model_request"`
+	}
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return Config{}, fmt.Errorf("上游配置 captcha 解析失败: %w", err)
+	}
+	// 客户端把 enabled 当作可选布尔：缺失时按启用处理，显式 null/非布尔才算无效。
+	enabled, err := optionalBoolDefaultTrue(c.Enabled, "enabled")
+	if err != nil {
+		return Config{}, err
+	}
+	skip, err := optionalBool(c.SkipModelRequest, "skip_model_request")
+	if err != nil {
+		return Config{}, err
+	}
+	cfg := Config{Enabled: enabled, SkipModelRequest: skip}
+	// 客户端仅在「未禁用且未跳过模型请求」时要求主动验证码三字段齐全；
+	// skip_model_request=true 时允许只下发跳过标记。
+	if enabled && !skip {
+		if cfg.Prefix, err = requireNonEmptyString(c.Prefix, "prefix"); err != nil {
+			return Config{}, err
+		}
+		if cfg.Region, err = requireNonEmptyString(c.Region, "region"); err != nil {
+			return Config{}, err
+		}
+		if cfg.SceneID, err = requireNonEmptyString(c.SceneID, "sceneId"); err != nil {
+			return Config{}, err
+		}
+		return cfg, nil
+	}
+	// enabled=false 是合法最小配置：未启用的字段不做要求，仅尽力保留字符串值。
+	cfg.Prefix = optionalString(c.Prefix)
+	cfg.Region = optionalString(c.Region)
+	cfg.SceneID = optionalString(c.SceneID)
+	return cfg, nil
+}
+
+// validateEnvelope 校验响应包装的业务状态（对齐 3.18.0 客户端）：
+// code 出现时必须为 0，显式 null 或非数字同样视为失败；
+// success 显式为 false 视为业务失败，缺失或其它取值不额外解释。
+func validateEnvelope(code, success json.RawMessage) error {
+	if raw := bytes.TrimSpace(code); len(raw) > 0 {
+		if bytes.Equal(raw, []byte("null")) {
+			return errors.New("上游配置业务状态异常: code 为 null")
+		}
+		// json.Number 会把 JSON 字符串 "0" 也当合法值，先按首字节排除非数字字面量。
+		if raw[0] != '-' && (raw[0] < '0' || raw[0] > '9') {
+			return fmt.Errorf("上游配置业务状态异常: code 不是数字（%s）", payloadSnippet(raw))
+		}
+		var num json.Number
+		if err := json.Unmarshal(raw, &num); err != nil {
+			return fmt.Errorf("上游配置业务状态异常: code 不是数字（%s）", payloadSnippet(raw))
+		}
+		if f, err := num.Float64(); err != nil || f != 0 {
+			return fmt.Errorf("上游配置业务状态异常: code=%s", num.String())
+		}
+	}
+	if raw := bytes.TrimSpace(success); len(raw) > 0 && bytes.Equal(raw, []byte("false")) {
+		return errors.New("上游配置业务状态异常: success=false")
+	}
+	return nil
+}
+
+// requireBool 读取必须是显式 JSON 布尔的字段；缺失、null 或其它类型都视为配置不完整。
+func requireBool(raw json.RawMessage, field string) (bool, error) {
+	switch string(bytes.TrimSpace(raw)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	case "":
+		return false, fmt.Errorf("上游配置 captcha.%s 缺失，必须为显式布尔值", field)
+	default:
+		return false, fmt.Errorf("上游配置 captcha.%s 必须为显式布尔值（实际 %s）", field, payloadSnippet(raw))
+	}
+}
+
+// optionalBoolDefaultTrue 读取可选布尔字段：缺失按 true 处理（客户端语义），
+// 出现时必须是显式布尔；显式 null 与非布尔都视为配置不完整。
+func optionalBoolDefaultTrue(raw json.RawMessage, field string) (bool, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return true, nil
+	}
+	return requireBool(raw, field)
+}
+
+// optionalBool 读取可选布尔字段：缺失视为 false，出现时必须是显式布尔。
+func optionalBool(raw json.RawMessage, field string) (bool, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false, nil
+	}
+	return requireBool(raw, field)
+}
+
+// requireNonEmptyString 校验启用验证码时的必需字符串字段（去空白后不能为空）。
+func requireNonEmptyString(raw json.RawMessage, field string) (string, error) {
+	value, ok := jsonString(raw)
+	if !ok {
+		return "", fmt.Errorf("上游配置 captcha.%s 必须为非空字符串（实际 %s）", field, payloadSnippet(raw))
+	}
+	if value == "" {
+		return "", fmt.Errorf("上游配置 captcha.%s 不能为空或纯空白", field)
+	}
+	return value, nil
+}
+
+// optionalString 读取可选字符串字段：缺失或非字符串按空串处理（未启用时不校验）。
+func optionalString(raw json.RawMessage) string {
+	value, _ := jsonString(raw)
+	return value
+}
+
+// jsonString 解析 JSON 字符串并去掉首尾空白；缺失、null 或非字符串返回 false。
+func jsonString(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(value), true
+}
+
+// payloadSnippet 截断原始 JSON 片段，便于在日志里定位问题又避免刷屏。
+func payloadSnippet(raw json.RawMessage) string {
+	const maxRunes = 48
+	runes := []rune(strings.TrimSpace(string(raw)))
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…"
+	}
+	return string(runes)
 }
 
 // GetVerifyParam 返回领取等非模型操作的验证码令牌，不受 SkipModelRequest 影响。

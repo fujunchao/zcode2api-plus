@@ -28,7 +28,7 @@ func TestPublicCaptchaConfigHTTPContract(t *testing.T) {
 				t.Errorf("公开配置不应携带认证/模型归因 %s", key)
 			}
 		}
-		_, _ = io.WriteString(w, `{"data":{"configs":{"captcha":{"enabled":true,"sceneId":"synthetic-scene"}}}}`)
+		_, _ = io.WriteString(w, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"synthetic-scene"}}}}`)
 	})
 	m := NewManager()
 	if cfg := m.FetchConfig(context.Background()); cfg.SceneID != "synthetic-scene" {

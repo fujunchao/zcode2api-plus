@@ -26,13 +26,15 @@ func TestModelCaptchaPolicyFromHTTP(t *testing.T) {
 		body     string
 		wantSkip bool
 	}{
-		{"模型跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"skip_model_request":true}}}}`, true},
+		{"模型跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":true}}}}`, true},
 		{"全局禁用", 200, `{"data":{"configs":{"captcha":{"enabled":false,"skip_model_request":false}}}}`, true},
-		{"仅模型标记", 200, `{"data":{"configs":{"captcha":{"skip_model_request":true}}}}`, true},
-		{"显式不跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"skip_model_request":false}}}}`, false},
-		{"旧版无字段", 200, `{"data":{"configs":{"captcha":{"enabled":true}}}}`, false},
-		{"空值不跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"skip_model_request":null}}}}`, false},
-		{"字符串不能开启跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"skip_model_request":"true"}}}}`, false},
+		// 3.18.0 要求 enabled 是显式布尔：缺失即视为配置不完整，回退 DefaultConfig（不跳过）。
+		{"缺少显式 enabled", 200, `{"data":{"configs":{"captcha":{"skip_model_request":true}}}}`, false},
+		{"显式不跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":false}}}}`, false},
+		{"旧版无字段", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc"}}}}`, false},
+		// 显式 null / 字符串都不是显式布尔：整条配置被判无效并回退 DefaultConfig（仍不跳过）。
+		{"跳过标记空值视为不完整", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":null}}}}`, false},
+		{"字符串不能开启跳过", 200, `{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":"true"}}}}`, false},
 		{"缺少配置对象", 200, `{"data":{"configs":{}}}`, false},
 		{"配置接口失败", 500, `{}`, false},
 		{"响应不是JSON", 200, `not-json`, false},
@@ -119,7 +121,7 @@ func TestModelCaptchaConfigFailureDoesNotCacheSkip(t *testing.T) {
 	setCaptchaServer(t, func(w http.ResponseWriter, r *http.Request) {
 		fetches.Add(1)
 		w.WriteHeader(int(status.Load()))
-		_, _ = w.Write([]byte(`{"data":{"configs":{"captcha":{"enabled":true,"skip_model_request":true}}}}`))
+		_, _ = w.Write([]byte(`{"data":{"configs":{"captcha":{"enabled":true,"prefix":"px","region":"cn","sceneId":"sc","skip_model_request":true}}}}`))
 	})
 	m := NewManager()
 	if token, err := m.GetModelVerifyParam(nil); token != nil || err != ErrUnavailable {
