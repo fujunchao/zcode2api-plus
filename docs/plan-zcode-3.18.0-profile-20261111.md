@@ -216,3 +216,26 @@ You have been invoked in the following environment:·
 1. **默认版本切换时机**：完成 Phase 1-2 后直接切默认（推荐），还是先只支持显式 `ZCODE_CLIENT_VERSION=3.18.0` 灰度、下个版本再切？
 2. **范围**：本轮是否包含 Phase 4（验证码）与 Phase 5（流防御）？建议包含；`zai_cn` 登录不包含。
 3. **发版**：完成后是否按 `2.14.0-go` 发版，还是只推工作分支等真实探针结果？
+
+## 10. 实施记录（2026-11-11）
+
+按推荐方案执行：Phase 1-5 全部完成，默认版本已切 3.18.0，未发版，`zai_cn` 未做。
+
+| 阶段 | 状态 | 提交 / 证据 |
+|---|---|---|
+| Phase 1 档案与选择器 | 完成 | `7544eaa`；`zcode_system_3180.json` block0/1/2 = 35 / 1,233 / 1,595 B |
+| Phase 2 回退装配与环境提醒 | 完成 | `7544eaa`；3180 三块 system、首轮 user 环境提醒、3.17.x 路径不变 |
+| Phase 3 默认版本与部署 | 完成 | `2f58b18`；`ZCODE_CLIENT_VERSION=3.18.0`、Compose/.env/README 同步 |
+| Phase 4 验证码完整性 | 完成 | `7c42a6e`；envelope/captcha/enabled/skip/三字段校验，last-good 保护 |
+| Phase 5 流事件防御 | 完成 | `7c42a6e`；Chat/Responses 登记不投影块、丢弃同 index 参数增量 |
+| Phase 6 完整 CI | 完成 | `b2c8454` → run `43031596400`；`1c86204` → run `43032612395`，14/14 全绿 |
+| 真实单账号探针 | **未执行** | 需隔离账号与独立授权；步骤见 [runbook](runbook-zcode-3.18.0-probe-20261111.md) |
+| 发版 | **未执行** | 等探针结果与版本号确认 |
+
+实现与计划的差异：
+
+- `enabled` 按 3.18.0 客户端**实际**语义实现为“可选布尔、缺失按启用处理”，而不是计划最初写的“必须显式”；显式 null/非布尔仍拒绝。
+- 环境是网关固定伪装值，不存在变化，因此只实现首轮完整环境提醒，未实现 `# Environment update` 增量。
+- 未模拟每轮 `total_tokens` 提醒；未接入 `zai_cn`；未实现原生 MCP 执行。
+
+CI 日志已直接显示默认请求 `system_text_bytes=[35,1233,1595]` 且三项 SHA256 与档案一致；下一步只剩隔离账号探针与发版决策。
