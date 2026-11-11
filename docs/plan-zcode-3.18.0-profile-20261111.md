@@ -219,7 +219,7 @@ You have been invoked in the following environment:·
 
 ## 10. 实施记录（2026-11-11）
 
-按推荐方案执行：Phase 1-5 全部完成，默认版本已切 3.18.0，未发版，`zai_cn` 未做。
+按推荐方案执行：Phase 1-5 全部完成，默认版本已切 3.18.0，服务器单账号探针已通过，未发版，`zai_cn` 未做。
 
 | 阶段 | 状态 | 提交 / 证据 |
 |---|---|---|
@@ -229,7 +229,7 @@ You have been invoked in the following environment:·
 | Phase 4 验证码完整性 | 完成 | `7c42a6e`；envelope/captcha/enabled/skip/三字段校验，last-good 保护 |
 | Phase 5 流事件防御 | 完成 | `7c42a6e`；Chat/Responses 登记不投影块、丢弃同 index 参数增量 |
 | Phase 6 完整 CI | 完成 | `b2c8454` → run `43031596400`；`1c86204` → run `43032612395`，14/14 全绿 |
-| 真实单账号探针 | **未执行** | 需隔离账号与独立授权；步骤见 [runbook](runbook-zcode-3.18.0-probe-20261111.md) |
+| 真实单账号探针 | **已执行，通过** | 2026-11-11 22:04 服务器测试镜像；3.18.0 返回 200 / 无 3012，3.17.2 回退同账号 200；见 [验证报告](verify-3.18.0-probe-20261111.md) |
 | 发版 | **未执行** | 等探针结果与版本号确认 |
 
 实现与计划的差异：
@@ -238,4 +238,4 @@ You have been invoked in the following environment:·
 - 环境是网关固定伪装值，不存在变化，因此只实现首轮完整环境提醒，未实现 `# Environment update` 增量。
 - 未模拟每轮 `total_tokens` 提醒；未接入 `zai_cn`；未实现原生 MCP 执行。
 
-CI 日志已直接显示默认请求 `system_text_bytes=[35,1233,1595]` 且三项 SHA256 与档案一致；下一步只剩隔离账号探针与发版决策。
+CI 日志已直接显示默认请求 `system_text_bytes=[35,1233,1595]` 且三项 SHA256 与档案一致；服务器探针进一步确认上游接受 3.18.0 完整装配。下一步只剩发版/合并决策。
