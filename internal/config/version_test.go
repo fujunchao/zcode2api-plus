@@ -26,11 +26,11 @@ func TestClientVersionShape(t *testing.T) {
 	}
 }
 
-// 默认声明必须是「已核验 system 文案配对」的版本：3.17.2 复用 3.17.1 那份用官方抓包
-// 逐字节校准的档案（identity 1235 B / sha16 4058874023c7541f，2026-11-03 逆向核验两版
-// CLI 文案完全相同），单账号探针 200 通过，故为默认。回退走环境变量，本断言只守默认值。
+// 默认声明必须是「已核验 system 文案配对」的版本：3.18.0 使用 2026-11-11 逆向核验的
+// 独立档案（block0 35 B / 身份段 1233 B / sha16 aac4ba4cc7b555b3），Environment 改走
+// 首轮 user reminder；旧版本走环境变量回退，本断言只守默认值。
 func TestDefaultClientVersionHasVerifiedPromptPair(t *testing.T) {
-	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.17.2" {
+	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.18.0" {
 		t.Fatalf("默认客户端声明未同步: %q", ZcodeClientVersion)
 	}
 }
@@ -42,8 +42,8 @@ func TestDefaultClientVersionHasVerifiedPromptPair(t *testing.T) {
 // profile.go 与 config.go 同级豁免：2026-09-24 起伪装身份的默认值集中在 profile.go
 // （见 profile_literals_test.go），ai-sdk / node 版本号也在那里定义一次。
 //
-	// zcode_system_profile.go 也豁免：它把「版本号 → 官方 system 文案档案」写成对照表，
-	// 版本字面量在这里就是定义处本身（与 config.go 同级），不是散落的第二份真相。
+// zcode_system_profile.go 也豁免：它把「版本号 → 官方 system 文案档案」写成对照表，
+// 版本字面量在这里就是定义处本身（与 config.go 同级），不是散落的第二份真相。
 // 刻意跳过 _test.go：测试夹具允许出现字面量（如故意伪装的透传头、OS 版本哨兵值）。
 func TestNoHardcodedClientVersion(t *testing.T) {
 	pat := regexp.MustCompile(`"\d+\.\d+\.\d+"`)

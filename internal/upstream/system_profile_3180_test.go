@@ -50,7 +50,7 @@ func Test3180SystemBlocksBytes(t *testing.T) {
 		prefix string
 	}{
 		{35, "7779642ea44a4696", "You are ZCode, an interactive agent"},
-		{1233, "aac4ba4cc7b555b3", "You are an agent working with the user toward their goals"},
+		{1233, "aac4ba4cc7b555b3", "\nYou are an agent working with the user toward their goals"},
 		{1595, "26a2daa8c8381086", "\n\nWrite code that reads like the surrounding code"},
 	}
 	for i, tc := range want {

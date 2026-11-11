@@ -240,14 +240,8 @@ func TestNormalizeBodyForeignSystemGetsOfficialPrefix(t *testing.T) {
 			t.Fatalf("第 %d 块应为官方标准块: %v", i, system[i])
 		}
 	}
-	dynamic := ""
-	for _, raw := range system {
-		text, _ := raw.(map[string]any)["text"].(string)
-		if strings.Contains(text, "# Communicating with the user") {
-			dynamic = text
-			break
-		}
-	}
+	dynamicBlock, _ := system[len(system)-1].(map[string]any)
+	dynamic, _ := dynamicBlock["text"].(string)
 	for _, want := range []string{"You are an AI agent powered by DeepSeek Harness.", "第三方补充指令"} {
 		if !strings.Contains(dynamic, want) {
 			t.Fatalf("第三方内容 %q 必须保留在 block 2，不得被删除或改写", want)

@@ -8,66 +8,108 @@ import (
 )
 
 func TestPrefixCacheLayoutAcrossProfiles(t *testing.T) {
-	oldSource, oldInject := config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment
+	oldSource, oldInject, oldVersion := config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment, config.ZcodeClientVersion
 	t.Cleanup(func() {
-		config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment = oldSource, oldInject
+		config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment, config.ZcodeClientVersion = oldSource, oldInject, oldVersion
 	})
 	config.UpstreamInjectEnvironment = false
+
+	checkCache := func(t *testing.T, blocks []any, wantStatic int) {
+		t.Helper()
+		if len(blocks) != wantStatic {
+			t.Fatalf("静态段应为 %d 块，实际 %d", wantStatic, len(blocks))
+		}
+		first := blocks[0].(map[string]any)
+		if _, exists := first["cache_control"]; exists {
+			t.Fatal("所有档案的固定前缀块都不得附 cache_control")
+		}
+		for i := 1; i < len(blocks); i++ {
+			cache, _ := blocks[i].(map[string]any)["cache_control"].(map[string]any)
+			if cache["type"] != "ephemeral" {
+				t.Fatalf("block %d 应保留 ephemeral", i)
+			}
+		}
+	}
 
 	for _, source := range []string{"electron", "cli"} {
 		t.Run(source, func(t *testing.T) {
 			config.ZcodeClientSourceTitle = source
-			blocks := ZcodeSystemBlocks()
-			if len(blocks) != 2 {
-				t.Fatalf("静态段应保持 2 块，实际 %d", len(blocks))
-			}
-			first := blocks[0].(map[string]any)
-			if _, exists := first["cache_control"]; exists {
-				t.Fatal("所有档案的固定前缀块都不得附 cache_control")
-			}
-			cache, _ := blocks[1].(map[string]any)["cache_control"].(map[string]any)
-			if cache["type"] != "ephemeral" {
-				t.Fatal("稳定身份块应保留 ephemeral")
-			}
+
+			config.ZcodeClientVersion = "3.17.2"
+			checkCache(t, ZcodeSystemBlocks(), 2)
+
+			// 3.18.0 的 block1 是纯身份段，block2 是独立 dynamic 块，共三块。
+			config.ZcodeClientVersion = "3.18.0"
+			checkCache(t, ZcodeSystemBlocks(), 3)
 		})
 	}
 }
 
 func TestFallbackHasNoCapabilitiesFourthBlock(t *testing.T) {
-	oldSource, oldInject := config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment
-	t.Cleanup(func() { config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment = oldSource, oldInject })
+	oldSource, oldInject, oldVersion := config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment, config.ZcodeClientVersion
+	t.Cleanup(func() {
+		config.ZcodeClientSourceTitle, config.UpstreamInjectEnvironment, config.ZcodeClientVersion = oldSource, oldInject, oldVersion
+	})
 	config.UpstreamInjectEnvironment = false
 
+	cases := []struct {
+		version string
+		prefix  string
+		want    []string
+		not     []string
+	}{
+		{
+			version: "3.17.2",
+			prefix:  "\n\n# Communicating with the user",
+			want:    []string{"# Environment", "# Context management"},
+		},
+		{
+			version: "3.18.0",
+			prefix:  "\n\nWrite code that reads like the surrounding code",
+			want:    []string{"# Context management", "<total_tokens>15000000 tokens left</total_tokens>"},
+			not:     []string{"# Environment", "# Communicating with the user"},
+		},
+	}
 	for _, source := range []string{"electron", "cli"} {
 		t.Run(source, func(t *testing.T) {
 			config.ZcodeClientSourceTitle = source
-			blocks := ZcodeFallbackSystemBlocks()
-			if len(blocks) != 3 {
-				t.Fatalf("回退路径应固定 3 块，实际 %d", len(blocks))
-			}
-			first := blocks[0].(map[string]any)
-			if _, exists := first["cache_control"]; exists {
-				t.Fatal("block 0 不得附 cache_control")
-			}
-			for i := 1; i < len(blocks); i++ {
-				cache, _ := blocks[i].(map[string]any)["cache_control"].(map[string]any)
-				if cache["type"] != "ephemeral" {
-					t.Fatalf("block %d 应保留 ephemeral", i)
-				}
-			}
-			dynamic, _ := blocks[2].(map[string]any)["text"].(string)
-			if !strings.HasPrefix(dynamic, "\n\n# Communicating with the user") {
-				t.Fatalf("block 2 应以两个换行和 dynamic 首段开头: %q", dynamic[:min(80, len(dynamic))])
-			}
-			for _, want := range []string{"# Environment", "# Context management"} {
-				if !strings.Contains(dynamic, want) {
-					t.Fatalf("block 2 缺少 %q", want)
-				}
-			}
-			for _, raw := range blocks {
-				if strings.Contains(raw.(map[string]any)["text"].(string), "# Gateway Desktop Capabilities") {
-					t.Fatal("不得再出现独立的 Gateway Desktop Capabilities 段")
-				}
+			for _, tc := range cases {
+				t.Run(tc.version, func(t *testing.T) {
+					config.ZcodeClientVersion = tc.version
+					blocks := ZcodeFallbackSystemBlocks()
+					if len(blocks) != 3 {
+						t.Fatalf("回退路径应固定 3 块，实际 %d", len(blocks))
+					}
+					first := blocks[0].(map[string]any)
+					if _, exists := first["cache_control"]; exists {
+						t.Fatal("block 0 不得附 cache_control")
+					}
+					for i := 1; i < len(blocks); i++ {
+						cache, _ := blocks[i].(map[string]any)["cache_control"].(map[string]any)
+						if cache["type"] != "ephemeral" {
+							t.Fatalf("block %d 应保留 ephemeral", i)
+						}
+					}
+					dynamic, _ := blocks[2].(map[string]any)["text"].(string)
+					if !strings.HasPrefix(dynamic, tc.prefix) {
+						t.Fatalf("block 2 前缀不符: %q", dynamic[:min(80, len(dynamic))])
+					}
+					for _, want := range tc.want {
+						if !strings.Contains(dynamic, want) {
+							t.Fatalf("block 2 缺少 %q", want)
+						}
+					}
+					for _, not := range tc.not {
+						if strings.Contains(dynamic, not) {
+							t.Fatalf("block 2 不应包含 %q", not)
+						}
+					}
+					for _, raw := range blocks {
+						if strings.Contains(raw.(map[string]any)["text"].(string), "# Gateway Desktop Capabilities") {
+							t.Fatal("不得再出现独立的 Gateway Desktop Capabilities 段")
+						}
+					}
+				})
 			}
 		})
 	}

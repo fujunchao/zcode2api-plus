@@ -205,19 +205,25 @@ func TestEmbeddedSystemJSONHasNoEnvBlock(t *testing.T) {
 // 实录 2313 字符）；旧快照只有前两节（1211 字符）。提示词文案与段落结构本身就是版本
 // 指纹：留旧措辞/缺桌面段，等于一边声称 X-ZCode-App-Version=3.14.5、一边交出一份
 // 3.14.5 永远不会产生的 system（也令「完整官方输入按块去重」失效）。
+// TestIdentityBlockMatchesInstalledClient 块 1 必须是 3.18.0 的身份段：
+// 只含身份正文与 # Harness，不再接 Desktop Context（后者改走首轮 user 提醒）。
 func TestIdentityBlockMatchesInstalledClient(t *testing.T) {
+	oldVersion := config.ZcodeClientVersion
+	config.ZcodeClientVersion = "3.18.0"
+	t.Cleanup(func() { config.ZcodeClientVersion = oldVersion })
+
 	blocks := ZcodeSystemBlocks()
-	if len(blocks) < 2 {
-		t.Fatalf("静态段至少应为 2 段，实得 %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("3.18.0 静态段应为 3 块，实得 %d", len(blocks))
 	}
 	m, _ := blocks[1].(map[string]any)
 	text, _ := m["text"].(string)
 
 	if !strings.Contains(text, "via mid-conversation system turns") {
-		t.Errorf("# Harness 应保留 3.14.x 的措辞（via mid-conversation system turns）：\n%s", text)
+		t.Errorf("# Harness 应保留现行措辞（via mid-conversation system turns）：\n%s", text)
 	}
 	if strings.Contains(text, "<system-reminder>") {
-		t.Errorf("# Harness 仍含旧版措辞（3.14.x 已替换）：\n%s", text)
+		t.Errorf("# Harness 不应含 system-reminder 标签：\n%s", text)
 	}
 	for _, want := range []string{
 		"# Harness",
@@ -225,13 +231,26 @@ func TestIdentityBlockMatchesInstalledClient(t *testing.T) {
 		"user-selected permission mode",
 		"dedicated file/search tools",
 		"file_path:line_number",
-		// 3.14.5 增补的桌面段（旧 1211 字符快照缺这一节）。
-		"# ZCode Desktop Context",
-		"### Files & URLs",
-		"### Inline Code Comments",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("块 1 缺少 %q：\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "# ZCode Desktop Context") {
+		t.Errorf("3.18.0 的 Desktop Context 不应留在块 1：\n%s", text)
+	}
+
+	dynamic, _ := blocks[2].(map[string]any)["text"].(string)
+	if !strings.HasPrefix(dynamic, "\n\nWrite code that reads like the surrounding code") {
+		t.Fatalf("块 2 动态文案前缀不符: %q", dynamic[:min(80, len(dynamic))])
+	}
+	for _, want := range []string{
+		"# Context management",
+		"<total_tokens>15000000 tokens left</total_tokens>",
+		"Report outcomes faithfully",
+	} {
+		if !strings.Contains(dynamic, want) {
+			t.Errorf("块 2 缺少 %q", want)
 		}
 	}
 }

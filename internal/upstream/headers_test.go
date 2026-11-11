@@ -296,12 +296,14 @@ func TestDeviceMidNotSentOnModelRequests(t *testing.T) {
 // 它守的是「该段一旦存在就必须与头同源」，不是「该段必须存在」。
 func TestHeaderAndBodyPlatformAgree(t *testing.T) {
 	oldBare, oldArch := config.ZcodeClientBarePlatform, config.ZcodeClientArch
-	oldInject := config.UpstreamInjectEnvironment
+	oldInject, oldVersion := config.UpstreamInjectEnvironment, config.ZcodeClientVersion
 	t.Cleanup(func() {
 		config.ZcodeClientBarePlatform, config.ZcodeClientArch = oldBare, oldArch
-		config.UpstreamInjectEnvironment = oldInject
+		config.UpstreamInjectEnvironment, config.ZcodeClientVersion = oldInject, oldVersion
 	})
 	config.UpstreamInjectEnvironment = true
+	// 本用例守旧档案把 Environment 拼进 system 的形态；3.18.0 已改走首轮 user reminder。
+	config.ZcodeClientVersion = "3.17.2"
 
 	for _, tc := range []struct{ bare, arch, header, envPlatform string }{
 		{"win32", "x64", "win32-x64", "win32"},

@@ -609,8 +609,11 @@ var (
 	// 2026-11-03 同步 3.17.2：CLI system 文案与 3.17.1 逐字节相同（block0 35 B /
 	// sha16 7779642e…，身份段 1235 B / 4058874023c7541f），来源头/端点/UA/模型目录
 	// 均未变，复用 3171 档案（映射见 zcode_system_profile.go）。
-	// 回退：ZCODE_CLIENT_VERSION=3.17.1（改环境变量重启即可，无需换镜像）。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.17.2")
+	// 2026-11-11 同步 3.18.0：CLI system 拆成三块（block0 35 B / 身份段 1233 B /
+	// dynamic 1595 B），Environment/Desktop Context 改走首轮 user 的 system-reminder；
+	// 来源头、模型/计费/领取端点、官方模型目录均未变。
+	// 回退：ZCODE_CLIENT_VERSION=3.17.2 或 3.17.1（改环境变量重启即可，无需换镜像）。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.18.0")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
