@@ -121,6 +121,38 @@ func Test3180FallbackMergesCallerSystemIntoBlock2(t *testing.T) {
 	}
 }
 
+// Test3180FallbackStripsOldOfficialTemplate 旧版本官方 system 进入 3.18 回退时，
+// 应剥离 Prefix/Identity（以及紧随的已知官方块），不能把旧 Desktop Context 漂进新 block2。
+func Test3180FallbackStripsOldOfficialTemplate(t *testing.T) {
+	for _, oldVersion := range []string{"3.16.3", "3.17.2"} {
+		t.Run(oldVersion, func(t *testing.T) {
+			withSystemVersion(t, oldVersion)
+			old := ZcodeSystemBlocks()
+			if len(old) != 2 {
+				t.Fatalf("%s 静态块应为 2，实际 %d", oldVersion, len(old))
+			}
+			oldIdentity := blockText(t, old, 1)
+			custom := map[string]any{"type": "text", "text": "调用者自定义指令"}
+			withSystemVersion(t, "3.18.0")
+
+			blocks := BuildFallbackSystem(map[string]any{"system": []any{old[0], old[1], custom}}, config.ZcodeClientProfile())
+			if len(blocks) != 3 {
+				t.Fatalf("回退应保持 3 块，实际 %d", len(blocks))
+			}
+			dynamic := blockText(t, blocks, 2)
+			if strings.Contains(dynamic, oldIdentity) {
+				t.Fatal("旧官方身份段不应并入新 block2")
+			}
+			if strings.Contains(dynamic, "# ZCode Desktop Context") {
+				t.Fatal("旧 Desktop Context 不应并入新 block2")
+			}
+			if !strings.HasSuffix(dynamic, "\n\n调用者自定义指令") {
+				t.Fatalf("调用者自定义块应保留在 block2 末尾: %q", dynamic[max(0, len(dynamic)-80):])
+			}
+		})
+	}
+}
+
 // Test3180EnvironmentReminderFirstTurn 首轮 user 注入完整环境 + 桌面上下文。
 func Test3180EnvironmentReminderFirstTurn(t *testing.T) {
 	withSystemVersion(t, "3.18.0")
@@ -163,21 +195,44 @@ func Test3180EnvironmentReminderFirstTurn(t *testing.T) {
 	}
 }
 
-// Test3180EnvironmentReminderSkipsContinuation 续轮、已有环境提醒、首条 tool_result 都不注入。
-func Test3180EnvironmentReminderSkipsContinuation(t *testing.T) {
+// Test3180EnvironmentReminderInjectsOnContinuation 续轮也要补基础环境：
+// 调用方保存的是自己的消息，不含网关出站时附加的附件；若按 assistant 跳过，
+// 模型从第二轮起就看不到环境。官方客户端的等价形态是环境提醒一直在历史里。
+func Test3180EnvironmentReminderInjectsOnContinuation(t *testing.T) {
+	withSystemVersion(t, "3.18.0")
+	body := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "你好"},
+			map[string]any{"role": "assistant", "content": "你好"},
+			map[string]any{"role": "user", "content": "继续"},
+		},
+	}
+	InjectEnvironmentReminder(body, config.ZcodeClientProfile())
+	messages := body["messages"].([]any)
+	content, ok := messages[0].(map[string]any)["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("续轮首条 user 也应补环境提醒，实际 %#v", messages[0])
+	}
+	reminder, _ := content[0].(map[string]any)["text"].(string)
+	if !strings.HasPrefix(reminder, "<system-reminder>\n# Environment\n") {
+		t.Fatalf("环境提醒应位于首条 user 最前面: %q", reminder[:min(80, len(reminder))])
+	}
+	if text, _ := content[1].(map[string]any)["text"].(string); text != "你好" {
+		t.Fatalf("用户正文被改写: %q", text)
+	}
+	if text, _ := messages[2].(map[string]any)["content"].(string); text != "继续" {
+		t.Fatalf("最后一轮正文不应被改写: %q", text)
+	}
+}
+
+// Test3180EnvironmentReminderSkipsAlreadyPresentOrToolResult 已有提醒（本地 ZCode
+// 客户端自带）或首条 user 就是 tool_result 时，不重复注入/不硬插。
+func Test3180EnvironmentReminderSkipsAlreadyPresentOrToolResult(t *testing.T) {
 	withSystemVersion(t, "3.18.0")
 	cases := []struct {
 		name     string
 		messages []any
 	}{
-		{
-			name: "已有 assistant，视为续轮",
-			messages: []any{
-				map[string]any{"role": "user", "content": "你好"},
-				map[string]any{"role": "assistant", "content": "你好"},
-				map[string]any{"role": "user", "content": "继续"},
-			},
-		},
 		{
 			name: "历史已有环境提醒",
 			messages: []any{

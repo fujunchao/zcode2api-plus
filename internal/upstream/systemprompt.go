@@ -115,7 +115,7 @@ func BuildFallbackSystem(body map[string]any, profile config.ZcodeProfile) []any
 		"cache_control": map[string]any{"type": "ephemeral"},
 	})
 	if body != nil {
-		if extra := callerSystemText(body["system"], generated); extra != "" {
+		if extra := callerSystemText(stripOfficialSystemPrefix(body["system"]), generated); extra != "" {
 			dynamic += "\n\n" + extra
 		}
 	}
@@ -124,6 +124,33 @@ func BuildFallbackSystem(body map[string]any, profile config.ZcodeProfile) []any
 		"text":          dynamic,
 		"cache_control": map[string]any{"type": "ephemeral"},
 	})
+}
+
+// stripOfficialSystemPrefix 在回退重建时剥离调用者带来的旧官方模板。
+//
+// 只有当首两块确实是某个已知档案的「Prefix + Identity」时，才把后续连续的已知官方
+// 块一起剥掉；调用者自己追加的普通文本块保持原样。这样 3.17.x 客户端在 3.18.0
+// 网关上重建时，不会把旧身份段/Desktop Context 当作第三方指令漂进新 block2。
+func stripOfficialSystemPrefix(raw any) any {
+	blocks, ok := raw.([]any)
+	if !ok || len(blocks) < 2 {
+		return raw
+	}
+	prefixes, identities, known := knownOfficialTemplates()
+	first, okFirst := systemBlockText(blocks[0])
+	second, okSecond := systemBlockText(blocks[1])
+	if !okFirst || !okSecond || !prefixes[first] || !identities[second] {
+		return raw
+	}
+	cut := 2
+	for cut < len(blocks) {
+		text, ok := systemBlockText(blocks[cut])
+		if !ok || !known[text] {
+			break
+		}
+		cut++
+	}
+	return blocks[cut:]
 }
 
 // buildFallbackSystem3180 3.18.0 的回退 system：三块全部来自档案，不生成 Environment。
@@ -135,7 +162,7 @@ func buildFallbackSystem3180(body map[string]any) []any {
 	if len(blocks) == 0 || body == nil {
 		return blocks
 	}
-	extra := callerSystemText(body["system"], blocks)
+	extra := callerSystemText(stripOfficialSystemPrefix(body["system"]), blocks)
 	if extra == "" {
 		return blocks
 	}
@@ -182,9 +209,10 @@ func environmentReminderTextFor3180(p config.ZcodeProfile) string {
 // 官方客户端把它作为 meta_user 附件持久化到会话历史，后续轮次只发环境变化；
 // 网关是无状态的，调用方历史也不含网关注入的附件，因此采用可解释的近似：
 //   - 只在回退重建 system 的路径调用（调用者自带官方 system 时不重复注入）；
-//   - 历史里已经有环境提醒则跳过（幂等）；
-//   - 历史里出现 assistant 或工具块则视为续轮，跳过（假设首轮已注入）；
-//   - 只注入首条 user，放在 content 最前面，顺序为 环境 → currentDate → 用户正文。
+//   - 历史里已经有环境提醒则跳过（幂等；调用者可能是本地 ZCode 客户端）；
+//   - 续轮也要注入基础环境：调用方保存的是自己的消息，不含网关出站时附加的附件，
+//     若续轮跳过，模型从第二轮起就看不到环境；这里不按 assistant/工具块跳过；
+//   - 只注入首条 user（若它是 tool_result 则跳过），顺序为 环境 → currentDate → 用户正文。
 //
 // 环境三元组在网关上固定，不存在“环境变化”，因此不实现 # Environment update。
 func InjectEnvironmentReminder(body map[string]any, profile config.ZcodeProfile) {
@@ -200,9 +228,6 @@ func InjectEnvironmentReminder(body map[string]any, profile config.ZcodeProfile)
 		if ok && contentHasEnvironmentReminder(msg["content"]) {
 			return
 		}
-	}
-	if historyIsContinuation(messages) {
-		return
 	}
 	text := environmentReminderTextFor3180(profile)
 	if text == "" {
@@ -260,19 +285,6 @@ func contentHasEnvironmentReminder(content any) bool {
 			if text, _ := block["text"].(string); check(text) {
 				return true
 			}
-		}
-	}
-	return false
-}
-
-func historyIsContinuation(messages []any) bool {
-	for _, raw := range messages {
-		msg, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if msg["role"] == "assistant" || contentHasToolBlock(msg["content"]) {
-			return true
 		}
 	}
 	return false

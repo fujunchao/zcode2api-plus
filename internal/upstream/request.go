@@ -102,6 +102,60 @@ func zcodeDesktopContext() string {
 	return desktop
 }
 
+// 已知官方模板块文本（三个档案的 block0/1/2 全集）。
+//
+// 用途：调用者可能带着旧版本官方 system 进入回退重建（例如本地还是 3.17.x 客户端）。
+// 这些块是“被替换掉的官方身份”，不能当作第三方指令并入新 block2；否则旧身份段
+// 会整段漂进新提示词。只在 caller 首两块确实是官方前缀+身份时剥离，避免误删
+// 调用者自己追加的同名文本块。
+var (
+	officialTemplatesOnce sync.Once
+	officialPrefixTexts   map[string]bool
+	officialIdentityTexts map[string]bool
+	officialBlockTexts    map[string]bool
+)
+
+// knownOfficialTemplates 解析三个内嵌档案，返回 prefix / identity / 全部块文本集合。
+// 数据是编译期常量，只解析一次；不要按当前档案选择，否则旧模板无法识别。
+func knownOfficialTemplates() (prefixes, identities, blocks map[string]bool) {
+	officialTemplatesOnce.Do(func() {
+		prefixes = map[string]bool{}
+		identities = map[string]bool{}
+		blocks = map[string]bool{}
+		for _, source := range [][]byte{zcodeSystemJSON, zcodeSystem3171JSON, zcodeSystem3180JSON} {
+			var parsed zcodeSystemFile
+			if err := json.Unmarshal(source, &parsed); err != nil {
+				continue
+			}
+			for index, raw := range parsed.Blocks {
+				text, ok := systemBlockText(raw)
+				if !ok {
+					continue
+				}
+				blocks[text] = true
+				switch index {
+				case 0:
+					prefixes[text] = true
+				case 1:
+					identities[text] = true
+				}
+			}
+		}
+		officialPrefixTexts, officialIdentityTexts, officialBlockTexts = prefixes, identities, blocks
+	})
+	return officialPrefixTexts, officialIdentityTexts, officialBlockTexts
+}
+
+// systemBlockText 取 system 文本块的 text；非文本块返回 false。
+func systemBlockText(raw any) (string, bool) {
+	block, ok := raw.(map[string]any)
+	if !ok || block["type"] != "text" {
+		return "", false
+	}
+	text, ok := block["text"].(string)
+	return text, ok
+}
+
 // zcodeDynamicConfig 返回当前档案的 dynamic 段模板（# Environment 前后两段）。
 func zcodeDynamicConfig() zcodeDynamicSections {
 	_, dynamic := zcodeProfileData()
