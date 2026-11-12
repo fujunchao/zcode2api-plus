@@ -239,3 +239,15 @@ You have been invoked in the following environment:·
 - 未模拟每轮 `total_tokens` 提醒；未接入 `zai_cn`；未实现原生 MCP 执行。
 
 CI 日志已直接显示默认请求 `system_text_bytes=[35,1233,1595]` 且三项 SHA256 与档案一致；服务器探针进一步确认上游接受 3.18.0 完整装配。下一步只剩发版/合并决策。
+
+### 10.1 复审修复（2026-11-12）
+
+外部审核提出 3 项，逐项判定并修复：
+
+| 审核项 | 判定 | 修复 |
+|---|---|---|
+| P2 续轮需保留基础环境提醒（`systemprompt.go:204-205`） | **真实 bug**：`historyIsContinuation` 假设“首轮环境提醒已持久化”，但网关是无状态的，调用方历史里没有网关注入的附件；续轮直接 return 会让模型从第二轮起看不到环境 | 删除该跳过；续轮仍向首条 user 补环境提醒。已有环境提醒（本地 ZCode 客户端自带）或首条 user 是 tool_result 时仍跳过 |
+| P2 重建时精确剥离旧官方模板（`systemprompt.go:138`） | **真实 bug/边界**：3.16/3.17 的 Prefix/Identity 进入 3.18 回退时会被 `callerSystemText` 当作第三方指令并入 block2，旧 Desktop Context/身份段会漂进新提示词 | 新增三档案已知 Prefix/Identity/块文本集合；仅当首两块确为官方前缀+身份时，剥离连续已知官方块；调用者自定义块保留 |
+| P3 探针输出示例层级（`runbook:24-28`） | **文档错误**：`probe --dry-run` 的指纹在 `system` 对象内，示例写成了真实请求报告的顶层字段 | runbook 改为嵌套示例，并注明真实请求报告才是顶层字段 |
+
+修复提交：`26364c6`（代码）、`4f8caee`（runbook）；CI run `43136344414` **14/14 全绿**。服务器测试镜像已按 `4f8caee` 重建，首轮探针结论不变。

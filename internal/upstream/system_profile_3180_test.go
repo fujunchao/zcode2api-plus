@@ -124,6 +124,9 @@ func Test3180FallbackMergesCallerSystemIntoBlock2(t *testing.T) {
 // Test3180FallbackStripsOldOfficialTemplate 旧版本官方 system 进入 3.18 回退时，
 // 应剥离 Prefix/Identity（以及紧随的已知官方块），不能把旧 Desktop Context 漂进新 block2。
 func Test3180FallbackStripsOldOfficialTemplate(t *testing.T) {
+	oldInject := config.UpstreamInjectEnvironment
+	config.UpstreamInjectEnvironment = false
+	t.Cleanup(func() { config.UpstreamInjectEnvironment = oldInject })
 	for _, oldVersion := range []string{"3.16.3", "3.17.2"} {
 		t.Run(oldVersion, func(t *testing.T) {
 			withSystemVersion(t, oldVersion)
