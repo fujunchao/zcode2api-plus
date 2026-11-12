@@ -179,6 +179,56 @@ func Test3180FallbackStripsOldOfficialTemplate(t *testing.T) {
 	}
 }
 
+// Test3180FallbackStripsStandaloneEnvironmentBlock 旧 ZcodeSystemBlocks 在
+// UpstreamInjectEnvironment=true 时返回「前两块 + 独立 # Environment」；该块不在
+// 静态 Blocks 集合里，必须按环境结构识别并剥离，不能拼回 3180 第三块。
+func Test3180FallbackStripsStandaloneEnvironmentBlock(t *testing.T) {
+	oldInject := config.UpstreamInjectEnvironment
+	config.UpstreamInjectEnvironment = true
+	t.Cleanup(func() { config.UpstreamInjectEnvironment = oldInject })
+
+	for _, oldVersion := range []string{"3.16.3", "3.17.2"} {
+		t.Run(oldVersion, func(t *testing.T) {
+			withSystemVersion(t, oldVersion)
+			old := ZcodeSystemBlocks()
+			if len(old) != 3 {
+				t.Fatalf("%s + 环境开关应生成 3 块，实际 %d", oldVersion, len(old))
+			}
+			envText := blockText(t, old, 2)
+			if !strings.HasPrefix(envText, "# Environment\nYou have been invoked in the following environment:") {
+				t.Fatalf("第三块不是独立环境块: %q", envText[:min(80, len(envText))])
+			}
+			oldIdentity := blockText(t, old, 1)
+			custom := map[string]any{"type": "text", "text": "调用者自定义指令"}
+			withSystemVersion(t, "3.18.0")
+
+			for _, tc := range []struct {
+				name   string
+				system []any
+			}{
+				{"独立环境块", []any{old[0], old[1], old[2]}},
+				{"独立环境块+自定义块", []any{old[0], old[1], old[2], custom}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					blocks := BuildFallbackSystem(map[string]any{"system": tc.system}, config.ZcodeClientProfile())
+					if len(blocks) != 3 {
+						t.Fatalf("回退应保持 3 块，实际 %d", len(blocks))
+					}
+					dynamic := blockText(t, blocks, 2)
+					for _, forbidden := range []string{oldIdentity, "# Environment", "# Communicating with the user"} {
+						if strings.Contains(dynamic, forbidden) {
+							t.Fatalf("新 block2 不应包含旧环境/身份 %q: %q", forbidden, dynamic[max(0, len(dynamic)-160):])
+						}
+					}
+					if len(tc.system) == 4 && !strings.HasSuffix(dynamic, "\n\n调用者自定义指令") {
+						t.Fatalf("自定义块应保留: %q", dynamic[max(0, len(dynamic)-80):])
+					}
+				})
+			}
+		})
+	}
+}
+
 // Test3180EnvironmentReminderFirstTurn 首轮 user 注入完整环境 + 桌面上下文。
 func Test3180EnvironmentReminderFirstTurn(t *testing.T) {
 	withSystemVersion(t, "3.18.0")

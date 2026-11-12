@@ -156,7 +156,11 @@ func stripOfficialSystemPrefix(raw any) any {
 			cut++
 			continue
 		}
-		if stripped, ok := stripOfficialDynamicBlock(text); ok {
+		stripped, matched := stripOfficialDynamicBlock(text)
+		if !matched {
+			stripped, matched = stripOfficialEnvironmentBlock(text)
+		}
+		if matched {
 			rest := slices.Clone(blocks[cut+1:])
 			if stripped == "" {
 				return rest
@@ -196,6 +200,30 @@ func stripOfficialDynamicBlock(text string) (string, bool) {
 		return strings.TrimLeft(tail, "\n"), true
 	}
 	return "", false
+}
+
+// stripOfficialEnvironmentBlock 识别旧 ZcodeSystemBlocks 在
+// UpstreamInjectEnvironment=true 时追加的独立 # Environment 第三块。
+//
+// 该块不在静态 Blocks 里，也没有 before/afterEnvironment 包裹；它从
+// "# Environment\nYou have been invoked..." 开始，到 "- OS Version: ..." 行为止。
+// 若调用者在其后追加了自定义文本，只保留自定义后缀。
+func stripOfficialEnvironmentBlock(text string) (string, bool) {
+	trimmed := strings.TrimLeft(text, "\r\n")
+	const head = "# Environment\nYou have been invoked in the following environment:"
+	if !strings.HasPrefix(trimmed, head) {
+		return "", false
+	}
+	const osVersion = "\n- OS Version: "
+	index := strings.Index(trimmed, osVersion)
+	if index < 0 {
+		return "", false
+	}
+	rest := trimmed[index+len(osVersion):]
+	if lineEnd := strings.Index(rest, "\n"); lineEnd >= 0 {
+		return strings.TrimLeft(rest[lineEnd+1:], "\r\n"), true
+	}
+	return "", true
 }
 
 // buildFallbackSystem3180 3.18.0 的回退 system：三块全部来自档案，不生成 Environment。
