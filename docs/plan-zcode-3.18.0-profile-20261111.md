@@ -258,4 +258,5 @@ CI 日志已直接显示默认请求 `system_text_bytes=[35,1233,1595]` 且三�
 
 - **v2.14.0-go 已发布**：tag `v2.14.0-go` → 提交 `9c63748`；release run `43140173198` success；Release 5 个二进制资产上传完成。
 - GHCR：`2.14.0-go` 与 `latest` 指向同一 multi-arch digest `sha256:a58116e22384669a6b027d9cf69ed5717e143d72017683f26c90eb2d38d7846a`（linux/amd64 + linux/arm64）。
-- 生产容器仍为 `2.13.6-go`，部署未执行；回退参数 `ZCODE_CLIENT_VERSION=3.17.2` 可用。
+- 生产已于 2026-11-12 10:28 部署 `2.14.0-go`：容器 healthy、`/meta` 返回 `2.14.0-go`，probe dry-run 显示 `client_version=3.18.0`；旧 `2.13.6-go` 镜像保留，compose 备份 `docker-compose.yml.bak_pre2140_20261112_102743`。
+- 回退：恢复备份 compose 后 `docker compose up -d`，或设置 `ZCODE_CLIENT_VERSION=3.17.2`。
