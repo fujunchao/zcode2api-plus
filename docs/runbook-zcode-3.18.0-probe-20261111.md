@@ -16,20 +16,22 @@ docker compose run --rm zcode2api status | head -8
 docker compose run --rm zcode2api probe --dry-run
 ```
 
-3.18.0 预期关键字段：
+3.18.0 预期关键字段（`probe --dry-run` 的指纹在 `system` 对象内，与真实请求报告的顶层字段不同）：
 
 ```json
 {
   "client_version": "3.18.0",
-  "system_profile": "3.18.0",
-  "system_blocks": 3,
-  "system_first_sha16": "7779642ea44a4696",
-  "system_identity_sha16": "aac4ba4cc7b555b3",
-  "system_dynamic_sha16": "26a2daa8c8381086"
+  "system": {
+    "profile": "3.18.0",
+    "blocks": 3,
+    "first_sha16": "7779642ea44a4696",
+    "identity_sha16": "aac4ba4cc7b555b3",
+    "dynamic_sha16": "26a2daa8c8381086"
+  }
 }
 ```
 
-三项 SHA16 必须同时正确；任何一项不符都不要继续发真实请求（说明镜像/档案/环境变量没有真正生效）。
+三项 SHA16 必须同时正确；任何一项不符都不要继续发真实请求（说明镜像/档案/环境变量没有真正生效）。真实请求（下一节）报告才是顶层 `system_first_sha16` 等字段。
 
 ## 1. 选择隔离账号
 
