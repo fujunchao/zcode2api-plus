@@ -144,13 +144,58 @@ func stripOfficialSystemPrefix(raw any) any {
 	}
 	cut := 2
 	for cut < len(blocks) {
-		text, ok := systemBlockText(blocks[cut])
-		if !ok || !known[text] {
+		block, ok := blocks[cut].(map[string]any)
+		if !ok {
 			break
 		}
-		cut++
+		text, ok := systemBlockText(block)
+		if !ok {
+			break
+		}
+		if known[text] {
+			cut++
+			continue
+		}
+		if stripped, ok := stripOfficialDynamicBlock(text); ok {
+			rest := slices.Clone(blocks[cut+1:])
+			if stripped == "" {
+				return rest
+			}
+			clone := maps.Clone(block)
+			clone["text"] = stripped
+			return append([]any{clone}, rest...)
+		}
+		break
 	}
 	return blocks[cut:]
+}
+
+// stripOfficialDynamicBlock 识别旧档案 BuildFallbackSystem 生成的第三块：
+// "\n\n" + beforeEnvironment + "\n\n" + Environment + "\n\n" + afterEnvironment
+// 以及其后由调用者追加的自定义文本。返回自定义后缀（可能为空）与是否命中。
+//
+// 旧档案的 dynamicSections 不在静态 Blocks 里，单靠文本集合无法剥离；这里按
+// 已知模板结构定位 Environment 与 afterEnvironment，只保留 afterEnvironment 之后
+// 的调用者文本，避免把 # Environment/# Context management 带回 3.18 system。
+func stripOfficialDynamicBlock(text string) (string, bool) {
+	for _, sections := range knownOfficialDynamicSections() {
+		rest := strings.TrimPrefix(text, "\n\n")
+		if !strings.HasPrefix(rest, sections.BeforeEnvironment) {
+			continue
+		}
+		rest = rest[len(sections.BeforeEnvironment):]
+		envIdx := strings.Index(rest, "# Environment")
+		if envIdx < 0 || strings.TrimSpace(rest[:envIdx]) != "" {
+			continue
+		}
+		afterIdx := strings.Index(rest[envIdx:], sections.AfterEnvironment)
+		if afterIdx < 0 {
+			continue
+		}
+		tail := rest[envIdx+afterIdx+len(sections.AfterEnvironment):]
+		return strings.TrimLeft(tail, "\n"), true
+	}
+	return "", false
 }
 
 // buildFallbackSystem3180 3.18.0 的回退 system：三块全部来自档案，不生成 Environment。

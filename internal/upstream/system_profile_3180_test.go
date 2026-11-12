@@ -122,35 +122,58 @@ func Test3180FallbackMergesCallerSystemIntoBlock2(t *testing.T) {
 }
 
 // Test3180FallbackStripsOldOfficialTemplate 旧版本官方 system 进入 3.18 回退时，
-// 应剥离 Prefix/Identity（以及紧随的已知官方块），不能把旧 Desktop Context 漂进新 block2。
+// 应剥离 Prefix/Identity、旧 Desktop Context，以及旧 BuildFallbackSystem 生成的
+// 第三块 dynamic（含 # Environment）；只保留调用者真正追加的自定义后缀。
 func Test3180FallbackStripsOldOfficialTemplate(t *testing.T) {
 	oldInject := config.UpstreamInjectEnvironment
 	config.UpstreamInjectEnvironment = false
 	t.Cleanup(func() { config.UpstreamInjectEnvironment = oldInject })
+
 	for _, oldVersion := range []string{"3.16.3", "3.17.2"} {
 		t.Run(oldVersion, func(t *testing.T) {
 			withSystemVersion(t, oldVersion)
-			old := ZcodeSystemBlocks()
-			if len(old) != 2 {
-				t.Fatalf("%s 静态块应为 2，实际 %d", oldVersion, len(old))
+			oldStatic := ZcodeSystemBlocks()
+			if len(oldStatic) != 2 {
+				t.Fatalf("%s 静态块应为 2，实际 %d", oldVersion, len(oldStatic))
 			}
-			oldIdentity := blockText(t, old, 1)
+			oldFull := BuildFallbackSystem(nil, config.ZcodeClientProfile())
+			oldWithSuffix := BuildFallbackSystem(map[string]any{"system": "调用者自定义指令"}, config.ZcodeClientProfile())
+			if len(oldFull) != 3 || len(oldWithSuffix) != 3 {
+				t.Fatalf("旧回退应生成 3 块: full=%d suffix=%d", len(oldFull), len(oldWithSuffix))
+			}
+			oldIdentity := blockText(t, oldStatic, 1)
 			custom := map[string]any{"type": "text", "text": "调用者自定义指令"}
 			withSystemVersion(t, "3.18.0")
 
-			blocks := BuildFallbackSystem(map[string]any{"system": []any{old[0], old[1], custom}}, config.ZcodeClientProfile())
-			if len(blocks) != 3 {
-				t.Fatalf("回退应保持 3 块，实际 %d", len(blocks))
+			cases := []struct {
+				name       string
+				system     []any
+				wantCustom bool
+			}{
+				{"旧两块静态+自定义块", []any{oldStatic[0], oldStatic[1], custom}, true},
+				{"旧完整三块", []any{oldFull[0], oldFull[1], oldFull[2]}, false},
+				{"旧完整三块+自定义后缀", []any{oldWithSuffix[0], oldWithSuffix[1], oldWithSuffix[2]}, true},
 			}
-			dynamic := blockText(t, blocks, 2)
-			if strings.Contains(dynamic, oldIdentity) {
-				t.Fatal("旧官方身份段不应并入新 block2")
-			}
-			if strings.Contains(dynamic, "# ZCode Desktop Context") {
-				t.Fatal("旧 Desktop Context 不应并入新 block2")
-			}
-			if !strings.HasSuffix(dynamic, "\n\n调用者自定义指令") {
-				t.Fatalf("调用者自定义块应保留在 block2 末尾: %q", dynamic[max(0, len(dynamic)-80):])
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					blocks := BuildFallbackSystem(map[string]any{"system": tc.system}, config.ZcodeClientProfile())
+					if len(blocks) != 3 {
+						t.Fatalf("回退应保持 3 块，实际 %d", len(blocks))
+					}
+					dynamic := blockText(t, blocks, 2)
+					for _, forbidden := range []string{oldIdentity, "# ZCode Desktop Context", "# Environment", "# Communicating with the user"} {
+						if strings.Contains(dynamic, forbidden) {
+							t.Fatalf("新 block2 不应包含旧模板 %q: %q", forbidden, dynamic[max(0, len(dynamic)-160):])
+						}
+					}
+					if tc.wantCustom {
+						if !strings.HasSuffix(dynamic, "\n\n调用者自定义指令") {
+							t.Fatalf("调用者自定义后缀应保留: %q", dynamic[max(0, len(dynamic)-80):])
+						}
+					} else if strings.Contains(dynamic, "调用者自定义指令") {
+						t.Fatal("无自定义后缀时不应凭空出现自定义文本")
+					}
+				})
 			}
 		})
 	}

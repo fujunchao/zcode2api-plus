@@ -109,10 +109,11 @@ func zcodeDesktopContext() string {
 // 会整段漂进新提示词。只在 caller 首两块确实是官方前缀+身份时剥离，避免误删
 // 调用者自己追加的同名文本块。
 var (
-	officialTemplatesOnce sync.Once
-	officialPrefixTexts   map[string]bool
-	officialIdentityTexts map[string]bool
-	officialBlockTexts    map[string]bool
+	officialTemplatesOnce   sync.Once
+	officialPrefixTexts     map[string]bool
+	officialIdentityTexts   map[string]bool
+	officialBlockTexts      map[string]bool
+	officialDynamicSections []zcodeDynamicSections
 )
 
 // knownOfficialTemplates 解析三个内嵌档案，返回 prefix / identity / 全部块文本集合。
@@ -140,10 +141,29 @@ func knownOfficialTemplates() (prefixes, identities, blocks map[string]bool) {
 					identities[text] = true
 				}
 			}
+			if parsed.DynamicSections.BeforeEnvironment != "" && parsed.DynamicSections.AfterEnvironment != "" {
+				duplicate := false
+				for _, existing := range officialDynamicSections {
+					if existing == parsed.DynamicSections {
+						duplicate = true
+						break
+					}
+				}
+				if !duplicate {
+					officialDynamicSections = append(officialDynamicSections, parsed.DynamicSections)
+				}
+			}
 		}
 		officialPrefixTexts, officialIdentityTexts, officialBlockTexts = prefixes, identities, blocks
 	})
 	return officialPrefixTexts, officialIdentityTexts, officialBlockTexts
+}
+
+// knownOfficialDynamicSections 旧档案（legacy/3171）的 dynamic 段模板；
+// 必须在 knownOfficialTemplates 之后读取，保证 Once 已填充。
+func knownOfficialDynamicSections() []zcodeDynamicSections {
+	knownOfficialTemplates()
+	return officialDynamicSections
 }
 
 // systemBlockText 取 system 文本块的 text；非文本块返回 false。
