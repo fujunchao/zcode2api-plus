@@ -7,7 +7,7 @@
 ## 1. 构建与样本
 
 - 在服务器 `/root/zcode2api-plus-3180` 浅克隆分支，本地 `docker build` 成功。
-- 测试镜像：`zcode2api-plus:3.18.0-test`，复审修复后按 `4f8caee` 重建，digest `sha256:42c7236fa8ab0c8dad0d6d5d0640b73b3f33695b2f2d46d0b395e1f35f07aaa3`，206 MB（首轮验证的旧镜像 digest 为 `6e30774d…`）。
+- 测试镜像：`zcode2api-plus:3.18.0-test`，复审修复后按 `1d3ee26` 重建，digest `sha256:ff558988776baa972481b0b9448866b90daa966e66684d6e9c3da35327193d8c`，206 MB（中间版本 `42c7236f…`，首轮验证的旧镜像为 `6e30774d…`）。
 - 账号库：从生产数据目录复制 `accounts.db` + WAL/SHM + `device_mid.txt` 到隔离目录；探针结束后已删除副本。
 - 账号：一个未使用过的 active 账号（报告不记录 ID/名称）。
 
@@ -83,7 +83,7 @@ docker run --rm -v /root/probe3180:/data \
 
 ## 4.1 复审修复后的复验（2026-11-12）
 
-- 代码修复续轮环境提醒与旧官方模板剥离（提交 `26364c6`）后，按 `4f8caee` 重建镜像；dry-run 指纹仍为 35 / 1,233 / 1,595 B 与三项 SHA16。
+- 复审连续补了旧动态第三块、旧独立 Environment 第三块的剥离（提交 `a084f67`、`1d3ee26`）后，按 `1d3ee26` 重建镜像；dry-run 指纹仍为 35 / 1,233 / 1,595 B 与三项 SHA16。
 - 换一个未使用过的 active 账号发真实 3.18.0 请求：**200**，`input_tokens=1097`、`output_tokens=3`，无 3012。
 - 原账号复验时曾返回 **429 / business_code=3009**（`model concurrency limit exceeded`）；这是上游并发限制，不是版本/文案拒绝，换账号即 200。
 
