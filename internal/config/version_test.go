@@ -26,11 +26,12 @@ func TestClientVersionShape(t *testing.T) {
 	}
 }
 
-// 默认声明必须是「已核验 system 文案配对」的版本：3.18.0 使用 2026-11-11 逆向核验的
-// 独立档案（block0 35 B / 身份段 1233 B / sha16 aac4ba4cc7b555b3），Environment 改走
-// 首轮 user reminder；旧版本走环境变量回退，本断言只守默认值。
+// 默认声明必须是「已核验 system 文案配对」的版本：3.18.2 与 3.18.0 的 system 文案
+// 逐字节相同（2026-11-13 逆向核验），共用一个档案（block0 35 B / 身份段 1233 B /
+// sha16 aac4ba4cc7b555b3，Environment 改走首轮 user reminder）；旧版本走环境变量回退，
+// 本断言只守默认值。
 func TestDefaultClientVersionHasVerifiedPromptPair(t *testing.T) {
-	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.18.0" {
+	if strings.TrimSpace(os.Getenv("ZCODE_CLIENT_VERSION")) == "" && ZcodeClientVersion != "3.18.2" {
 		t.Fatalf("默认客户端声明未同步: %q", ZcodeClientVersion)
 	}
 }

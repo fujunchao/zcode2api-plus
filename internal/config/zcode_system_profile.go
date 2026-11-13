@@ -22,6 +22,12 @@ const (
 	// block0 35 B / sha16 7779642e…，身份段 1233 B / sha16 aac4ba4c…（不再接
 	// Desktop Context 与连接换行），block2 1595 B / sha16 26a2daa8…；
 	// Environment/Desktop Context 改走普通 user 的 <system-reminder>，不进入 system。
+	//
+	// 3.18.2（2026-11-13 逆向核验）复用本档案：block0 35 B / 身份段 1,233 B /
+	// dynamic 1,595 B、三项 sha16 与 Desktop Context 1,100 B 均与 3.18.0 逐字节相同，
+	// 来源头、SSE/重试常量、模型目录亦未变。故 3.18.2 只在下面的精确映射加别名，
+	// **不新增档案常量**：新造常量还得同步改 UsesUserReminderEnvironment 与
+	// zcodeProfileSource 两处，等于人为制造分叉。
 	ZcodeSystemProfile3180 ZcodeSystemProfile = "3.18.0"
 )
 
@@ -42,7 +48,7 @@ func ZcodeSystemProfileFor(version string) ZcodeSystemProfile {
 // 包括仍走 legacy 的 3.15.3 / 3.16.2 / 3.16.3——它们的档案同样经过核验。
 func ZcodeSystemProfileForExact(version string) (ZcodeSystemProfile, bool) {
 	switch strings.TrimSpace(version) {
-	case "3.18.0":
+	case "3.18.0", "3.18.2":
 		return ZcodeSystemProfile3180, true
 	case "3.17.1", "3.17.2":
 		return ZcodeSystemProfile3171, true
