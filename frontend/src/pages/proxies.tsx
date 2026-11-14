@@ -477,6 +477,7 @@ export function ProxiesPage() {
             {(
               [
                 ['HTTP', 'http://host:port', 'bg-blue-100 text-blue-700'],
+                ['S4', 'socks4://host:port', 'bg-teal-100 text-teal-700'],
                 ['S5', 'socks5://host:port', 'bg-violet-100 text-violet-700'],
                 ['AUTH', 'http://user:pass@host:port', 'bg-amber-100 text-amber-700'],
               ] as [string, string, string][]
@@ -498,7 +499,7 @@ export function ProxiesPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>{editingId ? '編輯代理出口' : '新增代理出口'}</DialogTitle>
-            <DialogDescription>支援帶認證的 HTTP／SOCKS5 地址。</DialogDescription>
+            <DialogDescription>支援帶認證的 HTTP／SOCKS4／SOCKS5 地址。</DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-4">
             <div className="flex flex-col gap-2">
@@ -509,7 +510,7 @@ export function ProxiesPage() {
               <Label htmlFor="proxy-url">地址</Label>
               <Input
                 id="proxy-url"
-                placeholder="http://host:port 或 socks5://host:port"
+                placeholder="http://host:port、socks4://host:port 或 socks5://host:port"
                 autoComplete="off"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}

@@ -55,7 +55,11 @@ export function normalizeModel(model: unknown): string {
     .replace(/-+/g, '-')
 }
 
-/* 代理位址 → 顯示用的協定標籤 */
-export function proxyScheme(url: string | null | undefined): 'SOCKS5' | 'HTTP' {
-  return String(url || '').split(':')[0].toLowerCase().startsWith('socks') ? 'SOCKS5' : 'HTTP'
+/* 代理位址 → 顯示用的協定標籤。
+   socks4 與 socks5 的解析語義不同（前者本地解析、後者視 scheme 而定），
+   合併顯示成 SOCKS5 會讓人誤以為是同類線路。 */
+export function proxyScheme(url: string | null | undefined): 'SOCKS4' | 'SOCKS5' | 'HTTP' {
+  const scheme = String(url || '').split(':')[0].toLowerCase()
+  if (scheme === 'socks4') return 'SOCKS4'
+  return scheme.startsWith('socks') ? 'SOCKS5' : 'HTTP'
 }

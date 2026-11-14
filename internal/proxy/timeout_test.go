@@ -94,7 +94,7 @@ func TestSocks4HandshakeHonorsBudget(t *testing.T) {
 	defer conn.Close()
 	u, _ := url.Parse("socks4://" + addr)
 	start := time.Now()
-	if err := socks4Handshake(conn, u, "127.0.0.1:9", false); err == nil {
+	if err := socks4Handshake(context.Background(), conn, u, "127.0.0.1:9"); err == nil {
 		t.Fatal("无响应代理的 socks4 握手必须失败")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {

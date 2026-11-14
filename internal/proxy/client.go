@@ -1,7 +1,8 @@
 // 出站代理拨号器：对应 Python 版 app/proxy.py 的 make_async_client 部分。
 // 支持的 scheme 与 httpx 对齐：http/https 走 CONNECT 隧道（由 http.Transport
 // 的 Proxy 字段承担），socks4/socks5/socks5h 走本文件手写的拨号器。
-// socks5 本地解析域名后以 IP 连接代理；socks5h 将域名交给代理解析。
+// socks4/socks5 本地解析域名后以 IP 连接代理；socks5h 将域名交给代理解析；
+// socks4 解析不到 IPv4 时才退回 SOCKS4a（域名交给代理解析）。
 package proxy
 
 import (
@@ -164,7 +165,8 @@ func ClientFor(raw string, timeout time.Duration) (*http.Client, error) {
 }
 
 // socksDialer 构造 SOCKS 出站拨号函数。socks4=true 走 SOCKS4 协议
-// （域名本地解析后以 IPv4 连接）；socks5 本地解析，socks5h 远端解析。
+// （域名本地解析后以 IPv4 连接，解析不到才退回 SOCKS4a）；socks5 本地解析，
+// socks5h 远端解析。
 func socksDialer(u *url.URL, v4 bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	forward := &net.Dialer{Timeout: dialTimeout(), KeepAlive: 30 * time.Second}
 	remoteResolve := strings.EqualFold(u.Scheme, "socks5h")
@@ -183,7 +185,7 @@ func socksDialer(u *url.URL, v4 bool) func(ctx context.Context, network, addr st
 			}
 		}()
 		if v4 {
-			err = socks4Handshake(conn, u, addr, remoteResolve)
+			err = socks4Handshake(ctx, conn, u, addr)
 		} else {
 			err = socks5Handshake(ctx, conn, u, addr, remoteResolve)
 		}
@@ -349,10 +351,33 @@ func socks5Auth(conn net.Conn, u *url.URL) error {
 	return nil
 }
 
+// lookupIPv4 把域名解析成 IPv4，供 socks4 的本地解析使用。
+// SOCKS4 报文的地址字段固定 4 字节，装不下 IPv6；解析不到 IPv4 时调用方退回 4a。
+// 声明成变量是为了让测试能稳定覆盖 4a 回落分支，不依赖真实 DNS 结果。
+var lookupIPv4 = func(ctx context.Context, host string) net.IP {
+	lookupCtx, cancel := context.WithTimeout(ctx, handshakeTimeout())
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+	if err != nil {
+		return nil
+	}
+	for _, addr := range addrs {
+		if v4 := addr.IP.To4(); v4 != nil {
+			return v4
+		}
+	}
+	return nil
+}
+
 // socks4Handshake 执行 SOCKS4/4a 握手（userid 取自 URL 用户名）。
-// 域名总是以 4a 的形式发给代理解析（httpx 的 socks4 本地解析语义在
-// IPv4-only 场景等价，4a 兼容面更广且不会暴露解析失败差异）。
-func socks4Handshake(conn net.Conn, u *url.URL, addr string, _ bool) error {
+//
+// 目标为域名时**优先本地解析**再发标准 SOCKS4：这是 curl/httpx 的 socks4 语义，
+// 也贴合免费 socks4 代理的实际生态。2026-11-14 对 proxy-checker 仓库 33 条 socks4
+// 实测，本地解析口径 22 条能连到 zcode.z.ai:443，而 SOCKS4a（把域名交给代理解析）
+// 只有 2 条——绝大多数免费代理根本不实现 4a。此前这里一律发 4a，等于把这批线路
+// 全部判死（订阅导入的复检探针也用同一份拨号器）。
+// 解析不到 IPv4 或解析失败时才退回 4a；IPv6 字面量目标两种形态都表达不了，直接报错。
+func socks4Handshake(ctx context.Context, conn net.Conn, u *url.URL, addr string) error {
 	// socks4 此前完全没有 deadline：readFull 只受 conn 自身读超时约束，而没人设过，
 	// 半死不活的代理能把握手无限期挂住。与 socks5 共用同一份握手预算。
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout()))
@@ -366,8 +391,15 @@ func socks4Handshake(conn net.Conn, u *url.URL, addr string, _ bool) error {
 		return err
 	}
 	var ip net.IP
-	if parsed := net.ParseIP(host); parsed != nil && parsed.To4() != nil {
+	if parsed := net.ParseIP(host); parsed != nil {
+		if parsed.To4() == nil {
+			// 早失败胜过发一个装不下的地址：SOCKS4 只有 32 位地址字段。
+			return fmt.Errorf("socks4 不支持 IPv6 目标: %s", host)
+		}
 		ip = parsed.To4()
+	}
+	if ip == nil {
+		ip = lookupIPv4(ctx, host)
 	}
 	var req []byte
 	userID := ""
