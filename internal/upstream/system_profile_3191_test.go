@@ -333,3 +333,55 @@ func Test3191EnvironmentReminderGoesToUser(t *testing.T) {
 		t.Fatal("环境提醒应同时包含 # Environment 与桌面上下文")
 	}
 }
+
+// Test3191AliasFor400 锁死「4.0.0 复用 3191 档案」：默认三块 system 与 Desktop
+// Context 必须与 3.19.1 逐字节相同，且相邻的 4.0.x 继续回落 legacy。
+//
+// 上游按 app_version 校验 system 首段到身份段末尾，若 4.0.0 被错映射到 3180 或
+// 复制出第二份会漂移的档案，本用例直接变红；只加版本号不加映射则会静默回落
+// legacy（3.17.1 事故同型，见 docs/analysis-zcode-3.17.1-405-incident-20261101.md）。
+func Test3191AliasFor400(t *testing.T) {
+	profile, exact := config.ZcodeSystemProfileForExact("4.0.0")
+	if !exact || profile != config.ZcodeSystemProfile3191 {
+		t.Fatalf("4.0.0 映射 = (%q, %v)，期望 (%q, true)", profile, exact, config.ZcodeSystemProfile3191)
+	}
+	if !profile.UsesUserReminderEnvironment() {
+		t.Fatal("4.0.0 必须走「Environment 作为 user 提醒」的装配")
+	}
+	// 相邻未核验版本不得被前缀匹配带进来。
+	for _, version := range []string{"4.0", "4.0.1", "4.0.0.1"} {
+		if p, ok := config.ZcodeSystemProfileForExact(version); ok || p != config.ZcodeSystemProfileLegacy {
+			t.Fatalf("%s 应回落 legacy 且 exact=false，实际 (%q, %v)", version, p, ok)
+		}
+	}
+
+	withSystemVersion(t, "3.19.1")
+	wantBlocks := ZcodeSystemBlocks()
+	wantDesktop := zcodeDesktopContext()
+
+	withSystemVersion(t, "4.0.0")
+	gotBlocks := ZcodeSystemBlocks()
+	if !reflect.DeepEqual(gotBlocks, wantBlocks) {
+		t.Fatal("4.0.0 与 3.19.1 的静态 system 块应逐字节相同")
+	}
+	if desktop := zcodeDesktopContext(); desktop != wantDesktop {
+		t.Fatalf("4.0.0 桌面上下文与 3.19.1 不一致：%d B vs %d B", len(desktop), len(wantDesktop))
+	}
+	if len(gotBlocks) != 3 {
+		t.Fatalf("4.0.0 静态 system 应为 3 块，实际 %d", len(gotBlocks))
+	}
+	for i, tc := range []struct {
+		bytes int
+		sha16 string
+	}{
+		{35, "7779642ea44a4696"},
+		{1233, "aac4ba4cc7b555b3"},
+		{4564, "929856d5f112c283"},
+	} {
+		text := blockText(t, gotBlocks, i)
+		if len(text) != tc.bytes || shortSHA16(text) != tc.sha16 {
+			t.Fatalf("4.0.0 第 %d 块 = %d B / %s，期望 %d B / %s", i, len(text), shortSHA16(text), tc.bytes, tc.sha16)
+		}
+	}
+}
+

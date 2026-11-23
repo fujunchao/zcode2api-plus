@@ -20,7 +20,10 @@ func TestZcodeSystemProfileFor(t *testing.T) {
 		{"3.18.2", ZcodeSystemProfile3180},
 		{"3.19.1", ZcodeSystemProfile3191},
 		{" 3.19.1 ", ZcodeSystemProfile3191},
+		{"4.0.0", ZcodeSystemProfile3191},
+		{" 4.0.0 ", ZcodeSystemProfile3191},
 		{"3.19.0", ZcodeSystemProfileLegacy},
+		{"4.0.1", ZcodeSystemProfileLegacy},
 		{"", ZcodeSystemProfileLegacy},
 	}
 	for _, tc := range cases {
@@ -45,7 +48,9 @@ func TestZcodeSystemProfileForExact(t *testing.T) {
 		{"3.18.0", ZcodeSystemProfile3180, true},
 		{"3.18.2", ZcodeSystemProfile3180, true},
 		{"3.19.1", ZcodeSystemProfile3191, true},
+		{"4.0.0", ZcodeSystemProfile3191, true},
 		{"3.19.0", ZcodeSystemProfileLegacy, false},
+		{"4.0.1", ZcodeSystemProfileLegacy, false},
 		{"3.18.1", ZcodeSystemProfileLegacy, false},
 		{"3.17.0", ZcodeSystemProfileLegacy, false},
 		{"", ZcodeSystemProfileLegacy, false},

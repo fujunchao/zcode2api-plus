@@ -40,6 +40,12 @@ const (
 	// 第三块不同，所以**不能**给 3180 档案加 3.19.1 别名：那会让网关自建的 system
 	// 少掉两段新指令，与官方 3.19.1 的字节也不一致。首两块相同只意味着
 	// 「3.19.1 客户端带着完整上下文进来时仍可原样保留」，不代表档案可复用。
+	//
+	// 4.0.0（2026-11-23 逆向核验）复用本档案：默认桌面条件下三块 system
+	// （35 / 1,233 / 4,564 B）、Desktop Context 1,100 B 与缓存布局都与 3.19.1
+	// 逐字节相同（AST 白名单独立重建，非复制项目 JSON）；模型请求头、SDK 版本、
+	// 签名模块与随包模型目录也未变。4.0.0 的实质增量在客户端侧 OpenAI Responses
+	// 无状态回放，不触及本档案，因此**不复制**一份正文相同的 4000 JSON。
 	ZcodeSystemProfile3191 ZcodeSystemProfile = "3.19.1"
 )
 
@@ -60,7 +66,9 @@ func ZcodeSystemProfileFor(version string) ZcodeSystemProfile {
 // 包括仍走 legacy 的 3.15.3 / 3.16.2 / 3.16.3——它们的档案同样经过核验。
 func ZcodeSystemProfileForExact(version string) (ZcodeSystemProfile, bool) {
 	switch strings.TrimSpace(version) {
-	case "3.19.1":
+	case "3.19.1", "4.0.0":
+		// 4.0.0 与 3.19.1 的默认 system 逐字节相同（2026-11-23 核验），共用 3191 档案；
+		// 仍按精确枚举登记，未知的 4.0.x 继续回落 legacy 并告警。
 		return ZcodeSystemProfile3191, true
 	case "3.18.0", "3.18.2":
 		return ZcodeSystemProfile3180, true

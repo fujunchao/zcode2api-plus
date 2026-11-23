@@ -620,6 +620,11 @@ var (
 	// 与 "# Memory, notes and feedback"，<total_tokens> 改为默认关闭的开关），故新增
 	// 独立 3191 档案（映射见 zcode_system_profile.go）。协议层零变化：模型 API 路径、
 	// 请求头、body 字段、能力头与两份官方模型目录均与 3.18.2 一致。
+	// 2026-11-23 复核 4.0.0：默认桌面条件下三块 system（35 / 1,233 / 4,564 B）、
+	// Desktop Context 1,100 B、来源头、SDK 版本、签名与随包模型目录均与 3.19.1
+	// 逐字节/逐项相同，故在 zcode_system_profile.go 里登记 4.0.0 → 3191 别名；
+	// 默认值仍留 3.19.1，待单账号真机探针通过后再切换（见
+	// docs/implementation-zcode-4.0.0-profile-20261123.md）。
 	// 回退：ZCODE_CLIENT_VERSION=3.18.2（3180 档案保留），或更旧的 3.18.0 / 3.17.2 / 3.17.1
 	// （改环境变量重启即可，无需换镜像）。
 	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.19.1")

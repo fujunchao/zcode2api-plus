@@ -66,7 +66,7 @@ type ZcodeProfile struct {
 	OSRelease      string // 10.0.26100
 	Shell          string // cmd.exe
 	CWD            string // 伪装工作目录
-	AppVersion     string // 3.19.1（默认）；回退 3.18.2 / 3.18.0 / 3.17.2 / 3.17.1 / 3.16.3 走环境变量
+	AppVersion     string // 3.19.1（默认）；4.0.0 已登记为 3191 同档案别名，回退 3.18.x / 3.17.x / 3.16.3 走环境变量
 	SourceTitle    string // electron | cli
 	ReleaseChannel string // production
 	Language       string // zh-CN

@@ -40,6 +40,10 @@ var zcodeSystem3180JSON []byte
 // "# Memory, notes and feedback"）。档案必须与 ZCODE_CLIENT_VERSION 成对选择，
 // 详见 docs/plan-zcode-3.19.1-upgrade-20261123.md。
 //
+// 4.0.0（2026-11-23 逆向核验）复用本档案：默认三块 system 与 Desktop Context
+// 逐字节相同，故不新增 4000 JSON，只在 config.ZcodeSystemProfileForExact 里加
+// 精确别名；详见 docs/implementation-zcode-4.0.0-profile-20261123.md。
+//
 //go:embed zcode_system_3191.json
 var zcodeSystem3191JSON []byte
 
