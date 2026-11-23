@@ -33,3 +33,13 @@
 ## 回退
 
 本次没有数据迁移。需要回退修复行为时使用 `2.14.3-go` 镜像；只调整 `ZCODE_CLIENT_VERSION` 会切换文案档案，但仍使用新的精确剥离逻辑。
+
+## 复现证据
+
+回归提交 `d059278ded2e817c82daf021c099cca4b8e1ca9b` 的完整 [CI 45101498668](https://github.com/fujunchao/zcode2api-plus/actions/runs/45101498668)
+按预期在普通测试与竞态测试失败，其余验证任务通过。失败日志确认：
+
+- `TestNormalizeBodyStaticDynamicSuffix/强制回退`：第三块实际 6,226 B，仍包含 `<total_tokens>`。
+- `Test3191FallbackStripsKnownTemplates/3182_第三块内自定义后缀`：仍包含完整旧模板。
+- 3.18.0/3.18.2 → 3.19.1 的矩阵用例：实际 6,260 B，期望 4,663 B。
+- 3.19.1 → 3.18.0/3.18.2 的矩阵用例：实际 6,260 B，期望 1,694 B。

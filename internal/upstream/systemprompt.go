@@ -129,8 +129,8 @@ func BuildFallbackSystem(body map[string]any, profile config.ZcodeProfile) []any
 // stripOfficialSystemPrefix 在回退重建时剥离调用者带来的旧官方模板。
 //
 // 只有当首两块确实是某个已知档案的「Prefix + Identity」时，才把后续连续的已知官方
-// 块一起剥掉；调用者自己追加的普通文本块保持原样。这样 3.17.x 客户端在 3.18.0
-// 网关上重建时，不会把旧身份段/Desktop Context 当作第三方指令漂进新 block2。
+// 块一起剥掉；静态第三块携带自定义后缀时，仅剥离完整底座和拼接换行。
+// 调用者自己追加的普通文本块保持原样，避免新旧档案互换时把旧模板带入新 block2。
 func stripOfficialSystemPrefix(raw any) any {
 	blocks, ok := raw.([]any)
 	if !ok || len(blocks) < 2 {
@@ -156,7 +156,10 @@ func stripOfficialSystemPrefix(raw any) any {
 			cut++
 			continue
 		}
-		stripped, matched := stripOfficialDynamicBlock(text)
+		stripped, matched := stripOfficialStaticDynamicBlock(text)
+		if !matched {
+			stripped, matched = stripOfficialDynamicBlock(text)
+		}
 		if !matched {
 			stripped, matched = stripOfficialEnvironmentBlock(text)
 		}
@@ -172,6 +175,23 @@ func stripOfficialSystemPrefix(raw any) any {
 		break
 	}
 	return blocks[cut:]
+}
+
+// stripOfficialStaticDynamicBlock 按完整字节前缀识别3180/3191静态第三块及其后缀。
+// 只在首两块已确认为官方模板后调用；不按标题删除，也不使用当前版本底座代替全集。
+func stripOfficialStaticDynamicBlock(text string) (string, bool) {
+	knownOfficialTemplates()
+	longest := ""
+	for template := range officialStaticDynamicTexts {
+		if len(template) > len(longest) && strings.HasPrefix(text, template) {
+			longest = template
+		}
+	}
+	if longest == "" {
+		return "", false
+	}
+	// 仅去掉一个用于连接底座与后缀的双换行，保留后缀自身的空白。
+	return strings.TrimPrefix(text[len(longest):], "\n\n"), true
 }
 
 // stripOfficialDynamicBlock 识别旧档案 BuildFallbackSystem 生成的第三块：
