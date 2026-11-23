@@ -51,25 +51,35 @@ OpenAI Responses 无状态加密推理回放，不影响网关的 Anthropic 主�
 mkdir -p /tmp/zcode-probe && cp /opt/1panel/apps/local/zcode2api/data/accounts.db* /tmp/zcode-probe/
 
 # 2) 先用新镜像做 dry-run，确认 4.0.0 的 system 指纹
-docker run --rm -v /tmp/zcode-probe:/data:ro \
-  -e ZCODE_CLIENT_VERSION=4.0.0 ghcr.io/fujunchao/zcode2api-plus:2.14.5-go \
+docker run --rm -v /tmp/zcode-probe:/data \
+  -e TZ=Asia/Shanghai -e ZCODE_CLIENT_VERSION=4.0.0 ghcr.io/fujunchao/zcode2api-plus:2.14.5-go \
   probe --db /data/accounts.db --dry-run
 
-# 3) 真实单请求（挑选隔离账号）
-docker run --rm -v /tmp/zcode-probe:/data:ro \
-  -e ZCODE_CLIENT_VERSION=4.0.0 ghcr.io/fujunchao/zcode2api-plus:2.14.5-go \
-  probe --db /data/accounts.db --account <账号 id 或 name>
+# 3) 真实单请求（挑选隔离账号；glm-5.3 当时并发准入受限，用 flash 验证身份）
+docker run --rm -v /tmp/zcode-probe:/data \
+  -e TZ=Asia/Shanghai -e ZCODE_CLIENT_VERSION=4.0.0 ghcr.io/fujunchao/zcode2api-plus:2.14.5-go \
+  probe --db /data/accounts.db --account <账号 id 或 name> --model glm-5.3-flash
 ```
 
 判定：`http_status=200` 且无 `business_code` 通过；405 + `3012` 说明版本↔文案不匹配，停止切换；
 `3007` 换账号；其他网络/账号错误按 egress 排查，不改文案结论。
 
-**结果：待执行。**
+**结果（2026-11-23 21:12–21:15 CST，镜像 2.14.5-go，digest `sha256:05e99f18…`）：**
 
-## 5. 默认版本切换（2.14.6-go，探针通过后）
+| 步骤 | 账号 / 模型 | 结果 |
+|---|---|---|
+| dry-run | — / — | `client_version=4.0.0`、`system_profile=3.19.1`、3 块，sha16 `7779642e…` / `aac4ba4c…` / `929856d5…` 全部正确 |
+| 真实请求 | `ahxvtu` / glm-5.3 | HTTP 429、`3009 model concurrency limit exceeded`（账号/模型并发，不是版本拒绝） |
+| 真实请求 | `alevqo` / glm-5.3 | 同上 429 / 3009 |
+| 真实请求 | `arkcoh` / glm-5.3-flash | **HTTP 200**，约 3.6 s，input 1,691 / output 16，无业务错误码；system 三项 sha16 正确 |
 
-- `config.ZcodeClientVersion` 默认值改为 `4.0.0`，同步 `docker-compose.yml` 的 `ZCODE_CLIENT_VERSION`
-  默认值、README、默认版本测试（`TestDefaultClientVersionHasVerifiedPromptPair`）与相关注释。
-- 回退：`ZCODE_CLIENT_VERSION=3.19.1`（3191 档案保留），或整个镜像回退到 2.14.4-go。
+`glm-5.3` 当时的 3009 与生产日志里同类并发准入一致；换 flash 后同镜像、同账号库、同 4.0.0 身份返回 200，
+说明 4.0.0 版本号 + 3191 文案的配对被上游接受。探针只读副本库，未改生产账号状态。
 
-**状态：待探针结果。**
+## 5. 默认版本切换（2.14.6-go，已执行）
+
+- `config.ZcodeClientVersion` 默认值改为 `4.0.0`；`docker-compose.yml`、README、默认版本测试
+  （`TestDefaultClientVersionHasVerifiedPromptPair`）、`version_env_test` 与相关注释同步。
+- 回退：`ZCODE_CLIENT_VERSION=3.19.1`（3191 档案保留），或整个镜像回退到 2.14.5-go / 2.14.4-go。
+
+**状态：4.0.0 默认已随 2.14.6-go 提交；待 CI / release / 部署验收。**

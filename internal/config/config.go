@@ -623,11 +623,11 @@ var (
 	// 2026-11-23 复核 4.0.0：默认桌面条件下三块 system（35 / 1,233 / 4,564 B）、
 	// Desktop Context 1,100 B、来源头、SDK 版本、签名与随包模型目录均与 3.19.1
 	// 逐字节/逐项相同，故在 zcode_system_profile.go 里登记 4.0.0 → 3191 别名；
-	// 默认值仍留 3.19.1，待单账号真机探针通过后再切换（见
-	// docs/implementation-zcode-4.0.0-profile-20261123.md）。
-	// 回退：ZCODE_CLIENT_VERSION=3.18.2（3180 档案保留），或更旧的 3.18.0 / 3.17.2 / 3.17.1
-	// （改环境变量重启即可，无需换镜像）。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.19.1")
+	// 单账号真机探针（glm-5.3-flash，2.14.5-go 镜像）返回 200 后，默认值切到 4.0.0
+	// （见 docs/implementation-zcode-4.0.0-profile-20261123.md）。
+	// 回退：ZCODE_CLIENT_VERSION=3.19.1（3191 档案保留），或更旧的 3.18.2 / 3.18.0 /
+	// 3.17.2 / 3.17.1（改环境变量重启即可，无需换镜像）。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "4.0.0")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
@@ -650,7 +650,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.14.5-go"
+	AppVersion = "2.14.6-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

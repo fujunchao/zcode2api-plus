@@ -16,9 +16,9 @@ func TestClientVersionEnvironmentOverrides(t *testing.T) {
 	for _, tc := range []struct {
 		name, version, userAgent, wantVersion, wantUserAgent string
 	}{
-		{"defaults", "", "", "3.19.1", "ZCode/3.19.1"},
+		{"defaults", "", "", "4.0.0", "ZCode/4.0.0"},
 		{"version_override", " 3.14.5 ", "", "3.14.5", "ZCode/3.14.5"},
-		{"user_agent_override", "", "synthetic-custom-ua", "3.19.1", "synthetic-custom-ua"},
+		{"user_agent_override", "", "synthetic-custom-ua", "4.0.0", "synthetic-custom-ua"},
 		{"both_overrides", "3.14.5", "synthetic-custom-ua", "3.14.5", "synthetic-custom-ua"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
