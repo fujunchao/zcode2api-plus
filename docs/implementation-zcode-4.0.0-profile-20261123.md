@@ -82,4 +82,18 @@ docker run --rm -v /tmp/zcode-probe:/data \
   （`TestDefaultClientVersionHasVerifiedPromptPair`）、`version_env_test` 与相关注释同步。
 - 回退：`ZCODE_CLIENT_VERSION=3.19.1`（3191 档案保留），或整个镜像回退到 2.14.5-go / 2.14.4-go。
 
-**状态：4.0.0 默认已随 2.14.6-go 提交；待 CI / release / 部署验收。**
+**状态：已随 2.14.6-go 发布并部署到生产（2026-11-23 21:30 CST）。**
+
+部署验收：
+
+| 项目 | 结果 |
+|---|---|
+| 镜像 / 容器 | `ghcr.io/fujunchao/zcode2api-plus:2.14.6-go`，healthy，restarts=0 |
+| `/meta` | `{"version":"2.14.6-go"}` |
+| 容器内 dry-run | `client_version=4.0.0`、`system_profile=3.19.1`、3 块、三项 sha16 正确 |
+| 容器内真实探针 | 账号 `arkcoh` / `glm-5.3-flash`，**HTTP 200**，约 3.9 s，input 1,691 / output 16 |
+| 部署后 5 分钟日志 | 3012 / 405 / unusual activity 0，领取/额度错误 0（期间无真实流量，需继续观察） |
+
+生产回退：在 `docker-compose.yml` 的 environment 增加 `ZCODE_CLIENT_VERSION: "3.19.1"` 后
+`docker compose up -d`（无需换镜像）；整镜像回退用 `docker-compose.yml.bak_pre_2146_<时间戳>`
+把 image 改回 `2.14.4-go`。
