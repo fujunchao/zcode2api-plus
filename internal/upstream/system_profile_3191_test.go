@@ -1,6 +1,9 @@
 package upstream
 
 import (
+	"encoding/json"
+	"maps"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -181,6 +184,10 @@ func Test3191FallbackStripsKnownTemplates(t *testing.T) {
 	newDynamic := blockText(t, newBlocks, 2)
 
 	custom := map[string]any{"type": "text", "text": "调用者自定义指令"}
+	oldWithSuffix := maps.Clone(oldBlocks[2].(map[string]any))
+	oldWithSuffix["text"] = oldDynamic + "\n\n调用者自定义指令"
+	newWithSuffix := maps.Clone(newBlocks[2].(map[string]any))
+	newWithSuffix["text"] = newDynamic + "\n\n调用者自定义指令"
 	cases := []struct {
 		name       string
 		system     []any
@@ -188,8 +195,10 @@ func Test3191FallbackStripsKnownTemplates(t *testing.T) {
 		forbidden  []string
 	}{
 		{"3182 完整三块", []any{oldBlocks[0], oldBlocks[1], oldBlocks[2]}, false, []string{oldDynamic, oldIdentity, "# Environment"}},
-		{"3182 三块+自定义后缀", []any{oldBlocks[0], oldBlocks[1], oldBlocks[2], custom}, true, []string{oldDynamic, oldIdentity}},
+		{"3182 三块+独立自定义块", []any{oldBlocks[0], oldBlocks[1], oldBlocks[2], custom}, true, []string{oldDynamic, oldIdentity}},
+		{"3182 第三块内自定义后缀", []any{oldBlocks[0], oldBlocks[1], oldWithSuffix}, true, []string{oldDynamic, oldIdentity}},
 		{"3191 完整三块", []any{newBlocks[0], newBlocks[1], newBlocks[2]}, false, []string{"# Environment"}},
+		{"3191 第三块内自定义后缀", []any{newBlocks[0], newBlocks[1], newWithSuffix}, true, []string{oldIdentity, "# Environment"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -204,11 +213,8 @@ func Test3191FallbackStripsKnownTemplates(t *testing.T) {
 				}
 			}
 			if tc.wantCustom {
-				if !strings.HasSuffix(dynamic, "\n\n调用者自定义指令") {
-					t.Fatalf("调用者自定义后缀应保留: %q", dynamic[max(0, len(dynamic)-80):])
-				}
-				if !strings.HasPrefix(dynamic, newDynamic) {
-					t.Fatal("自定义后缀必须追加在 3191 默认底座之后")
+				if dynamic != newDynamic+"\n\n调用者自定义指令" {
+					t.Fatalf("回退应只保留新版底座和自定义后缀，实际 %d B", len(dynamic))
 				}
 				return
 			}
@@ -217,6 +223,88 @@ func Test3191FallbackStripsKnownTemplates(t *testing.T) {
 			}
 			if dynamic != newDynamic {
 				t.Fatalf("纯官方模板回退后应与 3191 默认第三块一致，实际 %d B", len(dynamic))
+			}
+		})
+	}
+}
+
+// TestFallbackStripsStaticDynamicSuffixAcrossProfiles 静态底座的块内后缀在新旧档案
+// 双向切换时都应保留，独立块的顺序、后缀空白和调用者对象不得被改写。
+func TestFallbackStripsStaticDynamicSuffixAcrossProfiles(t *testing.T) {
+	const suffix = "\n# Context management\n调用者自定义指令\n\n"
+	const standalone = "# Memory, notes and feedback\n独立追加指令"
+	versions := []string{"3.18.0", "3.18.2", "3.19.1"}
+	for _, sourceVersion := range versions {
+		for _, targetVersion := range versions {
+			t.Run(sourceVersion+"->"+targetVersion, func(t *testing.T) {
+				withSystemVersion(t, sourceVersion)
+				caller := ZcodeSystemBlocks()
+				third := caller[2].(map[string]any)
+				third["text"] = blockText(t, caller, 2) + "\n\n" + suffix
+				third["caller_metadata"] = "原始块不能被修改"
+				caller = append(caller, map[string]any{"type": "text", "text": standalone})
+				before, err := json.Marshal(caller)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				withSystemVersion(t, targetVersion)
+				base := blockText(t, ZcodeSystemBlocks(), 2)
+				blocks := BuildFallbackSystem(map[string]any{"system": caller}, config.ZcodeClientProfile())
+				if len(blocks) != 3 {
+					t.Fatalf("静态档案回退应保持三块，实际 %d", len(blocks))
+				}
+				if got, want := blockText(t, blocks, 2), base+"\n\n"+suffix+"\n\n"+standalone; got != want {
+					t.Fatalf("底座、块内后缀或独立块不符：实际 %d B，期望 %d B", len(got), len(want))
+				}
+				for i, raw := range blocks {
+					block := raw.(map[string]any)
+					if i == 0 {
+						if _, exists := block["cache_control"]; exists {
+							t.Fatal("回退的首块不得带缓存标记")
+						}
+						continue
+					}
+					cache, _ := block["cache_control"].(map[string]any)
+					if cache["type"] != "ephemeral" {
+						t.Fatalf("第 %d 块的缓存布局被改变", i)
+					}
+				}
+				after, err := json.Marshal(caller)
+				if err != nil || string(after) != string(before) {
+					t.Fatal("回退不得修改调用者持有的原始块")
+				}
+				repeated := BuildFallbackSystem(map[string]any{"system": blocks}, config.ZcodeClientProfile())
+				if !reflect.DeepEqual(repeated, blocks) {
+					t.Fatal("重复回退不应叠加底座或改变后缀")
+				}
+			})
+		}
+	}
+}
+
+// TestStripOfficialStaticDynamicPrefixKeepsCallerText 仅有同名标题或首两块非官方时，
+// 不能把调用者文本误判为官方底座后删除。
+func TestStripOfficialStaticDynamicPrefixKeepsCallerText(t *testing.T) {
+	withSystemVersion(t, "3.18.2")
+	blocks := ZcodeSystemBlocks()
+	withSuffix := maps.Clone(blocks[2].(map[string]any))
+	withSuffix["text"] = blockText(t, blocks, 2) + "\n\n调用者自定义指令"
+	custom := map[string]any{"type": "text", "text": "# Context management\n调用者规则\n\n# Finishing work\n调用者收尾规则"}
+	foreignPrefix := map[string]any{"type": "text", "text": "第三方前缀"}
+	foreignIdentity := map[string]any{"type": "text", "text": "第三方身份"}
+	for _, tc := range []struct {
+		name   string
+		system []any
+		want   []any
+	}{
+		{"同名标题", []any{blocks[0], blocks[1], custom}, []any{custom}},
+		{"首块非官方", []any{foreignPrefix, blocks[1], withSuffix}, []any{foreignPrefix, blocks[1], withSuffix}},
+		{"身份段非官方", []any{blocks[0], foreignIdentity, withSuffix}, []any{blocks[0], foreignIdentity, withSuffix}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripOfficialSystemPrefix(tc.system); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("不得按标题或未经确认的身份删除调用者文本: %#v", got)
 			}
 		})
 	}
