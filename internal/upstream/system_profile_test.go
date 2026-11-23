@@ -64,6 +64,14 @@ func TestZcodeSystemProfileFollowsClientVersion(t *testing.T) {
 			"You are an agent working with the user toward their goals",
 			1233, "aac4ba4cc7b555b3",
 		},
+		{
+			// 3.19.1（2026-11-22 逆向核验）：首两块与 Desktop Context 不变，但 block2 由
+			// 1,595 B 增至 4,564 B，必须走独立档案；若被别名到 3180，本行档案断言变红。
+			"3.19.1", "3.19.1",
+			"You are ZCode, an interactive agent",
+			"You are an agent working with the user toward their goals",
+			1233, "aac4ba4cc7b555b3",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.version, func(t *testing.T) {

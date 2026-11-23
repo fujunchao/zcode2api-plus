@@ -35,6 +35,14 @@ var zcodeSystem3171JSON []byte
 //go:embed zcode_system_3180.json
 var zcodeSystem3180JSON []byte
 
+// 3.19.1 的官方文案：block0 / 身份段 / Desktop Context 与 3.18.0 逐字节相同，
+// 但 block2 由 1,595 B 增至 4,564 B（新增 "# Finishing work" 与
+// "# Memory, notes and feedback"）。档案必须与 ZCODE_CLIENT_VERSION 成对选择，
+// 详见 docs/plan-zcode-3.19.1-upgrade-20261123.md。
+//
+//go:embed zcode_system_3191.json
+var zcodeSystem3191JSON []byte
+
 type zcodeDynamicSections struct {
 	BeforeEnvironment string `json:"beforeEnvironment"`
 	AfterEnvironment  string `json:"afterEnvironment"`
@@ -57,9 +65,11 @@ var (
 	zcodeDesktopContextText string
 )
 
-// zcodeProfileSource 按档案取内嵌文案：3.18.0 / 3.17.1 走独立档案，其余沿用 legacy。
+// zcodeProfileSource 按档案取内嵌文案：3.19.1 / 3.18.0 / 3.17.1 走独立档案，其余沿用 legacy。
 func zcodeProfileSource(profile config.ZcodeSystemProfile) []byte {
 	switch profile {
+	case config.ZcodeSystemProfile3191:
+		return zcodeSystem3191JSON
 	case config.ZcodeSystemProfile3180:
 		return zcodeSystem3180JSON
 	case config.ZcodeSystemProfile3171:
@@ -123,7 +133,7 @@ func knownOfficialTemplates() (prefixes, identities, blocks map[string]bool) {
 		prefixes = map[string]bool{}
 		identities = map[string]bool{}
 		blocks = map[string]bool{}
-		for _, source := range [][]byte{zcodeSystemJSON, zcodeSystem3171JSON, zcodeSystem3180JSON} {
+		for _, source := range [][]byte{zcodeSystemJSON, zcodeSystem3171JSON, zcodeSystem3180JSON, zcodeSystem3191JSON} {
 			var parsed zcodeSystemFile
 			if err := json.Unmarshal(source, &parsed); err != nil {
 				continue

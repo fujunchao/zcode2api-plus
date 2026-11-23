@@ -53,11 +53,11 @@ ZCode 3.14.4 起，网关识别上游 `captcha.skip_model_request`：明确为 `
 同步、异步及 OpenAI 兼容模型请求均跳过验证码，不依赖浏览器或人工回填；
 **套餐领取仍保留验证码**，因此自动领取场景不要关闭浏览器求解开关。
 该策略使用验证码配置缓存（默认 1 小时，失败保留 last-good），字段缺失或配置获取失败时保留原验证要求。
-默认客户端版本为 `3.18.2`（2026-11-13 逆向核验：3.18.2 的三块 system 与 Desktop Context 与 3.18.0 **逐字节相同**——block0 35 B / sha16 `7779642ea44a4696`、身份段 1233 B / `aac4ba4cc7b555b3`、dynamic 1595 B / `26a2daa8c8381086`、Desktop Context 1100 B / `39a1e86c93452c01`；来源头、SSE/重试常量、模型/计费/领取端点、UA 组成与官方模型目录亦未变，故两版共用 3180 档案。回退设 `ZCODE_CLIENT_VERSION=3.18.0`，旧档案与 UA 会一并回退；仍可退到 3.17.2）；
+默认客户端版本为 `3.19.1`（2026-11-22 逆向核验：block0 35 B / sha16 `7779642ea44a4696`、身份段 1233 B / `aac4ba4cc7b555b3`、Desktop Context 1100 B / `39a1e86c93452c01` 与 3.18.2 **逐字节相同**，但 dynamic 块由 1595 B 增至 **4564 B** / sha16 `929856d5f112c283`——新增 `# Finishing work` 与 `# Memory, notes and feedback`，`<total_tokens>` 改为默认关闭的开关；模型 API 路径、请求头、body 字段、能力头、UA 组成与两份官方模型目录均未变，故新增独立 3191 档案，**不能**把 3.19.1 别名到 3180。回退设 `ZCODE_CLIENT_VERSION=3.18.2`，旧档案与 UA 会一并回退；仍可退到 3.18.0 / 3.17.2）；
 若部署显式设置了 `ZCODE_CLIENT_VERSION` 或 `UPSTREAM_USER_AGENT`，需同步检查这些覆盖值。
 版本特定的内部状态与回滚要求见下方发布说明。
 升级不改变任何接口、配置项与数据结构：用户无需操作；想固定或回退时设置
-`ZCODE_CLIENT_VERSION`（根目录 `docker-compose.yml` 已按 `.env` 同名值透传；未设置时使用当前已核验的 `3.18.2`）。
+`ZCODE_CLIENT_VERSION`（根目录 `docker-compose.yml` 已按 `.env` 同名值透传；未设置时使用当前已核验的 `3.19.1`）。
 
 `v2.12.0-go` **验证码浏览器生命周期治理**：服务器上发现容器内 Chromium 常驻 3 天，
 renderer RSS 从 174MB 线性涨到 1509MB、CPU 从 3.4% 涨到 30.7%，而同期真实验证码消费为 **0**。

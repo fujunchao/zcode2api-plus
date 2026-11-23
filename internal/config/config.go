@@ -615,8 +615,14 @@ var (
 	// 2026-11-13 同步 3.18.2：三块 system（35 / 1,233 / 1,595 B）与 Desktop Context
 	// 1,100 B 均与 3.18.0 逐字节相同，来源头、SSE/重试常量、模型目录亦未变，故复用
 	// 3180 档案（映射见 zcode_system_profile.go），单账号真机探针两条请求均 200。
-	// 回退：ZCODE_CLIENT_VERSION=3.18.0，或更旧的 3.17.2 / 3.17.1（改环境变量重启即可，无需换镜像）。
-	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.18.2")
+	// 2026-11-23 同步 3.19.1：block0 35 B / 身份段 1,233 B / Desktop Context 1,100 B
+	// 与 3.18.2 逐字节相同，但 block2 由 1,595 B 增至 4,564 B（新增 "# Finishing work"
+	// 与 "# Memory, notes and feedback"，<total_tokens> 改为默认关闭的开关），故新增
+	// 独立 3191 档案（映射见 zcode_system_profile.go）。协议层零变化：模型 API 路径、
+	// 请求头、body 字段、能力头与两份官方模型目录均与 3.18.2 一致。
+	// 回退：ZCODE_CLIENT_VERSION=3.18.2（3180 档案保留），或更旧的 3.18.0 / 3.17.2 / 3.17.1
+	// （改环境变量重启即可，无需换镜像）。
+	ZcodeClientVersion = env("ZCODE_CLIENT_VERSION", "3.19.1")
 	// ZcodeClientPlatform 复合平台串（`${裸平台}-${架构}`），供请求头 X-Platform 与
 	// 后台展示使用。默认值由 profile.go 的裸平台 / 架构派生，避免两处各写一份而漂移；
 	// ZCODE_CLIENT_PLATFORM 仍可单独覆盖（旧部署兼容）。
@@ -639,7 +645,7 @@ var (
 	UserAgent = env("UPSTREAM_USER_AGENT", "ZCode/"+ZcodeClientVersion)
 
 	// AppVersion 供 /meta 与后台展示；-go 后缀标识运行时版本。
-	AppVersion = "2.14.2-go"
+	AppVersion = "2.14.3-go"
 )
 
 // RiskSilentWindow 风控静默窗口的 Duration 形态。

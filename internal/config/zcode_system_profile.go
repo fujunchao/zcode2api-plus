@@ -29,6 +29,18 @@ const (
 	// **不新增档案常量**：新造常量还得同步改 UsesUserReminderEnvironment 与
 	// zcodeProfileSource 两处，等于人为制造分叉。
 	ZcodeSystemProfile3180 ZcodeSystemProfile = "3.18.0"
+	// ZcodeSystemProfile3191 3.19.1 的文案（2026-11-22 逆向核验）：block0 35 B /
+	// sha16 7779642e…、身份段 1,233 B / sha16 aac4ba4c…、Desktop Context 1,100 B /
+	// sha16 39a1e86c… 均与 3.18.0 / 3.18.2 逐字节相同，但 **block2 由 1,595 B 增至
+	// 4,564 B / sha16 929856d5…**：新增 "# Finishing work"（1,304 B）与
+	// "# Memory, notes and feedback"（1,712 B）两段，`<total_tokens>` 改为
+	// totalTokensReminderEnabled 开关、默认关闭（显式开启时第三块 4,615 B /
+	// sha16 36458a63…）。
+	//
+	// 第三块不同，所以**不能**给 3180 档案加 3.19.1 别名：那会让网关自建的 system
+	// 少掉两段新指令，与官方 3.19.1 的字节也不一致。首两块相同只意味着
+	// 「3.19.1 客户端带着完整上下文进来时仍可原样保留」，不代表档案可复用。
+	ZcodeSystemProfile3191 ZcodeSystemProfile = "3.19.1"
 )
 
 // ZcodeSystemProfileFor 返回指定客户端版本应使用的文案档案。
@@ -48,6 +60,8 @@ func ZcodeSystemProfileFor(version string) ZcodeSystemProfile {
 // 包括仍走 legacy 的 3.15.3 / 3.16.2 / 3.16.3——它们的档案同样经过核验。
 func ZcodeSystemProfileForExact(version string) (ZcodeSystemProfile, bool) {
 	switch strings.TrimSpace(version) {
+	case "3.19.1":
+		return ZcodeSystemProfile3191, true
 	case "3.18.0", "3.18.2":
 		return ZcodeSystemProfile3180, true
 	case "3.17.1", "3.17.2":
@@ -62,10 +76,10 @@ func ZcodeSystemProfileForExact(version string) (ZcodeSystemProfile, bool) {
 // 普通 role=user 的 <system-reminder>（3.18.0 起），而不是拼进 system 的 dynamic 块。
 //
 // 这是一个档案级语义，不是全局开关：3.17.x 及更早档案仍按旧路径把 Environment
-// 拼进 system；只有 3.18.0 需要新的用户提醒装配。调用方必须用当前档案判断，
+// 拼进 system；3.18.0 / 3.19.1 需要新的用户提醒装配。调用方必须用当前档案判断，
 // 不要用版本号字符串或全局配置另写一份。
 func (p ZcodeSystemProfile) UsesUserReminderEnvironment() bool {
-	return p == ZcodeSystemProfile3180
+	return p == ZcodeSystemProfile3180 || p == ZcodeSystemProfile3191
 }
 
 // ZcodeSystemProfileKey 以当前伪装的客户端版本选择文案档案。

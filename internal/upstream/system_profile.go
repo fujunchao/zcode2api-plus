@@ -22,8 +22,9 @@ type ZcodeSystemProfileSummary struct {
 	FirstSHA16    string `json:"first_sha16"`
 	IdentityChars int    `json:"identity_chars"`
 	IdentitySHA16 string `json:"identity_sha16"`
-	// DynamicChars / DynamicSHA16 第三块（3.18.0 的 Dynamic Behavior +
-	// Context Management + Total Tokens）的指纹；旧档案默认只有两块时为空。
+	// DynamicChars / DynamicSHA16 第三块的指纹：3.18.0 是 Dynamic Behavior +
+	// Context Management + Total Tokens（1,595 B），3.19.1 追加 Finishing Work 与
+	// Memory Notes（4,564 B）；旧档案默认只有两块时为空。
 	DynamicChars int    `json:"dynamic_chars,omitempty"`
 	DynamicSHA16 string `json:"dynamic_sha16,omitempty"`
 }
