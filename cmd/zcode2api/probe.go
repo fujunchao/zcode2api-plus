@@ -45,6 +45,9 @@ type probeOptions struct {
 	MaxTokens  int
 	Timeout    time.Duration
 	SystemFile string
+	// Effort 非空时给请求体加 output_config.effort（low/high/max），
+	// 用于验证 GLM-5.4 等模型的推理档位；留空则保持默认。
+	Effort string
 }
 
 type probeCandidate struct {
@@ -92,6 +95,7 @@ func runProbe(args []string) int {
 		timeout    = fs.Duration("timeout", 90*time.Second, "单请求超时")
 		dryRun     = fs.Bool("dry-run", false, "只打印将要发送的指纹，不发请求")
 		systemFile = fs.String("system-file", "", "用自定义 JSON（{blocks:[…]}）覆盖 system，用于逐字节还原实验")
+		effort     = fs.String("effort", "", "output_config.effort（low/high/max），留空不发送")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -138,7 +142,7 @@ func runProbe(args []string) int {
 	}
 	report := probeSend(picked, summary, probeOptions{
 		Model: *modelName, Message: *message, MaxTokens: *maxTokens, Timeout: *timeout,
-		SystemFile: strings.TrimSpace(*systemFile),
+		SystemFile: strings.TrimSpace(*systemFile), Effort: strings.TrimSpace(*effort),
 	})
 	exitCode := 1
 	if report.OK {
@@ -337,6 +341,11 @@ func probeSend(picked *probeCandidate, summary upstream.ZcodeSystemProfileSummar
 			}},
 		},
 	}, true)
+	if opt.Effort != "" {
+		// 与官方客户端一致：推理档位走 Anthropic 的 output_config.effort。
+		// 只用于探针实验，不改变线上请求形态。
+		body["output_config"] = map[string]any{"effort": opt.Effort}
+	}
 	if opt.SystemFile != "" {
 		// 自定义文案：整块替换 system，其余（metadata、头、端点）与线上一致，
 		// 这样一次实验只改一个变量。

@@ -490,7 +490,12 @@ func (s *Service) handleBillingResponseForRequest(ctx context.Context, acc *mode
 		if !ok {
 			continue
 		}
-		name := firstNonEmptyString(balance["show_name"], balance["model"], "model")
+		// 模型身份优先取 capabilities 的 model: 项（2026-11-23 起上游的新形态），
+		// 见 balanceModelIDs；多模型共享同一额度桶时各记一列，避免漏掉模型身份。
+		names := balanceModelIDs(balance)
+		if len(names) == 0 {
+			names = []string{"model"}
+		}
 		// 与写入端同为 string：上游回非字符串时查不到对应项，退化为无周期信息，
 		// 而不是拿容器类型去查 map 触发 panic。
 		entID, _ := balance["entitlement_id"].(string)
@@ -501,24 +506,26 @@ func (s *Service) handleBillingResponseForRequest(ctx context.Context, acc *mode
 			planName = model.PlanText(plan)
 			planIsTrial = model.IsTrialPlan(plan)
 		}
-		key := name
-		if planName != "" {
-			key = name + " · " + planName
+		for _, name := range names {
+			key := name
+			if planName != "" {
+				key = name + " · " + planName
+			}
+			entry := map[string]any{
+				"total":         balance["total_units"],
+				"used":          balance["used_units"],
+				"remaining":     balance["remaining_units"],
+				"available":     balance["available_units"],
+				"period":        mapValueOrNil(ent, "period"),
+				"period_start":  balance["period_start"],
+				"period_end":    balance["period_end"],
+				"expires_at":    balance["expires_at"],
+				"model":         name,
+				"plan_name":     planName,
+				"plan_is_trial": planIsTrial,
+			}
+			quotaMap[key] = mergeQuotaEntry(quotaMap[key], entry)
 		}
-		entry := map[string]any{
-			"total":         balance["total_units"],
-			"used":          balance["used_units"],
-			"remaining":     balance["remaining_units"],
-			"available":     balance["available_units"],
-			"period":        mapValueOrNil(ent, "period"),
-			"period_start":  balance["period_start"],
-			"period_end":    balance["period_end"],
-			"expires_at":    balance["expires_at"],
-			"model":         name,
-			"plan_name":     planName,
-			"plan_is_trial": planIsTrial,
-		}
-		quotaMap[key] = mergeQuotaEntry(quotaMap[key], entry)
 	}
 
 	// 任一列 remaining 缺失时跳过该列；全部已列 remaining <= 0 才判耗尽
@@ -864,6 +871,46 @@ func (s *Service) Close() {
 func isZeroNumber(v any) bool {
 	n, ok := asNumber(v)
 	return ok && n == 0
+}
+
+// balanceModelIDs 解析额度条目对应的模型 ID 列表。
+//
+// 2026-11-23 起上游把模型身份放进 capabilities（如 ["model:glm-5.3"]），
+// show_name 可能为空且不再提供 model 字段。旧解析只读 show_name/model，会把
+// 5.3 额度落成通用名 "model"：后台汇总查不到该模型，ModelAvailability 还会
+// 判成 absent，把整池账号排除出 5.3 调度。
+//
+// 顺序与官方 resolveZaiStartPlanBalanceModelIds 对齐：capabilities 的 model:
+// 项优先；没有合法项时回落 show_name / model；全空返回 nil，由调用方使用兼容
+// 占位名。多个 model: 项表示额度桶由多个模型共享，各自记一列。
+func balanceModelIDs(balance map[string]any) []string {
+	const prefix = "model:"
+	caps, _ := balance["capabilities"].([]any)
+	ids := make([]string, 0, len(caps))
+	seen := map[string]bool{}
+	for _, raw := range caps {
+		s, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		s = strings.TrimSpace(s)
+		if len(s) <= len(prefix) || !strings.EqualFold(s[:len(prefix)], prefix) {
+			continue
+		}
+		id := strings.TrimSpace(s[len(prefix):])
+		if id == "" || seen[strings.ToLower(id)] {
+			continue
+		}
+		seen[strings.ToLower(id)] = true
+		ids = append(ids, id)
+	}
+	if len(ids) > 0 {
+		return ids
+	}
+	if name := firstNonEmptyString(balance["show_name"], balance["model"]); name != "" {
+		return []string{name}
+	}
+	return nil
 }
 
 // firstNonEmptyString 依次取第一个非空字符串项（对齐 or 链），全空时取末位兜底。

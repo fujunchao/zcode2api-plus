@@ -8,8 +8,9 @@ import (
 	"zcode2api/internal/model"
 )
 
-// 仅用于本项目当前开放的 GLM-5.3 / GLM-5.3-Flash，不是通用模型能力白名单。
-// 来源：https://docs.z.ai/guides/capabilities/thinking
+// 仅用于本项目当前开放的 GLM-5.3 / GLM-5.3-Flash / GLM-5.4，不是通用模型能力白名单。
+// 来源：https://docs.z.ai/guides/capabilities/thinking；GLM-5.4 沿用 5.3 的
+// low / high / max 三档（用户确认，2026-11-23）。
 // Coding Plan 将兼容档位归一为原生 low / high / max；none 不代表关闭思考。
 var glm53EffortAliases = map[string]string{
 	"none": "low", "minimal": "low", "low": "low",
@@ -19,14 +20,14 @@ var glm53EffortAliases = map[string]string{
 
 // applyGLM53Reasoning 将模型原生推理程度写入 Anthropic 的 output_config.effort。
 // effort 不是 token 预算：不再猜测 budget_tokens，也不擅自提高 max_tokens。
-// GLM-5.3 系列强制思考；无显式配置时保留上游默认 max。
+// GLM-5.3 系列与 GLM-5.4 强制思考；无显式配置时保留上游默认 max。
 func applyGLM53Reasoning(body, out map[string]any) error {
 	maxTokens := numberOr(out["max_tokens"], 0)
 	if maxTokens <= 0 || math.IsInf(maxTokens, 0) || math.IsNaN(maxTokens) || math.Trunc(maxTokens) != maxTokens {
 		return &convertError{"max_tokens / max_completion_tokens / max_output_tokens 必须是正整数"}
 	}
 	switch model.NormalizeModelName(out["model"]) {
-	case "glm-5.3", "glm-5.3-flash":
+	case "glm-5.3", "glm-5.3-flash", "glm-5.4":
 	default:
 		return nil // 模型白名单由 HTTP 入口统一拒绝，避免将此配置套到其它模型。
 	}
@@ -38,7 +39,7 @@ func applyGLM53Reasoning(body, out map[string]any) error {
 		}
 		switch explicit["type"] {
 		case "disabled":
-			return &convertError{"GLM-5.3 / GLM-5.3-Flash 不支持关闭思考；请使用 reasoning_effort=low"}
+			return &convertError{"GLM-5.3 / GLM-5.3-Flash / GLM-5.4 不支持关闭思考；请使用 reasoning_effort=low"}
 		case "enabled":
 			if value := explicit["budget_tokens"]; value != nil {
 				budget := numberOr(value, 0)
@@ -53,7 +54,7 @@ func applyGLM53Reasoning(body, out map[string]any) error {
 			}
 			out["thinking"] = thinking
 		default:
-			return &convertError{"GLM-5.3 / GLM-5.3-Flash 的 thinking.type 仅支持 enabled"}
+			return &convertError{"GLM-5.3 / GLM-5.3-Flash / GLM-5.4 的 thinking.type 仅支持 enabled"}
 		}
 	}
 

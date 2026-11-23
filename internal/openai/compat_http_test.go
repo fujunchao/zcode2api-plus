@@ -132,7 +132,7 @@ func TestToolControlsReachUpstream(t *testing.T) {
 }
 
 func TestThinkingControlsOverHTTP(t *testing.T) {
-	for _, modelName := range []string{"GLM-5.3", "glm-5.3-flash"} {
+	for _, modelName := range []string{"GLM-5.3", "glm-5.3-flash", "GLM-5.4", "glm-5.4"} {
 		for _, api := range []string{"chat", "responses"} {
 			for _, tc := range []struct {
 				name     string

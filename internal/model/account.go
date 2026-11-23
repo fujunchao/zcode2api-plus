@@ -598,6 +598,17 @@ func (a *Account) ModelAvailability(model any) string {
 		return "unknown"
 	}
 	if len(a.Quota) > 0 {
+		// 兼容旧快照：条目模型身份未知（键/字段为占位名 "model"）时不能断言
+		// absent——上游 2026-11-23 起把模型 ID 放进 capabilities，旧解析器落成
+		// "model"，若判 absent 会把整池账号排除出请求模型（实测 5.3 全池 503）。
+		for name, entry := range a.Quota {
+			if name == "model" {
+				return "unknown"
+			}
+			if entryModel, _ := entry["model"].(string); entryModel == "model" {
+				return "unknown"
+			}
+		}
 		return "absent"
 	}
 	return "unknown"

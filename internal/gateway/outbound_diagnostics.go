@@ -23,7 +23,7 @@ type outboundSnapshot struct {
 
 func inspectOutboundBody(body map[string]any) outboundSnapshot {
 	n := model.NormalizeModelName(body["model"])
-	if n != "glm-5.3" && n != "glm-5.3-flash" {
+	if n != "glm-5.3" && n != "glm-5.3-flash" && n != "glm-5.4" {
 		n = "other"
 	}
 	thinking, _ := body["thinking"].(map[string]any)

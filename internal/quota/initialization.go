@@ -45,8 +45,10 @@ func (s *Service) ObserveInitialization(ctx context.Context, a *store.Initializa
 			unknown = true
 			continue
 		}
-		name := firstNonEmptyString(balance["model"], balance["show_name"])
-		if strings.TrimSpace(name) == "" {
+		// 与额度解析同一口径：先看 capabilities 的 model: 项，再看 show_name/model。
+		// 旧实现只看 model/show_name，新回包会把所有余额都判成 unknown。
+		ids := balanceModelIDs(balance)
+		if len(ids) == 0 || strings.TrimSpace(ids[0]) == "" {
 			unknown = true
 			continue
 		}

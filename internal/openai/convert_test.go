@@ -312,6 +312,25 @@ func TestNativeEffortNotConvertedToBudget(t *testing.T) {
 	}
 }
 
+// GLM-5.4 沿用 5.3 的 low/high/max 三档（用户确认，2026-11-23）。
+func TestGLM54NativeEffort(t *testing.T) {
+	for _, effort := range []string{"low", "high", "max"} {
+		out := convertInput(t, map[string]any{
+			"model": "glm-5.4", "messages": []any{}, "reasoning_effort": effort,
+		})
+		config, _ := out["output_config"].(map[string]any)
+		if config["effort"] != effort || out["thinking"] != nil {
+			t.Fatalf("GLM-5.4 应传递原生 effort %s: %v", effort, out)
+		}
+	}
+	if _, err := ConvertRequest(map[string]any{
+		"model": "glm-5.4", "messages": []any{},
+		"thinking": map[string]any{"type": "disabled"},
+	}); err == nil {
+		t.Fatal("GLM-5.4 不支持关闭思考")
+	}
+}
+
 func TestReasoningEffortUnknownValueRejected(t *testing.T) {
 	_, err := ConvertRequest(map[string]any{
 		"model": "glm-5.3-flash", "messages": []any{}, "reasoning_effort": "extreme",

@@ -355,10 +355,15 @@ func JitteredDelay(d time.Duration) time.Duration {
 // 其余写法本就会被白名单拒绝，无需维护映射。
 var ModelNameMap = map[string]string{
 	"glm-5.3": "GLM-5.3",
+	"glm-5.4": "GLM-5.4",
 }
 
 // AvailableModels 对外公布的可用模型（/v1/models 与请求白名单）。
-var AvailableModels = []string{"glm-5.3-flash", "GLM-5.3"}
+//
+// GLM-5.4 是 ZCode 4.0.0 之后由云端目录（runtime zcode-builtin revision 48）
+// 下发的标准 ID（大写）。上游同时接受小写写法，但统一映射到官方 ID 可避免
+// 请求头/正文/日志出现大小写混用。
+var AvailableModels = []string{"glm-5.3-flash", "GLM-5.3", "GLM-5.4"}
 
 var allowedModels = func() map[string]bool {
 	set := map[string]bool{}

@@ -1298,11 +1298,20 @@ func TestModelsEndpoint(t *testing.T) {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Object != "list" || len(payload.Data) != 2 {
+	if payload.Object != "list" || len(payload.Data) != 3 {
 		t.Fatalf("模型清单不符: %s", raw)
 	}
 	if payload.Data[0].Type != "model" || payload.Data[0].DisplayName != payload.Data[0].ID {
 		t.Fatalf("模型条目不符: %+v", payload.Data[0])
+	}
+	found := false
+	for _, item := range payload.Data {
+		if item.ID == "GLM-5.4" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("模型清单应包含 GLM-5.4: %s", raw)
 	}
 }
 

@@ -367,15 +367,18 @@ func TestIsUpstreamOverload(t *testing.T) {
 }
 
 func TestModelAllowed(t *testing.T) {
-	for _, m := range []any{"glm-5.3-flash", "GLM-5.3", " glm-5.3 "} {
+	for _, m := range []any{"glm-5.3-flash", "GLM-5.3", " glm-5.3 ", "glm-5.4", "GLM-5.4", " glm-5.4 "} {
 		if !ModelAllowed(m) {
 			t.Fatalf("%v 应在开放清单内", m)
 		}
 	}
 	// GLM-5_3 正規化後為 glm-5-3，不还原点号，与 Python 版同语义：不在清单内
-	for _, m := range []any{"glm-5.2", "glm-5-turbo", "GLM-5_3", "", "gpt-4o"} {
+	for _, m := range []any{"glm-5.2", "glm-5-turbo", "GLM-5_3", "glm-5.5", "", "gpt-4o"} {
 		if ModelAllowed(m) {
 			t.Fatalf("%v 不应在开放清单内", m)
 		}
+	}
+	if ModelNameMap["glm-5.4"] != "GLM-5.4" {
+		t.Fatalf("glm-5.4 应映射到官方大写 ID: %v", ModelNameMap)
 	}
 }

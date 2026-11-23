@@ -564,6 +564,14 @@ func TestModelAvailability(t *testing.T) {
 	if got := empty.ModelAvailability("GLM-5.3"); got != "unknown" {
 		t.Fatalf("无快照应 unknown: %s", got)
 	}
+	// 旧快照的模型身份未知（占位名 "model"）不能判 absent：上游 2026-11-23 起
+	// 把模型 ID 放进 capabilities，旧解析落成 "model"，判 absent 会把整池排除。
+	legacy := &Account{Quota: map[string]map[string]any{
+		"model": {"model": "model", "remaining": float64(100)},
+	}}
+	if got := legacy.ModelAvailability("GLM-5.3"); got != "unknown" {
+		t.Fatalf("旧快照未知模型桶应 unknown: %s", got)
+	}
 }
 
 func TestSyncExhaustedModels(t *testing.T) {
