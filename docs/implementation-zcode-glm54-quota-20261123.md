@@ -43,12 +43,24 @@
 - `internal/openai/*_test.go`：GLM-5.4 的 low/high/max 与禁止关闭思考；Chat/Responses
   的思考档位循环加入 5.4。
 
-## 4. 部署后验证（待填）
+## 4. 部署后验证（2026-11-24 00:00 CST）
 
-1. 容器 `2.15.0-go` healthy、`/meta` 版本正确。
-2. 后台额度刷新后，5.3 汇总从 0 恢复；额度键出现 `GLM-5.3`。
-3. `probe --model GLM-5.4 --effort low|high|max` 三条均 200。
-4. 四入口（Messages / Chat / Responses / Async）对 GLM-5.4 放行。
+1. 容器 `2.15.0-go`（digest `sha256:eda6d125…`）healthy、restarts=0，`/meta` 返回 2.15.0-go。
+2. 部署后额度刷新完成：80 个账号中 79 个已重建为 `glm-5.3` / `glm-5.3-flash` / `glm-5.4`
+   三个额度键（1 个账号仍是旧快照，等下一轮刷新）；5.3 额度不再丢失。
+3. `probe --model glm-5.3-flash --effort high` 返回 **200**，证明 `--effort` 与
+   `output_config.effort` 链路正常。
+4. **GLM-5.4 三档测试暂被平台过载挡住**：00:00–00:06 用 4 个不同账号请求
+   `GLM-5.4`（含 low/high），均返回 `529/1305 该模型当前访问量过大`；22:55 曾返回 200。
+   待平台降载后重测 low / high / max。
+5. 部署后 5 分钟日志：3012 / 405 / unusual activity / no_available_account 均为 0。
+
+## 4.1 观察：GLM-5.3 权益已到期
+
+- 5.3 余额的 `period_end` 为 2026-11-23 23:59:59；00:04 用 5.3 探针请求返回
+  HTTP 200 + `code=1005 exceed quota limit`，套餐 entitlements 已只列 5.4 与 Flash。
+- 网关当前把 5.3 记为 available（余额快照仍为 3,000,000），但上游实际已不给额度。
+  后续可评估把 1005 纳入额度耗尽族，或按上游权益下线 5.3；本轮未改。
 
 ## 5. 回退
 
