@@ -119,6 +119,23 @@ C 的边界刻意选保守：日额度（周期跨度 24h）即使快照过期�
    - 管理端「模型额度」不再出现空卡误导文案；
    - `GLM-5.4` / `glm-5.3-flash` 正常 200，思考档位与既有行为一致。
 
+## 5.1 发布与部署结果（2026-11-24）
+
+| 项 | 结果 |
+|---|---|
+| 分支 CI | run `45326377243`（`codex/zcode-2.15.1-glm53-retire`，提交 `7329962`）全 job 通过 |
+| 发布 | tag `v2.15.1-go` → release run `45326929686` 全绿；附件 5 个（linux/darwin × amd64/arm64、windows amd64）；镜像 `ghcr.io/fujunchao/zcode2api-plus:2.15.1-go` 与 `latest` |
+| 部署 | 服务器 `154.12.85.101` 的 compose 镜像标签 2.15.0-go → 2.15.1-go，备份 `docker-compose.yml.bak_pre2151_*`；容器 `zcode2api` healthy、restarts=0、`/meta` 返回 `2.15.1-go` |
+| `GET /v1/models` | 仅 `glm-5.3-flash`、`GLM-5.4` |
+| `POST /v1/messages model=GLM-5.3` | **400** `model_not_available`，35 ms，`upstream_attempts=0`；message 含「可能已下架」与替代模型，details `unavailable_accounts=80`、`snapshot_accounts=80`、`suggested_models=[glm-5.3-flash,GLM-5.4]` |
+| `POST /v1/messages model=GLM-5.4` | **200**，3.9 s，正常返回 |
+| 管理端 `/admin/api/status` | `model_quotas` 三项均带 `snapshot_accounts:80`；GLM-5.3 `accounts=0`（前端据此显示「已下架」而非「请刷新」） |
+| 内嵌前端 | `/assets/index-BW77Je-S.js` 含新文案；`new-api` 容器内访问 `http://zcode2api:3000/meta` 正常 |
+
+部署期间一次 `docker compose up -d` 因命令超时被打断（旧容器已移除、新容器未创建，约 1 分钟不可用），
+随即用后台任务重跑 `docker compose up -d` 并 `--force-recreate` 恢复，容器名与网络别名均回到 `zcode2api`，
+`new-api` 到网关的链路不受影响。
+
 ## 6. 回滚
 
 - 若官方重新给 Start Plan 开放 5.3 权益：额度刷新后账号重新持有该模型条目，
