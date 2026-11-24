@@ -126,3 +126,74 @@ func TestSoonestNonRefreshingExpiry(t *testing.T) {
 		}
 	})
 }
+
+// 权益口径的「已到期」：只有「余额不会自己刷新、且已经过期」的额度列才算作废。
+// 日额度次日刷新，过期只说明快照旧了；任何一列还活着都不能判作废（宁可漏判，也不要
+// 把还能用的模型从对外清单里摘掉）。
+func TestModelEntitlementExpired(t *testing.T) {
+	now := time.Unix(1_760_000_000, 0)
+	day := 24 * time.Hour
+	past := float64(now.Add(-2 * day).Unix())
+	longAgo := float64(now.Add(-30 * day).Unix())
+	future := float64(now.Add(2 * day).Unix())
+	// 日额度：跨度 ≈24h，次日会自己刷新。
+	dailyStart := float64(now.Add(-12 * time.Hour).Unix())
+	dailyEnd := float64(now.Add(12 * time.Hour).Unix())
+
+	build := func(entries ...map[string]any) *Account {
+		quota := map[string]map[string]any{}
+		for i, e := range entries {
+			e["model"] = "GLM-5.3"
+			quota[string(rune('a'+i))] = e
+		}
+		return &Account{Quota: quota}
+	}
+
+	for _, tc := range []struct {
+		name string
+		acc  *Account
+		want bool
+	}{
+		{"月套餐已过期", build(map[string]any{
+			"remaining": float64(100), "period_start": longAgo, "period_end": past, "expires_at": past,
+		}), true},
+		{"one_time 活动已过期", build(map[string]any{
+			"remaining": float64(100), "period": "one_time", "expires_at": past,
+		}), true},
+		{"多列全部已过期", build(
+			map[string]any{"remaining": float64(100), "period": "one_time", "expires_at": past},
+			map[string]any{"remaining": float64(50), "period_start": longAgo, "period_end": past},
+		), true},
+		{"毫秒时间戳归一后已过期", build(map[string]any{
+			"remaining": float64(100), "period": "one_time", "expires_at": past * 1000,
+		}), true},
+		{"日额度过期不算作废", build(map[string]any{
+			"remaining": float64(100), "period": "daily",
+			"period_start": dailyStart, "period_end": dailyEnd, "expires_at": dailyEnd,
+		}), false},
+		{"尚未到期", build(map[string]any{
+			"remaining": float64(100), "period_start": longAgo, "period_end": future, "expires_at": future,
+		}), false},
+		{"缺少到期信息", build(map[string]any{"remaining": float64(100)}), false},
+		{"有一列是刷新型就不算作废", build(
+			map[string]any{"remaining": float64(100), "period": "one_time", "expires_at": past},
+			map[string]any{"remaining": float64(100), "period": "daily", "period_start": dailyStart, "period_end": dailyEnd},
+		), false},
+		{"没有该模型的额度列", &Account{Quota: map[string]map[string]any{
+			"x": {"model": "GLM-5.4", "period": "one_time", "expires_at": past},
+		}}, false},
+		{"没有额度快照", &Account{}, false},
+		{"nil 账号", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.acc.ModelEntitlementExpired("GLM-5.3", now); got != tc.want {
+				t.Fatalf("判定不符（期望 %v）: %+v", tc.want, tc.acc)
+			}
+		})
+	}
+
+	// 模型名为空时无从判定。
+	if build(map[string]any{"remaining": float64(100), "period": "one_time", "expires_at": past}).ModelEntitlementExpired("", now) {
+		t.Fatal("模型名为空应返回 false")
+	}
+}

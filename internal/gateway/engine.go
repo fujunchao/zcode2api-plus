@@ -351,21 +351,24 @@ func (e *Engine) RunMessages(ctx context.Context, body map[string]any, incomingH
 	// 这里。错误体如实携带池状态分解（文案 + 结构化 details），别再让一次整池
 	// 冷却被静态文案误读成绑定问题（2026-09-20 事故）。
 	stat := e.Store.PoolStats(model.ProviderZai, modelName)
-	// 模型维度的确定性不可用：池内没有任何账号持有该模型的额度条目，而池子确实
-	// 刷新过额度（官方下架后就是这种形态）。这不是「暂时没号」，不能回 503——客户端
+	// 模型维度的确定性不可用：每个非归档账号对该模型的权益都已确定，且都是「不含」
+	// ——官方下架或配额到期后就是这种形态。这不是「暂时没号」，不能回 503：客户端
 	// 与中转层会把 5xx 当临时故障反复重试，把一次必然失败的请求放大成整池压力。
 	// 改用 400 + 可程序化判读的 type，并给出手上确有权益的替代模型。
-	// 只要还有一个账号持有该模型（哪怕正在冷却/耗尽/停用），或整池都还没刷新过额度，
-	// 都不判定：那些是「此刻没号」，仍走下面的 503 分支让客户端可以重试。
+	// 只要还有一个账号持有它（哪怕正在冷却/耗尽/停用）、或权益未知（没刷过快照 /
+	// 旧快照身份不明），都不判定：那些是「此刻没号」或「还说不准」，仍走下面的 503
+	// 分支让客户端可以重试。
 	accounts := e.Store.ListAccounts("")
-	if DeterministicModelUnavailable(accounts, modelName) {
+	now := time.Now()
+	if DeterministicModelUnavailable(accounts, modelName, now) {
+		unavailableAccounts := UnavailableAccountCount(accounts, modelName, now)
 		snapshotAccounts := SnapshotAccountCount(accounts)
-		suggested := SuggestedModels(accounts, modelName)
-		web.ReqErr(reqID, fmt.Sprintf("模型 %s 确定性不可用：%d 个已刷新额度的账号套餐均不含此模型（可能已下架或未开通）",
-			modelName, snapshotAccounts))
+		suggested := SuggestedModels(accounts, modelName, now)
+		web.ReqErr(reqID, fmt.Sprintf("模型 %s 确定性不可用：%d 个账号的套餐均不含此模型（可能已下架、未开通或已到期）",
+			modelName, unavailableAccounts))
 		return errResultWithDetails(http.StatusBadRequest, "model_not_available",
-			DeterministicUnavailableMessage(modelName, snapshotAccounts, suggested),
-			DeterministicUnavailableDetails(stat, modelName, snapshotAccounts, suggested))
+			DeterministicUnavailableMessage(modelName, unavailableAccounts, suggested),
+			DeterministicUnavailableDetails(stat, modelName, unavailableAccounts, snapshotAccounts, suggested))
 	}
 	detailText := PoolStatusText(stat)
 	if modelName != "" {

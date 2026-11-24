@@ -34,29 +34,35 @@
 
 | 标识符 | 语义 |
 |---|---|
-| `ModelEntitlement{Model,Accounts,Available}` | 支持清单里每个模型在当前账号池的权益快照：持有该模型额度条目的非归档账号数、其中额度仍可用的账号数 |
-| `ModelEntitlements(accounts)` | 按 `AvailableModels` 顺序产出上面的快照 |
-| `EntitledModels(accounts)` | 只保留至少一个账号持有权益的模型；**一个都没有时退化为完整支持清单**，避免新装部署的 `/v1/models` 为空、客户端连一个模型都配不出来 |
-| `DeterministicModelUnavailable(accounts, model)` | 确定性判定：池内**没有任何非归档账号持有该模型的额度条目**，且**至少有一个账号刷新过额度快照**（否则无从判断）。冷却/耗尽/停用的账号只要持有条目就一律不算确定性不可用——那是「此刻没号」，必须留 503 |
-| `SuggestedModels(accounts, exclude)` | 当前池内有权益的替代模型，用于错误文案 |
+| `ModelEntitlement{Model,Accounts,Available,Unknown,Expired}` | 每个模型在池里的权益分布（一个非归档账号只落一个桶）：持有该模型额度条目的账号数、其中额度仍可用的账号数、**权益未知**（没有快照 / 旧快照模型身份不明）、**已到期**（额度列全是「不会自动刷新且已过期」的作废额度） |
+| `ModelEntitlements(accounts, now)` | 按 `AvailableModels` 顺序产出上面的分布 |
+| `EntitledModels(accounts, now)` | 收录 `Accounts>0` **或** `Unknown>0` 的模型（混合池里从不刷额度的 API Key 账号会为所有模型保留公布资格）；已到期的不收录；**一个都没有时退化为完整支持清单**，避免新装部署的 `/v1/models` 为空、客户端连一个模型都配不出来 |
+| `DeterministicModelUnavailable(accounts, model, now)` | 确定性判定：**每个非归档账号**对该模型的权益都已确定、且都是「不含」（absent，或额度列已到期）。任何一个账号是 available / exhausted / disabled / unknown 都不判——那是「此刻没号」或「还说不准」，必须留 503 |
+| `UnavailableAccountCount(accounts, model, now)` | 与上面同口径的账号数（absent + 已到期），供错误文案与 details 的 N |
+| `SuggestedModels(accounts, exclude, now)` | 当前池内确有权益的替代模型，用于错误文案 |
 
 ### 3.2 `GET /v1/models` 按当前权益公布
 
-`handleModels` 改为 `EntitledModels(h.Engine.Store.ListAccounts(""))`。响应形态不变（Anthropic + OpenAI
-字段并存的超集），只是条目集合跟随账号池权益变化——官方恢复权益后无需发版即可自动重新出现。
+`handleModels` 改为 `EntitledModels(h.Engine.Store.ListAccounts(""), time.Now())`。响应形态不变
+（Anthropic + OpenAI 字段并存的超集），只是条目集合跟随账号池权益变化——官方恢复权益后无需发版即可
+自动重新出现。
 
 ### 3.3 确定性不可用 → 400 `model_not_available`
 
 `RunMessages` 的 `no_available_account` 出口先判断 `DeterministicModelUnavailable`：成立时返回
 **400**（而不是 503），错误体 `type=model_not_available`，message 点明
-「目前 N 個帳號的套餐均不含此模型（該模型可能已下架或未開通），請改用 …」（N = 已刷新额度的非归档账号数），
-`error.details` 带 `model`、`total_accounts`、`active_accounts`、`snapshot_accounts`、
-`model_unavailable{absent:N}`、`suggested_models`。其余「暂时没号」（冷却、风控静默、未知快照、
-单模型耗尽、以及任何账号仍持有该模型条目但暂时不可调度）仍返回原 503，401/429/1005 等既有分类不变。
+「目前 N 個帳號的套餐均不含此模型（該模型可能已下架、未開通或已到期），請改用 …」
+（N = 确定不可用的非归档账号数：快照不含 + 额度列已到期），
+`error.details` 带 `model`、`total_accounts`、`active_accounts`、`unavailable_accounts`、
+`snapshot_accounts`、`model_unavailable{absent:N}`、`suggested_models`。其余「暂时没号」（冷却、风控静默、
+权益未知、单模型耗尽、以及任何账号仍持有该模型条目但暂时不可调度）仍返回原 503，
+401/429/1005 等既有分类不变。
 
-判定刻意做到「宁可 503，不可错报 400」：`PoolStat.ModelStat` 只统计通过健康门槛的账号，若拿它做判据，
-一个正在冷却、但确实持有该模型的账号会被算成「不含该模型」，于是客户端收到 400 不再重试——比 503 更糟。
-因此判据回到账号数据本身：只要还有非归档账号持有该模型条目，就不是永久缺失。
+判定刻意做到「宁可 503，不可错报 400」，两道防线：
+- **不看 `PoolStat.ModelStat`**：它只统计通过健康门槛的账号，一个正在冷却、但确实持有该模型的账号会被
+  算漏，于是「其余健康账号都不含」被误判成永久不可用，客户端收到 400 从此不再重试——比 503 更糟；
+- **权益未知不算「不含」**：没有额度快照、或旧快照模型身份不明的账号（例如从不刷额度的 API Key 账号、
+  刚入池还没刷新过的新账号）都可能持有该模型，只要存在这样的账号就不判 400。
 
 选择 400 而不是 503 的理由：4xx 表达「重试不会变好」，客户端与中转层不会把永久下线当成瞬时故障，
 也不会让 new-api 依据 5xx 给渠道降权。
@@ -81,12 +87,26 @@
   「僅在賬號仍有該模型權益時可用」。
 - README 与 `docs/client-compatibility.md` 同步说明「模型能力 ≠ 当前权益」。
 
+### 3.6 评审修复（A–D，同日）
+
+初版提交 `e2e329a` 经独立评审提出四条，逐条定性后全部修复：
+
+| 编号 | 定性 | 问题 | 修复 |
+|---|---|---|---|
+| A | 真 bug | 「未知权益」被当成「确定缺失」：79 个已刷新账号不含 + 1 个从未刷新/身份未知的账号也会判 400，等于替客户端放弃一个可能可用的模型 | 判定改为「每个非归档账号的权益都已确定且都是 absent」，任一账号 available/exhausted/disabled/unknown 即不判 |
+| B | 真 bug | `/v1/models` 只数「有额度条目」的账号，混合池里从不刷额度的 API Key 账号能用的模型会被藏掉 | `ModelEntitlement` 增 `Unknown`，收录条件改为 `Accounts>0 \|\| Unknown>0` |
+| C | 既有缺口被放大 | `ModelAvailability` 只看剩余额度、不看到期时间：2026-11-23 的 GLM-5.3 正是「remaining>0 + expires_at 已过」，权益层仍把它当在售 | 新增 `(*Account).ModelEntitlementExpired`（只认不会自动刷新、且已过期的额度列），权益层把这类账号记为 `Expired`：不公布、按「确定不可用」参与判定；**调度语义不改** |
+| D | 真 bug（测试卫生） | 网关测试夹具只隔离了 `config.DBPath`，引擎出站调用 `config.DeviceMid()` 会把 `device_mid.txt` 写进仓库 `data/` | `openStore` 一并隔离 `config.DataDir`（对齐 `internal/adminapi` 既有做法），并补隔离断言用例 |
+
+C 的边界刻意选保守：日额度（周期跨度 24h）即使快照过期也不算作废——次日就刷新，把它判成过期会让
+`/v1/models` 每天抖动一次；只有 one_time 活动额度或跨度 > 36h 的套餐周期才走到期判定。
+
 ## 4. 契约（对外）
 
 | 位置 | 变化 |
 |---|---|
-| `GET /v1/models` | 条目集合改为当前有权益的模型；字段结构不变 |
-| `POST /v1/messages`（及 chat/responses 转换层） | 确定性不可用时 `400` + `error.type=model_not_available` + `error.details` |
+| `GET /v1/models` | 条目集合改为当前有权益的模型（持有条目或权益未知；已到期不公布）；字段结构不变 |
+| `POST /v1/messages`（及 chat/responses 转换层） | 确定性不可用时 `400` + `error.type=model_not_available` + `error.details`（含 `unavailable_accounts`、`snapshot_accounts`、`suggested_models`） |
 | `POST /async/v1/messages` | 事件 `type=no_account` 不变；message/details 增加下架口径与替代模型 |
 | `GET /admin/api/accounts`、`GET /admin/api/status` | `model_quotas[]` 每项新增 `snapshot_accounts` |
 

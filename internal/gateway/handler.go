@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"zcode2api/internal/auth"
 	"zcode2api/internal/config"
@@ -82,12 +83,13 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		WriteAuthError(w, e)
 		return
 	}
-	// 支持清单与当前权益分离：只公布池内确有额度条目的模型（官方下架某模型后，
-	// 客户端不该再挑中一个必然失败的模型）。池内一个权益都没有（新装/未刷额度）时
-	// EntitledModels 会退回完整清单，因此不会返回空列表。
+	// 支持清单与当前权益分离：只公布池内确有权益的模型（官方下架某模型后，客户端
+	// 不该再挑中一个必然失败的模型）。权益未知的账号（混合池里从不刷额度的 API Key
+	// 账号）会为所有模型保留公布资格；池内一个权益都没有时 EntitledModels 退回完整
+	// 清单，因此不会返回空列表。
 	// 双兼容超集（M4）：每项同时带 Anthropic 侧 id/display_name/type 与
 	// OpenAI 侧 object/created/owned_by，顶层 object:list
-	entitled := EntitledModels(h.Engine.Store.ListAccounts(""))
+	entitled := EntitledModels(h.Engine.Store.ListAccounts(""), time.Now())
 	data := make([]map[string]any, 0, len(entitled))
 	for _, id := range entitled {
 		data = append(data, map[string]any{

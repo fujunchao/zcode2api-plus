@@ -653,6 +653,43 @@ func (a *Account) SoonestNonRefreshingExpiry(model any, now time.Time, window ti
 	return best, found
 }
 
+// ModelEntitlementExpired 该模型的额度列是否「全部为不会自动刷新的已过期列」。
+//
+// 用途：权益层（/v1/models 公布清单与「确定性不可用」判定）识别「余额还在、实际已
+// 作废」的额度。2026-11-23 的 GLM-5.3 就是这种形态：快照里 remaining > 0，
+// expires_at 却已过去，上游照旧回 1005——只看剩余额度会把它当成仍在售。
+//
+// 只认**不会自动刷新**的额度列（quotaNonRefreshing：one_time 活动额度，或周期跨度
+// > 36h 的套餐/周/月额度）。日额度次日就会刷新，过期只说明快照旧了，不算作废。
+// 任何一列属于刷新型、缺少到期信息、或尚未到期，都返回 false——宁可漏判一个
+// 「已过期」，也不能把还能用的模型从对外清单里摘掉。
+//
+// 本方法只服务权益口径，不参与调度：ModelAvailability 与选号仍以剩余额度为准。
+func (a *Account) ModelEntitlementExpired(model any, now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	target := NormalizeModelName(model)
+	if target == "" {
+		return false
+	}
+	entries := a.QuotaEntriesForModel(target)
+	if len(entries) == 0 {
+		return false
+	}
+	nowSec := float64(now.UnixNano()) / 1e9
+	for _, quota := range entries {
+		if !quotaNonRefreshing(quota) {
+			return false
+		}
+		expire, ok := quotaExpiryUnix(quota)
+		if !ok || expire > nowSec {
+			return false
+		}
+	}
+	return true
+}
+
 // quotaHasBalance 该额度列是否仍有余额。available 优先于 remaining（与
 // UsableQuotaForModel 同口径：available 是「现在还能用多少」）。
 func quotaHasBalance(quota map[string]any) bool {

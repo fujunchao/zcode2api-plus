@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -98,15 +99,40 @@ func newFixture(t *testing.T) *fixture {
 
 func openStore(t *testing.T) *store.Store {
 	t.Helper()
-	old := config.DBPath
+	oldDB, oldData := config.DBPath, config.DataDir
 	config.DBPath = filepath.Join(t.TempDir(), "accounts.db")
-	t.Cleanup(func() { config.DBPath = old })
+	// 设备指纹目录同样要隔离：引擎出站会调 config.DeviceMid()，它把 device_mid.txt
+	// 写进 DataDir——不隔离就会落到仓库的 data/ 或与其他用例共享的目录里（对齐
+	// internal/adminapi/adminapi_test.go 的 setup 做法）。
+	config.DataDir = t.TempDir()
+	t.Cleanup(func() { config.DBPath, config.DataDir = oldDB, oldData })
 	st, err := store.New()
 	if err != nil {
 		t.Fatalf("打开存储失败: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+// TestFixtureIsolatesDeviceDataDir 夹具必须把设备指纹目录也换成临时目录。
+//
+// 不依赖 deviceMidOnce：它全局只触发一次，被先跑的用例消费掉后就不会再写盘，用它
+// 断言会得到「没写文件 = 已隔离」的假阳性。这里直接比配置值——隔离后的 DataDir 必须
+// 与调用前不同，且落在 t.TempDir() 这样的临时根目录下（同一测试的临时目录是兄弟目录）。
+func TestFixtureIsolatesDeviceDataDir(t *testing.T) {
+	before := config.DataDir
+	tempRoot := filepath.Dir(t.TempDir())
+	newFixture(t)
+	if config.DataDir == before {
+		t.Fatalf("newFixture 必须把 config.DataDir 换成隔离目录（仍是 %q）", before)
+	}
+	if got := filepath.Dir(config.DataDir); got != tempRoot {
+		t.Fatalf("隔离后的 DataDir 应位于临时根目录 %q 下: %q", tempRoot, config.DataDir)
+	}
+	info, err := os.Stat(config.DataDir)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("隔离后的 DataDir 应是一个存在的目录: %q %v", config.DataDir, err)
+	}
 }
 
 func (f *fixture) callCount() int {
