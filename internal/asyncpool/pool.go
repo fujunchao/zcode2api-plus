@@ -486,6 +486,20 @@ func (p *Pool) processTicket(ctx context.Context, ticketID string) {
 			// 与 sync 路径同口径：选不出号要如实说明「为什么」——冷却/风控/停用
 			// 都会走到这里，别让静态文案把它误读成绑定/额度问题（2026-09-20 事故）。
 			stat := p.Store.PoolStats(model.ProviderZai, modelName)
+			// 模型确定性不可用（池内没有任何账号持有它，通常是官方下架）：async 已经
+			// 先回了 200 SSE，改不了 HTTP 状态，只能在事件里给出与 sync 400 同口径的文案
+			// 与 details，让客户端/中转层判成「换模型」而不是「账号池临时故障」而反复重投。
+			// 只要还有账号持有该模型、或整池都没刷新过额度，仍走下面的 503 口径。
+			accounts := p.Store.ListAccounts("")
+			if gateway.DeterministicModelUnavailable(accounts, modelName) {
+				snapshotAccounts := gateway.SnapshotAccountCount(accounts)
+				suggested := gateway.SuggestedModels(accounts, modelName)
+				p.emitErrorWithDetails(ctx, ticketID,
+					gateway.DeterministicUnavailableMessage(modelName, snapshotAccounts, suggested),
+					"no_account",
+					gateway.DeterministicUnavailableDetails(stat, modelName, snapshotAccounts, suggested))
+				return
+			}
 			msg := "无可用 OAuth 账号"
 			if text := gateway.PoolStatusText(stat); text != "" {
 				msg += "（" + text + "）"

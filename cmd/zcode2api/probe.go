@@ -89,7 +89,7 @@ func runProbe(args []string) int {
 		account    = fs.String("account", "", "账号 id 或 name；留空则挑最久未使用的一个")
 		listOnly   = fs.Bool("list", false, "只列出候选账号，不发请求")
 		clientVer  = fs.String("client-version", "", "覆盖伪装版本（默认取 ZCODE_CLIENT_VERSION）")
-		modelName  = fs.String("model", "glm-5.3", "探针模型")
+		modelName  = fs.String("model", "glm-5.3-flash", "探针模型（默认 Flash：Start Plan 自 2026-11-24 起目录已不含 GLM-5.3）")
 		message    = fs.String("message", "只回复 OK", "探针消息")
 		maxTokens  = fs.Int("max-tokens", 16, "max_tokens")
 		timeout    = fs.Duration("timeout", 90*time.Second, "单请求超时")

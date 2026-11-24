@@ -90,3 +90,49 @@ func TestSummarizeModelQuotasInvalidNumbers(t *testing.T) {
 }
 
 func floatPtr(value float64) *float64 { return &value }
+
+// SnapshotAccounts 是池级口径：用来区分「该模型不在任何账号的套餐里（可能已下架）」
+// 与「账号还没刷新过额度」这两种零账号。空快照、归档账号都不计入。
+func TestSummarizeModelQuotasSnapshotAccounts(t *testing.T) {
+	archived := 1.0
+	accounts := []*Account{
+		{Quota: map[string]map[string]any{"套餐": {"model": "GLM-5.4", "total": 10, "used": 1, "remaining": 9}}},
+		// 停用只影响调度，不影响已经取得的额度快照。
+		{Status: StatusDisabled, Quota: map[string]map[string]any{"GLM-5.3": {"total": 10, "used": 0, "remaining": 10}}},
+		{Quota: map[string]map[string]any{}}, // 空快照不算「已有快照」
+		{ArchivedAt: &archived, Quota: map[string]map[string]any{"GLM-5.3": {"remaining": 1}}},
+		nil,
+	}
+	got := SummarizeModelQuotas(accounts, []string{"glm-5.3-flash", "GLM-5.4"})
+	if len(got) != 2 {
+		t.Fatalf("模型清单不符: %+v", got)
+	}
+	wantAccounts := map[string]int{"glm-5.3-flash": 0, "GLM-5.4": 1}
+	for _, q := range got {
+		if q.SnapshotAccounts != 2 {
+			t.Fatalf("模型 %s 的池级快照账号数应为 2（非归档且有额度快照）: %+v", q.Model, q)
+		}
+		if q.Accounts != wantAccounts[q.Model] {
+			t.Fatalf("模型 %s 的账号数不符: %+v", q.Model, q)
+		}
+	}
+	// 零账号 + 有快照 = 「快照里确实没有它」：这正是管理端提示下架而不是刷新的依据。
+	if got[0].Accounts != 0 || got[0].SnapshotAccounts == 0 {
+		t.Fatalf("零账号必须能与「没刷过额度」区分: %+v", got[0])
+	}
+	// JSON 键名是与管理端/前端的对接约定，改名会让额度卡读不到池级口径。
+	raw, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view map[string]any
+	if err := json.Unmarshal(raw, &view); err != nil {
+		t.Fatal(err)
+	}
+	if view["snapshot_accounts"] != float64(2) {
+		t.Fatalf("JSON 字段 snapshot_accounts 缺失或取值不符: %s", raw)
+	}
+	if empty := SummarizeModelQuotas(nil, []string{"GLM-5.4"}); empty[0].SnapshotAccounts != 0 {
+		t.Fatalf("空池的快照账号数应为 0: %+v", empty[0])
+	}
+}

@@ -12,6 +12,10 @@ type ModelQuotaSummary struct {
 	Accounts  int      `json:"accounts"`
 	Items     int      `json:"items"`
 	Partial   bool     `json:"partial"`
+	// SnapshotAccounts 池内已有额度快照（Quota 非空）且未归档的账号数。
+	// 每个模型汇总都带同一个池级数值：用来区分「该模型不在任何账号套餐里
+	//（可能已下架）」与「账号还没刷新过额度」这两种零账号。
+	SnapshotAccounts int `json:"snapshot_accounts"`
 }
 
 // SummarizeModelQuotas 按调用方给定的模型顺序汇总非归档账号的所有套餐。
@@ -20,8 +24,18 @@ type ModelQuotaSummary struct {
 // 调用方应传入独立账号快照，函数不修改账号，也不触发上游查询。
 func SummarizeModelQuotas(accounts []*Account, models []string) []ModelQuotaSummary {
 	result := make([]ModelQuotaSummary, 0, len(models))
+	// 池级口径只算一次：模型循环里每个汇总都带同一个数值。
+	snapshotAccounts := 0
+	for _, account := range accounts {
+		if account == nil || account.ArchivedAt != nil {
+			continue
+		}
+		if len(account.Quota) > 0 {
+			snapshotAccounts++
+		}
+	}
 	for _, name := range models {
-		summary := ModelQuotaSummary{Model: name}
+		summary := ModelQuotaSummary{Model: name, SnapshotAccounts: snapshotAccounts}
 		for _, account := range accounts {
 			if account == nil || account.ArchivedAt != nil {
 				continue

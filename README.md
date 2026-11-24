@@ -6,10 +6,18 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 額度與套餐到期監控、OAuth 登錄、賬號級出站代理、活動套餐自動領取、賬號歸檔，
 單二進制交付（前端已內嵌，無外部運行時）。
 
-仪表板与账号池分别汇总 **GLM-5.3**、**GLM-5.4** 与 **GLM-5.3-Flash** 的总额度、已用和剩余，
+仪表板与账号池分别汇总 **GLM-5.4**、**GLM-5.3-Flash** 与 **GLM-5.3** 的总额度、已用和剩余，
 同一模型跨账号、跨套餐累加，不再混合不同模型的额度。
 统计采用非归档账号的最近上游快照（含停用、冷却及失效账号），并非当前可调度额度；
 未获取数据与额度为零分别展示。升级无需数据库迁移。
+
+> **模型按当前权益公布（2.15.1-go 起）**：`GET /v1/models` 只列出当前账号池里至少有一个账号
+> 持有额度的模型；当某模型已从官方目录移除、池内没有任何账号持有它的权益时，请求会直接返回
+> `400 model_not_available` 并提示可用的替代模型，而不是 503 让客户端与中转层把它当临时故障反复重试。
+> 2026-11-24 起 ZCode Start Plan 目录已用 GLM-5.4 取代 GLM-5.3（Coding Plan 目录仍列 GLM-5.3），
+> 因此以 Start Plan 账号为主的部署看不到 GLM-5.3；若你的账号仍有该模型权益，网关会自动把它
+> 重新列入 `/v1/models`，无需改代码或发版。管理端「模型额度」对这类模型不再画空卡，
+> 而是明确标注「账号套餐均不含该模型（可能已下架）」。
 
 > 📦 歷史沿革：本項目原為 Python 實現，現已由 Go 重寫版取代成為主線。
 > Python 舊版保留在 [`python-legacy`](../../tree/python-legacy) 分支（僅歸檔維護，不再更新）。
@@ -22,7 +30,7 @@ Z.AI ZCode Coding Plan → OpenAI/Anthropic 兼容網關（**Go 版，現為主�
 | `POST /v1/chat/completions` | OpenAI Chat | 本地轉換為 Anthropic Messages，含工具調用 |
 | `POST /v1/responses` | OpenAI Responses | 服務 Codex CLI（無狀態模式；`previous_response_id` 返回 400） |
 | `POST /async/v1/messages` | Anthropic 異步 | ticket + keepalive + 流中斷語義 |
-| `GET /v1/models` | 雙兼容超集 | Anthropic 與 OpenAI 形態字段並存 |
+| `GET /v1/models` | 雙兼容超集 | Anthropic 與 OpenAI 形態字段並存；僅列當前賬號池有權益的模型 |
 | `/admin/*` | — | 內嵌 React 管理後台 |
 
 對外三種請求格式，內部統一走 Anthropic Messages 上游管道：選號循環、驗證碼求解、
@@ -633,6 +641,8 @@ JWT 賬號入池（批量添加 / OAuth / CLI login）後自動：激活事件�
 网关支持函数工具协议转换，实际工具由 Pi 等客户端执行，不在服务端执行命令。
 Chat Completions 支持 `tool_calls`、`reasoning_content`；Responses 补齐文本、思考摘要及函数工具的流事件。
 GLM-5.3 / GLM-5.4 / GLM-5.3-Flash 的原生思考档位为 `low/high/max`，默认且推荐 `max`，不能关闭思考。
+思考档位是模型能力，是否可调用取决于账号权益：Start Plan 自 2026-11-24 起目录已不含 GLM-5.3，
+此时网关对 GLM-5.3 直接返回 `400 model_not_available`（见文首「模型按当前权益公布」）。
 `v2.0.4-go` 修正了旧版错误拒绝 `max` 的问题：按官方 Coding Plan 规则兼容别名，
 并传递原生 effort，不再把思考程度替换成固定 token 预算；输出上限仍由调用方控制。
 不支持的工具类型、`strict:true`、真正未知的档位或显式关闭思考请求会明确返回 400。

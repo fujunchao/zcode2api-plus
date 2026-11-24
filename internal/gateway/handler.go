@@ -82,10 +82,14 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		WriteAuthError(w, e)
 		return
 	}
+	// 支持清单与当前权益分离：只公布池内确有额度条目的模型（官方下架某模型后，
+	// 客户端不该再挑中一个必然失败的模型）。池内一个权益都没有（新装/未刷额度）时
+	// EntitledModels 会退回完整清单，因此不会返回空列表。
 	// 双兼容超集（M4）：每项同时带 Anthropic 侧 id/display_name/type 与
 	// OpenAI 侧 object/created/owned_by，顶层 object:list
-	data := make([]map[string]any, 0, len(AvailableModels))
-	for _, id := range AvailableModels {
+	entitled := EntitledModels(h.Engine.Store.ListAccounts(""))
+	data := make([]map[string]any, 0, len(entitled))
+	for _, id := range entitled {
 		data = append(data, map[string]any{
 			"id":           id,
 			"type":         "model",

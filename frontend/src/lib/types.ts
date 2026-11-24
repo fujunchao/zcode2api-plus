@@ -374,9 +374,16 @@ export interface ModelQuotaSummary {
   total: number | null
   used: number | null
   remaining: number | null
+  /** 持有该模型额度条目的非归档账号数；0 表示池内没有账号的套餐包含该模型。 */
   accounts: number
   items: number
   partial: boolean
+  /**
+   * 池内已有额度快照（quota 非空）的非归档账号数，池级数值，每个模型项都一样。
+   * accounts === 0 时靠它区分「模型已不在任何账号套餐里」与「还没刷新过额度」，
+   * 否则会把刷不回来的模型误报成「请刷新额度」。
+   */
+  snapshot_accounts: number
 }
 
 export interface SettingsResponse {

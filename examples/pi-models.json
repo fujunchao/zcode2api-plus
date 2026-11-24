@@ -14,11 +14,12 @@
       },
       "models": [
         {
-          "id": "GLM-5.3",
-          "name": "ZCode GLM-5.3",
+          "id": "GLM-5.4",
+          "name": "ZCode GLM-5.4",
           "reasoning": true,
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "maxTokens": 16384,
           "thinkingLevelMap": {
@@ -38,6 +39,24 @@
           "input": [
             "text",
             "image"
+          ],
+          "maxTokens": 16384,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          }
+        },
+        {
+          "id": "GLM-5.3",
+          "name": "ZCode GLM-5.3（僅在賬號仍有該模型權益時可用）",
+          "reasoning": true,
+          "input": [
+            "text"
           ],
           "maxTokens": 16384,
           "thinkingLevelMap": {

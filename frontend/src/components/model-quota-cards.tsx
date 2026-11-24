@@ -2,7 +2,15 @@ import { Card, CardContent } from '@/components/ui/card'
 import { fmt, fmtCompact } from '@/lib/format'
 import type { ModelQuotaSummary } from '@/lib/types'
 
-/** 只展示后端汇总，不再把不同模型的额度相加；未知数值不绘制进度条。 */
+/**
+ * 只展示后端汇总，不再把不同模型的额度相加；未知数值不绘制进度条。
+ *
+ * accounts === 0 表示池内没有任何账号的套餐包含该模型。此时必须分清两种成因，
+ * 否则运维会把「模型已经不在任何套餐里」误当成「刷新一下额度就好了」：
+ *   - snapshot_accounts > 0：池内已有账号刷新过额度，只是都不含该模型 → 可能已下架；
+ *   - snapshot_accounts === 0：一次额度都还没刷到过，无从判断 → 提示去刷新。
+ * 两种情况都不再画「--」三列数字与空进度条，收缩成「标题 + 一行说明」的紧凑卡片。
+ */
 export function ModelQuotaCards({ quotas }: { quotas: ModelQuotaSummary[] }) {
   return (
     <section aria-label="模型额度" className="flex flex-col gap-3">
@@ -12,16 +20,40 @@ export function ModelQuotaCards({ quotas }: { quotas: ModelQuotaSummary[] }) {
       </div>
       <div className="grid gap-3 md:grid-cols-2">
         {quotas.map((quota) => {
-          const { model, total, used, remaining, partial } = quota
+          const { model, total, used, remaining, partial, accounts, items, snapshot_accounts: snapshotAccounts } = quota
           const percent = !partial && total != null && total > 0 && remaining != null
             ? Math.max(0, Math.min(100, remaining / total * 100))
             : null
+          // 没有任何账号持有该模型额度条目：只说明成因，不摆一排没有意义的「--」。
+          if (accounts === 0) {
+            const withdrawn = snapshotAccounts > 0
+            return (
+              <Card key={model} role="region" aria-label={`${model} 额度`} className="gap-3 py-4">
+                <CardContent className="flex flex-col gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="font-mono text-sm font-semibold">{model}</h3>
+                    <span className="text-xs text-muted-foreground">
+                      {withdrawn
+                        ? `0 个账号持有 · 共 ${fmt(snapshotAccounts)} 个账号已刷新额度`
+                        : `${fmt(accounts)} 个账号 · ${fmt(items)} 个额度项目`}
+                    </span>
+                  </div>
+                  {/* 用琥珀而非 destructive 红：这是套餐覆盖范围变了，不是系统故障。 */}
+                  <p className={`text-xs ${withdrawn ? 'text-amber-700' : 'text-muted-foreground'}`}>
+                    {withdrawn
+                      ? `当前账号池的 ${fmt(snapshotAccounts)} 个账号套餐均不含该模型（可能已下架），请求会直接失败。`
+                      : '尚未获取该模型额度，请在账号池刷新额度。'}
+                  </p>
+                </CardContent>
+              </Card>
+            )
+          }
           return (
             <Card key={model} role="region" aria-label={`${model} 额度`}>
               <CardContent className="flex flex-col gap-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-mono text-sm font-semibold">{model}</h3>
-                  <span className="text-xs text-muted-foreground">{fmt(quota.accounts)} 个账号 · {fmt(quota.items)} 个额度项目</span>
+                  <span className="text-xs text-muted-foreground">{fmt(accounts)} 个账号 · {fmt(items)} 个额度项目</span>
                 </div>
                 <dl className="grid grid-cols-3 gap-3">
                   <QuotaValue label="剩余额度" value={remaining} prominent />

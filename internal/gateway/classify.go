@@ -358,7 +358,11 @@ var ModelNameMap = map[string]string{
 	"glm-5.4": "GLM-5.4",
 }
 
-// AvailableModels 对外公布的可用模型（/v1/models 与请求白名单）。
+// AvailableModels 支持的模型全集（请求白名单 + /v1/models 的兜底清单）。
+//
+// /v1/models 实际公布的是池内有权益的子集（见 EntitledModels）；本清单仍是请求
+// 白名单的上界——白名单若随额度快照收缩，一次额度刷新抖动就会把合法模型判成
+// 不可重试的 400。
 //
 // GLM-5.4 是 ZCode 4.0.0 之后由云端目录（runtime zcode-builtin revision 48）
 // 下发的标准 ID（大写）。上游同时接受小写写法，但统一映射到官方 ID 可避免

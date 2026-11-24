@@ -65,8 +65,8 @@ environment:
 
 ## 思考程度（v2.0.4 修正）
 
-GLM-5.3 和 GLM-5.3-Flash 的原生档位是 low、high、max，默认且推荐 max。
-两者均强制思考，不能关闭。v2.0.3 把自定义 token 预算映射误当成模型能力白名单，
+GLM-5.3、GLM-5.4 和 GLM-5.3-Flash 的原生档位是 low、high、max，默认且推荐 max。
+三者均强制思考，不能关闭。v2.0.3 把自定义 token 预算映射误当成模型能力白名单，
 错误拒绝了 max；该限制已移除。
 
 按官方 Coding Plan 的兼容规则归一化：
@@ -106,7 +106,8 @@ thinking.type=disabled 明确返回 400，建议用 low 降低开销；真正未
 
 将 examples/pi-models.json 中 zcode2api 提供商条目合入 Pi 的 models.json，
 不要覆盖其它提供商；按实际部署修改 baseUrl，并设置环境变量 ZCODE_GATEWAY_KEY。
-示例同时包含 GLM-5.3 和 glm-5.3-flash，使用独立提供商名，不修改其它代理配置。
+示例包含 GLM-5.4、glm-5.3-flash 与 GLM-5.3（后者已从 Start Plan 目录移除，仅在账号仍有该模型权益时可用），
+使用独立提供商名，不修改其它代理配置。
 
 关键设置：
 
